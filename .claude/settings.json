@@ -9,11 +9,7 @@
       "Bash(pnpm -r test:*)",
       "Bash(pnpm -r lint:*)",
       "Bash(pnpm -r typecheck:*)",
-      "Bash(pnpm -r build:*)",
-      "Bash(pnpm --filter * test:*)",
-      "Bash(pnpm --filter * lint:*)",
-      "Bash(pnpm --filter * typecheck:*)",
-      "Bash(pnpm --filter * build:*)"
+      "Bash(pnpm -r build:*)"
     ],
     "deny": [
       "Bash(docker * --privileged*)",
@@ -25,7 +21,11 @@
       "Read(**/.env.local)",
       "Read(**/.env.development)",
       "Read(**/.env.production)",
-      "Read(**/.env.test)"
+      "Read(**/.env.test)",
+      "Bash(pnpm exec:*)",
+      "Bash(pnpm dlx:*)",
+      "Bash(pnpm * exec*)",
+      "Bash(pnpm * dlx*)"
     ]
   }
 }
