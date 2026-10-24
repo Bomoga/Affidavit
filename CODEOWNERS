@@ -1,0 +1,17 @@
+# TODO: replace each placeholder with real GitHub handles or teams.
+# Lane 1: Discovery and Case File
+/packages/discovery/ @TODO-lane1-owner
+/packages/corpus/ @TODO-lane1-owner
+# Lane 2: Sandbox and Evidence Harness
+/packages/sandbox/ @TODO-lane2-owner
+/packages/judge/ @TODO-lane2-owner
+/packages/evidence/ @TODO-lane2-owner
+# Lane 3: Trial Engine
+/packages/trial/ @TODO-lane3-owner
+/packages/prompts/ @TODO-lane3-owner
+/packages/evals/ @TODO-lane3-owner
+# Contracts: every change needs the contracts owner (Lane 3 lead)
+/packages/contracts/ @TODO-contracts-owner
+# Lane 4: Platform, UI, and Integrations
+/apps/ @TODO-lane4-owner
+/packages/db/ @TODO-lane4-owner

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(pnpm test:*)",
+      "Bash(pnpm lint:*)",
+      "Bash(pnpm typecheck:*)",
+      "Bash(pnpm build:*)",
+      "Bash(pnpm -r test:*)",
+      "Bash(pnpm -r lint:*)",
+      "Bash(pnpm -r typecheck:*)",
+      "Bash(pnpm -r build:*)",
+      "Bash(pnpm --filter * test:*)",
+      "Bash(pnpm --filter * lint:*)",
+      "Bash(pnpm --filter * typecheck:*)",
+      "Bash(pnpm --filter * build:*)"
+    ],
+    "deny": [
+      "Bash(docker * --privileged*)",
+      "Bash(docker * /var/run/docker.sock*)",
+      "Bash(docker * docker.sock*)",
+      "Bash(curl:*)",
+      "Bash(wget:*)",
+      "Read(**/.env)",
+      "Read(**/.env.local)",
+      "Read(**/.env.development)",
+      "Read(**/.env.production)",
+      "Read(**/.env.test)"
+    ]
+  }
+}
