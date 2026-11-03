@@ -43,7 +43,12 @@ export interface Escalation {
 }
 
 export type TrialEventType =
-  'stage-entered' | 'stage-exited' | 'cost-charged' | 'budget-exhausted' | 'escalated';
+  | 'stage-entered'
+  | 'stage-exited'
+  | 'cost-charged'
+  | 'budget-exhausted'
+  | 'exhibit-inadmissible'
+  | 'escalated';
 
 export interface TrialEvent {
   caseId: string;
@@ -108,3 +113,8 @@ export interface CaseStore {
 export interface EventSink {
   emit(event: TrialEvent): Promise<void>;
 }
+
+export type SchemaValidation = { ok: true } | { ok: false; errors: string[] };
+
+/** Validates an agent submission against the named contracts schema. */
+export type SchemaValidator = (schemaRef: string, value: unknown) => SchemaValidation;

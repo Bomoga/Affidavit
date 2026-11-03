@@ -9,9 +9,11 @@ import {
   type ModelTurnRequest,
   type ModelTurnResult,
   type Role,
+  type SchemaValidator,
   type StageCost,
   type TrialEventType,
 } from './interim/types.js';
+import { assertAllowedTools } from './roles.js';
 
 /** A request for one agent turn. Same shape as the model port's, plus who is acting. */
 export interface AgentRequest extends ModelTurnRequest {
@@ -22,6 +24,11 @@ export type StageResult =
   | { kind: 'advance'; next: CaseStage }
   | { kind: 'escalate'; reason: EscalationReason; detail: string };
 
+export type ValidatedAgentResult =
+  | { outcome: 'admitted'; value: unknown; result: ModelTurnResult }
+  | { outcome: 'inadmissible'; rule: 'schema'; errors: string[]; result: ModelTurnResult }
+  | { outcome: 'no-submission'; result: ModelTurnResult };
+
 export interface StageContext {
   readonly caseId: string;
   readonly stage: CaseStage;
@@ -29,6 +36,11 @@ export interface StageContext {
   readonly attempt: number;
   /** The only way a handler reaches a model. Charges the budget before the call. */
   runAgent(req: AgentRequest): Promise<ModelTurnResult>;
+  /**
+   * runAgent plus schema validation of the submission. Output that fails the schema
+   * is recorded as inadmissible and returned; it is never retried here.
+   */
+  runAgentValidated(req: AgentRequest): Promise<ValidatedAgentResult>;
 }
 
 export interface StageHandler {
@@ -48,6 +60,7 @@ export interface OrchestratorDeps {
   sink: EventSink;
   model: ModelPort;
   handlers: Partial<Record<CaseStage, StageHandler>>;
+  validate: SchemaValidator;
   config: OrchestratorConfig;
 }
 
@@ -130,6 +143,7 @@ export class Orchestrator {
       stage,
       attempt,
       runAgent: (req) => this.runAgent(caseId, stage, attempt, req),
+      runAgentValidated: (req) => this.runAgentValidated(caseId, stage, attempt, req),
     };
   }
 
@@ -141,6 +155,7 @@ export class Orchestrator {
   ): Promise<ModelTurnResult> {
     const { store, model, config } = this.deps;
     const now = config.now ?? Date.now;
+    assertAllowedTools(req.actor, req.tools);
     if (await config.killSwitch()) throw new KillSwitchError();
 
     // Charge the worst case before the call, so a retry cannot spend unrecorded money.
@@ -179,6 +194,28 @@ export class Orchestrator {
       throw new BudgetExhaustedError(`model reported its budget exhausted in ${stage}`);
     }
     return result;
+  }
+
+  private async runAgentValidated(
+    caseId: string,
+    stage: CaseStage,
+    attempt: number,
+    req: AgentRequest,
+  ): Promise<ValidatedAgentResult> {
+    const result = await this.runAgent(caseId, stage, attempt, req);
+    if (result.outcome !== 'submitted') return { outcome: 'no-submission', result };
+
+    const check = this.deps.validate(req.outputSchemaRef, result.submission);
+    if (check.ok) return { outcome: 'admitted', value: result.submission, result };
+
+    await this.emit(
+      caseId,
+      stage,
+      'exhibit-inadmissible',
+      { rule: 'schema', schemaRef: req.outputSchemaRef, errors: check.errors, attempt },
+      req.actor,
+    );
+    return { outcome: 'inadmissible', rule: 'schema', errors: check.errors, result };
   }
 
   private async escalate(
