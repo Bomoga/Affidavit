@@ -10,7 +10,7 @@ Contracts version in use: none yet (Phase 0 contracts, ports, fakes, and fixture
 | L3-01 | done | lane3/L3-01-orchestrator (PR 5) | Built on interim types in packages/trial/src/interim; replace at P0-03 and P0-04. Graphile job wrapper deferred to apps/worker |
 | L3-02 | done | lane3/L3-02-safety-envelope (stacked on PR 5) | Tool allowlists and schema admission. Validator is injected until contracts land |
 | L3-03 | done | lane3/L3-03-prompts-package (PR pending review) | Prompts, untrusted wrapper, append-only version history. Role and schema names are string refs until contracts land |
-| L3-04 | todo | | Needs L3-02, L3-03 |
+| L3-04 | done | lane3/L3-04-defense (stacked on PR 6) | Renderer injected; real L1-07 planted-instruction case file still to run |
 | L3-05 | todo | | Needs L3-04 |
 | L3-06 | todo | | Needs L3-05 |
 | L3-07 | doing | lane3/L3-07a-design-tokens (partial) | Tokens and contrast done. Shell, router, case view need P0-05 for fixtures; React, Vite, TanStack are not installed until P0-02 |
