@@ -7,7 +7,7 @@ Contracts version in use: none yet (Phase 0 contracts, ports, fakes, and fixture
 
 | ID | Status (todo, doing, done, blocked) | Branch or PR | Notes |
 | --- | --- | --- | --- |
-| L3-01 | todo | | Needs P0-03, P0-04 |
+| L3-01 | done | lane3/L3-01-orchestrator (PR 5) | Built on interim types in packages/trial/src/interim; replace at P0-03 and P0-04. Graphile job wrapper deferred to apps/worker |
 | L3-02 | todo | | Needs L3-01. Write the per-role tool allowlist enumeration test first |
 | L3-03 | done | lane3/L3-03-prompts-package (PR pending review) | Prompts, untrusted wrapper, append-only version history. Role and schema names are string refs until contracts land |
 | L3-04 | todo | | Needs L3-02, L3-03 |
@@ -32,6 +32,9 @@ Contracts version in use: none yet (Phase 0 contracts, ports, fakes, and fixture
 - 2026-11-03: `packages/prompts` has a pure-TypeScript SHA-256 instead of `node:crypto`, because no Node typings are installed and adding `@types/node` is outside the approved dependency list.
 - 2026-11-03: Prompt versioning uses an append-only history of (version, digest) per prompt. A prompt whose text changes under an unchanged version fails `versions.test.ts`.
 - 2026-11-03: The second Defense attempt is its own prompt id (`defense-second-attempt`) so it differs in text from the first, as F3 requires. The model difference is the orchestrator's job (L3-04).
+
+- 2026-11-03: Adrian approved interim local types for L3-01 so work is not idle while Phase 0 is pending. They live only in `packages/trial/src/interim` and `src/testing`, and are deleted when contracts v1.0 and `@affidavit/testing` land.
+- 2026-11-03: Orchestrator charges a worst-case reservation before each model call and settles to actual cost after. The real `CaseStore` port needs `chargeBudget` (returns a receipt), `settleCost`, and `nextSeq`. Kill switch escalates with reason `budget-exhausted`; `escalated` must be reachable from any non-terminal stage.
 
 ## Metrics from real runs
 
