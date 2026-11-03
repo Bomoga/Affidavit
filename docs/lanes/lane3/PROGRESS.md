@@ -8,7 +8,7 @@ Contracts version in use: none yet (Phase 0 contracts, ports, fakes, and fixture
 | ID | Status (todo, doing, done, blocked) | Branch or PR | Notes |
 | --- | --- | --- | --- |
 | L3-01 | done | lane3/L3-01-orchestrator (PR 5) | Built on interim types in packages/trial/src/interim; replace at P0-03 and P0-04. Graphile job wrapper deferred to apps/worker |
-| L3-02 | todo | | Needs L3-01. Write the per-role tool allowlist enumeration test first |
+| L3-02 | done | lane3/L3-02-safety-envelope (stacked on PR 5) | Tool allowlists and schema admission. Validator is injected until contracts land |
 | L3-03 | done | lane3/L3-03-prompts-package (PR pending review) | Prompts, untrusted wrapper, append-only version history. Role and schema names are string refs until contracts land |
 | L3-04 | todo | | Needs L3-02, L3-03 |
 | L3-05 | todo | | Needs L3-04 |
