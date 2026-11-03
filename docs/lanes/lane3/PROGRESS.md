@@ -12,7 +12,7 @@ Contracts version in use: none yet (Phase 0 contracts, ports, fakes, and fixture
 | L3-03 | done | lane3/L3-03-prompts-package (PR pending review) | Prompts, untrusted wrapper, append-only version history. Role and schema names are string refs until contracts land |
 | L3-04 | done | lane3/L3-04-defense (stacked on PR 6) | Renderer injected; real L1-07 planted-instruction case file still to run |
 | L3-05 | done | lane3/L3-05-remedy (stacked on PR 7) | Interim VerifyResult and TrialWorkspace; counterexamples empty until L3-08 |
-| L3-06 | todo | | Needs L3-05 |
+| L3-06 | done | lane3/L3-06-verdict (stacked on PR 8) | Interim Verdict and exhibit id pattern; dismissed and escalated verdicts not wired yet |
 | L3-07 | doing | lane3/L3-07a-design-tokens (partial) | Tokens and contrast done. Shell, router, case view need P0-05 for fixtures; React, Vite, TanStack are not installed until P0-02 |
 | L3-08 | todo | | Phase 2 |
 | L3-09 | todo | | Phase 2 |
