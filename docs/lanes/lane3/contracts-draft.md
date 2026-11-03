@@ -108,8 +108,8 @@ Verdict = z.object({
   jurorCorrelation: z.number().min(-1).max(1).optional(),
   summary: z.string(),                      // generated from the fields above, never the reverse
   bundleSha256: z.string().length(64).optional(),
-  promptVersions: z.record(z.string(), z.string()),  // see issue A
-  modelIds: z.record(z.string(), z.string()),        // see issue A
+  promptVersions: z.partialRecord(PromptId, z.string()),  // keyed by prompt id (issue A, decided)
+  modelIds: z.partialRecord(PromptId, z.string()),        // keyed by prompt id (issue A, decided)
   cost: z.array(StageCost),
 });
 ```
@@ -153,13 +153,22 @@ Lane 2 and Lane 1 own the exact shapes. Lane 3 needs these properties from them:
 
 ## 4. Issues found while drafting (need a decision)
 
-A. `Verdict.promptVersions` and `modelIds` are `Record<Role, string>` in the plan, but a role can have several prompts and models: Defense has a first and a second attempt (F3) on different models, and the jury has three jurors on different prompts. A role-keyed record cannot hold them. Proposal: key by prompt id (`defense`, `defense-second-attempt`, `juror-security`, and so on), which matches `packages/prompts`. This is breaking if v1.0 ships role-keyed, so decide before freeze.
+A. DECIDED (Adrian): `Verdict.promptVersions` and `modelIds` are keyed by prompt id, not `Role`. A role can have several prompts and models: Defense has a first and a second attempt (F3) on different models, and the jury has three jurors on different prompts. Keys are the ids in `packages/prompts` (`defense`, `defense-second-attempt`, `prosecution`, `remedy`, `juror-security`, `juror-maintainability`, `juror-blast-radius`). In the contract the key type is a string enum of those ids, owned by contracts and mirrored by `PromptId` in `packages/prompts`; a test in prompts should assert the two lists match once contracts lands. This replaces the plan's `Record<Role, string>`, so it must be in v1.0 before the freeze. Only prompts that actually ran appear in a given verdict.
 
 B. `Witness` has no `sha256`, but the `JudgePort` fake is "scripted by fixture: maps `witness.sha256` to a recorded result". `Exhibit` has `sha256`. Proposal: the Judge and fake key on the exhibit that wraps the witness, or `Witness` gains `sha256`. Either way, state it in the contract.
 
 C. `Verdict.severity` is required in the plan's list, but `dismissed`, `escalated`, and `not-proven` outcomes have no severity to give. Proposal: optional, as sketched above.
 
 D. `Role` includes `judge` and `stenographer`, which never author prompts or submissions. That is fine for events (`actor`) but `Verdict` records should not claim a prompt version for them. Resolved by issue A.
+
+Also add `PromptId` to the contracts exports as part of A:
+
+```ts
+PromptId = z.enum([
+  'defense', 'defense-second-attempt', 'prosecution', 'remedy',
+  'juror-security', 'juror-maintainability', 'juror-blast-radius',
+]);
+```
 
 E. Budgets: the plan puts per-case token and dollar budgets in Lane 3 but `StageCost` only records spend. Proposal: keep `Budget` as Lane 3 config, not a contract, unless Lane 1 needs to persist it. Say so in the changelog.
 
