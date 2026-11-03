@@ -6,6 +6,10 @@ import {
   type ChargeReceipt,
   type Escalation,
   type EventSink,
+  type JudgePort,
+  type JudgeResult,
+  type CaseFile,
+  type WitnessSubmission,
   type ModelPort,
   type ModelTurnRequest,
   type ModelTurnResult,
@@ -114,6 +118,19 @@ export class FakeModel implements ModelPort {
     const next = this.script.shift();
     if (!next) return Promise.reject(new Error('model script exhausted'));
     this.log.push(`model:${next.cost.stage}:${next.cost.attempt}`);
+    return Promise.resolve(next);
+  }
+}
+
+/** Scripted Judge: returns recorded results in order. The only source of pass or fail. */
+export class FakeJudge implements JudgePort {
+  readonly calls: WitnessSubmission[] = [];
+  constructor(private readonly script: JudgeResult[]) {}
+
+  runWitness(_caseFile: CaseFile, witness: WitnessSubmission): Promise<JudgeResult> {
+    this.calls.push(witness);
+    const next = this.script.shift();
+    if (!next) return Promise.reject(new Error('judge script exhausted'));
     return Promise.resolve(next);
   }
 }
