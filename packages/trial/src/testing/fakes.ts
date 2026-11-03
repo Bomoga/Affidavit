@@ -11,6 +11,7 @@ import {
   type PatchOutcome,
   type PatchSubmission,
   type TrialWorkspace,
+  type Verdict,
   type VerifyResult,
   type CaseFile,
   type WitnessSubmission,
@@ -99,6 +100,10 @@ export class FakeCaseStore implements CaseStore {
   nextSeq(): Promise<number> {
     return Promise.resolve(++this.seq);
   }
+
+  getCosts(): Promise<StageCost[]> {
+    return Promise.resolve([...this.settled]);
+  }
 }
 
 export class FakeEventSink implements EventSink {
@@ -153,6 +158,8 @@ export class FakeJudge implements JudgePort {
 export class InMemoryWorkspace implements TrialWorkspace {
   private witness = new Map<string, WitnessSubmission>();
   private outcome = new Map<string, PatchOutcome>();
+  private exhibits = new Map<string, string[]>();
+  private verdicts = new Map<string, Verdict>();
   saveWitness(caseId: string, w: WitnessSubmission): Promise<void> {
     this.witness.set(caseId, w);
     return Promise.resolve();
@@ -166,5 +173,19 @@ export class InMemoryWorkspace implements TrialWorkspace {
   }
   getPatchOutcome(caseId: string): Promise<PatchOutcome | undefined> {
     return Promise.resolve(this.outcome.get(caseId));
+  }
+  addExhibit(caseId: string, exhibitId: string): Promise<void> {
+    this.exhibits.set(caseId, [...(this.exhibits.get(caseId) ?? []), exhibitId]);
+    return Promise.resolve();
+  }
+  saveVerdict(caseId: string, v: Verdict): Promise<void> {
+    this.verdicts.set(caseId, v);
+    return Promise.resolve();
+  }
+  getVerdict(caseId: string): Promise<Verdict | undefined> {
+    return Promise.resolve(this.verdicts.get(caseId));
+  }
+  getExhibits(caseId: string): Promise<string[]> {
+    return Promise.resolve(this.exhibits.get(caseId) ?? []);
   }
 }

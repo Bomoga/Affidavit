@@ -104,6 +104,7 @@ export function createRemedyHandler(deps: RemedyDeps): StageHandler {
         if (isAccepted(result)) {
           await ctx.record('patch-verified', { accepted: true }, 'judge');
           await workspace.savePatchOutcome(ctx.caseId, { accepted: true, patch, result });
+          if (result.patchExhibitId) await workspace.addExhibit(ctx.caseId, result.patchExhibitId);
           return { kind: 'advance', next: 'verify' };
         }
 

@@ -142,6 +142,7 @@ async function attempt(
     );
     if (verdict.admissible && verdict.passed) {
       await deps.workspace?.saveWitness(ctx.caseId, witness);
+      await deps.workspace?.addExhibit(ctx.caseId, verdict.exhibitId);
       return { admitted: true, feedback };
     }
 
