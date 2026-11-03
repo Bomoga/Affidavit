@@ -14,6 +14,9 @@ export type CaseStage =
   | 'jury'
   | 'verdict'
   | 'dismissed'
+  | 'patch-submitted'
+  | 'patch-rejected'
+  | 'patch-verified'
   | 'escalated';
 
 export const TERMINAL_STAGES: readonly CaseStage[] = ['verdict', 'dismissed', 'escalated'];
@@ -51,6 +54,9 @@ export type TrialEventType =
   | 'exhibit-submitted'
   | 'exhibit-result'
   | 'dismissed'
+  | 'patch-submitted'
+  | 'patch-rejected'
+  | 'patch-verified'
   | 'escalated';
 
 export interface TrialEvent {
@@ -148,6 +154,56 @@ export interface JudgeResult {
 
 export interface JudgePort {
   runWitness(caseFile: CaseFile, witness: WitnessSubmission): Promise<JudgeResult>;
+  verifyPatch(
+    caseFile: CaseFile,
+    patch: PatchSubmission,
+    witness: WitnessSubmission,
+    counterexampleIds: readonly string[],
+  ): Promise<VerifyResult>;
+}
+
+// Interim Remedy shapes. Replace with PatchExhibit and VerifyResult from contracts v1.0.
+export interface PatchSubmission {
+  diff: string;
+  filesTouched: string[];
+  linesChanged: number;
+}
+
+export type VerifyRejection =
+  'literal-only-patch' | 'diff-too-large' | 'suite-fails' | 'counterexample-survives';
+
+export interface VerifyResult {
+  familyFlipped: boolean;
+  suitePassed: boolean;
+  rescanClean: boolean;
+  counterexamples: { exhibitId: string; survived: boolean }[];
+  rejectedBy?: VerifyRejection;
+  detail?: string;
+}
+
+export function isAccepted(r: VerifyResult): boolean {
+  return (
+    r.rejectedBy === undefined &&
+    r.familyFlipped &&
+    r.suitePassed &&
+    r.rescanClean &&
+    r.counterexamples.every((c) => !c.survived)
+  );
+}
+
+export interface PatchOutcome {
+  accepted: boolean;
+  patch?: PatchSubmission;
+  result?: VerifyResult;
+  reason?: string;
+}
+
+/** Interim handoff between stages until an exhibit store exists in the real ports. */
+export interface TrialWorkspace {
+  saveWitness(caseId: string, witness: WitnessSubmission): Promise<void>;
+  getWitness(caseId: string): Promise<WitnessSubmission | undefined>;
+  savePatchOutcome(caseId: string, outcome: PatchOutcome): Promise<void>;
+  getPatchOutcome(caseId: string): Promise<PatchOutcome | undefined>;
 }
 
 export interface RenderedPrompt {
