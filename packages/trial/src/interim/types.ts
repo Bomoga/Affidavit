@@ -14,9 +14,6 @@ export type CaseStage =
   | 'jury'
   | 'verdict'
   | 'dismissed'
-  | 'patch-submitted'
-  | 'patch-rejected'
-  | 'patch-verified'
   | 'escalated';
 
 export const TERMINAL_STAGES: readonly CaseStage[] = ['verdict', 'dismissed', 'escalated'];
