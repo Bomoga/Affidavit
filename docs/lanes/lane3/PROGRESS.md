@@ -13,7 +13,7 @@ Contracts version in use: none yet (Phase 0 contracts, ports, fakes, and fixture
 | L3-04 | todo | | Needs L3-02, L3-03 |
 | L3-05 | todo | | Needs L3-04 |
 | L3-06 | todo | | Needs L3-05 |
-| L3-07 | todo | | Needs P0-05 for fixtures; React, Vite, TanStack are not installed until P0-02 |
+| L3-07 | doing | lane3/L3-07a-design-tokens (partial) | Tokens and contrast done. Shell, router, case view need P0-05 for fixtures; React, Vite, TanStack are not installed until P0-02 |
 | L3-08 | todo | | Phase 2 |
 | L3-09 | todo | | Phase 2 |
 | L3-10 | todo | | Phase 2 |
