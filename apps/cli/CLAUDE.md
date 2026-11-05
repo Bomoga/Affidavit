@@ -1,8 +1,8 @@
-Read docs/plan.md and the Lane 4 section before working in this package.
+Read docs/plan.md, then docs/implementation-plan.md section 5 (Lane 1) before working in this package.
 
 # @affidavit/cli
 
-**Owner:** Lane 4 (Platform, UI, and Integrations)
+**Owner:** Lane 1 (Intake and Platform)
 
 **Mission:** CLI entry point: affidavit scan, status, and replay.
 
@@ -16,7 +16,7 @@ Run from this directory, or add `--filter @affidavit/cli` from the repo root.
 
 ## Intended libraries (notes for later, not installed yet)
 
-- A CLI argument parser (TBD when Lane 4 starts)
+- A CLI argument parser (commander or citty, decided in L1-11)
 - @affidavit/evidence (replay)
 
 Root CLAUDE.md rules apply here. Do not add dependencies without asking.

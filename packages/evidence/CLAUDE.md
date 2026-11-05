@@ -1,8 +1,8 @@
-Read docs/plan.md and the Lane 2 section before working in this package.
+Read docs/plan.md, then docs/implementation-plan.md section 6 (Lane 2) before working in this package.
 
 # @affidavit/evidence
 
-**Owner:** Lane 2 (Sandbox and Evidence Harness)
+**Owner:** Lane 2 (Judge and Evidence)
 
 **Mission:** Evidence bundles, replay, and signing.
 

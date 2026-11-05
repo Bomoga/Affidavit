@@ -8,10 +8,14 @@
     "moduleResolution": "NodeNext",
     "strict": true,
     "noUncheckedIndexedAccess": true,
-    "declaration": true,
-    "composite": true,
+    "declaration": false,
+    "composite": false,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "isolatedModules": true
+    "isolatedModules": true,
+    "noEmit": true,
+    "types": [
+      "node"
+    ]
   }
 }

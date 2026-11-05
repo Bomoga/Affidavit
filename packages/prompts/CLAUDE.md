@@ -1,8 +1,8 @@
-Read docs/plan.md and the Lane 3 section before working in this package.
+Read docs/plan.md, then docs/implementation-plan.md section 7 (Lane 3) before working in this package.
 
 # @affidavit/prompts
 
-**Owner:** Lane 3 (Trial Engine)
+**Owner:** Lane 3 (Trial and Courtroom)
 
 **Mission:** Versioned role prompts for Defense, Prosecution, Remedy, and Jury.
 

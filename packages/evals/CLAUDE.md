@@ -1,8 +1,8 @@
-Read docs/plan.md and the Lane 3 section before working in this package.
+Read docs/plan.md, then docs/implementation-plan.md section 7 (Lane 3) before working in this package.
 
 # @affidavit/evals
 
-**Owner:** Lane 3 (Trial Engine)
+**Owner:** Lane 3 (Trial and Courtroom)
 
 **Mission:** Calibration and cost reports run against the corpus.
 

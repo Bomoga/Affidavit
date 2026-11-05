@@ -1,0 +1,338 @@
+[
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 0,
+    "stage": "intake",
+    "at": "2026-11-05T12:00:00.000Z",
+    "actor": "stenographer",
+    "type": "stage-entered",
+    "payload": {}
+  },
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 1,
+    "stage": "intake",
+    "at": "2026-11-05T12:00:01.000Z",
+    "actor": "stenographer",
+    "type": "stage-exited",
+    "payload": {
+      "to": "map"
+    }
+  },
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 2,
+    "stage": "map",
+    "at": "2026-11-05T12:00:02.000Z",
+    "actor": "stenographer",
+    "type": "stage-entered",
+    "payload": {
+      "from": "intake"
+    }
+  },
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 3,
+    "stage": "map",
+    "at": "2026-11-05T12:00:03.000Z",
+    "actor": "stenographer",
+    "type": "stage-exited",
+    "payload": {
+      "to": "arraign"
+    }
+  },
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 4,
+    "stage": "arraign",
+    "at": "2026-11-05T12:00:04.000Z",
+    "actor": "stenographer",
+    "type": "stage-entered",
+    "payload": {
+      "from": "map"
+    }
+  },
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 5,
+    "stage": "arraign",
+    "at": "2026-11-05T12:00:05.000Z",
+    "actor": "stenographer",
+    "type": "stage-exited",
+    "payload": {
+      "to": "defense"
+    }
+  },
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 6,
+    "stage": "defense",
+    "at": "2026-11-05T12:00:06.000Z",
+    "actor": "defense",
+    "type": "stage-entered",
+    "payload": {
+      "from": "arraign"
+    }
+  },
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 7,
+    "stage": "defense",
+    "at": "2026-11-05T12:00:07.000Z",
+    "actor": "defense",
+    "type": "exhibit-submitted",
+    "payload": {
+      "exhibitId": "exhibit-witness-001",
+      "kind": "witness"
+    }
+  },
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 8,
+    "stage": "defense",
+    "at": "2026-11-05T12:00:08.000Z",
+    "actor": "judge",
+    "type": "exhibit-result",
+    "payload": {
+      "result": {
+        "schemaVersion": 1,
+        "exhibitId": "exhibit-witness-001",
+        "admissible": true,
+        "runs": [
+          {
+            "variant": "vulnerable",
+            "attempt": 1,
+            "exitCode": 0,
+            "passed": true,
+            "durationMs": 812,
+            "stdoutSha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "stderrSha256": "3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "variant": "vulnerable",
+            "attempt": 2,
+            "exitCode": 0,
+            "passed": true,
+            "durationMs": 812,
+            "stdoutSha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "stderrSha256": "3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "variant": "vulnerable",
+            "attempt": 3,
+            "exitCode": 0,
+            "passed": true,
+            "durationMs": 812,
+            "stdoutSha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "stderrSha256": "3333333333333333333333333333333333333333333333333333333333333333"
+          }
+        ],
+        "vulnPass": true,
+        "safeVariantFail": true,
+        "egressAttempts": 0,
+        "familyResults": [
+          {
+            "paramIndex": 0,
+            "passed": true
+          },
+          {
+            "paramIndex": 1,
+            "passed": true
+          },
+          {
+            "paramIndex": 2,
+            "passed": true
+          }
+        ],
+        "passed": true,
+        "durationMs": 2600
+      }
+    }
+  },
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 9,
+    "stage": "defense",
+    "at": "2026-11-05T12:00:09.000Z",
+    "actor": "defense",
+    "type": "cost-charged",
+    "payload": {
+      "cost": {
+        "stage": "defense",
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "usd": 0,
+        "wallMs": 0,
+        "attempt": 1
+      },
+      "remaining": {
+        "remainingInputTokens": 900000,
+        "remainingOutputTokens": 90000,
+        "remainingUsd": 4.5,
+        "exhausted": false
+      }
+    }
+  },
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 10,
+    "stage": "defense",
+    "at": "2026-11-05T12:00:10.000Z",
+    "actor": "defense",
+    "type": "stage-exited",
+    "payload": {
+      "to": "prosecution"
+    }
+  },
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 11,
+    "stage": "prosecution",
+    "at": "2026-11-05T12:00:11.000Z",
+    "actor": "prosecution",
+    "type": "stage-entered",
+    "payload": {
+      "from": "defense"
+    }
+  },
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 12,
+    "stage": "prosecution",
+    "at": "2026-11-05T12:00:12.000Z",
+    "actor": "prosecution",
+    "type": "stage-exited",
+    "payload": {
+      "to": "remedy"
+    }
+  },
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 13,
+    "stage": "remedy",
+    "at": "2026-11-05T12:00:13.000Z",
+    "actor": "remedy",
+    "type": "stage-entered",
+    "payload": {
+      "from": "prosecution"
+    }
+  },
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 14,
+    "stage": "remedy",
+    "at": "2026-11-05T12:00:14.000Z",
+    "actor": "remedy",
+    "type": "exhibit-submitted",
+    "payload": {
+      "exhibitId": "exhibit-patch-001",
+      "kind": "patch"
+    }
+  },
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 15,
+    "stage": "remedy",
+    "at": "2026-11-05T12:00:15.000Z",
+    "actor": "remedy",
+    "type": "stage-exited",
+    "payload": {
+      "to": "verify"
+    }
+  },
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 16,
+    "stage": "verify",
+    "at": "2026-11-05T12:00:16.000Z",
+    "actor": "judge",
+    "type": "stage-entered",
+    "payload": {
+      "from": "remedy"
+    }
+  },
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 17,
+    "stage": "verify",
+    "at": "2026-11-05T12:00:17.000Z",
+    "actor": "judge",
+    "type": "stage-exited",
+    "payload": {
+      "to": "verdict"
+    }
+  },
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 18,
+    "stage": "verdict",
+    "at": "2026-11-05T12:00:18.000Z",
+    "actor": "stenographer",
+    "type": "verdict-written",
+    "payload": {
+      "verdict": {
+        "schemaVersion": 1,
+        "caseId": "case-nodegoat-sqli-001",
+        "outcome": "proven-fixed",
+        "severity": "high",
+        "exhibits": [
+          "exhibit-witness-001",
+          "exhibit-patch-001"
+        ],
+        "ballots": [
+          {
+            "schemaVersion": 1,
+            "jurorId": "juror-security",
+            "model": "model-id-placeholder",
+            "mandate": "security",
+            "inputVariant": "raw-results-only",
+            "confidence": 0.8,
+            "citedExhibits": [
+              "exhibit-witness-001"
+            ],
+            "question": "severity",
+            "vote": "high"
+          }
+        ],
+        "summary": "Summary generated from the structured verdict.",
+        "promptVersions": {
+          "defense": "v1",
+          "remedy": "v1"
+        },
+        "modelIds": {
+          "defense": "model-id-placeholder",
+          "remedy": "model-id-placeholder"
+        },
+        "cost": [
+          {
+            "stage": "defense",
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "usd": 0,
+            "wallMs": 0,
+            "attempt": 1
+          }
+        ]
+      }
+    }
+  }
+]

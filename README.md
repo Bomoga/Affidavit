@@ -24,4 +24,4 @@ The canonical build plan is [docs/plan.md](docs/plan.md). Read it before startin
 
 ## Status
 
-This repo is scaffolding only. Every package is an empty stub; core logic comes later.
+Phase 0 (lead setup) is in place: contracts v1.0, ports, fakes, and fixtures. Every other package is still an empty stub. See [docs/implementation-plan.md](docs/implementation-plan.md) for the lane tasks and [docs/decisions.md](docs/decisions.md) for open decisions.

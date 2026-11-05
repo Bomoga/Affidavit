@@ -3,6 +3,9 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -10,5 +13,12 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test": "vitest run"
+  },
+  "dependencies": {
+    "@affidavit/contracts": "workspace:*",
+    "dockerode": "5.0.1"
+  },
+  "devDependencies": {
+    "@types/dockerode": "4.0.2"
   }
 }

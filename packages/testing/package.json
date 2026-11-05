@@ -1,0 +1,22 @@
+{
+  "name": "@affidavit/testing",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "generate:fixtures": "tsx scripts/generate-fixtures.ts"
+  },
+  "dependencies": {
+    "@affidavit/contracts": "workspace:*",
+    "zod": "4.6.7"
+  }
+}
