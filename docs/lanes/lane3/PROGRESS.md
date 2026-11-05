@@ -1,7 +1,7 @@
 # Lane 3 progress
 
 Owner: Adrian
-Contracts version in use: none yet (Phase 0 contracts, ports, fakes, and fixtures have not landed on `main`)
+Contracts version in use: v1.0 is on `main` (Phase 0 merged, PR 11). Lane 3 code still runs on interim local types; migration to `@affidavit/contracts` and `@affidavit/testing` is the next task.
 
 ## Tasks
 
@@ -24,8 +24,8 @@ Contracts version in use: none yet (Phase 0 contracts, ports, fakes, and fixture
 
 ## Blocked
 
-- L3-01, L3-02, L3-04 to L3-06: blocked on Phase 0 (contracts v1.0, ports, `packages/testing` fakes). Nothing to try; waiting on P0-03 and P0-04 to merge to `main`.
-- L3-07: blocked on P0-02 (UI dependencies) and P0-05 (`fixtures/trials`). Lane 3 may not add dependencies itself.
+- None on Phase 0 any more. Open work: migrate the interim types in `packages/trial/src/interim` and `apps/web/src/model` to `@affidavit/contracts`, swap local fakes for `@affidavit/testing`, and move the placeholder fixtures to `fixtures/trials/`.
+- L3-07 shell, router and accessibility check: need the UI dependencies from P0-02 to be confirmed installed on `main`.
 
 ## Decisions made in this lane
 

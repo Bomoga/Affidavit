@@ -1,0 +1,30 @@
+{
+  "name": "@affidavit/worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@affidavit/contracts": "workspace:*",
+    "@affidavit/db": "workspace:*",
+    "@affidavit/discovery": "workspace:*",
+    "@affidavit/evidence": "workspace:*",
+    "@affidavit/judge": "workspace:*",
+    "@affidavit/prompts": "workspace:*",
+    "@affidavit/sandbox": "workspace:*",
+    "@affidavit/testing": "workspace:*",
+    "@affidavit/trial": "workspace:*",
+    "@opentelemetry/api": "1.10.0",
+    "graphile-worker": "0.18.0"
+  }
+}

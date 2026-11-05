@@ -1,0 +1,108 @@
+[
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 0,
+    "stage": "defense",
+    "at": "2026-11-05T12:00:00.000Z",
+    "actor": "defense",
+    "type": "stage-entered",
+    "payload": {
+      "from": "arraign"
+    }
+  },
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 1,
+    "stage": "defense",
+    "at": "2026-11-05T12:00:01.000Z",
+    "actor": "defense",
+    "type": "exhibit-submitted",
+    "payload": {
+      "exhibitId": "exhibit-witness-001",
+      "kind": "witness"
+    }
+  },
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 2,
+    "stage": "defense",
+    "at": "2026-11-05T12:00:02.000Z",
+    "actor": "judge",
+    "type": "exhibit-inadmissible",
+    "payload": {
+      "exhibitId": "exhibit-witness-001",
+      "rejectedBy": "stable-3of3"
+    }
+  },
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 3,
+    "stage": "defense",
+    "at": "2026-11-05T12:00:03.000Z",
+    "actor": "defense",
+    "type": "cost-charged",
+    "payload": {
+      "cost": {
+        "stage": "defense",
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "usd": 0,
+        "wallMs": 0,
+        "attempt": 1
+      },
+      "remaining": {
+        "remainingInputTokens": 900000,
+        "remainingOutputTokens": 90000,
+        "remainingUsd": 4.5,
+        "exhausted": false
+      }
+    }
+  },
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 4,
+    "stage": "defense",
+    "at": "2026-11-05T12:00:04.000Z",
+    "actor": "defense",
+    "type": "exhibit-submitted",
+    "payload": {
+      "exhibitId": "exhibit-witness-002",
+      "kind": "witness"
+    }
+  },
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 5,
+    "stage": "defense",
+    "at": "2026-11-05T12:00:05.000Z",
+    "actor": "judge",
+    "type": "exhibit-inadmissible",
+    "payload": {
+      "exhibitId": "exhibit-witness-002",
+      "rejectedBy": "differential"
+    }
+  },
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 6,
+    "stage": "defense",
+    "at": "2026-11-05T12:00:06.000Z",
+    "actor": "stenographer",
+    "type": "escalated",
+    "payload": {
+      "escalation": {
+        "schemaVersion": 1,
+        "caseId": "case-nodegoat-sqli-001",
+        "reason": "no-admissible-witness-above-floor",
+        "detail": "second Defense attempt produced no admissible witness"
+      }
+    }
+  }
+]

@@ -1,7 +1,7 @@
 services:
   postgres:
-    # TODO: pin this image by digest.
-    image: postgres:16
+    # Multi-arch index digest for postgres:16, resolved 2026-11-05 with `docker buildx imagetools inspect`.
+    image: postgres:16@sha256:933463a6c8eba2b9f5cd414138738cd8d5519cd2c471214c222652f547a66a32
     environment:
       POSTGRES_USER: affidavit
       POSTGRES_DB: affidavit

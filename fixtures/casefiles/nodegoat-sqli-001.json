@@ -1,0 +1,81 @@
+{
+  "schemaVersion": 1,
+  "id": "case-nodegoat-sqli-001",
+  "tenantId": "tenant-dev",
+  "target": {
+    "repo": "repo-nodegoat",
+    "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "variant": "vulnerable"
+  },
+  "candidate": {
+    "schemaVersion": 1,
+    "id": "cand-sqli-001",
+    "tool": "semgrep",
+    "ruleId": "affidavit.injection.sql-concat",
+    "cls": "injection",
+    "file": "app/data/allocations-dao.js",
+    "range": {
+      "startLine": 70,
+      "endLine": 74
+    },
+    "reachability": "reachable",
+    "score": 0.92,
+    "scoreInputs": {
+      "reachability": 1,
+      "sinkType": 0.9,
+      "noAuthOnPath": 1,
+      "toolAgreement": 0.5
+    },
+    "toolAgreement": 1
+  },
+  "slices": [
+    {
+      "file": "app/data/allocations-dao.js",
+      "range": {
+        "startLine": 60,
+        "endLine": 80
+      },
+      "code": "/* slice recorded from run [id] */",
+      "strippedComments": true,
+      "untrusted": true
+    }
+  ],
+  "route": {
+    "method": "GET",
+    "path": "/allocations/:userId",
+    "handlerFile": "app/routes/allocations.js",
+    "middleware": [
+      "isLoggedIn"
+    ],
+    "authRequired": true
+  },
+  "bootHints": {
+    "kind": "compose",
+    "path": "docker-compose.yml",
+    "service": "web",
+    "ports": [
+      4000
+    ],
+    "healthRoute": "/login",
+    "healthTimeoutMs": 60000,
+    "stubs": [],
+    "env": {
+      "NODE_ENV": "synthetic"
+    }
+  },
+  "redactions": [
+    {
+      "file": "config/env.js",
+      "startLine": 4,
+      "endLine": 4,
+      "kind": "generic-api-key",
+      "placeholder": "[REDACTED:1]"
+    }
+  ],
+  "escalationFloor": 0.7,
+  "safeVariant": {
+    "repo": "repo-nodegoat",
+    "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "variant": "safe"
+  }
+}
