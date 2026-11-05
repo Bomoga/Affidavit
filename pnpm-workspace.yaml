@@ -11,3 +11,10 @@ allowBuilds:
   ssh2: false
   tree-sitter-javascript: false
   tree-sitter-typescript: false
+
+# Transitive dev-tooling advisories found by the osv CI job. Remove once upstream releases move past them.
+# GHSA-67mh-4wv8-2f99: esbuild 0.18.20 comes from drizzle-kit's @esbuild-kit loader.
+# GHSA-g3hv-75wg-m249: minimatch 10.2.6 comes from eslint; the fix exists only in 11.x.
+overrides:
+  "@esbuild-kit/core-utils>esbuild": 0.25.12
+  minimatch: 11.0.1
