@@ -1,17 +1,44 @@
-# TODO: replace each placeholder with real GitHub handles or teams.
-# Lane 1: Discovery and Case File
-/packages/discovery/ @TODO-lane1-owner
-/packages/corpus/ @TODO-lane1-owner
-# Lane 2: Sandbox and Evidence Harness
-/packages/sandbox/ @TODO-lane2-owner
-/packages/judge/ @TODO-lane2-owner
-/packages/evidence/ @TODO-lane2-owner
-# Lane 3: Trial Engine
-/packages/trial/ @TODO-lane3-owner
-/packages/prompts/ @TODO-lane3-owner
-/packages/evals/ @TODO-lane3-owner
-# Contracts: every change needs the contracts owner (Lane 3 lead)
-/packages/contracts/ @TODO-contracts-owner
-# Lane 4: Platform, UI, and Integrations
-/apps/ @TODO-lane4-owner
-/packages/db/ @TODO-lane4-owner
+# Owners by lane (docs/implementation-plan.md section 2.2).
+# Lanes 1 and 2 have no named owner yet (open decision 1); @Bomoga holds them until assigned.
+# Replace the handle on those lines when owners are named.
+
+# Lead: contracts, testing fakes, root config, docs
+/packages/contracts/ @Bomoga
+/packages/testing/ @Bomoga
+/.claude/ @Bomoga
+/.github/ @Bomoga
+/docs/ @Bomoga
+/CLAUDE.md @Bomoga
+/CODEOWNERS @Bomoga
+/docker/compose.yaml @Bomoga
+/package.json @Bomoga
+/pnpm-workspace.yaml @Bomoga
+
+# Lane 1: Intake and Platform
+/packages/discovery/ @Bomoga
+/packages/corpus/ @Bomoga
+/packages/db/ @Bomoga
+/apps/api/ @Bomoga
+/apps/cli/ @Bomoga
+/apps/github-app/ @Bomoga
+/apps/worker/ @Bomoga
+/docker/tools/ @Bomoga
+/fixtures/casefiles/ @Bomoga
+/fixtures/corpus/ @Bomoga
+
+# Lane 2: Judge and Evidence
+/packages/sandbox/ @Bomoga
+/packages/judge/ @Bomoga
+/packages/evidence/ @Bomoga
+/apps/signer/ @Bomoga
+/docker/sandbox/ @Bomoga
+/fixtures/exhibit-results/ @Bomoga
+/fixtures/bundles/ @Bomoga
+
+# Lane 3: Trial and Courtroom
+/packages/trial/ @Bomoga
+/packages/prompts/ @Bomoga
+/packages/evals/ @Bomoga
+/apps/web/ @Bomoga
+/apps/mcp/ @Bomoga
+/fixtures/trials/ @Bomoga

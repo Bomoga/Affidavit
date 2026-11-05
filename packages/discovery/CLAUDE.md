@@ -1,8 +1,8 @@
-Read docs/plan.md and the Lane 1 section before working in this package.
+Read docs/plan.md, then docs/implementation-plan.md section 5 (Lane 1) before working in this package.
 
 # @affidavit/discovery
 
-**Owner:** Lane 1 (Discovery and Case File)
+**Owner:** Lane 1 (Intake and Platform)
 
 **Mission:** Repo ingestion, the map, tool runners, and arraignment scoring.
 

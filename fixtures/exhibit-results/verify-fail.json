@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "patchExhibitId": "exhibit-patch-001",
+  "familyFlipped": false,
+  "suitePassed": true,
+  "rescanClean": true,
+  "counterexamples": [
+    {
+      "exhibitId": "exhibit-counter-001",
+      "survived": true
+    }
+  ],
+  "rejectedBy": "literal-only-patch"
+}

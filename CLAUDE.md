@@ -1,4 +1,4 @@
-docs/plan.md is the canonical build plan. Every session should read it before starting work.
+docs/plan.md is the canonical product and architecture plan. docs/implementation-plan.md is the execution plan (three lanes, tasks, ports, schedule); where the two disagree on lane structure, the implementation plan wins. Every session should read both before starting work.
 
 # Affidavit project rules
 
@@ -15,14 +15,17 @@ These non-negotiables apply to every session in every package:
 
 ## Repo layout
 
-- `apps/` api, web, cli, github-app, mcp (Lane 4)
-- `packages/contracts` Zod schemas for every boundary (Lane 3 lead approves changes)
-- `packages/db` (Lane 4); `packages/discovery`, `packages/corpus` (Lane 1)
-- `packages/sandbox`, `packages/judge`, `packages/evidence` (Lane 2)
-- `packages/trial`, `packages/prompts`, `packages/evals` (Lane 3)
-- `docs/` canonical docs including plan.md; `fixtures/` recorded mocks; `docker/` local compose and tool images
+Three lanes. A path belongs to exactly one lane (docs/implementation-plan.md section 2.2).
 
-Each package has its own short CLAUDE.md with its commands and the libraries it intends to use. Those library lists are notes for later, not installs.
+- Lane 1, Intake and Platform: `packages/discovery`, `packages/corpus`, `packages/db`, `apps/api`, `apps/cli`, `apps/github-app`, `apps/worker`, `docker/tools/`
+- Lane 2, Judge and Evidence: `packages/sandbox`, `packages/judge`, `packages/evidence`, `apps/signer`, `docker/sandbox/`
+- Lane 3, Trial and Courtroom: `packages/trial`, `packages/prompts`, `packages/evals`, `apps/web`, `apps/mcp`
+- Lead: `packages/contracts`, `packages/testing`, root config, `.claude/`, `.github/`, `docs/`, `docker/compose.yaml`
+- `fixtures/` recorded mocks, split by lane under `fixtures/<kind>/`
+
+`apps/worker` is the composition root: wiring and config only, no logic. Lanes talk through ports in `packages/contracts` and fakes in `packages/testing`.
+
+Each package has its own short CLAUDE.md with its commands and invariants. Do not add dependencies outside your lane's approved list without asking.
 
 ## Commands
 

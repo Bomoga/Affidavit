@@ -1,8 +1,8 @@
-Read docs/plan.md and the Lane 4 section before working in this package.
+Read docs/plan.md, then docs/implementation-plan.md section 5 (Lane 1) before working in this package.
 
 # @affidavit/api
 
-**Owner:** Lane 4 (Platform, UI, and Integrations)
+**Owner:** Lane 1 (Intake and Platform)
 
 **Mission:** Fastify API: auth, cases, webhooks, and the SSE stream of trial events.
 

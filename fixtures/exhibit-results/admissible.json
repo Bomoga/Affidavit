@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "exhibitId": "exhibit-witness-001",
+  "admissible": true,
+  "runs": [
+    {
+      "variant": "vulnerable",
+      "attempt": 1,
+      "exitCode": 0,
+      "passed": true,
+      "durationMs": 812,
+      "stdoutSha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "stderrSha256": "3333333333333333333333333333333333333333333333333333333333333333"
+    },
+    {
+      "variant": "vulnerable",
+      "attempt": 2,
+      "exitCode": 0,
+      "passed": true,
+      "durationMs": 812,
+      "stdoutSha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "stderrSha256": "3333333333333333333333333333333333333333333333333333333333333333"
+    },
+    {
+      "variant": "vulnerable",
+      "attempt": 3,
+      "exitCode": 0,
+      "passed": true,
+      "durationMs": 812,
+      "stdoutSha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "stderrSha256": "3333333333333333333333333333333333333333333333333333333333333333"
+    }
+  ],
+  "vulnPass": true,
+  "safeVariantFail": true,
+  "egressAttempts": 0,
+  "familyResults": [
+    {
+      "paramIndex": 0,
+      "passed": true
+    },
+    {
+      "paramIndex": 1,
+      "passed": true
+    },
+    {
+      "paramIndex": 2,
+      "passed": true
+    }
+  ],
+  "passed": true,
+  "durationMs": 2600
+}

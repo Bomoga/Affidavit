@@ -2,5 +2,12 @@ packages:
   - "apps/*"
   - "packages/*"
 
+# Install scripts are allowed only where we have reviewed the need. Everything else stays off.
+# Native tree-sitter builds are not used: discovery loads grammars through web-tree-sitter (wasm).
 allowBuilds:
+  cpu-features: false
   esbuild: true
+  protobufjs: false
+  ssh2: false
+  tree-sitter-javascript: false
+  tree-sitter-typescript: false

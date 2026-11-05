@@ -15,6 +15,35 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm -r typecheck
-      - run: pnpm -r lint
-      - run: pnpm -r test
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm format:check
+      - run: pnpm test
+      - run: pnpm build
+
+  fixtures:
+    # Fixtures are part of the contract: every fixture must parse, and the committed fixtures and
+    # exported JSON Schema must match what the generators produce from the current contracts.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @affidavit/testing test
+      - run: pnpm --filter @affidavit/testing generate:fixtures
+      - run: git diff --exit-code -- fixtures
+      - run: pnpm --filter @affidavit/contracts export:schema
+
+  osv:
+    # Dogfooding: scan our own lockfile with the tool we ship. Image pinned by digest.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: >
+          docker run --rm -v "$PWD:/src:ro"
+          ghcr.io/google/osv-scanner@sha256:4f3b7e2c64b9d38a5febc5a7e4a3dfef1d1362f726dea7a2ef4762b46469fcd0
+          scan source --lockfile=/src/pnpm-lock.yaml

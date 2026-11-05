@@ -1,8 +1,8 @@
-Read docs/plan.md and the Lane 4 section before working in this package.
+Read docs/plan.md, then docs/implementation-plan.md section 7 (Lane 3) before working in this package.
 
 # @affidavit/mcp
 
-**Owner:** Lane 4 (Platform, UI, and Integrations)
+**Owner:** Lane 3 (Trial and Courtroom)
 
 **Mission:** MCP server so other agents can request a verdict on their own changes.
 

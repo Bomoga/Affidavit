@@ -1,4 +1,8 @@
-// TODO: boundary objects to be defined later with Zod (Lane 3 lead approves changes):
-//   Candidate, CaseFile, Witness, Exhibit, ExhibitResult, Ballot, Verdict, TrialEvent.
-// Do not define them in the scaffolding pass.
-export {};
+export * from './common.js';
+export * from './discovery.js';
+export * from './evidence.js';
+export * from './trial.js';
+export * from './api.js';
+export * from './ports/index.js';
+export { schemaRegistry } from './registry.js';
+export { samples } from './samples.js';
