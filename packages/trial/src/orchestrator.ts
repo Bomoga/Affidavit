@@ -41,6 +41,8 @@ export interface StageContext {
    * is recorded as inadmissible and returned; it is never retried here.
    */
   runAgentValidated(req: AgentRequest): Promise<ValidatedAgentResult>;
+  /** Append a trial event for this stage. */
+  record(type: TrialEventType, payload: Record<string, unknown>, actor?: Role): Promise<void>;
 }
 
 export interface StageHandler {
@@ -144,6 +146,7 @@ export class Orchestrator {
       attempt,
       runAgent: (req) => this.runAgent(caseId, stage, attempt, req),
       runAgentValidated: (req) => this.runAgentValidated(caseId, stage, attempt, req),
+      record: (type, payload, actor) => this.emit(caseId, stage, type, payload, actor),
     };
   }
 

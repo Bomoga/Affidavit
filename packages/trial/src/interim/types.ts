@@ -48,6 +48,9 @@ export type TrialEventType =
   | 'cost-charged'
   | 'budget-exhausted'
   | 'exhibit-inadmissible'
+  | 'exhibit-submitted'
+  | 'exhibit-result'
+  | 'dismissed'
   | 'escalated';
 
 export interface TrialEvent {
@@ -118,3 +121,45 @@ export type SchemaValidation = { ok: true } | { ok: false; errors: string[] };
 
 /** Validates an agent submission against the named contracts schema. */
 export type SchemaValidator = (schemaRef: string, value: unknown) => SchemaValidation;
+
+// Interim shapes for the Defense stage. Replace with contracts v1.0 (CaseFile, Witness,
+// ExhibitResult) and the JudgePort when P0-03 lands.
+export interface CaseFile {
+  id: string;
+  /** Candidates scoring at or above this are never dismissed on one attempt (F3). */
+  escalationFloor: number;
+  candidate: { id: string; cls: 'injection' | 'idor'; score: number };
+  /** Already stripped of comments and prose by discovery. Still untrusted. */
+  slices: { file: string; code: string }[];
+}
+
+export interface WitnessSubmission {
+  template: string;
+  params: unknown;
+}
+
+export interface JudgeResult {
+  exhibitId: string;
+  admissible: boolean;
+  rejectedBy?: string;
+  passed: boolean;
+  detail?: string;
+}
+
+export interface JudgePort {
+  runWitness(caseFile: CaseFile, witness: WitnessSubmission): Promise<JudgeResult>;
+}
+
+export interface RenderedPrompt {
+  promptId: string;
+  version: string;
+  outputSchemaRef: string;
+  system: string;
+  user: string;
+}
+
+/** Matches renderPrompt in @affidavit/prompts. Injected so trial does not depend on it directly. */
+export type PromptRenderer = (
+  id: string,
+  blocks: readonly { label: string; content: string }[],
+) => RenderedPrompt;
