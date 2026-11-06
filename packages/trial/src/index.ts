@@ -16,3 +16,5 @@ export type { ValidatedAgentResult } from './orchestrator.js';
 export { ROLE_TOOLS, assertAllowedTools } from './roles.js';
 export { createDefenseHandler } from './defense.js';
 export type { DefenseConfig, DefenseDeps } from './defense.js';
+export { createRemedyHandler } from './remedy.js';
+export type { RemedyConfig, RemedyDeps } from './remedy.js';

@@ -8,6 +8,10 @@ import {
   type EventSink,
   type JudgePort,
   type JudgeResult,
+  type PatchOutcome,
+  type PatchSubmission,
+  type TrialWorkspace,
+  type VerifyResult,
   type CaseFile,
   type WitnessSubmission,
   type ModelPort,
@@ -125,12 +129,42 @@ export class FakeModel implements ModelPort {
 /** Scripted Judge: returns recorded results in order. The only source of pass or fail. */
 export class FakeJudge implements JudgePort {
   readonly calls: WitnessSubmission[] = [];
-  constructor(private readonly script: JudgeResult[]) {}
+  readonly patches: PatchSubmission[] = [];
+  constructor(
+    private readonly script: JudgeResult[] = [],
+    private readonly verifyScript: VerifyResult[] = [],
+  ) {}
+
+  verifyPatch(_caseFile: CaseFile, patch: PatchSubmission): Promise<VerifyResult> {
+    this.patches.push(patch);
+    const next = this.verifyScript.shift();
+    if (!next) return Promise.reject(new Error('verify script exhausted'));
+    return Promise.resolve(next);
+  }
 
   runWitness(_caseFile: CaseFile, witness: WitnessSubmission): Promise<JudgeResult> {
     this.calls.push(witness);
     const next = this.script.shift();
     if (!next) return Promise.reject(new Error('judge script exhausted'));
     return Promise.resolve(next);
+  }
+}
+
+export class InMemoryWorkspace implements TrialWorkspace {
+  private witness = new Map<string, WitnessSubmission>();
+  private outcome = new Map<string, PatchOutcome>();
+  saveWitness(caseId: string, w: WitnessSubmission): Promise<void> {
+    this.witness.set(caseId, w);
+    return Promise.resolve();
+  }
+  getWitness(caseId: string): Promise<WitnessSubmission | undefined> {
+    return Promise.resolve(this.witness.get(caseId));
+  }
+  savePatchOutcome(caseId: string, o: PatchOutcome): Promise<void> {
+    this.outcome.set(caseId, o);
+    return Promise.resolve();
+  }
+  getPatchOutcome(caseId: string): Promise<PatchOutcome | undefined> {
+    return Promise.resolve(this.outcome.get(caseId));
   }
 }

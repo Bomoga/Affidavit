@@ -3,6 +3,7 @@ import type {
   CaseFile,
   JudgePort,
   PromptRenderer,
+  TrialWorkspace,
   WitnessSubmission,
 } from './interim/types.js';
 import type { StageContext, StageHandler, StageResult } from './orchestrator.js';
@@ -27,6 +28,8 @@ export interface DefenseDeps {
   judge: JudgePort;
   render: PromptRenderer;
   config: DefenseConfig;
+  /** Where an admitted witness is handed to later stages. */
+  workspace?: TrialWorkspace;
 }
 
 interface AttemptOutcome {
@@ -137,7 +140,10 @@ async function attempt(
       },
       'judge',
     );
-    if (verdict.admissible && verdict.passed) return { admitted: true, feedback };
+    if (verdict.admissible && verdict.passed) {
+      await deps.workspace?.saveWitness(ctx.caseId, witness);
+      return { admitted: true, feedback };
+    }
 
     feedback.push(
       `judge: ${verdict.rejectedBy ?? 'witness did not pass'}${verdict.detail ? ` (${verdict.detail})` : ''}`,
