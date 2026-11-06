@@ -54,6 +54,7 @@ export type TrialEventType =
   | 'patch-submitted'
   | 'patch-rejected'
   | 'patch-verified'
+  | 'verdict-written'
   | 'escalated';
 
 export interface TrialEvent {
@@ -114,6 +115,8 @@ export interface CaseStore {
   settleCost(caseId: string, chargeId: string, actual: StageCost): Promise<void>;
   recordEscalation(escalation: Escalation): Promise<void>;
   nextSeq(caseId: string): Promise<number>;
+  /** Settled cost rows for the case, in order. */
+  getCosts(caseId: string): Promise<StageCost[]>;
 }
 
 export interface EventSink {
@@ -173,6 +176,7 @@ export interface VerifyResult {
   familyFlipped: boolean;
   suitePassed: boolean;
   rescanClean: boolean;
+  patchExhibitId?: string;
   counterexamples: { exhibitId: string; survived: boolean }[];
   rejectedBy?: VerifyRejection;
   detail?: string;
@@ -195,12 +199,43 @@ export interface PatchOutcome {
   reason?: string;
 }
 
+// Interim Verdict shape, following docs/lanes/lane3/contracts-draft.md. Replace with contracts v1.0.
+export type VerdictOutcome =
+  'proven-fixed' | 'proven-unfixed' | 'not-proven' | 'dismissed' | 'escalated';
+
+export type Severity = 'low' | 'medium' | 'high' | 'critical';
+
+/** Everything in a verdict except the plain-language summary. Built first. */
+export interface StructuredVerdict {
+  schemaVersion: 1;
+  caseId: string;
+  outcome: VerdictOutcome;
+  severity?: Severity;
+  exhibits: string[];
+  ballots: unknown[];
+  jurorCorrelation?: number;
+  bundleSha256?: string;
+  /** Keyed by prompt id, per the decision on contracts draft issue A. */
+  promptVersions: Record<string, string>;
+  modelIds: Record<string, string>;
+  cost: StageCost[];
+}
+
+export interface Verdict extends StructuredVerdict {
+  summary: string;
+}
+
 /** Interim handoff between stages until an exhibit store exists in the real ports. */
 export interface TrialWorkspace {
   saveWitness(caseId: string, witness: WitnessSubmission): Promise<void>;
   getWitness(caseId: string): Promise<WitnessSubmission | undefined>;
   savePatchOutcome(caseId: string, outcome: PatchOutcome): Promise<void>;
   getPatchOutcome(caseId: string): Promise<PatchOutcome | undefined>;
+  /** Exhibit ids the Judge admitted or verified, in the order they were produced. */
+  addExhibit(caseId: string, exhibitId: string): Promise<void>;
+  getExhibits(caseId: string): Promise<string[]>;
+  saveVerdict(caseId: string, verdict: Verdict): Promise<void>;
+  getVerdict(caseId: string): Promise<Verdict | undefined>;
 }
 
 export interface RenderedPrompt {
