@@ -12,3 +12,5 @@ export type {
   StageHandler,
   StageResult,
 } from './orchestrator.js';
+export type { ValidatedAgentResult } from './orchestrator.js';
+export { ROLE_TOOLS, assertAllowedTools } from './roles.js';

@@ -71,6 +71,7 @@ function setup(opts: { usd?: number; script?: ModelTurnResult[]; killed?: () => 
       sink,
       model,
       handlers,
+      validate: () => ({ ok: true }),
       config: { killSwitch: () => killed(), maxStageAttempts: 3, now: () => 1_700_000_000_000 },
     });
   return { log, store, sink, model, make };
