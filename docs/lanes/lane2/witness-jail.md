@@ -69,7 +69,9 @@ L2-05 replaces this format with a TypeScript test run by Vitest inside the runne
 
 ## A tampered trace fails `no-egress`
 
-The jailed process can write into gVisor's syscall trace through its command name and paths (`sandbox-runner.md`). The executor passes the parser's `tampered` flag to the Judge as `RawAttempt.traceTampered`, and `no-egress` rejects any evidence with a tampered attempt: a trace that may hide an attempt cannot show that there was none.
+The jailed process can write into gVisor's syscall trace through its command name and paths (`sandbox-runner.md`). The executor passes the parser's `tampered` flag to the Judge as `RawAttempt.traceTampered`, and `no-egress` rejects any evidence with a tampered attempt: a trace that may hide an attempt cannot show that there was none. A trace cut off at its size cap counts as tampered; such a run is also killed, so it usually fails `completes` first.
+
+The executor reads the artifact up to the limit the Judge sends in each `ExecutionRequest` (`maxArtifactBytes`), so the two can never disagree.
 
 ## Open items
 

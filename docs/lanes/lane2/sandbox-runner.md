@@ -67,7 +67,13 @@ gVisor cannot start under an SELinux process label (`SELinux is not supported: s
 | `pidsLimitHit`                | A fork or clone refused with `EAGAIN`, or gVisor's warning that the host refused it a process (below)                                                                                                    |
 | `oomKilled`, `timedOut`       | Docker's container state and the runner's own timer                                                                                                                                                      |
 
-The runner throws, rather than reporting a clean run, when Docker or the runtime is missing, the trace is missing, empty or over 256 MiB, or a container is left behind. The trace file is deleted after reading.
+The runner throws, rather than reporting a clean run, when Docker or the runtime is missing, the trace is missing or empty, or a container is left behind. The trace file is deleted after reading.
+
+### The trace is capped while the run goes
+
+gVisor writes the trace to the host's disk during the run. Measured on 2026-11-14: one thread opening files in a loop wrote 67 MiB in 5 s, so a witness left to run to its 120 s timeout could write well over a gigabyte per attempt. The runner checks the trace size every 250 ms and kills the run when it passes 64 MiB (`DEFAULT_MAX_TRACE_BYTES`). The largest trace from a normal containment run was 1.4 MiB. A run cut off this way is reported as `tampered`: it cannot be shown to be clean, so a witness fails, and the containment runner refuses it.
+
+The same watcher enforces the wall-clock timeout and retries `docker kill` on every tick until the Docker client exits, because a kill sent before Docker has created the container fails and would otherwise leave the run unbounded.
 
 ### The jailed process can write into the trace
 

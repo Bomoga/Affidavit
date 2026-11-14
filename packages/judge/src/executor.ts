@@ -15,6 +15,11 @@ export interface ExecutionRequest {
   params: ParamSpace;
   /** Hard wall clock. The executor kills the run at this point and reports `timedOut`. */
   timeoutMs: number;
+  /**
+   * The Judge's artifact limit. The executor reads at most one byte more, so an oversized
+   * artifact still reaches the Judge as oversized and one within the limit is never cut.
+   */
+  maxArtifactBytes: number;
 }
 
 /** What the executor observed for one run, before the Judge decides anything. */

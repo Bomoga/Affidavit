@@ -1,6 +1,5 @@
 import type { CaseNetwork } from '@affidavit/sandbox';
 import type { ExecutionRequest, RawAttempt, WitnessExecutor } from '../executor.js';
-import { DEFAULT_POLICY } from '../rules.js';
 import { runWitnessJail, type WitnessJailOptions } from './jail.js';
 
 /** Where the witness finds the target for one request. */
@@ -24,8 +23,6 @@ export const NO_TARGET: TargetProvider = { endpoint: () => Promise.resolve(null)
 
 export interface JailExecutorOptions extends WitnessJailOptions {
   targets: TargetProvider;
-  /** Bytes read from the artifact before the Judge sees it; keep equal to the Judge's policy. */
-  maxArtifactBytes?: number;
 }
 
 /**
@@ -50,7 +47,7 @@ export class JailExecutor implements WitnessExecutor {
         network: endpoint === null ? undefined : { net: endpoint.net, hosts: endpoint.hosts },
       },
       this.opts,
-      this.opts.maxArtifactBytes ?? DEFAULT_POLICY.maxArtifactBytes,
+      req.maxArtifactBytes,
     );
     return {
       exitCode: jailed.exitCode,

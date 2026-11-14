@@ -26,8 +26,8 @@ Contracts version in use: v1.0
 
 ## Skipped tests
 
-- `packages/judge/src/jail/jail.integration.test.ts` (8 tests) is skipped in plain `pnpm test` for the same reason. It runs with `pnpm --filter @affidavit/judge test:sandbox-host` and passed on 2026-11-14 on the owner's workstation.
-- `packages/sandbox/src/gvisor/runner.integration.test.ts` (6 tests) is skipped in plain `pnpm test` because it needs Docker with the `runsc-affidavit` runtime. It runs with `pnpm --filter @affidavit/sandbox test:sandbox-host` and passed on 2026-11-14 on the owner's workstation. It moves into CI with L2-11 once a sandbox host runner exists.
+- `packages/judge/src/jail/jail.integration.test.ts` (9 tests) is skipped in plain `pnpm test` for the same reason. It runs with `pnpm --filter @affidavit/judge test:sandbox-host` and passed on 2026-11-14 on the owner's workstation.
+- `packages/sandbox/src/gvisor/runner.integration.test.ts` (7 tests) is skipped in plain `pnpm test` because it needs Docker with the `runsc-affidavit` runtime. It runs with `pnpm --filter @affidavit/sandbox test:sandbox-host` and passed on 2026-11-14 on the owner's workstation. It moves into CI with L2-11 once a sandbox host runner exists.
 
 ## Decisions made in this lane
 

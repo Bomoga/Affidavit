@@ -83,6 +83,22 @@ describe.runIf(onSandboxHost)('gVisor runner on a sandbox host', { timeout: 120_
     expect(readdirSync(DEFAULT_TRACE_ROOT).length).toBe(before);
   });
 
+  it('kills a run whose trace passes its cap, deletes the trace, and refuses to judge it', async () => {
+    const before = readdirSync(DEFAULT_TRACE_ROOT).length;
+    const started = Date.now();
+    await expect(
+      new GvisorRunner({ maxTraceBytes: 4 * 1024 * 1024 }).run({
+        script: `import fs from 'node:fs';
+          for (;;) { try { fs.openSync('/nope'); } catch {} }`,
+        args: {},
+        timeoutMs: 60_000,
+      }),
+    ).rejects.toThrow(/size cap/);
+    expect(Date.now() - started).toBeLessThan(20_000);
+    expect(leftovers()).toBe('');
+    expect(readdirSync(DEFAULT_TRACE_ROOT).length).toBe(before);
+  });
+
   it('kills a run at its timeout and leaves nothing behind', async () => {
     const started = Date.now();
     const r = await new GvisorRunner().run({

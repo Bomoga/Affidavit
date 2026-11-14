@@ -149,6 +149,25 @@ describe.runIf(onSandboxHost)('witness jail on a sandbox host', { timeout: 300_0
     expect(r.egressAttempts).toBeGreaterThan(0);
   });
 
+  it('rejects a witness that floods the trace past its cap (no-egress), without crashing', async () => {
+    const flooding = new Judge(
+      new JailExecutor({
+        workRoot,
+        maxTraceBytes: 4 * 1024 * 1024,
+        targets: { endpoint: (req) => Promise.resolve(endpoints.get(req.variant) ?? null) },
+      }),
+      { ...DEFAULT_POLICY, hardTimeoutMs: 30_000, timeBudgetMs: 20_000 },
+    );
+    const r = await flooding.runWitness(
+      gateCaseFile(),
+      witness(`import fs from 'node:fs';
+        export default () => { for (;;) { try { fs.openSync('/nope'); } catch {} } };`),
+      ['vulnerable'],
+    );
+    expect(r).toMatchObject({ admissible: false });
+    expect(['completes', 'no-egress']).toContain(r.rejectedBy);
+  });
+
   it('rejects a witness that renames its process to hide from the trace (no-egress)', async () => {
     const r = await judge.runWitness(
       gateCaseFile(),
