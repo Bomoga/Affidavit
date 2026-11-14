@@ -4,21 +4,20 @@ Owner: @Thearius123 (claimed 2026-11-14)
 Contracts version in use: v1.0
 
 ## Tasks
-
-| ID    | Status (todo, doing, done, blocked) | Branch or PR                                    | Notes                                                                                                                                                                                                                                                        |
-| ----- | ----------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| L2-01 | done                                | PR #12 (`lane2/L2-01-containment-suite`)        | 8 probes in `packages/sandbox/src/containment`, run with `pnpm --filter @affidavit/sandbox containment`. Plain Docker: 7 of 8 contained, 1 of 8 recorded. See `containment.md`                                                                               |
-| L2-02 | doing                               | `lane2/L2-02-gvisor-runner` (stacked on PR #12) | `packages/sandbox/src/gvisor`: hardened gVisor runner, syscall trace parser, mount allowlist, `ToolRunnerPort` for Lane 1. Containment suite 8 of 8 on the owner's workstation; done when it also passes on the shared sandbox host. See `sandbox-runner.md` |
-| L2-03 | todo                                |                                                 |                                                                                                                                                                                                                                                              |
-| L2-04 | todo                                |                                                 |                                                                                                                                                                                                                                                              |
-| L2-05 | todo                                |                                                 |                                                                                                                                                                                                                                                              |
-| L2-06 | todo                                |                                                 |                                                                                                                                                                                                                                                              |
-| L2-07 | todo                                |                                                 |                                                                                                                                                                                                                                                              |
-| L2-08 | todo                                |                                                 |                                                                                                                                                                                                                                                              |
-| L2-09 | todo                                |                                                 |                                                                                                                                                                                                                                                              |
-| L2-10 | todo                                |                                                 |                                                                                                                                                                                                                                                              |
-| L2-11 | todo                                |                                                 |                                                                                                                                                                                                                                                              |
-| L2-12 | todo                                |                                                 |                                                                                                                                                                                                                                                              |
+| ID | Status (todo, doing, done, blocked) | Branch or PR | Notes |
+| --- | --- | --- | --- |
+| L2-01 | done | PR #12 (`lane2/L2-01-containment-suite`) | 8 probes in `packages/sandbox/src/containment`, run with `pnpm --filter @affidavit/sandbox containment`. Plain Docker: 7 of 8 contained, 1 of 8 recorded. See `containment.md` |
+| L2-02 | doing | PR #14 (`lane2/L2-02-gvisor-runner`, stacked on PR #12) | `packages/sandbox/src/gvisor`: hardened gVisor runner, syscall trace parser, mount allowlist, `ToolRunnerPort` for Lane 1. Containment suite 8 of 8 on the owner's workstation; done when it also passes on the shared sandbox host. See `sandbox-runner.md` |
+| L2-03 | doing | `lane2/L2-03-witness-jail` (on PR #14 and PR #13) | |
+| L2-04 | todo |  | |
+| L2-05 | doing |  | Result artifact format defined in `packages/judge/src/artifact.ts` (with L2-06). Runner image and witness execution still to do, needs L2-03 |
+| L2-06 | done | PR #13 (`lane2/L2-06-rules-of-evidence`) | `Judge` implements `runWitness` and `runCounterexample` over a `WitnessExecutor` port. Real executor arrives with L2-03 and L2-05. See `rules-of-evidence.md` |
+| L2-07 | todo |  | |
+| L2-08 | todo |  | |
+| L2-09 | todo |  | |
+| L2-10 | todo |  | |
+| L2-11 | todo |  | |
+| L2-12 | todo |  | |
 
 ## Blocked
 
