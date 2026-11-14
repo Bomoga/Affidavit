@@ -49,12 +49,13 @@ export class Judge implements JudgePort {
   ): Promise<ExhibitResult> {
     const cf = CaseFile.parse(caseFile);
     const targets = this.#targets(cf, variants);
-    const w = Witness.safeParse(witness);
-    if (!w.success) return rejectBeforeRunning(fallbackId('witness', witness), 'schema');
-    const exhibitId = witnessExhibitId(w.data);
-    if (w.data.caseId !== cf.id || !this.#familyAllowed(w.data.params)) {
-      return rejectBeforeRunning(exhibitId, 'schema');
+    const w = safely(() => Witness.safeParse(witness));
+    if (!w?.success) return rejectBeforeRunning(fallbackId('witness', witness), 'schema');
+    const exhibitId = safely(() => witnessExhibitId(w.data));
+    if (exhibitId === undefined) {
+      return rejectBeforeRunning(fallbackId('witness', witness), 'schema');
     }
+    if (!this.#witnessFits(cf, w.data)) return rejectBeforeRunning(exhibitId, 'schema');
     return this.#run(cf, targets, { exhibitId, template: w.data.template, params: w.data.params });
   }
 
@@ -69,16 +70,17 @@ export class Judge implements JudgePort {
   ): Promise<ExhibitResult> {
     const cf = CaseFile.parse(caseFile);
     const targets = this.#targets(cf, ['vulnerable']);
-    const c = Exhibit.safeParse(counterexample);
-    if (!c.success)
+    const c = safely(() => Exhibit.safeParse(counterexample));
+    if (!c?.success) {
       return rejectBeforeRunning(fallbackId('counterexample', counterexample), 'schema');
-    const w = Witness.safeParse(witness);
+    }
+    const w = safely(() => Witness.safeParse(witness));
     if (
       c.data.kind !== 'counterexample' ||
       c.data.caseId !== cf.id ||
-      !w.success ||
-      w.data.caseId !== cf.id ||
-      !this.#familyAllowed(w.data.params)
+      utf8Bytes(c.data.code) > this.#policy.maxSourceBytes ||
+      !w?.success ||
+      !this.#witnessFits(cf, w.data)
     ) {
       return rejectBeforeRunning(c.data.id, 'schema');
     }
@@ -93,8 +95,18 @@ export class Judge implements JudgePort {
     return Promise.reject(new Error('verifyPatch is task L2-07 and is not implemented yet'));
   }
 
-  #familyAllowed(params: ParamSpace): boolean {
-    return familySize(params) <= this.#policy.maxFamilySize;
+  /** Checks a parsed witness against this case and the policy's size limits. */
+  #witnessFits(cf: CaseFile, w: Witness): boolean {
+    const p = this.#policy;
+    const paramsBytes = safely(() => utf8Bytes(canonicalJson(w.params)));
+    return (
+      w.caseId === cf.id &&
+      w.cls === cf.candidate.cls &&
+      utf8Bytes(w.template) <= p.maxSourceBytes &&
+      paramsBytes !== undefined &&
+      paramsBytes <= p.maxParamsBytes &&
+      familySize(w.params) <= p.maxFamilySize
+    );
   }
 
   /**
@@ -143,7 +155,22 @@ export class Judge implements JudgePort {
   }
 }
 
-/** Id for an exhibit too malformed to read its fields; still stable for the same input. */
+/** Id for an exhibit too malformed to read its fields; stable for the same input when hashable. */
 function fallbackId(kind: 'witness' | 'counterexample', value: unknown): ExhibitId {
-  return `exhibit-${kind}-invalid-${sha256Hex(canonicalJson(value)).slice(0, 24)}` as ExhibitId;
+  const digest = safely(() => sha256Hex(canonicalJson(value)).slice(0, 24)) ?? 'unhashable';
+  return `exhibit-${kind}-invalid-${digest}` as ExhibitId;
+}
+
+const utf8Bytes = (s: string): number => Buffer.byteLength(s, 'utf8');
+
+/**
+ * Runs validation that may blow the stack on hostile input (deeply nested or cyclic values).
+ * Any throw means "not readable", which the caller turns into a `schema` rejection.
+ */
+function safely<T>(fn: () => T): T | undefined {
+  try {
+    return fn();
+  } catch {
+    return undefined;
+  }
 }

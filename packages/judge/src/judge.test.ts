@@ -123,6 +123,54 @@ describe('Judge.runWitness', () => {
     expect(exec.requests).toHaveLength(0);
   });
 
+  it.each([
+    [
+      'a template over the size limit',
+      () => ({ template: 'x'.repeat(DEFAULT_POLICY.maxSourceBytes + 1) }),
+    ],
+    [
+      'parameters over the size limit',
+      () => ({ params: [{ name: 'p', values: ['x'.repeat(DEFAULT_POLICY.maxParamsBytes)] }] }),
+    ],
+    ['a different vulnerability class than the case', () => ({ cls: 'idor' })],
+    [
+      'deeply nested parameter values',
+      () => {
+        let deep: unknown = 0;
+        for (let i = 0; i < 100_000; i++) deep = [deep];
+        return { params: [{ name: 'p', values: [deep] }] };
+      },
+    ],
+  ])('rejects a witness with %s under schema without running it', async (_name, make) => {
+    const exec = new ScriptedExecutor(differentialTarget(3));
+    const witness = { ...gateWitness(), ...make() } as unknown as Witness;
+    const result = await new Judge(exec).runWitness(gateCaseFile(), witness, ['vulnerable']);
+    expect(result).toMatchObject({ admissible: false, rejectedBy: 'schema', runs: [] });
+    expect(exec.requests).toHaveLength(0);
+  });
+
+  it('rejects a cyclic witness under schema instead of crashing', async () => {
+    const exec = new ScriptedExecutor(differentialTarget(3));
+    const cyclic: Record<string, unknown> = { ...gateWitness() };
+    cyclic.self = cyclic;
+    cyclic.params = [{ name: 'p', values: [cyclic] }];
+    const result = await new Judge(exec).runWitness(gateCaseFile(), cyclic as unknown as Witness, [
+      'vulnerable',
+    ]);
+    expect(result.rejectedBy).toBe('schema');
+    expect(exec.requests).toHaveLength(0);
+  });
+
+  it('turns an executor returning garbage into an error, not a verdict', async () => {
+    const exec = new ScriptedExecutor(() => ({
+      ...raw([true, true, true]),
+      egressAttempts: Number.NaN,
+    }));
+    await expect(
+      new Judge(exec).runWitness(gateCaseFile(), gateWitness(), ['vulnerable']),
+    ).rejects.toThrow(/egressAttempts/);
+  });
+
   it('propagates executor failures instead of blaming the witness', async () => {
     const exec = new ScriptedExecutor(() => Promise.reject(new Error('docker daemon gone')));
     await expect(
@@ -200,6 +248,7 @@ describe('Judge.runCounterexample', () => {
     ['a patch exhibit', { kind: 'patch' }],
     ['a witness exhibit', { kind: 'witness' }],
     ['another case', { caseId: 'case-other' }],
+    ['code over the size limit', { code: 'x'.repeat(DEFAULT_POLICY.maxSourceBytes + 1) }],
   ] as [string, Record<string, unknown>][])(
     'rejects %s under schema without running it',
     async (_name, over) => {

@@ -4,7 +4,7 @@ Code: `packages/judge/src/rules.ts` (the rules, pure), `judge.ts` (the `JudgePor
 
 ## How a witness is judged
 
-1. The Judge validates the witness (or counterexample) and the case file. A malformed exhibit, an exhibit for another case, or a family larger than `maxFamilySize` is rejected by `schema` without running anything. A malformed case file or a bad variant list is a caller bug and throws.
+1. The Judge validates the witness (or counterexample) and the case file. A malformed exhibit, an exhibit for another case, a witness whose vulnerability class differs from the candidate's, a source or parameter space over its size limit, a family larger than `maxFamilySize`, or input too deeply nested or cyclic to read is rejected by `schema` without running anything. A malformed case file or a bad variant list is a caller bug and throws.
 2. It runs three attempts on `vulnerable`, then three on `safe` when the case file has a safe variant. The safe variant always runs when it exists, whatever variants the caller passed, so differential proof cannot be skipped (F2). Attempts run one at a time.
 3. Each attempt runs the whole family and leaves a result artifact with one pass or fail per parameter combination. The Judge reads it as untrusted bytes: a size cap first, then JSON, then an exact shape check. It never evaluates it.
 4. The rules below are applied in order and the first one that fails is recorded in `rejectedBy`.
@@ -30,7 +30,7 @@ Patch rules (`literal-only-patch`, `diff-too-large`, `suite-fails`, `counterexam
 - **Counterexamples** run under the same rules as witnesses, over the witness's parameter space.
 - **stdout and stderr are hashed, never stored** in the result.
 - **A run that never exited** is recorded with exit code `-1`.
-- **Executor failures throw.** An infrastructure failure is never turned into a rejection that blames the witness.
+- **Executor failures throw.** An infrastructure failure is never turned into a rejection that blames the witness. The same goes for an executor that returns nonsense (a NaN or negative egress count, a negative duration): the Judge throws instead of judging, so an executor bug cannot slip a witness past `no-egress`.
 
 ## Result artifact format
 
@@ -52,6 +52,8 @@ These are configuration placeholders, not measurements. Tune them per corpus app
 | `timeBudgetMs` | 60000 |
 | `maxArtifactBytes` | 65536 |
 | `maxFamilySize` | 64 |
+| `maxSourceBytes` | 262144 |
+| `maxParamsBytes` | 65536 |
 
 ## Open questions for the contracts owner
 

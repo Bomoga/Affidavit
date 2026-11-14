@@ -257,3 +257,25 @@ describe('result shape', () => {
     });
   });
 });
+
+describe('executor output is checked, never trusted', () => {
+  it.each([
+    ['a NaN egress count', { egressAttempts: Number.NaN }, /egressAttempts/],
+    ['a negative egress count', { egressAttempts: -3 }, /egressAttempts/],
+    ['a fractional egress count', { egressAttempts: 0.5 }, /egressAttempts/],
+    ['a NaN duration', { durationMs: Number.NaN }, /durationMs/],
+    ['a negative duration', { durationMs: -1 }, /durationMs/],
+    ['a fractional exit code', { exitCode: 1.5 }, /exitCode/],
+    ['a non-string artifact', { artifact: 42 as unknown as string }, /artifact/],
+  ])('throws on %s instead of judging it', (_name, over, why) => {
+    const attempts = gateWith(observed('vulnerable', 2, ALL, over));
+    expect(() => judgeEvidence(evidence(attempts), DEFAULT_POLICY)).toThrow(why);
+  });
+
+  it('cannot cancel a real egress attempt with a negative count elsewhere', () => {
+    const attempts = gateWith(observed('vulnerable', 1, ALL, { egressAttempts: 1 })).map((a) =>
+      a.variant === 'safe' && a.attempt === 1 ? { ...a, egressAttempts: -1 } : a,
+    );
+    expect(() => judgeEvidence(evidence(attempts), DEFAULT_POLICY)).toThrow(/egressAttempts/);
+  });
+});

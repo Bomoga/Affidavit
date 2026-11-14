@@ -27,6 +27,10 @@ export interface JudgePolicy {
   maxArtifactBytes: number;
   /** Largest family the Judge will run; a larger ParamSpace fails `schema` before any run. */
   maxFamilySize: number;
+  /** Largest witness or counterexample source, in UTF-8 bytes. */
+  maxSourceBytes: number;
+  /** Largest parameter space, as canonical JSON in UTF-8 bytes. */
+  maxParamsBytes: number;
 }
 
 export const DEFAULT_POLICY: Readonly<JudgePolicy> = {
@@ -34,6 +38,8 @@ export const DEFAULT_POLICY: Readonly<JudgePolicy> = {
   timeBudgetMs: 60_000,
   maxArtifactBytes: 64 * 1024,
   maxFamilySize: 64,
+  maxSourceBytes: 256 * 1024,
+  maxParamsBytes: 64 * 1024,
 };
 
 export interface ObservedAttempt extends RawAttempt {
@@ -57,7 +63,31 @@ const allFalse = (xs: readonly boolean[]): boolean => xs.every((x) => !x);
 const sameResults = (a: readonly boolean[], b: readonly boolean[]): boolean =>
   a.length === b.length && a.every((x, i) => x === b[i]);
 
+const isCount = (n: unknown): boolean => Number.isSafeInteger(n) && (n as number) >= 0;
+
+/**
+ * The executor is our code, but a bug there must never turn into a wrong verdict: an attempt
+ * with a NaN egress count would otherwise slip past `no-egress`. Bad input throws.
+ */
+function checkAttempt(a: ObservedAttempt): void {
+  const problems: string[] = [];
+  if (a.exitCode !== null && !Number.isSafeInteger(a.exitCode)) problems.push('exitCode');
+  if (typeof a.timedOut !== 'boolean') problems.push('timedOut');
+  if (typeof a.oomKilled !== 'boolean') problems.push('oomKilled');
+  if (!(Number.isFinite(a.durationMs) && a.durationMs >= 0)) problems.push('durationMs');
+  if (!isCount(a.egressAttempts)) problems.push('egressAttempts');
+  if (typeof a.stdout !== 'string') problems.push('stdout');
+  if (typeof a.stderr !== 'string') problems.push('stderr');
+  if (a.artifact !== null && typeof a.artifact !== 'string') problems.push('artifact');
+  if (problems.length > 0) {
+    throw new Error(
+      `executor returned an invalid ${a.variant} attempt ${a.attempt}: ${problems.join(', ')}`,
+    );
+  }
+}
+
 function checkShape(attempts: readonly ObservedAttempt[]): void {
+  attempts.forEach(checkAttempt);
   const variants = new Set(attempts.map((a) => a.variant));
   if (!variants.has('vulnerable')) throw new Error('evidence has no vulnerable runs');
   for (const v of variants) {
@@ -78,7 +108,7 @@ function toRunRecord(a: ObservedAttempt, art: ArtifactParse | null): RunRecord {
     attempt: a.attempt,
     exitCode: a.exitCode ?? NO_EXIT_CODE,
     passed: completed && art !== null && art.ok && allTrue(art.results),
-    durationMs: Math.max(0, Math.round(a.durationMs)),
+    durationMs: Math.round(a.durationMs),
     stdoutSha256: sha256Hex(a.stdout),
     stderrSha256: sha256Hex(a.stderr),
   };
@@ -125,8 +155,8 @@ export function judgeEvidence(evidence: Evidence, policy: Readonly<JudgePolicy>)
     schemaVersion: 1 as const,
     exhibitId,
     runs: parsed.map(({ a, art }) => toRunRecord(a, art)),
-    egressAttempts: attempts.reduce((n, a) => n + Math.max(0, Math.trunc(a.egressAttempts)), 0),
-    durationMs: attempts.reduce((n, a) => n + Math.max(0, Math.round(a.durationMs)), 0),
+    egressAttempts: attempts.reduce((n, a) => n + a.egressAttempts, 0),
+    durationMs: attempts.reduce((n, a) => n + Math.round(a.durationMs), 0),
   };
   const reject = (rule: WitnessRule): ExhibitResult =>
     ExhibitResult.parse({
