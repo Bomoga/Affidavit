@@ -6,7 +6,7 @@ Contracts version in use: v1.0
 ## Tasks
 | ID | Status (todo, doing, done, blocked) | Branch or PR | Notes |
 | --- | --- | --- | --- |
-| L2-01 | done | `lane2/L2-01-containment-suite` (local, not pushed) | 8 probes in `packages/sandbox/src/containment`, run with `pnpm --filter @affidavit/sandbox containment`. Plain Docker: 7 of 8 contained, 1 of 8 recorded. See `containment.md` |
+| L2-01 | done | PR #12 (`lane2/L2-01-containment-suite`) | 8 probes in `packages/sandbox/src/containment`, run with `pnpm --filter @affidavit/sandbox containment`. Plain Docker: 7 of 8 contained, 1 of 8 recorded. See `containment.md` |
 | L2-02 | todo |  | |
 | L2-03 | todo |  | |
 | L2-04 | todo |  | |
