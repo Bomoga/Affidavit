@@ -10,8 +10,8 @@ Contracts version in use: v1.0
 | L2-02 | todo |  | |
 | L2-03 | todo |  | |
 | L2-04 | todo |  | |
-| L2-05 | todo |  | |
-| L2-06 | todo |  | |
+| L2-05 | doing |  | Result artifact format defined in `packages/judge/src/artifact.ts` (with L2-06). Runner image and witness execution still to do, needs L2-03 |
+| L2-06 | done | `lane2/L2-06-rules-of-evidence` | `Judge` implements `runWitness` and `runCounterexample` over a `WitnessExecutor` port. Real executor arrives with L2-03 and L2-05. See `rules-of-evidence.md` |
 | L2-07 | todo |  | |
 | L2-08 | todo |  | |
 | L2-09 | todo |  | |
