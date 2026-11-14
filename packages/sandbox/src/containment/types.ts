@@ -67,6 +67,8 @@ export interface HostFixtures {
 export interface HostChecks {
   orchestratorRequests: number;
   evidenceDirUnchanged: boolean;
+  /** Wall time the suite measured around the runner call, so a runner cannot under-report it. */
+  elapsedMs: number;
 }
 
 export interface ProbeOutcome {

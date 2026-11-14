@@ -122,3 +122,25 @@ describe('renderMarkdown', () => {
     expect(md).toContain('| no-egress | no | no | FAIL | a / b |');
   });
 });
+
+describe('host clock', () => {
+  it('passes the time it measured around the runner call to assess', async () => {
+    vi.useFakeTimers();
+    let seen = -1;
+    const p: Probe = {
+      ...probe(true, true),
+      assess: (_r, _fx, host) => {
+        seen = host.elapsedMs;
+        return { invariant: 'no-egress', contained: true, recorded: true, detail: 'd' };
+      },
+    };
+    const slow = runner(
+      () =>
+        new Promise((resolve) => setTimeout(() => resolve({ ...report, durationMs: 1 }), 2_000)),
+    );
+    const pending = runProbe(p, slow, fakeHost());
+    await vi.advanceTimersByTimeAsync(2_000);
+    await pending;
+    expect(seen).toBeGreaterThanOrEqual(2_000);
+  });
+});

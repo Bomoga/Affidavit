@@ -13,7 +13,7 @@ export interface HostHarness {
   fixtures(): HostFixtures;
   /** Resets counters and restores the evidence directory before a probe runs. */
   reset(): Promise<void>;
-  checks(): Promise<HostChecks>;
+  checks(): Promise<Omit<HostChecks, 'elapsedMs'>>;
 }
 
 export interface SuiteReport {
@@ -52,6 +52,7 @@ export async function runProbe(
   await host.reset();
   const fx = host.fixtures();
   let report: JailRunReport | null;
+  const started = Date.now();
   try {
     report = await runWithDeadline(runner, probe, fx);
   } catch (err) {
@@ -73,7 +74,8 @@ export async function runProbe(
       detail: 'runner did not return',
     };
   }
-  const outcome = probe.assess(report, fx, await host.checks());
+  const elapsedMs = Date.now() - started;
+  const outcome = probe.assess(report, fx, { ...(await host.checks()), elapsedMs });
   return { ...outcome, passed: outcome.contained && outcome.recorded };
 }
 

@@ -42,20 +42,31 @@ function leaked(report: JailRunReport, canary: string): boolean {
 
 const egress: Probe = {
   invariant: 'no-egress',
-  description: 'Resolves a public name and opens a TCP connection to a public address.',
-  timeoutMs: 20_000,
+  description:
+    'Resolves a public name, opens TCP connections to a public IPv4 and IPv6 address, and sends a UDP datagram.',
+  timeoutMs: 30_000,
   script: `${PRELUDE}
 import net from 'node:net';
+import dgram from 'node:dgram';
 import dns from 'node:dns/promises';
 let resolved = false;
 try { await dns.lookup('example.com'); resolved = true; } catch {}
-const connected = await new Promise((done) => {
-  const s = net.connect({ host: '1.1.1.1', port: 443, timeout: 3000 });
+const tcp = (host) => new Promise((done) => {
+  const s = net.connect({ host, port: 443, timeout: 3000 });
   s.once('connect', () => { s.destroy(); done(true); });
   s.once('error', () => done(false));
   s.once('timeout', () => { s.destroy(); done(false); });
 });
-report({ resolved, connected });
+const connected = await tcp('1.1.1.1');
+const v6Connected = await tcp('2606:4700:4700::1111');
+const udpSent = await new Promise((done) => {
+  try {
+    const s = dgram.createSocket('udp4');
+    s.once('error', () => { s.close(); done(false); });
+    s.send('affidavit', 53, '1.1.1.1', (err) => { s.close(); done(!err); });
+  } catch { done(false); }
+});
+report({ resolved, connected, v6Connected, udpSent });
 `,
   args: () => ({}),
   assess(report) {
@@ -68,12 +79,16 @@ report({ resolved, connected });
         recorded,
         detail: 'probe did not report',
       };
-    const contained = r.resolved === false && r.connected === false;
+    const contained =
+      r.resolved === false &&
+      r.connected === false &&
+      r.v6Connected === false &&
+      r.udpSent === false;
     return {
       invariant: this.invariant,
       contained,
       recorded,
-      detail: `dns resolved: ${String(r.resolved)}, tcp connected: ${String(r.connected)}`,
+      detail: `dns resolved: ${String(r.resolved)}, tcp connected: ${String(r.connected)}, tcp6 connected: ${String(r.v6Connected)}, udp sent: ${String(r.udpSent)}`,
     };
   },
 };
@@ -165,7 +180,20 @@ report({ reached });
   },
 };
 
-const OUTSIDE_SCRATCH = ['/', '/etc', '/tmp', '/usr/local/lib', '/witness'];
+/** Includes the tmpfs paths Docker adds even with --read-only (/dev/shm) and common home dirs. */
+export const OUTSIDE_SCRATCH = [
+  '/',
+  '/etc',
+  '/tmp',
+  '/var/tmp',
+  '/run',
+  '/dev/shm',
+  '/dev/mqueue',
+  '/home/node',
+  '/root',
+  '/usr/local/lib',
+  '/witness',
+];
 
 const writes: Probe = {
   invariant: 'no-writes-outside-scratch',
@@ -296,14 +324,15 @@ const wallClock: Probe = {
 setInterval(() => {}, 1000);
 `,
   args: () => ({}),
-  assess(report) {
-    const contained =
-      probeStarted(report) && report.durationMs <= this.timeoutMs + WALL_CLOCK_GRACE_MS;
+  assess(report, _fx, host) {
+    // Trust the slower of the two clocks: the runner's own report or the suite's measurement.
+    const elapsed = Math.max(report.durationMs, host.elapsedMs);
+    const contained = probeStarted(report) && elapsed <= this.timeoutMs + WALL_CLOCK_GRACE_MS;
     return {
       invariant: this.invariant,
       contained,
       recorded: report.observations.timedOut === true,
-      detail: `stopped after ${report.durationMs} ms (timeout ${this.timeoutMs} ms)`,
+      detail: `stopped after ${elapsed} ms (timeout ${this.timeoutMs} ms)`,
     };
   },
 };

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   MEMORY_TARGET_MB,
+  OUTSIDE_SCRATCH,
   PROBE_MARKER,
   PROBES,
   PROCESS_ATTEMPTS,
@@ -25,7 +26,11 @@ const fx: HostFixtures = {
   evidenceDir: '/host/evidence',
   orchestratorUrl: 'http://172.17.0.1:9/',
 };
-const cleanHost: HostChecks = { orchestratorRequests: 0, evidenceDirUnchanged: true };
+const cleanHost: HostChecks = {
+  orchestratorRequests: 0,
+  evidenceDirUnchanged: true,
+  elapsedMs: 100,
+};
 
 function probe(invariant: Invariant): Probe {
   const p = PROBES.find((x) => x.invariant === invariant);
@@ -82,9 +87,13 @@ const cases: Record<
 > = {
   'no-egress': {
     held: [
-      report([STARTED_MARKER, marker({ resolved: false, connected: false })], {
-        egressAttempts: 2,
-      }),
+      report(
+        [
+          STARTED_MARKER,
+          marker({ resolved: false, connected: false, v6Connected: false, udpSent: false }),
+        ],
+        { egressAttempts: 2 },
+      ),
       cleanHost,
     ],
     breached: [report([STARTED_MARKER, marker({ resolved: true, connected: true })]), cleanHost],
@@ -100,14 +109,14 @@ const cases: Record<
     ],
     breached: [
       report([STARTED_MARKER, fx.evidenceCanary, marker({ wrote: true })]),
-      { orchestratorRequests: 0, evidenceDirUnchanged: false },
+      { ...cleanHost, evidenceDirUnchanged: false },
     ],
   },
   'no-orchestrator-reach': {
     held: [report([STARTED_MARKER, marker({ reached: false })], { egressAttempts: 1 }), cleanHost],
     breached: [
       report([STARTED_MARKER, marker({ reached: true })]),
-      { orchestratorRequests: 1, evidenceDirUnchanged: true },
+      { ...cleanHost, orchestratorRequests: 1 },
     ],
   },
   'no-writes-outside-scratch': {
@@ -117,13 +126,7 @@ const cases: Record<
           STARTED_MARKER,
           marker({
             scratch: true,
-            outside: {
-              '/': false,
-              '/etc': false,
-              '/tmp': false,
-              '/usr/local/lib': false,
-              '/witness': false,
-            },
+            outside: Object.fromEntries(OUTSIDE_SCRATCH.map((d) => [d, false])),
           }),
         ],
         { deniedWrites: 5 },
@@ -150,7 +153,7 @@ const cases: Record<
     breached: [report([STARTED_MARKER, marker({ allocatedMb: MEMORY_TARGET_MB })]), cleanHost],
   },
   'bounded-wall-clock': {
-    held: [report([STARTED_MARKER], { timedOut: true }, 5_200), cleanHost],
+    held: [report([STARTED_MARKER], { timedOut: true }, 5_200), { ...cleanHost, elapsedMs: 5_300 }],
     breached: [report([STARTED_MARKER], {}, 5_000 + WALL_CLOCK_GRACE_MS + 1), cleanHost],
   },
 };
@@ -195,5 +198,49 @@ describe('no-credential-access', () => {
   it('catches a canary that leaks through stderr', () => {
     const r = { ...report([STARTED_MARKER, marker({ done: true })]), stderr: fx.credentialCanary };
     expect(probe('no-credential-access').assess(r, fx, cleanHost).contained).toBe(false);
+  });
+});
+
+describe('no-egress', () => {
+  it.each([
+    ['IPv6', { v6Connected: true }],
+    ['UDP', { udpSent: true }],
+    ['DNS', { resolved: true }],
+  ])('is not contained when only %s gets out', (_label, leak) => {
+    const r = report([
+      STARTED_MARKER,
+      marker({ resolved: false, connected: false, v6Connected: false, udpSent: false, ...leak }),
+    ]);
+    expect(probe('no-egress').assess(r, fx, cleanHost).contained).toBe(false);
+  });
+
+  it('is not contained when the report omits a channel', () => {
+    const r = report([STARTED_MARKER, marker({ resolved: false, connected: false })]);
+    expect(probe('no-egress').assess(r, fx, cleanHost).contained).toBe(false);
+  });
+});
+
+describe('no-writes-outside-scratch coverage', () => {
+  it('checks the tmpfs paths Docker adds even with a read-only root', () => {
+    expect(OUTSIDE_SCRATCH).toEqual(
+      expect.arrayContaining(['/dev/shm', '/tmp', '/var/tmp', '/run']),
+    );
+  });
+
+  it('counts a path missing from the report as written', () => {
+    const outside = Object.fromEntries(OUTSIDE_SCRATCH.slice(1).map((d) => [d, false]));
+    const r = report([STARTED_MARKER, marker({ scratch: true, outside })]);
+    expect(probe('no-writes-outside-scratch').assess(r, fx, cleanHost).contained).toBe(false);
+  });
+});
+
+describe('bounded-wall-clock', () => {
+  it('uses the suite clock when the runner under-reports its duration', () => {
+    const lying = report([STARTED_MARKER], { timedOut: true }, 10);
+    const o = probe('bounded-wall-clock').assess(lying, fx, {
+      ...cleanHost,
+      elapsedMs: 5_000 + WALL_CLOCK_GRACE_MS + 1,
+    });
+    expect(o.contained).toBe(false);
   });
 });

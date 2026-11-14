@@ -65,7 +65,7 @@ export async function createHostHarness(listenHost: string): Promise<RealHostHar
       await writeFile(join(evidenceDir, 'exhibit.bin'), evidenceCanary);
       expectedEvidence = await evidenceSnapshot();
     },
-    async checks(): Promise<HostChecks> {
+    async checks(): Promise<Omit<HostChecks, 'elapsedMs'>> {
       return {
         orchestratorRequests: requests,
         evidenceDirUnchanged: (await evidenceSnapshot()) === expectedEvidence,
