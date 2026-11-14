@@ -12,7 +12,8 @@ Run from this directory, or add `--filter @affidavit/sandbox` from the repo root
 
 - `pnpm typecheck`
 - `pnpm lint`
-- `pnpm test`
+- `pnpm test` (unit tests, no Docker needed)
+- `pnpm containment` runs the L2-01 containment suite against Docker and updates `docs/lanes/lane2/containment.md`. Run it after every change to this package or `packages/judge`.
 
 ## Intended libraries (notes for later, not installed yet)
 
