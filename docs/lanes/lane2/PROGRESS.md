@@ -1,6 +1,6 @@
 # Lane 2 progress: Judge and Evidence
 
-Owner: [unassigned]
+Owner: @Thearius123 (claimed 2026-11-14)
 Contracts version in use: v1.0
 
 ## Tasks

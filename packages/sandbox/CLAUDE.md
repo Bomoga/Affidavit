@@ -2,7 +2,7 @@ Read docs/plan.md, then docs/implementation-plan.md section 6 (Lane 2) before wo
 
 # @affidavit/sandbox
 
-**Owner:** Lane 2 (Judge and Evidence)
+**Owner:** Lane 2 (Judge and Evidence), @Thearius123
 
 **Mission:** Isolation runner and witness jail (gVisor first, deny-all egress).
 
