@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { PROBE_IMAGE, buildProbeDockerArgs } from './plain-docker.js';
+import { buildProbeDockerArgs } from './plain-docker.js';
+import { PROBE_IMAGE } from './probes.js';
 
 describe('buildProbeDockerArgs', () => {
   const args = buildProbeDockerArgs('affidavit-probe-x', '{}');
