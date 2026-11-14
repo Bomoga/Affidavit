@@ -34,7 +34,7 @@ Patch rules (`literal-only-patch`, `diff-too-large`, `suite-fails`, `counterexam
 
 ## Result artifact format
 
-The runner side is L2-05. The format is fixed here so both sides agree:
+The runner side is `docker/sandbox/witness-runner/run.mjs` (L2-05, `witness-protocol.md`). The format is fixed here so both sides agree:
 
 ```json
 { "schemaVersion": 1, "results": [{ "paramIndex": 0, "passed": true }] }

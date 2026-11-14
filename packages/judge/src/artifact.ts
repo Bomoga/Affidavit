@@ -1,7 +1,7 @@
 import type { ParamSpace } from '@affidavit/contracts';
 
 /**
- * The result artifact the witness runner writes inside the jail (L2-05 owns the runner side).
+ * The result artifact the witness runner writes inside the jail (docker/sandbox/witness-runner/run.mjs).
  * The Judge reads it as untrusted bytes: size first, then JSON, then shape, never evaluated.
  *
  *   { "schemaVersion": 1, "results": [{ "paramIndex": 0, "passed": true }, ...] }
