@@ -49,6 +49,22 @@ describe('parseTrace: egress', () => {
     expect(t.egressAttempts).toBe(0);
   });
 
+  it('does not count connects inside the case network, but counts everything else', () => {
+    const local = { sensitivePaths: [], localNetworks: ['172.18.0.0/16'] };
+    const t = parseTrace(
+      [
+        exit(connect('AF_INET', '172.18.0.2', 4000), OK),
+        exit(connect('AF_INET6', '::ffff:172.18.0.2', 4000), OK),
+        exit(connect('AF_INET', '172.17.0.1', 8080), ENETUNREACH),
+        exit(connect('AF_INET', '172.19.0.2', 4000), ENETUNREACH),
+        exit(connect('AF_INET6', '::ffff:1.1.1.1'), ENETUNREACH),
+        exit(connect('AF_INET6', 'fd00::2'), ENETUNREACH),
+      ].join('\n'),
+      local,
+    );
+    expect(t.egressAttempts).toBe(4);
+  });
+
   it('only counts exit lines, so one attempt is not counted twice', () => {
     const call = connect('AF_INET', '1.1.1.1');
     expect(parse(enter(call), exit(call, ENETUNREACH)).egressAttempts).toBe(1);

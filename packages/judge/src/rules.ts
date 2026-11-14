@@ -76,6 +76,7 @@ function checkAttempt(a: ObservedAttempt): void {
   if (typeof a.oomKilled !== 'boolean') problems.push('oomKilled');
   if (!(Number.isFinite(a.durationMs) && a.durationMs >= 0)) problems.push('durationMs');
   if (!isCount(a.egressAttempts)) problems.push('egressAttempts');
+  if (typeof a.traceTampered !== 'boolean') problems.push('traceTampered');
   if (typeof a.stdout !== 'string') problems.push('stdout');
   if (typeof a.stderr !== 'string') problems.push('stderr');
   if (a.artifact !== null && typeof a.artifact !== 'string') problems.push('artifact');
@@ -187,7 +188,9 @@ export function judgeEvidence(evidence: Evidence, policy: Readonly<JudgePolicy>)
     if (!ATTEMPTS.every((n) => sameResults(first, resultsOf(v, n)))) return reject('stable-3of3');
   }
 
-  if (base.egressAttempts > 0) return reject('no-egress');
+  // no-egress: none recorded, and the record itself is trustworthy. A tampered trace cannot
+  // show the absence of egress, so it fails this rule rather than passing it.
+  if (base.egressAttempts > 0 || attempts.some((a) => a.traceTampered)) return reject('no-egress');
 
   if (attempts.some((a) => a.durationMs > policy.timeBudgetMs)) return reject('time-budget');
 

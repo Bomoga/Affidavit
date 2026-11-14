@@ -12,10 +12,13 @@
     "lint": "eslint src",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:sandbox-host": "AFFIDAVIT_SANDBOX_HOST=1 vitest run src/jail",
+    "containment": "tsx src/jail/cli.ts"
   },
   "dependencies": {
     "@affidavit/contracts": "workspace:*",
+    "@affidavit/sandbox": "workspace:*",
     "@opentelemetry/api": "1.10.0"
   }
 }

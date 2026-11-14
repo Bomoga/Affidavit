@@ -89,6 +89,6 @@ Docker's `--pids-limit` is enforced on the host, where it counts gVisor's own th
 ## Open items
 
 - Shared sandbox host and CI runner (P0-10, open decision 1). Until then `runner.integration.test.ts` is skipped in `pnpm test` (see `PROGRESS.md`).
-- Target and witness on a per-case internal network, with no route out (L2-03 and L2-04). Today every run is `--network none`.
+- Per-case internal network: done in L2-03 (`network.ts`, see `witness-jail.md`). Booting real targets on it is L2-04.
 - gVisor logs `SECCOMP WARNING: host filesystem enabled: syscall filters less restrictive` on this host. To evaluate with `--directfs=false` on the audit runtime before the shared host is signed off.
 - Lane 1's `LocalDockerToolRunner` can switch to `GvisorToolRunner` once the lead signs off the SELinux decision above.

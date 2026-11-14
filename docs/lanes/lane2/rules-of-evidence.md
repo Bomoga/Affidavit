@@ -1,6 +1,6 @@
 # Rules of evidence (L2-06)
 
-Code: `packages/judge/src/rules.ts` (the rules, pure), `judge.ts` (the `JudgePort` implementation), `artifact.ts` (the result artifact the runner writes), `executor.ts` (the port to the jail).
+Code: `packages/judge/src/rules.ts` (the rules, pure), `judge.ts` (the `JudgePort` implementation), `artifact.ts` (the result artifact the runner writes), `executor.ts` (the port to the jail), `jail/` (the real executor, L2-03; see `witness-jail.md`).
 
 ## How a witness is judged
 
@@ -9,14 +9,14 @@ Code: `packages/judge/src/rules.ts` (the rules, pure), `judge.ts` (the `JudgePor
 3. Each attempt runs the whole family and leaves a result artifact with one pass or fail per parameter combination. The Judge reads it as untrusted bytes: a size cap first, then JSON, then an exact shape check. It never evaluates it.
 4. The rules below are applied in order and the first one that fails is recorded in `rejectedBy`.
 
-| Order | Rule | Fails when |
-| --- | --- | --- |
-| 1 | `schema` | The exhibit is malformed, or any result artifact is oversized, not JSON, has extra keys, or does not report every parameter exactly once |
-| 2 | `completes` | Any attempt timed out, was OOM-killed, never exited, or exited without writing an artifact |
-| 3 | `stable-3of3` | On either variant, the three attempts disagree on any parameter |
-| 4 | `no-egress` | Any attempt recorded an egress attempt |
-| 5 | `time-budget` | Any completed attempt took longer than `timeBudgetMs` (a soft budget below the hard kill timeout) |
-| 6 | `differential` | Some parameter did not pass on `vulnerable`, or, with a safe variant, some parameter did not fail on `safe` |
+| Order | Rule           | Fails when                                                                                                                               |
+| ----- | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| 1     | `schema`       | The exhibit is malformed, or any result artifact is oversized, not JSON, has extra keys, or does not report every parameter exactly once |
+| 2     | `completes`    | Any attempt timed out, was OOM-killed, never exited, or exited without writing an artifact                                               |
+| 3     | `stable-3of3`  | On either variant, the three attempts disagree on any parameter                                                                          |
+| 4     | `no-egress`    | Any attempt recorded an egress attempt, or its syscall trace was tampered with (so the absence of egress cannot be shown)                |
+| 5     | `time-budget`  | Any completed attempt took longer than `timeBudgetMs` (a soft budget below the hard kill timeout)                                        |
+| 6     | `differential` | Some parameter did not pass on `vulnerable`, or, with a safe variant, some parameter did not fail on `safe`                              |
 
 Patch rules (`literal-only-patch`, `diff-too-large`, `suite-fails`, `counterexample-survives`) belong to `verifyPatch`, task L2-07.
 
@@ -46,14 +46,14 @@ The runner side is L2-05. The format is fixed here so both sides agree:
 
 These are configuration placeholders, not measurements. Tune them per corpus app once real runs exist.
 
-| Setting | Default |
-| --- | --- |
-| `hardTimeoutMs` | 120000 |
-| `timeBudgetMs` | 60000 |
-| `maxArtifactBytes` | 65536 |
-| `maxFamilySize` | 64 |
-| `maxSourceBytes` | 262144 |
-| `maxParamsBytes` | 65536 |
+| Setting            | Default |
+| ------------------ | ------- |
+| `hardTimeoutMs`    | 120000  |
+| `timeBudgetMs`     | 60000   |
+| `maxArtifactBytes` | 65536   |
+| `maxFamilySize`    | 64      |
+| `maxSourceBytes`   | 262144  |
+| `maxParamsBytes`   | 65536   |
 
 ## Open questions for the contracts owner
 
