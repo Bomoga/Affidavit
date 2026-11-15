@@ -13,7 +13,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test": "vitest run",
-    "test:sandbox-host": "AFFIDAVIT_SANDBOX_HOST=1 vitest run src/gvisor",
+    "test:sandbox-host": "AFFIDAVIT_SANDBOX_HOST=1 vitest run --no-file-parallelism src/gvisor src/boot",
     "containment": "tsx src/containment/cli.ts"
   },
   "dependencies": {

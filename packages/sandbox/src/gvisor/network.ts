@@ -2,7 +2,14 @@ import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { networkInterfaces } from 'node:os';
 import { promisify } from 'node:util';
-import { CASE_NETWORK, PLAIN_RUNTIME, RUN_LABEL, buildGvisorRunArgs, type Limits } from './args.js';
+import {
+  CASE_NETWORK,
+  PLAIN_RUNTIME,
+  RUN_LABEL,
+  buildGvisorRunArgs,
+  type Limits,
+  type TmpfsMount,
+} from './args.js';
 import { inCidr, ipv4ToInt, isIpv4Cidr } from './cidr.js';
 import type { Mount } from './mounts.js';
 
@@ -95,6 +102,12 @@ export interface ServiceSpec {
   /** Command run inside the service until it exits 0 (for example a health request). */
   readiness?: readonly string[];
   readinessTimeoutMs?: number;
+  /** Names this service resolves (other services on the case network). */
+  hosts?: Readonly<Record<string, string>>;
+  env?: Readonly<Record<string, string>>;
+  workdir?: string;
+  tmpfs?: readonly TmpfsMount[];
+  writableTmpMb?: number;
 }
 
 export interface RunningService {
@@ -122,7 +135,11 @@ export async function startJailedService(
     mounts: spec.mounts ?? [],
     limits: spec.limits,
     runtime: PLAIN_RUNTIME,
-    network: { name: net.name },
+    network: { name: net.name, hosts: spec.hosts },
+    env: spec.env,
+    workdir: spec.workdir,
+    tmpfs: spec.tmpfs,
+    writableTmpMb: spec.writableTmpMb,
   });
   await exec('docker', [args[0] ?? 'run', '--detach', ...args.slice(1)]);
   const { stdout } = await exec('docker', [
