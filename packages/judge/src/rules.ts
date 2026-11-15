@@ -3,7 +3,7 @@ import type { AdmissibilityRule, ExhibitId, RunRecord } from '@affidavit/contrac
 import { parseResultArtifact } from './artifact.js';
 import type { ArtifactParse } from './artifact.js';
 import { sha256Hex } from './canonical.js';
-import type { Attempt, EvidenceVariant, RawAttempt } from './executor.js';
+import type { Attempt, ExecutionVariant, RawAttempt } from './executor.js';
 
 /** Witness rules in the order they are applied. The first one that fails is recorded. */
 export const WITNESS_RULES = [
@@ -31,6 +31,10 @@ export interface JudgePolicy {
   maxSourceBytes: number;
   /** Largest parameter space, as canonical JSON in UTF-8 bytes. */
   maxParamsBytes: number;
+  /** Diff size cap (L2-07): added plus removed lines, counted from the diff. Over it fails `diff-too-large`. */
+  maxPatchLinesChanged: number;
+  /** Most files one patch may touch. Over it fails `diff-too-large`. */
+  maxPatchFiles: number;
 }
 
 export const DEFAULT_POLICY: Readonly<JudgePolicy> = {
@@ -40,10 +44,12 @@ export const DEFAULT_POLICY: Readonly<JudgePolicy> = {
   maxFamilySize: 64,
   maxSourceBytes: 256 * 1024,
   maxParamsBytes: 64 * 1024,
+  maxPatchLinesChanged: 100,
+  maxPatchFiles: 5,
 };
 
 export interface ObservedAttempt extends RawAttempt {
-  variant: EvidenceVariant;
+  variant: ExecutionVariant;
   attempt: Attempt;
 }
 
@@ -87,10 +93,10 @@ function checkAttempt(a: ObservedAttempt): void {
   }
 }
 
-function checkShape(attempts: readonly ObservedAttempt[]): void {
+function checkShape(attempts: readonly ObservedAttempt[], required: ExecutionVariant): void {
   attempts.forEach(checkAttempt);
   const variants = new Set(attempts.map((a) => a.variant));
-  if (!variants.has('vulnerable')) throw new Error('evidence has no vulnerable runs');
+  if (!variants.has(required)) throw new Error(`evidence has no ${required} runs`);
   for (const v of variants) {
     const seen = attempts
       .filter((a) => a.variant === v)
@@ -130,21 +136,26 @@ export function rejectBeforeRunning(exhibitId: ExhibitId, rule: AdmissibilityRul
   });
 }
 
-/**
- * Applies the rules of evidence to what the executor observed. Pure: the same evidence always
- * gives the same result, which is what replay (L2-08) relies on.
- *
- * Semantics:
- * - An attempt passes only if every parameter in the family passed.
- * - `vulnPass` is true only when the evidence got as far as `differential` and the whole family
- *   passed on `vulnerable`. Evidence rejected by an earlier rule is not credited.
- * - `differential` needs the whole family to pass on `vulnerable` and, when a safe variant was
- *   run, the whole family to fail on `safe` (F2).
- */
-export function judgeEvidence(evidence: Evidence, policy: Readonly<JudgePolicy>): ExhibitResult {
-  const { exhibitId, familySize, attempts } = evidence;
-  checkShape(attempts);
+interface Screened {
+  base: Omit<ExhibitResult, 'admissible' | 'rejectedBy' | 'vulnPass' | 'passed'>;
+  /** The first rule before `differential` that failed, if any. */
+  rejectedBy?: WitnessRule;
+  variants: ExecutionVariant[];
+  resultsOf: (v: ExecutionVariant, n: Attempt) => boolean[];
+}
 
+/**
+ * The rules every run is held to before its outcome means anything: `schema`, `completes`,
+ * `stable-3of3`, `no-egress` and `time-budget`, in that order. Shared by witnesses,
+ * counterexamples and the reruns inside verifyPatch, so a patched target is judged exactly like
+ * the vulnerable one.
+ */
+function screen(
+  attempts: readonly ObservedAttempt[],
+  exhibitId: ExhibitId,
+  familySize: number,
+  policy: Readonly<JudgePolicy>,
+): Screened {
   const parsed = attempts.map((a) => ({
     a,
     art:
@@ -159,40 +170,67 @@ export function judgeEvidence(evidence: Evidence, policy: Readonly<JudgePolicy>)
     egressAttempts: attempts.reduce((n, a) => n + a.egressAttempts, 0),
     durationMs: attempts.reduce((n, a) => n + Math.round(a.durationMs), 0),
   };
-  const reject = (rule: WitnessRule): ExhibitResult =>
-    ExhibitResult.parse({
-      ...base,
-      admissible: false,
-      rejectedBy: rule,
-      vulnPass: false,
-      passed: false,
-    });
+  const results = new Map<string, boolean[]>();
+  const resultsOf = (v: ExecutionVariant, n: Attempt): boolean[] => results.get(`${v}:${n}`) ?? [];
+  const variants = [...new Set(attempts.map((a) => a.variant))];
+  const out = (rejectedBy?: WitnessRule): Screened =>
+    rejectedBy === undefined
+      ? { base, variants, resultsOf }
+      : { base, variants, resultsOf, rejectedBy };
 
   // schema: every artifact that exists must be well formed.
-  if (parsed.some(({ art }) => art !== null && !art.ok)) return reject('schema');
+  if (parsed.some(({ art }) => art !== null && !art.ok)) return out('schema');
 
   // completes: every attempt exited on its own and left an artifact.
-  const results = new Map<string, boolean[]>();
   for (const { a, art } of parsed) {
     if (a.exitCode === null || a.timedOut || a.oomKilled || art === null || !art.ok) {
-      return reject('completes');
+      return out('completes');
     }
     results.set(`${a.variant}:${a.attempt}`, art.results);
   }
-  const resultsOf = (v: EvidenceVariant, n: Attempt): boolean[] => results.get(`${v}:${n}`) ?? [];
 
   // stable-3of3: per variant, all three attempts agree on every parameter.
-  const variants = [...new Set(attempts.map((a) => a.variant))];
   for (const v of variants) {
     const first = resultsOf(v, 1);
-    if (!ATTEMPTS.every((n) => sameResults(first, resultsOf(v, n)))) return reject('stable-3of3');
+    if (!ATTEMPTS.every((n) => sameResults(first, resultsOf(v, n)))) return out('stable-3of3');
   }
 
   // no-egress: none recorded, and the record itself is trustworthy. A tampered trace cannot
   // show the absence of egress, so it fails this rule rather than passing it.
-  if (base.egressAttempts > 0 || attempts.some((a) => a.traceTampered)) return reject('no-egress');
+  if (base.egressAttempts > 0 || attempts.some((a) => a.traceTampered)) return out('no-egress');
 
-  if (attempts.some((a) => a.durationMs > policy.timeBudgetMs)) return reject('time-budget');
+  if (attempts.some((a) => a.durationMs > policy.timeBudgetMs)) return out('time-budget');
+
+  return out();
+}
+
+/**
+ * Applies the rules of evidence to what the executor observed. Pure: the same evidence always
+ * gives the same result, which is what replay (L2-08) relies on.
+ *
+ * Semantics:
+ * - An attempt passes only if every parameter in the family passed.
+ * - `vulnPass` is true only when the evidence got as far as `differential` and the whole family
+ *   passed on `vulnerable`. Evidence rejected by an earlier rule is not credited.
+ * - `differential` needs the whole family to pass on `vulnerable` and, when a safe variant was
+ *   run, the whole family to fail on `safe` (F2).
+ */
+export function judgeEvidence(evidence: Evidence, policy: Readonly<JudgePolicy>): ExhibitResult {
+  const { exhibitId, familySize, attempts } = evidence;
+  checkShape(attempts, 'vulnerable');
+  if (attempts.some((a) => a.variant === 'patched')) {
+    throw new Error('patched runs are judged by judgePatchedFamily, not judgeEvidence');
+  }
+  const { base, rejectedBy, variants, resultsOf } = screen(attempts, exhibitId, familySize, policy);
+  if (rejectedBy !== undefined) {
+    return ExhibitResult.parse({
+      ...base,
+      admissible: false,
+      rejectedBy,
+      vulnPass: false,
+      passed: false,
+    });
+  }
 
   const vuln = resultsOf('vulnerable', 1);
   const vulnPass = allTrue(vuln);
@@ -209,4 +247,46 @@ export function judgeEvidence(evidence: Evidence, policy: Readonly<JudgePolicy>)
     familyResults,
     passed: admissible,
   });
+}
+
+export interface FamilyOnPatch {
+  /** The whole family passed on `vulnerable` and failed on every parameter on `patched`. */
+  familyFlipped: boolean;
+  /** Why it did not flip: an earlier rule, or `differential` when the runs were clean. */
+  rejectedBy?: WitnessRule;
+}
+
+/**
+ * verifyPatch's family check (F5): the witness family reruns on the vulnerable commit, where it
+ * must still pass on every parameter, and on the patched target, where it must fail on every
+ * parameter. A single parameter still passing on the patch means the family did not flip.
+ */
+export function judgePatchedFamily(
+  evidence: Evidence,
+  policy: Readonly<JudgePolicy>,
+): FamilyOnPatch {
+  const { exhibitId, familySize, attempts } = evidence;
+  checkShape(attempts, 'vulnerable');
+  if (!attempts.some((a) => a.variant === 'patched'))
+    throw new Error('evidence has no patched runs');
+  if (attempts.some((a) => a.variant === 'safe')) throw new Error('safe runs do not belong here');
+  const { rejectedBy, resultsOf } = screen(attempts, exhibitId, familySize, policy);
+  if (rejectedBy !== undefined) return { familyFlipped: false, rejectedBy };
+  const flipped = allTrue(resultsOf('vulnerable', 1)) && allFalse(resultsOf('patched', 1));
+  return flipped ? { familyFlipped: true } : { familyFlipped: false, rejectedBy: 'differential' };
+}
+
+/**
+ * A counterexample is defeated by the patch only when its runs on the patched target are clean
+ * (every screening rule holds) and every parameter fails. Anything else, including a run that
+ * never completes, counts as surviving: the Judge cannot show the patch beat it.
+ */
+export function counterexampleSurvives(evidence: Evidence, policy: Readonly<JudgePolicy>): boolean {
+  const { exhibitId, familySize, attempts } = evidence;
+  checkShape(attempts, 'patched');
+  if (attempts.some((a) => a.variant !== 'patched')) {
+    throw new Error('counterexamples are rerun on the patched target only');
+  }
+  const { rejectedBy, resultsOf } = screen(attempts, exhibitId, familySize, policy);
+  return rejectedBy !== undefined || !allFalse(resultsOf('patched', 1));
 }

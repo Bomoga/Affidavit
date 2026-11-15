@@ -1,18 +1,36 @@
-import { CaseFile, Exhibit, Witness } from '@affidavit/contracts';
+import { CaseFile, Exhibit, PatchExhibit, VerifyResult, Witness } from '@affidavit/contracts';
 import type {
+  AdmissibilityRule,
   ExhibitId,
   ExhibitResult,
   JudgePort,
   ParamSpace,
+  RescanPort,
   TargetRef,
   TargetVariant,
-  VerifyResult,
 } from '@affidavit/contracts';
 import { familySize } from './artifact.js';
 import { exhibitDigest, sha256Hex, canonicalJson } from './canonical.js';
-import type { EvidenceVariant, WitnessExecutor } from './executor.js';
-import { ATTEMPTS, DEFAULT_POLICY, judgeEvidence, rejectBeforeRunning } from './rules.js';
+import type { ExecutionVariant, WitnessExecutor } from './executor.js';
+import { addedLines, parseUnifiedDiff } from './patch/diff.js';
+import type { ParsedDiff } from './patch/diff.js';
+import { findLiteralSpecialCases } from './patch/literal.js';
+import type { PatchWorkbench, PreparedPatch } from './patch/workbench.js';
+import {
+  ATTEMPTS,
+  DEFAULT_POLICY,
+  counterexampleSurvives,
+  judgeEvidence,
+  judgePatchedFamily,
+  rejectBeforeRunning,
+} from './rules.js';
 import type { JudgePolicy, ObservedAttempt } from './rules.js';
+
+/** What verifyPatch needs besides the executor: somewhere to build the patch, and Lane 1's re-scan. */
+export interface PatchVerification {
+  workbench: PatchWorkbench;
+  rescan: RescanPort;
+}
 
 /** Exhibit id the Judge assigns to a witness: stable for the same template and family. */
 export function witnessExhibitId(witness: Pick<Witness, 'template' | 'params'>): ExhibitId {
@@ -33,13 +51,19 @@ interface Runnable {
 export class Judge implements JudgePort {
   readonly #executor: WitnessExecutor;
   readonly #policy: Readonly<JudgePolicy>;
+  readonly #verify: PatchVerification | undefined;
 
-  constructor(executor: WitnessExecutor, policy: Readonly<JudgePolicy> = DEFAULT_POLICY) {
+  constructor(
+    executor: WitnessExecutor,
+    policy: Readonly<JudgePolicy> = DEFAULT_POLICY,
+    verify?: PatchVerification,
+  ) {
     if (policy.timeBudgetMs >= policy.hardTimeoutMs) {
       throw new Error('timeBudgetMs must be below hardTimeoutMs');
     }
     this.#executor = executor;
     this.#policy = policy;
+    this.#verify = verify;
   }
 
   async runWitness(
@@ -91,8 +115,132 @@ export class Judge implements JudgePort {
     });
   }
 
-  verifyPatch(): Promise<VerifyResult> {
-    return Promise.reject(new Error('verifyPatch is task L2-07 and is not implemented yet'));
+  /**
+   * L2-07, F5. Cheap static rules first, so a bad patch never costs a build:
+   * `schema` (unreadable exhibit, witness or diff, declared counts that disagree with the diff, or
+   * a patch that does not apply), `diff-too-large`, `literal-only-patch`. Then the patch is built
+   * and every dynamic check runs, so an appeal gets the whole picture: the witness family on the
+   * vulnerable commit (must pass) and on the patched target (must fail on every parameter), the
+   * target's test suite, every counterexample on the patched target, and the discovery re-scan.
+   *
+   * `rejectedBy` names the first failed rule in that order. A failed re-scan has no rule of its
+   * own in contracts v1.0 and shows only as `rescanClean: false`. When a check never ran, its
+   * flag is false and every counterexample is reported as surviving: nothing was shown.
+   */
+  async verifyPatch(
+    caseFile: CaseFile,
+    patch: PatchExhibit,
+    witness: Witness,
+    counterexamples: readonly Exhibit[],
+  ): Promise<VerifyResult> {
+    const cf = CaseFile.parse(caseFile);
+    const deps = this.#verify;
+    if (deps === undefined) throw new Error('verifyPatch needs a PatchWorkbench and a RescanPort');
+    const p = safely(() => PatchExhibit.safeParse(patch));
+    const patchExhibitId = p?.success ? p.data.id : fallbackId('patch', patch);
+    const counterIds = counterexamples.map((c) => {
+      const parsed = safely(() => Exhibit.safeParse(c));
+      return parsed?.success ? parsed.data.id : fallbackId('counterexample', c);
+    });
+    const reject = (rule: AdmissibilityRule): VerifyResult =>
+      VerifyResult.parse({
+        schemaVersion: 1,
+        patchExhibitId,
+        familyFlipped: false,
+        suitePassed: false,
+        rescanClean: false,
+        counterexamples: counterIds.map((exhibitId) => ({ exhibitId, survived: true })),
+        rejectedBy: rule,
+      });
+
+    if (!p?.success || p.data.caseId !== cf.id || p.data.author !== 'remedy') {
+      return reject('schema');
+    }
+    if (utf8Bytes(p.data.diff) > this.#policy.maxSourceBytes) return reject('schema');
+    const w = safely(() => Witness.safeParse(witness));
+    if (!w?.success || !this.#witnessFits(cf, w.data)) return reject('schema');
+    const parse = parseUnifiedDiff(p.data.diff);
+    if (!parse.ok || !declaredMatches(p.data, parse.diff)) return reject('schema');
+    const diff = parse.diff;
+    if (
+      diff.linesChanged > this.#policy.maxPatchLinesChanged ||
+      diff.files.length > this.#policy.maxPatchFiles
+    ) {
+      return reject('diff-too-large');
+    }
+    if (findLiteralSpecialCases(addedLines(diff), w.data.params).length > 0) {
+      return reject('literal-only-patch');
+    }
+
+    const outcome = await deps.workbench.prepare(cf, p.data, diff);
+    if (!outcome.ok) return reject(outcome.stage === 'apply' ? 'schema' : 'suite-fails');
+    const prepared = outcome.prepared;
+    try {
+      checkPrepared(cf, prepared);
+      const params = w.data.params;
+      const family = judgePatchedFamily(
+        {
+          exhibitId: patchExhibitId,
+          familySize: familySize(params),
+          attempts: await this.#attempts(
+            cf,
+            [
+              ['vulnerable', cf.target],
+              ['patched', prepared.target],
+            ],
+            w.data.template,
+            params,
+          ),
+        },
+        this.#policy,
+      );
+      const suite = await deps.workbench.runSuite(cf, prepared);
+      const counters: VerifyResult['counterexamples'] = [];
+      for (const [i, c] of counterexamples.entries()) {
+        const exhibitId = counterIds[i] as ExhibitId;
+        const parsed = safely(() => Exhibit.safeParse(c));
+        if (
+          !parsed?.success ||
+          parsed.data.kind !== 'counterexample' ||
+          parsed.data.caseId !== cf.id ||
+          utf8Bytes(parsed.data.code) > this.#policy.maxSourceBytes
+        ) {
+          counters.push({ exhibitId, survived: true });
+          continue;
+        }
+        const attempts = await this.#attempts(
+          cf,
+          [['patched', prepared.target]],
+          parsed.data.code,
+          params,
+        );
+        const survived = counterexampleSurvives(
+          { exhibitId, familySize: familySize(params), attempts },
+          this.#policy,
+        );
+        counters.push({ exhibitId, survived });
+      }
+      const rescan = await deps.rescan.rescan(cf, prepared.workspacePath);
+
+      const rejectedBy: AdmissibilityRule | undefined =
+        family.rejectedBy ??
+        (!suite.passed
+          ? 'suite-fails'
+          : counters.some((c) => c.survived)
+            ? 'counterexample-survives'
+            : undefined);
+      return VerifyResult.parse({
+        schemaVersion: 1,
+        patchExhibitId,
+        familyFlipped: family.familyFlipped,
+        suitePassed: suite.passed === true,
+        rescanClean: rescan.clean === true,
+        counterexamples: counters,
+        ...(rejectedBy === undefined ? {} : { rejectedBy }),
+      });
+    } finally {
+      await deps.workbench.release(prepared);
+    }
   }
 
   /** Checks a parsed witness against this case and the policy's size limits. */
@@ -114,7 +262,7 @@ export class Judge implements JudgePort {
    * variant it is always run, whatever the caller asked for, so differential proof cannot be
    * skipped (F2). Asking for a safe variant that does not exist, or for `patched`, is a caller bug.
    */
-  #targets(cf: CaseFile, variants: readonly TargetVariant[]): [EvidenceVariant, TargetRef][] {
+  #targets(cf: CaseFile, variants: readonly TargetVariant[]): [ExecutionVariant, TargetRef][] {
     if (variants.includes('patched')) {
       throw new Error('the patched variant is judged by verifyPatch, not runWitness');
     }
@@ -122,17 +270,18 @@ export class Judge implements JudgePort {
     if (variants.includes('safe') && cf.safeVariant === undefined) {
       throw new Error(`case ${cf.id} has no safe variant`);
     }
-    const out: [EvidenceVariant, TargetRef][] = [['vulnerable', cf.target]];
+    const out: [ExecutionVariant, TargetRef][] = [['vulnerable', cf.target]];
     if (cf.safeVariant !== undefined) out.push(['safe', cf.safeVariant]);
     return out;
   }
 
   /** Runs attempts one at a time so one run cannot disturb another's timing or state. */
-  async #run(
+  async #attempts(
     caseFile: CaseFile,
-    targets: readonly [EvidenceVariant, TargetRef][],
-    r: Runnable,
-  ): Promise<ExhibitResult> {
+    targets: readonly [ExecutionVariant, TargetRef][],
+    template: string,
+    params: ParamSpace,
+  ): Promise<ObservedAttempt[]> {
     const attempts: ObservedAttempt[] = [];
     for (const [variant, target] of targets) {
       for (const attempt of ATTEMPTS) {
@@ -141,14 +290,23 @@ export class Judge implements JudgePort {
           variant,
           target,
           attempt,
-          template: r.template,
-          params: r.params,
+          template,
+          params,
           timeoutMs: this.#policy.hardTimeoutMs,
           maxArtifactBytes: this.#policy.maxArtifactBytes,
         });
         attempts.push({ ...raw, variant, attempt });
       }
     }
+    return attempts;
+  }
+
+  async #run(
+    caseFile: CaseFile,
+    targets: readonly [ExecutionVariant, TargetRef][],
+    r: Runnable,
+  ): Promise<ExhibitResult> {
+    const attempts = await this.#attempts(caseFile, targets, r.template, r.params);
     return judgeEvidence(
       { exhibitId: r.exhibitId, familySize: familySize(r.params), attempts },
       this.#policy,
@@ -156,8 +314,27 @@ export class Judge implements JudgePort {
   }
 }
 
+/** The author's `filesTouched` and `linesChanged` must be exactly what the diff contains. */
+function declaredMatches(patch: PatchExhibit, diff: ParsedDiff): boolean {
+  const declared = [...new Set(patch.filesTouched)].sort();
+  const actual = diff.files.map((f) => f.path).sort();
+  return (
+    declared.length === patch.filesTouched.length &&
+    declared.join('\n') === actual.join('\n') &&
+    patch.linesChanged === diff.linesChanged
+  );
+}
+
+/** A workbench that hands back the wrong target is our bug, never the patch author's. */
+function checkPrepared(cf: CaseFile, prepared: PreparedPatch): void {
+  const t = prepared.target;
+  if (t.variant !== 'patched' || t.repo !== cf.target.repo) {
+    throw new Error(`workbench returned a target that is not the patched ${cf.target.repo}`);
+  }
+}
+
 /** Id for an exhibit too malformed to read its fields; stable for the same input when hashable. */
-function fallbackId(kind: 'witness' | 'counterexample', value: unknown): ExhibitId {
+function fallbackId(kind: 'witness' | 'counterexample' | 'patch', value: unknown): ExhibitId {
   const digest = safely(() => sha256Hex(canonicalJson(value)).slice(0, 24)) ?? 'unhashable';
   return `exhibit-${kind}-invalid-${digest}` as ExhibitId;
 }
