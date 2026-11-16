@@ -198,10 +198,34 @@ export const events = pgTable(
 ).enableRLS();
 
 /**
- * Durable record that a stage attempt has started. The task wrapper inserts the row before
- * running a handler and skips the handler when the row already exists, so an attempt runs at
- * most once even after Graphile Worker has deleted its finished job. `completed_at` is set once
- * when the handler returns; a row with no `completed_at` is an attempt that crashed or is running.
+ * Durable record that a stage attempt was enqueued, written by enqueue_stage() (the only writer).
+ * The claim function checks a job payload against this record, so a forged or rewritten queue job
+ * is refused at claim. Insert-only.
+ */
+export const stageJobs = pgTable(
+  'stage_jobs',
+  {
+    tenantId: tenantId(),
+    caseId: text('case_id').notNull(),
+    stage: text('stage').notNull(),
+    attempt: integer('attempt').notNull(),
+    enqueuedAt: timestamp('enqueued_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.tenantId, t.caseId, t.stage, t.attempt] }),
+    caseRef(t),
+    check('stage_jobs_stage_valid', sql`${t.stage} in (${stageList})`),
+    check('stage_jobs_attempt_valid', sql`${t.attempt} >= 1`),
+  ],
+).enableRLS();
+
+/**
+ * Durable record that a stage attempt was claimed, written only by claim_stage_run() after it
+ * verified the job against stage_jobs. An attempt runs at most once even after Graphile Worker
+ * has deleted its finished job. The claim carries a lease (worker_id, heartbeat_at,
+ * lease_expires_at). `completed_at` (written in the handler's own final transaction when it can)
+ * and `failed_at` plus `error` are each write-once and exclusive. A row with neither, past its
+ * lease, is an attempt whose worker died.
  */
 export const stageRuns = pgTable(
   'stage_runs',
@@ -210,8 +234,13 @@ export const stageRuns = pgTable(
     caseId: text('case_id').notNull(),
     stage: text('stage').notNull(),
     attempt: integer('attempt').notNull(),
+    workerId: text('worker_id').notNull(),
     claimedAt: timestamp('claimed_at', { withTimezone: true }).notNull().defaultNow(),
+    heartbeatAt: timestamp('heartbeat_at', { withTimezone: true }).notNull().defaultNow(),
+    leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true }).notNull(),
     completedAt: timestamp('completed_at', { withTimezone: true }),
+    failedAt: timestamp('failed_at', { withTimezone: true }),
+    error: text('error'),
   },
   (t) => [
     primaryKey({ columns: [t.tenantId, t.caseId, t.stage, t.attempt] }),

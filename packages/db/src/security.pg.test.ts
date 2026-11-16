@@ -109,6 +109,87 @@ describePg('session and role hardening', () => {
     }
   });
 
+  it('startup refuses inherited privilege, owned functions or schemas or database, and a wrong search_path', async () => {
+    const probe = async (
+      name: string,
+      setup: string[],
+      teardown: string[],
+      expected: RegExp,
+      pinPath = true,
+    ) => {
+      await db().admin.query(`drop role if exists ${name}`);
+      await db().admin.query(`create role ${name} login password 'probe-pw'`);
+      if (pinPath) {
+        await db().admin.query(
+          `alter role ${name} in database ${db().name} set search_path = pg_catalog, public, pg_temp`,
+        );
+      }
+      try {
+        for (const s of setup) await db().admin.query(s);
+        const u = new URL(db().adminUrl);
+        u.username = name;
+        u.password = 'probe-pw';
+        await expect(openPool(u.toString()), name).rejects.toThrow(expected);
+      } finally {
+        for (const s of teardown) await db().admin.query(s);
+        await db().admin.query(`drop owned by ${name}`);
+        await db().admin.query(`drop role ${name}`);
+      }
+    };
+    await probe('probe_pgdata', ['grant pg_read_all_data to probe_pgdata'], [], /pg_read_all_data/);
+    await probe(
+      'probe_chain',
+      [
+        'create role probe_mid nologin',
+        'grant pg_write_all_data to probe_mid',
+        'grant probe_mid to probe_chain',
+      ],
+      ['drop role probe_mid'],
+      /pg_write_all_data/,
+    );
+    await probe(
+      'probe_func',
+      [
+        'create function public.probe_fn() returns int language sql as $$ select 1 $$',
+        'alter function public.probe_fn() owner to probe_func',
+      ],
+      [],
+      /owns functions/,
+    );
+    await probe(
+      'probe_schema',
+      ['create schema probe_s authorization probe_schema'],
+      [],
+      /owns a schema/,
+    );
+    await probe('probe_path', [], [], /search_path/, false);
+    const dbOwner = 'probe_dbowner';
+    await db().admin.query(`drop role if exists ${dbOwner}`);
+    await db().admin.query(`create role ${dbOwner} login password 'probe-pw'`);
+    await db().admin.query(
+      `alter role ${dbOwner} in database ${db().name} set search_path = pg_catalog, public, pg_temp`,
+    );
+    const root = new URL(db().adminUrl);
+    root.pathname = '/postgres';
+    const rootPool = new pg.Pool({ connectionString: root.toString(), max: 1 });
+    const owned = `affidavit_owned_${Date.now()}`;
+    try {
+      await rootPool.query(`create database ${owned} owner ${dbOwner}`);
+      await rootPool.query(
+        `alter role ${dbOwner} in database ${owned} set search_path = pg_catalog, public, pg_temp`,
+      );
+      const u = new URL(db().adminUrl);
+      u.pathname = `/${owned}`;
+      u.username = dbOwner;
+      u.password = 'probe-pw';
+      await expect(openPool(u.toString())).rejects.toThrow(/owns the database/);
+    } finally {
+      await rootPool.query(`drop database if exists ${owned} with (force)`);
+      await rootPool.end();
+      await db().admin.query(`drop role ${dbOwner}`);
+    }
+  });
+
   it('startup accepts the application and worker roles', async () => {
     await expect(openPool(db().appUrl).then((p) => p.end())).resolves.toBeUndefined();
     await expect(openPool(db().workerUrl).then((p) => p.end())).resolves.toBeUndefined();

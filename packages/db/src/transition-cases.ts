@@ -48,17 +48,24 @@ const appeal = ['remedy', 'verify'] as const;
 const verifyAfter1Appeal = [...P.verify, ...appeal] as const;
 const verifyAfter2Appeals = [...P.verify, ...appeal, ...appeal] as const;
 
+/**
+ * Every pair in STAGE_TRANSITIONS must be accepted from a state where the extra rules allow it
+ * (low score for defense to dismissed, jury off for verify to verdict).
+ */
+const legalPairs: TransitionCase[] = stages.flatMap((from) =>
+  STAGE_TRANSITIONS[from].map((to) => ({
+    name: `${from} -> ${to} is legal`,
+    path: P[from],
+    ...(from === 'defense' && to === 'dismissed' ? { score: 0.5, floor: 0.7 } : {}),
+    ...(from === 'verify' && to === 'verdict' ? { juryEnabled: false } : {}),
+    to,
+    ok: true,
+  })),
+);
+
 export const transitionCases: readonly TransitionCase[] = [
   ...forbiddenPairs,
-  { name: 'intake -> map', path: P.intake, to: 'map', ok: true },
-  { name: 'map -> arraign', path: P.map, to: 'arraign', ok: true },
-  { name: 'arraign -> defense', path: P.arraign, to: 'defense', ok: true },
-  { name: 'arraign -> dismissed', path: P.arraign, to: 'dismissed', ok: true },
-  { name: 'defense -> prosecution', path: P.defense, to: 'prosecution', ok: true },
-  { name: 'defense -> escalated', path: P.defense, to: 'escalated', ok: true },
-  { name: 'prosecution -> remedy', path: P.prosecution, to: 'remedy', ok: true },
-  { name: 'remedy -> verify', path: P.remedy, to: 'verify', ok: true },
-  { name: 'jury -> verdict', path: P.jury, to: 'verdict', ok: true },
+  ...legalPairs,
   // F3: defense to dismissed only below the escalation floor.
   {
     name: 'defense -> dismissed below the floor',

@@ -93,13 +93,30 @@ CREATE TABLE "repos" (
 );
 --> statement-breakpoint
 ALTER TABLE "repos" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
+CREATE TABLE "stage_jobs" (
+	"tenant_id" text NOT NULL,
+	"case_id" text NOT NULL,
+	"stage" text NOT NULL,
+	"attempt" integer NOT NULL,
+	"enqueued_at" timestamp with time zone DEFAULT now() NOT NULL,
+	CONSTRAINT "stage_jobs_tenant_id_case_id_stage_attempt_pk" PRIMARY KEY("tenant_id","case_id","stage","attempt"),
+	CONSTRAINT "stage_jobs_stage_valid" CHECK ("stage_jobs"."stage" in ('intake', 'map', 'arraign', 'defense', 'prosecution', 'remedy', 'verify', 'jury', 'verdict', 'dismissed', 'escalated')),
+	CONSTRAINT "stage_jobs_attempt_valid" CHECK ("stage_jobs"."attempt" >= 1)
+);
+--> statement-breakpoint
+ALTER TABLE "stage_jobs" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
 CREATE TABLE "stage_runs" (
 	"tenant_id" text NOT NULL,
 	"case_id" text NOT NULL,
 	"stage" text NOT NULL,
 	"attempt" integer NOT NULL,
+	"worker_id" text NOT NULL,
 	"claimed_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"heartbeat_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"lease_expires_at" timestamp with time zone NOT NULL,
 	"completed_at" timestamp with time zone,
+	"failed_at" timestamp with time zone,
+	"error" text,
 	CONSTRAINT "stage_runs_tenant_id_case_id_stage_attempt_pk" PRIMARY KEY("tenant_id","case_id","stage","attempt"),
 	CONSTRAINT "stage_runs_stage_valid" CHECK ("stage_runs"."stage" in ('intake', 'map', 'arraign', 'defense', 'prosecution', 'remedy', 'verify', 'jury', 'verdict', 'dismissed', 'escalated')),
 	CONSTRAINT "stage_runs_attempt_valid" CHECK ("stage_runs"."attempt" >= 1)
@@ -141,6 +158,7 @@ ALTER TABLE "escalations" ADD CONSTRAINT "escalations_tenant_id_case_id_cases_te
 ALTER TABLE "events" ADD CONSTRAINT "events_tenant_id_case_id_cases_tenant_id_id_fk" FOREIGN KEY ("tenant_id","case_id") REFERENCES "public"."cases"("tenant_id","id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "exhibits" ADD CONSTRAINT "exhibits_tenant_id_case_id_cases_tenant_id_id_fk" FOREIGN KEY ("tenant_id","case_id") REFERENCES "public"."cases"("tenant_id","id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "repos" ADD CONSTRAINT "repos_tenant_id_tenants_tenant_id_fk" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("tenant_id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "stage_jobs" ADD CONSTRAINT "stage_jobs_tenant_id_case_id_cases_tenant_id_id_fk" FOREIGN KEY ("tenant_id","case_id") REFERENCES "public"."cases"("tenant_id","id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "stage_runs" ADD CONSTRAINT "stage_runs_tenant_id_case_id_cases_tenant_id_id_fk" FOREIGN KEY ("tenant_id","case_id") REFERENCES "public"."cases"("tenant_id","id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "stages" ADD CONSTRAINT "stages_tenant_id_case_id_cases_tenant_id_id_fk" FOREIGN KEY ("tenant_id","case_id") REFERENCES "public"."cases"("tenant_id","id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "verdicts" ADD CONSTRAINT "verdicts_tenant_id_case_id_cases_tenant_id_id_fk" FOREIGN KEY ("tenant_id","case_id") REFERENCES "public"."cases"("tenant_id","id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint

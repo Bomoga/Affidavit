@@ -27,6 +27,7 @@ describePg('migrations on a fresh Postgres', () => {
       'events',
       'exhibits',
       'repos',
+      'stage_jobs',
       'stage_runs',
       'stages',
       'tenants',
@@ -60,7 +61,11 @@ describePg('migrations on a fresh Postgres', () => {
       );
       expect(member.rows, role).toHaveLength(0);
       const owned = await db().admin.query(
-        `select 1 from pg_class c join pg_roles r on r.oid = c.relowner where r.rolname = $1`,
+        `select 1 from pg_class c join pg_roles r on r.oid = c.relowner where r.rolname = $1
+         union all select 1 from pg_proc p join pg_roles r on r.oid = p.proowner
+           join pg_namespace n on n.oid = p.pronamespace where r.rolname = $1 and n.nspname not like 'pg\\_%'
+         union all select 1 from pg_namespace n join pg_roles r on r.oid = n.nspowner where r.rolname = $1
+         union all select 1 from pg_database d join pg_roles r on r.oid = d.datdba where r.rolname = $1`,
         [role],
       );
       expect(owned.rows, role).toHaveLength(0);

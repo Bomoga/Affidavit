@@ -1,6 +1,6 @@
 {
-  "id": "f0ddee4d-8d14-42c0-a87e-12e253a9a73a",
-  "prevId": "59a11d79-3398-47cf-b231-c7c072689299",
+  "id": "4c47256e-0c54-4c82-bde6-a87347f7e992",
+  "prevId": "42c7b8b9-b093-4809-a572-b0adc4353689",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -602,6 +602,74 @@
       "checkConstraints": {},
       "isRLSEnabled": true
     },
+    "public.stage_jobs": {
+      "name": "stage_jobs",
+      "schema": "",
+      "columns": {
+        "tenant_id": {
+          "name": "tenant_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "case_id": {
+          "name": "case_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "stage": {
+          "name": "stage",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "attempt": {
+          "name": "attempt",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "enqueued_at": {
+          "name": "enqueued_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "stage_jobs_tenant_id_case_id_cases_tenant_id_id_fk": {
+          "name": "stage_jobs_tenant_id_case_id_cases_tenant_id_id_fk",
+          "tableFrom": "stage_jobs",
+          "columnsFrom": ["tenant_id", "case_id"],
+          "tableTo": "cases",
+          "columnsTo": ["tenant_id", "id"],
+          "onUpdate": "no action",
+          "onDelete": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "stage_jobs_tenant_id_case_id_stage_attempt_pk": {
+          "name": "stage_jobs_tenant_id_case_id_stage_attempt_pk",
+          "columns": ["tenant_id", "case_id", "stage", "attempt"]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "stage_jobs_stage_valid": {
+          "name": "stage_jobs_stage_valid",
+          "value": "\"stage_jobs\".\"stage\" in ('intake', 'map', 'arraign', 'defense', 'prosecution', 'remedy', 'verify', 'jury', 'verdict', 'dismissed', 'escalated')"
+        },
+        "stage_jobs_attempt_valid": {
+          "name": "stage_jobs_attempt_valid",
+          "value": "\"stage_jobs\".\"attempt\" >= 1"
+        }
+      },
+      "isRLSEnabled": true
+    },
     "public.stage_runs": {
       "name": "stage_runs",
       "schema": "",
@@ -630,6 +698,12 @@
           "primaryKey": false,
           "notNull": true
         },
+        "worker_id": {
+          "name": "worker_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
         "claimed_at": {
           "name": "claimed_at",
           "type": "timestamp with time zone",
@@ -637,9 +711,34 @@
           "notNull": true,
           "default": "now()"
         },
+        "heartbeat_at": {
+          "name": "heartbeat_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "lease_expires_at": {
+          "name": "lease_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
         "completed_at": {
           "name": "completed_at",
           "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "failed_at": {
+          "name": "failed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "error": {
+          "name": "error",
+          "type": "text",
           "primaryKey": false,
           "notNull": false
         }

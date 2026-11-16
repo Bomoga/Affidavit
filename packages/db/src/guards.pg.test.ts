@@ -9,6 +9,7 @@ import {
 import { describe, expect, it } from 'vitest';
 import { PgCaseStore } from './case-store.js';
 import { provisionTenant } from './migrate.js';
+import { enqueueStage } from './queue.js';
 import { claimStageRun } from './stage-runs.js';
 import { BUDGET, describePg, sampleCase, useTestDatabase } from './test-support.js';
 
@@ -151,6 +152,109 @@ describePg('database guards behind the store', () => {
     });
   });
 
+  describe('inserts cannot start in a forged state', () => {
+    const insertCase = (over: Record<string, string>, id: string, repo: string) => {
+      const v = {
+        stage: `'intake'`,
+        appeals: '0',
+        seq: '0',
+        exhausted: 'false',
+        input: '1',
+        usd: '1',
+        score: '0.5',
+        ...over,
+      };
+      return {
+        text: `insert into cases (tenant_id, id, repo_id, case_file, candidate_score, escalation_floor,
+          remaining_input_tokens, remaining_output_tokens, remaining_usd, stage, appeals, seq, exhausted)
+          values ($1, $2, $3, '{}', ${v.score}, 0.1, ${v.input}, 1, ${v.usd}, ${v.stage}, ${v.appeals}, ${v.seq}, ${v.exhausted})`,
+        params: [T, id, repo],
+      };
+    };
+
+    it('a case must start at intake with no appeals, seq 0, not exhausted, a sane budget and score', async () => {
+      const { file } = await openCase();
+      const forged: Record<string, string>[] = [
+        { stage: `'dismissed'`, score: '0.99', appeals: '7', seq: '-5' },
+        { stage: `'verdict'` },
+        { appeals: '7' },
+        { seq: '-5' },
+        { exhausted: 'true' },
+        { input: '-1' },
+        { usd: '-1' },
+        { score: '1.5' },
+      ];
+      for (const [i, over] of forged.entries()) {
+        const q = insertCase(over, `forged-${i}`, file.target.repo);
+        expect(await asApp(q.text, q.params), JSON.stringify(over)).toMatch(
+          /inserted at intake|non-negative budget|between 0 and 1/,
+        );
+      }
+      const ok = insertCase({}, 'not-forged', file.target.repo);
+      expect(await asApp(ok.text, ok.params)).toBe('no error');
+    });
+
+    it('an exhibit cannot be inserted with a result already set', async () => {
+      const { file } = await openCase();
+      const exhibit = Exhibit.parse({ ...(samples.Exhibit as object), caseId: file.id });
+      const text = `insert into exhibits (tenant_id, case_id, id, kind, author, sha256, exhibit, result)
+        values ($1, $2, 'forged-ex', 'witness', 'defense', 'a', $3, '{"passed": true}')`;
+      expect(await asApp(text, [T, file.id, JSON.stringify(exhibit)])).toMatch(/without a result/);
+      await expect(db().admin.query(text, [T, file.id, JSON.stringify(exhibit)])).rejects.toThrow(
+        /without a result/,
+      );
+    });
+
+    it('a stage run cannot be inserted finished, and its lease and outcome rules hold', async () => {
+      const { file } = await openCase();
+      const base = `insert into stage_runs (tenant_id, case_id, stage, attempt, worker_id, lease_expires_at`;
+      for (const [cols, vals] of [
+        [', completed_at', `, now()`],
+        [', failed_at', `, now()`],
+        [', error', `, 'x'`],
+      ] as const) {
+        await expect(
+          db().admin.query(`${base}${cols}) values ($1, $2, 'map', 1, 'w', now()${vals})`, [
+            T,
+            file.id,
+          ]),
+        ).rejects.toThrow(/inserted open/);
+      }
+      const run = { tenantId: T, caseId: file.id, stage: 'map' as const, attempt: 2 };
+      await enqueueStage(db().app, run);
+      await claimStageRun(db().worker, run, 'w', 60);
+      const upd = (set: string) =>
+        db().admin.query(`update stage_runs set ${set} where case_id = $1 and attempt = 2`, [
+          file.id,
+        ]);
+      await expect(
+        upd(`lease_expires_at = lease_expires_at - interval '1 minute'`),
+      ).rejects.toThrow(/lease only moves forward/);
+      await expect(upd(`worker_id = 'other'`)).rejects.toThrow(/identity/);
+      await expect(upd(`completed_at = now(), failed_at = now(), error = 'x'`)).rejects.toThrow(
+        /not both/,
+      );
+      await expect(upd(`error = 'x'`)).rejects.toThrow(/only with failed_at/);
+      await upd(`failed_at = now(), error = 'x'`);
+      await expect(upd(`completed_at = now()`)).rejects.toThrow(/finished stage run is immutable/);
+    });
+
+    it('case exhaustion never clears', async () => {
+      const { store, file } = await openCase();
+      await store.chargeBudget(file.id, {
+        stage: 'map',
+        inputTokens: 5_000_000,
+        outputTokens: 0,
+        usd: 0,
+        wallMs: 0,
+        attempt: 1,
+      });
+      await expect(
+        db().admin.query(`update cases set exhausted = false where id = $1`, [file.id]),
+      ).rejects.toThrow(/exhaustion never clears/);
+    });
+  });
+
   describe('stage history', () => {
     it('cannot be forged: wrong stage, wrong ordinal, or a repeat', async () => {
       const { file } = await openCase();
@@ -205,7 +309,9 @@ describePg('database guards behind the store', () => {
     it('exhibits and stage runs can never be deleted', async () => {
       const { store, file } = await openCase();
       await store.putExhibit(Exhibit.parse({ ...(samples.Exhibit as object), caseId: file.id }));
-      await claimStageRun(db().app, { tenantId: T, caseId: file.id, stage: 'map', attempt: 1 });
+      const run = { tenantId: T, caseId: file.id, stage: 'map' as const, attempt: 1 };
+      await enqueueStage(db().app, run);
+      await claimStageRun(db().worker, run, 'w', 60);
       await expect(db().admin.query(`delete from exhibits`)).rejects.toThrow(/never deleted/);
       await expect(db().admin.query(`truncate exhibits`)).rejects.toThrow(/never deleted/);
       await expect(db().admin.query(`delete from stage_runs`)).rejects.toThrow(/never deleted/);

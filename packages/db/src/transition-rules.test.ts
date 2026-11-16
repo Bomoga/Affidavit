@@ -1,7 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { STAGE_TRANSITIONS, type CaseStage } from '@affidavit/contracts';
+import { MAX_APPEALS, STAGE_TRANSITIONS, type CaseStage } from '@affidavit/contracts';
 import { scramVerifier } from './migrate.js';
+import { decideResume } from './stage-runs.js';
 import { getTableConfig, type PgTable } from 'drizzle-orm/pg-core';
 import { describe, expect, it } from 'vitest';
 import * as schema from './schema.js';
@@ -59,6 +60,7 @@ describe('schema and migrations', () => {
     schema.verdicts,
     schema.costRows,
     schema.stageRuns,
+    schema.stageJobs,
     schema.escalations,
     schema.events,
   ];
@@ -68,7 +70,7 @@ describe('schema and migrations', () => {
     'utf8',
   );
 
-  it('declares eleven tables', () => {
+  it('declares twelve tables', () => {
     expect(tables.map((t) => getTableConfig(t).name).sort()).toEqual([
       'ballots',
       'cases',
@@ -77,6 +79,7 @@ describe('schema and migrations', () => {
       'events',
       'exhibits',
       'repos',
+      'stage_jobs',
       'stage_runs',
       'stages',
       'tenants',
@@ -101,12 +104,30 @@ describe('schema and migrations', () => {
   });
 
   it('never grants DELETE or TRUNCATE, and never UPDATE on verdicts or events', () => {
-    const grants = security.split('\n').filter((l) => l.startsWith('GRANT'));
+    // Statements end at a semicolon, so multi-line GRANTs are parsed whole.
+    const grants = security
+      .split(/;\s*(?:\n|$)/)
+      .map((s) => s.replace(/^(?:--[^\n]*\n|\s)+/, ''))
+      .filter((s) => /^GRANT\b/.test(s));
+    expect(grants.length).toBeGreaterThanOrEqual(8);
     for (const g of grants) {
-      expect(g).not.toMatch(/DELETE|TRUNCATE|ALL/);
-      if (/UPDATE/.test(g)) expect(g).toMatch(/(.*)/s);
-      if (/UPDATE/.test(g)) expect(g).not.toMatch(/verdicts|events/);
+      if (/\bON (?:public\.)?[a-z_]/.test(g) && !/FUNCTION|SCHEMA/.test(g)) {
+        expect(g, g).not.toMatch(/DELETE|TRUNCATE|\bALL\b|REFERENCES|TRIGGER/);
+      }
+      if (/UPDATE/.test(g)) {
+        // Only column-level UPDATE grants, and never on append-only tables.
+        expect(g, g).toMatch(/UPDATE\s*\(/);
+        expect(g, g).not.toMatch(
+          /verdicts|events|ballots|stages\b|cost_rows|escalations|stage_jobs/,
+        );
+      }
     }
+  });
+
+  it('inserts into the lifecycle tables are not granted to the application role', () => {
+    expect(security).not.toMatch(/GRANT[^;]*INSERT[^;]*stage_runs/);
+    expect(security).not.toMatch(/GRANT[^;]*INSERT[^;]*stage_jobs/);
+    expect(security).not.toMatch(/GRANT[^;]*INSERT[^;]*tenants/);
   });
 });
 
@@ -132,6 +153,62 @@ describe('SQL guards', () => {
     expect(fns.length).toBeGreaterThanOrEqual(8);
     for (const f of fns) expect(f).toContain('SET search_path = pg_catalog, public');
     expect(security).toContain('REVOKE TEMPORARY ON DATABASE');
+  });
+});
+
+describe('SQL appeal limit and shared table coverage', () => {
+  const security = readFileSync(
+    fileURLToPath(new URL('../drizzle/0001_security.sql', import.meta.url)),
+    'utf8',
+  );
+
+  it('the SQL appeal limit is MAX_APPEALS', () => {
+    const m = /OLD\.appeals >= (\d+)/.exec(security);
+    expect(m).not.toBeNull();
+    expect(Number(m![1])).toBe(MAX_APPEALS);
+  });
+
+  it('the shared table has an accepting case for every pair in STAGE_TRANSITIONS', () => {
+    for (const [from, tos] of Object.entries(STAGE_TRANSITIONS)) {
+      for (const to of tos) {
+        const hit = transitionCases.some(
+          (c) => c.ok && c.to === to && c.name.startsWith(`${from} -> ${to}`),
+        );
+        expect(hit, `${from} -> ${to}`).toBe(true);
+      }
+    }
+  });
+});
+
+describe('decideResume', () => {
+  const now = new Date('2026-11-15T12:00:00Z');
+  const future = new Date(now.getTime() + 60_000);
+  const past = new Date(now.getTime() - 60_000);
+  const run = (state: 'running' | 'completed' | 'failed', leaseExpiresAt: Date) => ({
+    state,
+    leaseExpiresAt,
+  });
+  const d = (r: ReturnType<typeof run> | null, caseStage: string) =>
+    decideResume({ run: r, caseStage, jobStage: 'defense', now });
+
+  it('starts an unclaimed attempt only while the case is still at the stage', () => {
+    expect(d(null, 'defense')).toBe('start');
+    expect(d(null, 'prosecution')).toBe('adopt-complete');
+  });
+  it('waits for a live lease, and moves on once it has expired', () => {
+    expect(d(run('running', future), 'defense')).toBe('wait');
+    expect(d(run('running', past), 'defense')).toBe('next-attempt');
+  });
+  it('a failed attempt at the same stage means the next attempt', () => {
+    expect(d(run('failed', future), 'defense')).toBe('next-attempt');
+  });
+  it('an attempt whose case already left the stage counts as complete, never re-run', () => {
+    expect(d(run('running', past), 'prosecution')).toBe('adopt-complete');
+    expect(d(run('failed', past), 'prosecution')).toBe('adopt-complete');
+  });
+  it('a completed attempt is done', () => {
+    expect(d(run('completed', past), 'defense')).toBe('done');
+    expect(d(run('completed', past), 'prosecution')).toBe('done');
   });
 });
 

@@ -30,10 +30,14 @@ export class UnsafeRoleError extends Error {
   }
 }
 
+/** The search_path both login roles are given by the security migration. */
+export const EXPECTED_SEARCH_PATH = 'pg_catalog, public, pg_temp';
+
 /**
- * Connect-time guard: the role must not be a superuser, must not bypass RLS, must not be able to
- * create roles or databases, must not own any table or function in the schemas we use, and must
- * not inherit from a role that does any of that. A mistaken admin URL fails here, loudly.
+ * Connect-time guard. The role must not be a superuser, bypass RLS, create roles or databases, own
+ * any relation, function, schema or the database, or be a member (directly or through other
+ * roles) of a privileged role or a predefined pg_* role (pg_write_all_data and friends). Its
+ * search_path must be the pinned one. A mistaken admin URL fails here, loudly.
  */
 export async function assertSafeRole(pool: pg.Pool): Promise<void> {
   const { rows } = await pool.query<{
@@ -42,25 +46,48 @@ export async function assertSafeRole(pool: pg.Pool): Promise<void> {
     rolbypassrls: boolean;
     rolcreaterole: boolean;
     rolcreatedb: boolean;
-    owns: boolean;
-    via_membership: boolean;
+    owns_relation: boolean;
+    owns_function: boolean;
+    owns_schema: boolean;
+    owns_database: boolean;
+    bad_memberships: string | null;
+    search_path: string;
   }>(`
-    select r.rolname, r.rolsuper, r.rolbypassrls, r.rolcreaterole, r.rolcreatedb,
+    with recursive memb(oid) as (
+      select r.oid from pg_roles r where r.rolname = current_user
+      union
+      select m.roleid from pg_auth_members m join memb on m.member = memb.oid
+    )
+    select me.rolname, me.rolsuper, me.rolbypassrls, me.rolcreaterole, me.rolcreatedb,
       exists (select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace
-              where c.relowner = r.oid and n.nspname in ('public', 'graphile_worker')) as owns,
-      exists (select 1 from pg_auth_members m join pg_roles g on g.oid = m.roleid
-              where m.member = r.oid
-                and (g.rolsuper or g.rolbypassrls or g.rolcreaterole or g.rolcreatedb)) as via_membership
-    from pg_roles r where r.rolname = current_user`);
+              where c.relowner = me.oid and n.nspname <> 'information_schema'
+                and n.nspname not like 'pg\\_%') as owns_relation,
+      exists (select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+              where p.proowner = me.oid and n.nspname <> 'information_schema'
+                and n.nspname not like 'pg\\_%') as owns_function,
+      exists (select 1 from pg_namespace n where n.nspowner = me.oid) as owns_schema,
+      exists (select 1 from pg_database d where d.datdba = me.oid) as owns_database,
+      (select string_agg(g.rolname, ', ') from memb join pg_roles g on g.oid = memb.oid
+        where g.oid <> me.oid and (g.rolsuper or g.rolbypassrls or g.rolcreaterole
+          or g.rolcreatedb or g.rolname like 'pg\\_%')) as bad_memberships,
+      current_setting('search_path') as search_path
+    from pg_roles me where me.rolname = current_user`);
   const r = rows[0];
   if (!r) throw new UnsafeRoleError(['current role not found']);
   const reasons: string[] = [];
-  if (r.rolsuper) reasons.push(`${r.rolname} is a superuser`);
-  if (r.rolbypassrls) reasons.push(`${r.rolname} has BYPASSRLS`);
-  if (r.rolcreaterole) reasons.push(`${r.rolname} can create roles`);
-  if (r.rolcreatedb) reasons.push(`${r.rolname} can create databases`);
-  if (r.owns) reasons.push(`${r.rolname} owns tables`);
-  if (r.via_membership) reasons.push(`${r.rolname} is a member of a privileged role`);
+  const n = r.rolname;
+  if (r.rolsuper) reasons.push(`${n} is a superuser`);
+  if (r.rolbypassrls) reasons.push(`${n} has BYPASSRLS`);
+  if (r.rolcreaterole) reasons.push(`${n} can create roles`);
+  if (r.rolcreatedb) reasons.push(`${n} can create databases`);
+  if (r.owns_relation) reasons.push(`${n} owns tables or other relations`);
+  if (r.owns_function) reasons.push(`${n} owns functions`);
+  if (r.owns_schema) reasons.push(`${n} owns a schema`);
+  if (r.owns_database) reasons.push(`${n} owns the database`);
+  if (r.bad_memberships) reasons.push(`${n} is a member of privileged roles: ${r.bad_memberships}`);
+  if (r.search_path !== EXPECTED_SEARCH_PATH) {
+    reasons.push(`${n} has search_path "${r.search_path}", expected "${EXPECTED_SEARCH_PATH}"`);
+  }
   if (reasons.length > 0) throw new UnsafeRoleError(reasons);
 }
 

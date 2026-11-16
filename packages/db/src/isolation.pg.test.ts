@@ -4,6 +4,7 @@ import type pg from 'pg';
 import { beforeAll, expect, it } from 'vitest';
 import { PgCaseStore } from './case-store.js';
 import { PgEventSink } from './event-sink.js';
+import { enqueueStage } from './queue.js';
 import { claimStageRun } from './stage-runs.js';
 import { withTenant } from './tenant.js';
 import { BUDGET, describePg, sampleCase, useTestDatabase } from './test-support.js';
@@ -16,6 +17,7 @@ const TABLES = [
   'repos',
   'cases',
   'stages',
+  'stage_jobs',
   'stage_runs',
   'exhibits',
   'ballots',
@@ -25,7 +27,12 @@ const TABLES = [
   'events',
 ] as const;
 
-async function seed(pool: pg.Pool, tenant: string, caseFile: CaseFile): Promise<void> {
+async function seed(
+  pool: pg.Pool,
+  workerPool: pg.Pool,
+  tenant: string,
+  caseFile: CaseFile,
+): Promise<void> {
   const store = new PgCaseStore(pool, tenant);
   const sink = new PgEventSink(pool, tenant);
   await store.open(caseFile, BUDGET);
@@ -40,7 +47,9 @@ async function seed(pool: pg.Pool, tenant: string, caseFile: CaseFile): Promise<
   });
   await store.appendVerdict(Verdict.parse({ ...(samples.Verdict as object), caseId: caseFile.id }));
   await store.putExhibit(Exhibit.parse({ ...(samples.Exhibit as object), caseId: caseFile.id }));
-  await claimStageRun(pool, { tenantId: tenant, caseId: caseFile.id, stage: 'map', attempt: 1 });
+  const run = { tenantId: tenant, caseId: caseFile.id, stage: 'map' as const, attempt: 1 };
+  await enqueueStage(pool, run);
+  await claimStageRun(workerPool, run, 'seed-worker', 60);
   const base = {
     schemaVersion: 1,
     caseId: caseFile.id,
@@ -107,8 +116,8 @@ describePg('cross-tenant isolation (tenant A against tenant B data)', () => {
     storeA = new PgCaseStore(db().app, A);
     storeB = new PgCaseStore(db().app, B);
     sinkB = new PgEventSink(db().app, B);
-    await seed(db().app, A, caseA);
-    await seed(db().app, B, caseB);
+    await seed(db().app, db().worker, A, caseA);
+    await seed(db().app, db().worker, B, caseB);
   }, 60_000);
 
   it('seeded tenant A and tenant B data in every table', async () => {
@@ -236,8 +245,13 @@ describePg('cross-tenant isolation (tenant A against tenant B data)', () => {
       text: `insert into stages (tenant_id, case_id, ordinal, stage) values ($1, $2, 99, 'map')`,
       params: () => [B, caseB.id],
     },
+    stage_jobs: {
+      text: `insert into stage_jobs (tenant_id, case_id, stage, attempt) values ($1, $2, 'map', 9)`,
+      params: () => [B, caseB.id],
+    },
     stage_runs: {
-      text: `insert into stage_runs (tenant_id, case_id, stage, attempt) values ($1, $2, 'map', 9)`,
+      text: `insert into stage_runs (tenant_id, case_id, stage, attempt, worker_id, lease_expires_at)
+        values ($1, $2, 'map', 9, 'w', now())`,
       params: () => [B, caseB.id],
     },
     exhibits: {

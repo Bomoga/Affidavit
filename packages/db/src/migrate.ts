@@ -56,6 +56,11 @@ async function grantQueueAccess(admin: pg.Pool): Promise<void> {
     `REVOKE INSERT, UPDATE, DELETE ON ${s}.migrations FROM ${WORKER_ROLE}`,
     `GRANT USAGE ON ALL SEQUENCES IN SCHEMA ${s} TO ${WORKER_ROLE}`,
     `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA ${s} TO ${WORKER_ROLE}`,
+    // Tables Graphile adds in a later upgrade (created by this owner) are reachable by the worker
+    // role. Its RLS policy is added by re-running applyMigrations after a Graphile upgrade.
+    `ALTER DEFAULT PRIVILEGES IN SCHEMA ${s} GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO ${WORKER_ROLE}`,
+    `ALTER DEFAULT PRIVILEGES IN SCHEMA ${s} GRANT USAGE ON SEQUENCES TO ${WORKER_ROLE}`,
+    `ALTER DEFAULT PRIVILEGES IN SCHEMA ${s} GRANT EXECUTE ON FUNCTIONS TO ${WORKER_ROLE}`,
   ]) {
     await admin.query(stmt);
   }
