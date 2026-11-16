@@ -1,0 +1,19 @@
+diff --git a/app/data/allocations-dao.js b/app/data/allocations-dao.js
+index 24d4718..8da4dc8 100644
+--- a/app/data/allocations-dao.js
++++ b/app/data/allocations-dao.js
+@@ -109,6 +109,14 @@ const AllocationsDAO = function(db){
+         });
+     };
+ 
++    const HIGH_STOCK_PERCENT = 50;
++
++    this.countHighStockAllocations = callback => {
++        allocationsCol.find({
++            $where: `this.stocks > ${HIGH_STOCK_PERCENT}`
++        }).count(callback);
++    };
++
+ };
+ 
+ module.exports.AllocationsDAO = AllocationsDAO;
