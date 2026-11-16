@@ -1,4 +1,4 @@
-import { lstat, readFile, writeFile } from 'node:fs/promises';
+import { lstat, readFile, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import type { ToolRunnerPort } from '@affidavit/contracts';
 import { buildInvocation, type ToolInvocation, type ToolRunOptions } from './invocations.js';
@@ -12,13 +12,15 @@ import {
   type QuarantinedSnapshot,
 } from './quarantine.js';
 import { findGitleaksUnscannable, type Unscannable } from './unscannable.js';
-import { remapWindowReport, writeWindows } from './windows.js';
+import { remapWindowReport, windowPathParts, writeWindows } from './windows.js';
 
 export type RunToolOptions = Omit<ToolRunOptions, 'sourceDir'> & {
   /** The quarantined scan copy. Its removed-path list is passed through on the result. */
   snapshot: QuarantinedSnapshot;
   /** Largest report file runTool will read, in bytes. Default 128 MiB. */
   maxReportBytes?: number | undefined;
+  /** Largest total of window bytes written for the gitleaks windows pass. Default 256 MiB. */
+  maxWindowBytes?: number | undefined;
 };
 
 const DEFAULT_MAX_REPORT_BYTES = 128 * 1024 * 1024;
@@ -359,7 +361,7 @@ export async function runTool(
   name: ToolName,
   options: RunToolOptions,
 ): Promise<ToolRunResult> {
-  const { snapshot, maxReportBytes, ...rest } = options;
+  const { snapshot, maxReportBytes, maxWindowBytes, ...rest } = options;
   const maxBytes = maxReportBytes ?? DEFAULT_MAX_REPORT_BYTES;
   const q = snapshot.removed;
   const outputDir = resolve(options.outputDir);
@@ -476,28 +478,55 @@ export async function runTool(
     // Windows pass: every plain text file over 100,000 bytes again, in overlapping windows under
     // 100,000 bytes, so gitleaks reads each window in one piece and cannot cut through a secret.
     const windowsDir = `${resolve(snapshot.dir)}.windows`;
-    const entries = await writeWindows(snapshot.dir, windowsDir);
-    if (entries.length > 0) {
-      const winOut = `${outputDir}-windows`;
-      await execute(
-        runner,
-        manifest,
-        name,
-        {
-          ...rest,
-          sourceDir: windowsDir,
-          outputDir: winOut,
-          scratchDir: `${scratchDir}-windows`,
-        },
-        q,
-        'windows',
-      );
-      const winFile = join(winOut, run.inv.outputFile);
-      const winDoc = await readJsonReport(name, winFile, q, 'windows', maxBytes);
-      remapWindowReport(winDoc, entries);
-      await writeFile(winFile, JSON.stringify(winDoc));
-      reports.push({ file: winFile, origin: 'windows' });
-      windowedFiles = [...new Set(entries.map((e) => `/src/${e.original}`))];
+    try {
+      const win = await writeWindows(snapshot.dir, windowsDir, maxWindowBytes);
+      for (const f of win.skippedForBudget) {
+        notifications.push({
+          level: 'warning',
+          id: 'windows-budget-exceeded',
+          message: `/src/${f} was not scanned in windows because the window byte budget ran out, so a secret across a gitleaks chunk cut in it may be missed`,
+        });
+      }
+      if (win.entries.length > 0) {
+        // A window can still be skipped as binary by an offset signature (for example `ustar` at
+        // byte 257). Check every window with the same table and report hits against the original.
+        const byName = new Map(win.entries.map((e) => [e.name, e]));
+        for (const hit of await findGitleaksUnscannable(windowsDir)) {
+          const parts = windowPathParts(hit.path);
+          const w = parts === undefined ? undefined : byName.get(parts.name);
+          if (w !== undefined) {
+            notifications.push({
+              level: 'warning',
+              id: 'window-skipped',
+              message: `/src/${w.original} has a window (from line ${w.startLine}) that gitleaks may skip (${hit.kind}), so a secret in that part may be missed`,
+            });
+          }
+        }
+        const winOut = `${outputDir}-windows`;
+        await execute(
+          runner,
+          manifest,
+          name,
+          {
+            ...rest,
+            sourceDir: windowsDir,
+            outputDir: winOut,
+            scratchDir: `${scratchDir}-windows`,
+          },
+          q,
+          'windows',
+        );
+        const winFile = join(winOut, run.inv.outputFile);
+        const winDoc = await readJsonReport(name, winFile, q, 'windows', maxBytes);
+        remapWindowReport(winDoc, win.entries);
+        await writeFile(winFile, JSON.stringify(winDoc));
+        reports.push({ file: winFile, origin: 'windows' });
+        windowedFiles = [...new Set(win.entries.map((e) => `/src/${e.original}`))];
+      }
+    } finally {
+      // The windows are scratch data and can be large. Remove them even on failure so a retry does
+      // not trip over WindowsDirNotFreshError.
+      await rm(windowsDir, { recursive: true, force: true });
     }
     const split = coverageSplit(unscanned.sort((a, b) => a.path.localeCompare(b.path)));
     notifications.push(...split.notifications);

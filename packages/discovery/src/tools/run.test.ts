@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import type { ToolRunnerPort } from '@affidavit/contracts';
@@ -436,6 +436,63 @@ describe('runTool', () => {
     }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ToolOutputMissingError);
     expect((err as Error).message).toMatch(/report too large/);
+  });
+
+  describe('windows pass', () => {
+    const bigText = (extra = '') => {
+      const line = `${'a'.repeat(79)}\n`;
+      return extra + line.repeat(1400);
+    };
+
+    it('reports a window that gitleaks would skip because of an offset signature', async () => {
+      // 'ustar' at byte 238 of the file is byte 257 of the first window (after the 19 byte prefix)
+      const text = Buffer.from(bigText());
+      Buffer.from('ustar').copy(text, 238);
+      const snap = await snapshot({ 'src/app.js': 'x' });
+      writeFileSync(join(snap.dir, 'src', 'notes.txt'), text);
+      const { runner } = fakeRunner((out) => writeFileSync(join(out, 'gitleaks.sarif'), sarif()));
+      const res = await runTool(runner, manifest, 'gitleaks', await options(snap));
+      expect(res.partial).toBe(true);
+      const note = res.notifications.find((n) => n.id === 'window-skipped');
+      expect(note?.message).toContain('/src/src/notes.txt');
+      expect(res.windowedFiles).toEqual(['/src/src/notes.txt']);
+      expect(res.reports.map((x) => x.origin)).toEqual(['snapshot', 'windows']);
+    });
+
+    it('marks the run partial when the window byte budget runs out', async () => {
+      const snap = await snapshot({ 'src/app.js': 'x' });
+      writeFileSync(join(snap.dir, 'src', 'big.txt'), bigText());
+      const { runner } = fakeRunner((out) => writeFileSync(join(out, 'gitleaks.sarif'), sarif()));
+      const res = await runTool(runner, manifest, 'gitleaks', {
+        ...(await options(snap)),
+        maxWindowBytes: 1000,
+      });
+      expect(res.partial).toBe(true);
+      expect(res.notifications.some((n) => n.id === 'windows-budget-exceeded')).toBe(true);
+      expect(res.windowedFiles).toEqual([]);
+    });
+
+    it('removes the windows directory afterwards, so a retry does not fail', async () => {
+      const snap = await snapshot({ 'src/app.js': 'x' });
+      writeFileSync(join(snap.dir, 'src', 'big.txt'), bigText());
+      const { runner } = fakeRunner((out) => writeFileSync(join(out, 'gitleaks.sarif'), sarif()));
+      await runTool(runner, manifest, 'gitleaks', await options(snap));
+      expect(existsSync(`${snap.dir}.windows`)).toBe(false);
+      await runTool(runner, manifest, 'gitleaks', await options(snap)); // would throw if it were left
+    });
+
+    it('removes the windows directory when the windows run fails', async () => {
+      const snap = await snapshot({ 'src/app.js': 'x' });
+      writeFileSync(join(snap.dir, 'src', 'big.txt'), bigText());
+      let n = 0;
+      const { runner } = fakeRunner((out) => {
+        if (n++ === 0) writeFileSync(join(out, 'gitleaks.sarif'), sarif());
+      });
+      await expect(
+        runTool(runner, manifest, 'gitleaks', await options(snap)),
+      ).rejects.toBeInstanceOf(ToolOutputMissingError);
+      expect(existsSync(`${snap.dir}.windows`)).toBe(false);
+    });
   });
 
   it('never truncates coverage notifications, however many files', async () => {

@@ -98,6 +98,15 @@ describe('PrivateKeyScan', () => {
     }
   });
 
+  it('flags header A with no END, a blank line, then header B with no close after it', () => {
+    // gitleaks can match A up to B's own KEY----- (at least 64 characters after A's header), and a
+    // cut at the blank line splits it. The 64 characters are measured from the first header.
+    const a = `-----BEGIN PRIVATE KEY-----\n${body(0)}\n${body(1)}`;
+    const b = `-----BEGIN PRIVATE KEY-----\n${body(2)}${body(3)}`;
+    expect(scan(big(`${a}${b}`)).risky).toBe(true);
+    expect(scan(big(`${a}${b}`), 4_097).risky).toBe(true);
+  });
+
   it('gives the same answer for every read split of a doubled header', () => {
     const k = key('').replace(
       '-----BEGIN RSA PRIVATE KEY-----',

@@ -865,6 +865,51 @@ describe.skipIf(!enabled)('tool images, offline', () => {
       expect(res.windowedFiles).toContain('/src/src/heroku.txt');
     }, 300_000);
 
+    for (const lead of ['MZ', '%PDF']) {
+      it(`windows that would start with ${JSON.stringify(lead)} are not skipped as binary`, async () => {
+        const r = rng(11);
+        const hex = (n: number) => randomChars(r, n, '0123456789abcdef');
+        const uuid = `${hex(8)}-${hex(4)}-${hex(4)}-${hex(4)}-${hex(12)}`;
+        // every line starts with the signature; the first line does not, so the whole file is text
+        const line = `${lead}${'x'.repeat(78 - lead.length)}\n`;
+        const lines = (bytes: number) => line.repeat(Math.floor(bytes / 80));
+        const head = 'start\n';
+        // 6 + 99,920 + 59 = 99,985: the keyword starts before byte 100,000, as in the plain case
+        const text = `${head}${lines(99_920)}${'y'.repeat(59)}heroku_api_key =\n\n"${uuid}"\n${lines(60_000)}`;
+        const name = lead === 'MZ' ? 'mz.txt' : 'pdf.txt';
+        const sc = scenario('repo', (src) => writeFileSync(join(src, 'src', name), text));
+        const res = await runGitleaks(sc);
+        // Whether gitleaks alone finds this one depends on its cuts, so the test does not rely on
+        // it. The point is the windows pass: the window that holds the key starts at a line that
+        // begins with the signature, and without the neutral first line gitleaks skips it.
+        expect(
+          has(windowFindings(res), 'heroku-api-key', `src/${name}`),
+          'windows pass finds it',
+        ).toBe(true);
+      }, 300_000);
+    }
+
+    it('path-scoped rules still fire on windows: a Kubernetes secret split by a blank line in a yaml file', async () => {
+      const r = rng(5);
+      const b64 = Buffer.from(randomChars(r, 24)).toString('base64');
+      const pad = `${'p'.repeat(69)}\n`;
+      const text = `${`${'x'.repeat(79)}\n`.repeat(1249)}${pad}kind: Secret\ndata:\n\n  dsn: ${b64}\n${`${'x'.repeat(79)}\n`.repeat(400)}`;
+      expect(text.indexOf('data:\n\n')).toBeGreaterThan(100_000);
+      const sc = scenario('repo', (src) => {
+        mkdirSync(join(src, 'deploy'));
+        writeFileSync(join(src, 'deploy', 'cut.yaml'), text);
+      });
+      const res = await runGitleaks(sc);
+      expect(
+        has(mainFindings(sc), 'kubernetes-secret-yaml', 'deploy/cut.yaml'),
+        'gitleaks alone should miss it',
+      ).toBe(false);
+      expect(
+        has(windowFindings(res), 'kubernetes-secret-yaml', 'deploy/cut.yaml'),
+        'windows pass finds it',
+      ).toBe(true);
+    }, 300_000);
+
     it('seeded sweep: a decoy-wrapped key is always found or flagged, never silently missed', async () => {
       const r = rng(2024);
       const shapes = [

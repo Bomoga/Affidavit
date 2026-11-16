@@ -1,13 +1,16 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { cleanupTmp, tmp } from './testkit.js';
 import {
+  BIG_FILE,
   OVERLAP_BYTES,
   WINDOW_BYTES,
+  WINDOW_PREFIX,
   WindowsDirNotFreshError,
   remapWindowReport,
   windowFile,
+  windowPathParts,
   writeWindows,
   type WindowEntry,
 } from './windows.js';
@@ -43,13 +46,13 @@ function randomText(seed: number, bytes: number, longLines: boolean): Buffer {
 
 async function windowsOf(
   data: Buffer,
-): Promise<{ bytes: Buffer; startLine: number; start: number }[]> {
+): Promise<{ bytes: Buffer; startLine: number; startColumn: number; start: number }[]> {
   const dir = tmp();
   const file = join(dir, 'f.txt');
   writeFileSync(file, data);
-  const out: { bytes: Buffer; startLine: number; start: number }[] = [];
-  await windowFile(file, data.length, (bytes, startLine) => {
-    out.push({ bytes, startLine, start: -1 });
+  const out: { bytes: Buffer; startLine: number; startColumn: number; start: number }[] = [];
+  await windowFile(file, data.length, (bytes, startLine, startColumn) => {
+    out.push({ bytes, startLine, startColumn, start: -1 });
     return Promise.resolve();
   });
   // locate each window in the original (windows are exact slices, in order, overlapping)
@@ -113,44 +116,99 @@ describe('windowFile', () => {
   });
 });
 
-describe('writeWindows and remapWindowReport', () => {
-  it('windows only plain text files over 100,000 bytes, and maps findings back', async () => {
+describe('window columns', () => {
+  it('records how far into its first line each window starts', async () => {
+    const r = rng(77); // random letters, so each window is found at its own offset
+    const data = Buffer.concat([
+      Buffer.from('short line\n'),
+      Buffer.from(Array.from({ length: 900_000 }, () => 97 + Math.floor(r() * 26))),
+      Buffer.from('\nend\n'),
+    ]);
+    const windows = await windowsOf(data);
+    for (const w of windows) {
+      const lastNl = data.subarray(0, w.start).lastIndexOf(0x0a);
+      expect(w.startColumn, `window at ${w.start}`).toBe(w.start - (lastNl + 1));
+    }
+    expect(windows.some((w) => w.startColumn > 0)).toBe(true);
+  });
+});
+
+describe('writeWindows', () => {
+  const entryFor = (
+    original: string,
+    name = 'w0001/p0001',
+    startLine = 1,
+    startColumn = 0,
+  ): WindowEntry => ({
+    name,
+    original,
+    startLine,
+    startColumn,
+  });
+
+  it('windows plain text files over 100,000 bytes exactly, not 100,000 or less', async () => {
     const root = tmp();
     const snap = join(root, 'snap');
-    mkdirSync(join(snap, 'a'), { recursive: true });
-    writeFileSync(join(snap, 'a', 'big.txt'), randomText(9, 250_000, false));
+    mkdirSync(snap);
+    writeFileSync(join(snap, 'exact.txt'), 'x'.repeat(BIG_FILE));
+    writeFileSync(join(snap, 'one-over.txt'), 'x'.repeat(BIG_FILE + 1));
+    const { entries } = await writeWindows(snap, join(root, 'snap.windows'));
+    expect(new Set(entries.map((e) => e.original))).toEqual(new Set(['one-over.txt']));
+  });
+
+  it('writes windows under neutral directories at the original path, each under 100,000 bytes', async () => {
+    const root = tmp();
+    const snap = join(root, 'snap');
+    mkdirSync(join(snap, 'k8s'), { recursive: true });
+    writeFileSync(join(snap, 'k8s', 'cut.yaml'), randomText(9, 250_000, false));
     writeFileSync(join(snap, 'small.txt'), 'x'.repeat(50_000));
     writeFileSync(
       join(snap, 'big.bin'),
       Buffer.concat([Buffer.from('%PDF-1.4'), Buffer.alloc(150_000, 0x61)]),
     );
     const windowsDir = join(root, 'snap.windows');
-    const entries = await writeWindows(snap, windowsDir);
-    expect(new Set(entries.map((e) => e.original))).toEqual(new Set(['a/big.txt']));
+    const { entries, skippedForBudget } = await writeWindows(snap, windowsDir);
+    expect(skippedForBudget).toEqual([]);
+    expect(new Set(entries.map((e) => e.original))).toEqual(new Set(['k8s/cut.yaml']));
     expect(entries.length).toBeGreaterThanOrEqual(3);
     for (const e of entries) {
-      expect(readFileSync(join(windowsDir, e.name)).length).toBeLessThan(100_000);
+      const bytes = readFileSync(join(windowsDir, e.name, 'k8s', 'cut.yaml'));
+      expect(bytes.length).toBeLessThan(100_000);
+      // every window starts with the neutral first line, so no window can begin with a binary header
+      expect(bytes.subarray(0, WINDOW_PREFIX.length).toString()).toBe(WINDOW_PREFIX);
     }
     await expect(writeWindows(snap, windowsDir)).rejects.toBeInstanceOf(WindowsDirNotFreshError);
+  });
 
-    // a finding on window line 3 of the second window maps to original line startLine + 2
-    const second = entries[1] as WindowEntry;
-    const report = {
-      runs: [
-        {
-          results: [
-            finding('r', `/src/${second.name}`, 3),
-            finding('r', `/src/${second.name}`, 3), // the same finding again: deduplicated
-            finding('r', `/src/${entries[0]?.name ?? ''}`, 7),
-          ],
-        },
-      ],
-    };
-    const kept = remapWindowReport(report, entries);
-    expect(kept).toBe(2);
-    const results = report.runs[0]?.results ?? [];
-    expect(results[0]?.locations[0]?.physicalLocation.artifactLocation.uri).toBe('/src/a/big.txt');
-    expect(results[0]?.locations[0]?.physicalLocation.region.startLine).toBe(second.startLine + 2);
+  it('a window that would start with a binary header starts with the neutral line instead', async () => {
+    const root = tmp();
+    const snap = join(root, 'snap');
+    mkdirSync(snap);
+    // every line starts with MZ, so every later window would start with it
+    writeFileSync(join(snap, 'lines.txt'), 'start\n' + `MZ${'x'.repeat(77)}\n`.repeat(2500));
+    const windowsDir = join(root, 'snap.windows');
+    const { entries } = await writeWindows(snap, windowsDir);
+    expect(entries.length).toBeGreaterThanOrEqual(2);
+    for (const e of entries) {
+      const bytes = readFileSync(join(windowsDir, e.name, 'lines.txt'));
+      expect(bytes.subarray(0, 2).toString()).toBe('# ');
+    }
+  });
+
+  it('stops at the byte budget and lists the files it did not window', async () => {
+    const root = tmp();
+    const snap = join(root, 'snap');
+    mkdirSync(snap);
+    writeFileSync(join(snap, 'a.txt'), randomText(11, 200_000, false));
+    writeFileSync(join(snap, 'b.txt'), randomText(12, 200_000, false));
+    const { entries, skippedForBudget, bytes } = await writeWindows(
+      snap,
+      join(root, 'snap.windows'),
+      300_000,
+    );
+    expect(new Set(entries.map((e) => e.original)).size).toBe(1);
+    expect(skippedForBudget).toHaveLength(1);
+    expect(bytes).toBeLessThanOrEqual(300_000);
   });
 
   it('creates nothing when there is nothing to window', async () => {
@@ -158,22 +216,90 @@ describe('writeWindows and remapWindowReport', () => {
     const snap = join(root, 'snap');
     mkdirSync(snap);
     writeFileSync(join(snap, 'small.txt'), 'x');
-    const entries = await writeWindows(snap, join(root, 'snap.windows'));
+    const { entries } = await writeWindows(snap, join(root, 'snap.windows'));
     expect(entries).toEqual([]);
-    expect(() => readFileSync(join(root, 'snap.windows'))).toThrow();
+    expect(existsSync(join(root, 'snap.windows'))).toBe(false);
+  });
+
+  it('maps a window path back through its generated prefix, ignoring what follows it', () => {
+    expect(windowPathParts('/src/w0001/p0002/a/b.yaml')).toEqual({
+      name: 'w0001/p0002',
+      rest: 'a/b.yaml',
+    });
+    expect(windowPathParts('w0003/p0001/w0001/p0002/x')).toEqual({
+      name: 'w0003/p0001',
+      rest: 'w0001/p0002/x',
+    });
+    expect(windowPathParts('/src/a/w0001/p0002/x')).toBeUndefined();
+    void entryFor;
   });
 });
 
-function finding(ruleId: string, uri: string, line: number) {
-  return {
+describe('remapWindowReport', () => {
+  const entry = (n: number, over: Partial<WindowEntry> = {}): WindowEntry => ({
+    name: `w0001/p000${n}`,
+    original: 'a/long.txt',
+    startLine: 1,
+    startColumn: 0,
+    ...over,
+  });
+  const at = (
+    ruleId: string,
+    e: WindowEntry,
+    startLine: number,
+    startColumn: number,
+    endLine = startLine,
+    endColumn = startColumn + 10,
+  ) => ({
     ruleId,
     locations: [
       {
         physicalLocation: {
-          artifactLocation: { uri },
-          region: { startLine: line, endLine: line, startColumn: 1, endColumn: 10 },
+          artifactLocation: { uri: `/src/${e.name}/${e.original}` },
+          region: { startLine, endLine, startColumn, endColumn },
         },
       },
     ],
-  };
-}
+  });
+  const region = (doc: { runs: { results: ReturnType<typeof at>[] }[] }, i: number) =>
+    doc.runs[0]?.results[i]?.locations[0]?.physicalLocation.region;
+
+  it('maps lines (window line 1 is the prefix) and the original path', () => {
+    const e = entry(2, { startLine: 400 });
+    const doc = { runs: [{ results: [at('r', e, 3, 5)] }] };
+    expect(remapWindowReport(doc, [e])).toBe(1);
+    expect(doc.runs[0]?.results[0]?.locations[0]?.physicalLocation.artifactLocation.uri).toBe(
+      '/src/a/long.txt',
+    );
+    expect(region(doc, 0)).toMatchObject({ startLine: 401, endLine: 401, startColumn: 5 });
+  });
+
+  it('adds the start column to findings on the first original line only', () => {
+    const e = entry(2, { startLine: 10, startColumn: 700 });
+    const doc = { runs: [{ results: [at('r', e, 2, 5), at('r', e, 3, 5)] }] };
+    remapWindowReport(doc, [e]);
+    expect(region(doc, 0)).toMatchObject({ startLine: 10, startColumn: 705, endColumn: 715 });
+    expect(region(doc, 1)).toMatchObject({ startLine: 11, startColumn: 5 });
+  });
+
+  it('keeps two same-rule, same-length findings on one long line, and merges true duplicates', () => {
+    // one very long line cut mid-line: window 1 starts at column 0, window 2 at column 50,000
+    const w1 = entry(1, { startLine: 1, startColumn: 0 });
+    const w2 = entry(2, { startLine: 1, startColumn: 50_000 });
+    const doc = {
+      runs: [
+        {
+          results: [
+            at('github-pat', w1, 2, 60_000), // finding A, seen in window 1
+            at('github-pat', w1, 2, 80_000), // finding B, same rule and length, elsewhere on the line
+            at('github-pat', w2, 2, 10_000), // finding A again, seen in the overlap in window 2
+          ],
+        },
+      ],
+    };
+    expect(remapWindowReport(doc, [w1, w2])).toBe(2);
+    expect(
+      doc.runs[0]?.results.map((r) => r.locations[0]?.physicalLocation.region.startColumn),
+    ).toEqual([60_000, 80_000]);
+  });
+});

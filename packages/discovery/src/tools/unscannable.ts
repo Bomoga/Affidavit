@@ -322,7 +322,8 @@ export class PrivateKeyScan {
   private abs = 0; // absolute offset of the end of the data fed so far
   private carry = ''; // last PK_CARRY characters of the previous buffer
   private open = false;
-  private beginEnd = 0; // absolute end of the open block's begin marker
+  private beginEnd = 0; // absolute end of the open block's FIRST begin marker
+  private lastBegin = 0; // absolute end of the most recent begin marker seen
   private blank = false; // a blank-ish line was seen inside the open block
   private flagged = false;
   private total = 0;
@@ -368,15 +369,17 @@ export class PrivateKeyScan {
     events.sort((x, y) => x.at - y.at);
     for (const e of events) {
       if (e.kind === 'begin') {
+        this.lastBegin = e.end;
         if (!this.open) {
           this.open = true;
           this.beginEnd = e.end;
           this.blank = false;
         } else {
           // A second begin marker (a decoy comment, a stray marker, or a header written twice) must
-          // not end the block early: gitleaks reads on past it. Keep the block and its blank flag,
-          // and move the header end forward.
-          this.beginEnd = Math.max(this.beginEnd, e.end);
+          // not end the block early, and must not reset its blank flag: gitleaks reads on past it.
+          // The 64-character minimum before a close is measured from the FIRST header end, as in
+          // gitleaks' regex, so a later header's own \`KEY-----\` can still close the block (header A
+          // with no END, a blank line, header B: gitleaks can match A up to B's header).
         }
       } else if (e.kind === 'blank') {
         if (this.open) this.blank = true;
@@ -385,6 +388,13 @@ export class PrivateKeyScan {
         // close marker sooner than that (an \`xKEY-----\` line right after the header) is not one.
         if (this.blank) this.flagged = true;
         this.open = false;
+        // A close that is the header of a later begin marker (its own KEY-----) ends the first
+        // block but starts the next one, so a real key after a decoy is still tracked.
+        if (e.at < this.lastBegin) {
+          this.open = true;
+          this.beginEnd = this.lastBegin;
+          this.blank = false;
+        }
       }
     }
 
