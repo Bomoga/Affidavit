@@ -210,8 +210,10 @@ describe('verify stage writes the verdict (jury disabled)', () => {
   it('escalates instead of writing a proven outcome without an admitted witness exhibit', async () => {
     const t = await verifyOnly({ witness: false, accepted: true });
     expect((await t.orch.run(CF.id)).stage).toBe('escalated');
-    expect(await t.store.getVerdict(CF.id)).toBeNull();
-    expect(t.events().some((e) => e.type === 'verdict-written')).toBe(false);
+    // Terminal verdicts (L3-06b): the only verdict written is an `escalated` one, never proven.
+    expect((await t.store.getVerdict(CF.id))?.outcome).toBe('escalated');
+    const written = t.events().filter((e) => e.type === 'verdict-written');
+    expect(written.map((e) => e.payload.verdict.outcome)).toEqual(['escalated']);
     expect(t.events().find((e) => e.type === 'escalated')?.payload).toMatchObject({
       escalation: { reason: 'no-admissible-witness-above-floor' },
     });
