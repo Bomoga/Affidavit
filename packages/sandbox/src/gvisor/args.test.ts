@@ -79,3 +79,47 @@ describe('buildGvisorRunArgs', () => {
     expect(buildGvisorRunArgs({ ...spec, stdin: true })).toContain('-i');
   });
 });
+
+describe('buildGvisorRunArgs: case network', () => {
+  const net = 'affidavit-net-0123456789abcdef';
+
+  it('joins only a per-case network, with hosts and no host search domains', () => {
+    const a = buildGvisorRunArgs({
+      ...spec,
+      network: { name: net, hosts: { target: '172.18.0.2' } },
+    });
+    const f = a.slice(0, a.indexOf(PROBE_IMAGE));
+    expect(f[f.indexOf('--network') + 1]).toBe(net);
+    expect(f[f.indexOf('--add-host') + 1]).toBe('target:172.18.0.2');
+    expect(f[f.indexOf('--dns-search') + 1]).toBe('.');
+  });
+
+  it.each(['host', 'bridge', 'none', 'affidavit-net-xyz', 'container:abc', `${net} --privileged`])(
+    'refuses to join %j',
+    (name) => {
+      expect(() => buildGvisorRunArgs({ ...spec, network: { name } })).toThrow(/per-case network/);
+    },
+  );
+
+  it.each([
+    ['a host name with a colon', { 'evil:1.2.3.4 x': '1.2.3.4' }],
+    ['an address that is not IPv4', { target: 'example.com' }],
+    ['an upper-case name', { Target: '172.18.0.2' }],
+  ])('refuses %s in /etc/hosts', (_label, hosts) => {
+    expect(() => buildGvisorRunArgs({ ...spec, network: { name: net, hosts } })).toThrow(
+      /bad host/,
+    );
+  });
+});
+
+describe('buildGvisorRunArgs: file size limit', () => {
+  it('sets RLIMIT_FSIZE only when asked', () => {
+    expect(flags.some((f) => f.startsWith('fsize='))).toBe(false);
+    const a = buildGvisorRunArgs({ ...spec, maxFileBytes: 1048576 });
+    expect(a[a.indexOf('fsize=1048576:1048576') - 1]).toBe('--ulimit');
+  });
+
+  it.each([0, -1, 1.5, Number.NaN])('refuses %s', (n) => {
+    expect(() => buildGvisorRunArgs({ ...spec, maxFileBytes: n })).toThrow(/maxFileBytes/);
+  });
+});
