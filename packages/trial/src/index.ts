@@ -32,3 +32,13 @@ export {
   WitnessSubmission,
 } from './envelope.js';
 export type { BallotSubmission, SubmissionCheck, SubmissionSpec } from './envelope.js';
+export { createDefenseHandler, loadCaseFile } from './defense.js';
+export type {
+  DefenseAttemptConfig,
+  DefenseConfig,
+  DefenseDeps,
+  PromptRenderer,
+} from './defense.js';
+export { buildWitness, variantsFor, witnessExhibitId, witnessSha256 } from './witness.js';
+export { InMemoryWorkspace } from './workspace.js';
+export type { AdmittedWitness, TrialWorkspace } from './workspace.js';
