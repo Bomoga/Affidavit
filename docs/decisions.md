@@ -6,7 +6,7 @@ Status as of Nov 5, 2026. Items here come from `docs/plan.md` (Human prerequisit
 
 | Item | Blocks | Owner | Needed by | Status |
 | --- | --- | --- | --- | --- |
-| Linux sandbox host (cloud VM or spare machine) for gVisor | L2-02 and everything after it in Lane 2 | unassigned | Before L2-02 starts | Open |
+| Linux sandbox host (cloud VM or spare machine) for gVisor | L2-02 and everything after it in Lane 2 | @Thearius123 | Before L2-02 starts | In progress: Lane 2 owner's Fedora 44 workstation, gVisor setup started 2026-11-14. A shared host for CI and the demo is still open |
 | Anthropic Console dev key with a monthly spend limit | Any real model call in Lane 3 (fakes cover tests until then) | unassigned | Before the first real trial run | Open |
 | Repro code reuse: confirm copying is fine and which agreement covers it | L2-02 starting point | unassigned | Before L2-02 starts | Open |
 | Licensing: CodeQL CLI terms and Semgrep rules license, decision recorded here | Enabling CodeQL in L1-02 | unassigned | plan.md says before week 2 (Nov 2), so this is overdue | Open |
@@ -17,7 +17,7 @@ Until the licensing decision lands, the default is the one plan.md already state
 
 ## Other open decisions (implementation-plan section 11)
 
-1. Lane owners for Lanes 1 and 2, and a backup contracts reviewer. CODEOWNERS lists @Bomoga for every path until owners are named.
+1. Lane owner for Lane 1, and a backup contracts reviewer. Lane 2 was claimed by @Thearius123 on 2026-11-14. CODEOWNERS lists @Bomoga for every other path until owners are named.
 2. Whether `docs/plan.md` is re-synced from the Claude Doc to reflect three lanes, or keeps four lanes with `docs/implementation-plan.md` as the override. Current state: the implementation plan wins, as its header says.
 
 ## Decisions made
