@@ -25,7 +25,7 @@ The fetch and scripts steps mount the staged tree read-write from the host's wor
 - After the fetch step and again after the scripts step, before the tree becomes a build context, `checkBuiltTree` walks it with `lstat` (links counted, never followed) and an explicit stack. More than `BUILT_TREE_CAPS.maxEntries` (200 000) entries, more than `maxBytes` (2 GiB, the sum of `st_size`, which is what `COPY .` writes for a sparse file), any FIFO, socket or device, or any directory the host cannot read stops the build at that step (`failed`, reason with tree-relative paths).
 - **Host setup:** the work root should sit on its own filesystem or quota, so that what a step writes before the walk sees it (up to the tree caps, plus `/scratch` and `/tmp` in RAM) cannot fill the host disk. Not enforced by this code.
 
-Build steps write into the staged tree as uid 65534, which the host user cannot delete. A jailed janitor container, as the same user, runs `chmod -R u+rwX /w` (a build script can leave `chmod 000` directories that even uid 65534 cannot descend into) and then `find /w -mindepth 1 -delete`; its exit status is checked. The host then removes the build directory. Cleanup never throws, so it cannot replace the build's real outcome. If the directory is still there afterwards, the outcome carries `leftovers` (a separate operational signal, not an error), or a process warning is emitted when the build itself threw.
+Build steps write into the staged tree as uid 65534, which the host user cannot delete. A jailed janitor container, as the same user, first gives owner rwx to every directory that lacks it, one at a time as `find` visits it and before it descends (a build script can leave `chmod 000` directories that even uid 65534 cannot descend into; busybox `chmod -R` does not work here because it stops at the host-owned `/w`), and then runs `find /w -mindepth 1 -delete`; its exit status is checked. The host then removes the build directory. Cleanup never throws, so it cannot replace the build's real outcome. If the directory is still there afterwards, the outcome carries `leftovers` (a separate operational signal, not an error), or a process warning is emitted when the build itself threw.
 
 ### Reasons never carry host paths
 
@@ -130,15 +130,20 @@ The only other host-side CLI call that touches the tree is the assemble step's `
 - Base images: official `node` only. Sidecar images must be plain Docker Hub names (no registry host, which could point the Docker daemon at an internal address).
 - The final Dockerfile stage cannot build on an earlier stage, and compose build args are not supported.
 
-## Verified on the sandbox host (2026-11-15, owner's workstation)
+## Verified on the sandbox host (2026-11-16, owner's workstation)
 
-This evidence predates the hardening above (the fetch proxy, the Lane 2 npm image, the base allowlist, ONBUILD refusal, the YAML precheck, the timeout clamp, `main`'s volume refusal, the host-side Compose isolation, the build write caps and the cleanup changes). `test:sandbox-host` must be re-run on the hardened tip before it counts, together with the new sandbox-host tests: the fetch step cannot reach an IP literal, cloud metadata or the bridge gateway; the proxy refuses other hosts; ONBUILD is detected; a non-node base is refused; a `.docker/cli-plugins/docker-compose` shipped in the tree never runs; a build script cannot write a 1 TiB sparse file or a tree over the byte cap; a `chmod 000` directory left by a build script is cleaned up; and failed build reasons carry no host paths.
+Re-run on the hardened tip of PR #18 (round-3 fixes plus the two fixes below). `pnpm --filter @affidavit/sandbox test:sandbox-host` with `AFFIDAVIT_NODEGOAT_DIR` pointing at the L1-08 corpus checkout (`node packages/corpus/scripts/fetch-pinned.mjs nodegoat`, NodeGoat `c5cb68a7`): 337 of 337 pass, none skipped, and no containers or networks are left behind. That covers:
 
-`pnpm --filter @affidavit/sandbox test:sandbox-host` with `AFFIDAVIT_NODEGOAT_DIR` pointing at OWASP NodeGoat `c5cb68a7`:
-
-- NodeGoat vulnerable and safe (its own documented `$where` fix) build, boot healthy with the mongo sidecar, and return their image IDs.
+- NodeGoat vulnerable and safe (its own documented `$where` fix) build through the proxy, boot healthy with the mongo sidecar, and return their image IDs.
 - A target that needs an external HTTP service boots against a stub.
-- A target that connects to an outside address, and one that looks up an outside name, are `unsupported`. Each detection path was disabled in turn and its test failed.
-- A target that never listens is `failed`. A lockfile pointing outside the registry is refused before any build step.
+- A target that connects to an outside address, and one that looks up an outside name, are `unsupported`. A target that never listens is `failed`. A lockfile pointing outside the registry is refused before any build step.
+- The tests added in review: the fetch step cannot reach an IP literal, a documentation address, cloud metadata or the default bridge gateway, and the case network gives the host no address; the proxy forwards only the registry; ONBUILD is detected; a non-node base is refused; a `.docker/cli-plugins/docker-compose` shipped in the tree never runs; a 1 TiB sparse file and a tree over the byte cap are stopped; a `chmod 000` directory left by a build script is cleaned up; failed build reasons carry no host paths.
+
+Two fixes came out of this run:
+
+- **Janitor.** Busybox `chmod -R u+rwX /w` never reached a locked directory: it does not descend into a directory it failed to chmod, and `/w` belongs to the host user, so it stopped at the top and the build directory was left behind. The janitor now runs `find /w -mindepth 1 -type d ! -perm -u=rwx -exec chmod u+rwx {} \;`, which fixes each directory as `find` visits it, before descending. Checked on runsc with nested `chmod 000` directories under both nobody-owned and host-owned parents, plus a symlink.
+- **Gateway test.** The case network sets `inhibit_ipv4`, so it has no gateway (Docker 29 prints `invalid IP`), and Docker hands `.1` to the first container on it, which is the proxy. The test now asserts the case network has no gateway and probes the default bridge gateway on 22, 80, 2375 and 3128.
+
+The judge jail tests (`pnpm --filter @affidavit/judge test:sandbox-host`, 31 of 31) and both containment suites (8 of 8, contained and recorded) pass on the same tip.
 
 Build and boot times: [metric] until they are measured on the shared sandbox host.

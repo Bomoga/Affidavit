@@ -476,13 +476,17 @@ async function removeBuildDir(dir: string): Promise<string | null> {
 }
 
 /**
- * The janitor's command. `chmod -R u+rwX` changes a directory before descending into it, so a
- * `chmod 000` directory the build left becomes readable again; errors on files the host staged
- * (owned by the host user, already world-writable) are ignored. `find -delete` then empties the
- * tree, and its exit status is the janitor's.
+ * The janitor's command. The first `find` visits every directory before reading it and gives
+ * each one that lacks owner rwx those bits, so a `chmod 000` directory the build left (at any
+ * depth, under any parent) becomes traversable before `find` descends into it. Only directories
+ * matter: deleting an entry needs write and search on its parent, not rights on the entry.
+ * `-type d` uses lstat, so a symlink is never chmodded through. Directories the host staged are
+ * already 0777 and do not match. (Busybox `chmod -R` cannot do this: it does not descend into a
+ * directory it failed to chmod, and `/w` itself belongs to the host user.) The second `find`
+ * empties the tree, and its exit status is the janitor's.
  */
 export const JANITOR_COMMAND = [
   'sh',
   '-c',
-  'chmod -R u+rwX /w 2>/dev/null; find /w -mindepth 1 -delete',
+  'find /w -mindepth 1 -type d ! -perm -u=rwx -exec chmod u+rwx {} \\; 2>/dev/null; find /w -mindepth 1 -delete',
 ];

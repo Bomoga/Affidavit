@@ -15,6 +15,7 @@ import { join } from 'node:path';
 import type { BootHints } from '@affidavit/contracts';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { RUN_LABEL } from '../gvisor/args.js';
+import { ipv4ToInt } from '../gvisor/cidr.js';
 import { createCaseNetwork, removeCaseNetwork } from '../gvisor/network.js';
 import { runJailed } from '../gvisor/runner.js';
 import { bootTarget, type BootOutcome } from './boot.js';
@@ -336,12 +337,15 @@ describe.runIf(onSandboxHost)(
         },
         { trace: false },
       );
-    const gateway = (net: string): string =>
-      execFileSync(
-        'docker',
-        ['network', 'inspect', '--format', '{{(index .IPAM.Config 0).Gateway}}', net],
-        { encoding: 'utf8' },
-      ).trim();
+    const ipamConfig = (net: string): { Gateway?: string; Subnet?: string } => {
+      const [config] = JSON.parse(
+        execFileSync('docker', ['network', 'inspect', '--format', '{{json .IPAM.Config}}', net], {
+          encoding: 'utf8',
+        }),
+      ) as { Gateway?: string; Subnet?: string }[];
+      if (config === undefined) throw new Error(`network ${net} has no IPAM config`);
+      return config;
+    };
 
     beforeAll(async () => {
       await pullPinned(FETCH_IMAGE);
@@ -367,13 +371,17 @@ describe.runIf(onSandboxHost)(
       expect(run.exitCode).not.toBe(0);
     });
 
-    it('cannot connect to the bridge gateway of its own network or of the default bridge', async () => {
-      for (const gw of [gateway(fetchEnv().net.name), gateway('bridge')]) {
-        expect(gw).toMatch(/^\d+\.\d+\.\d+\.\d+$/);
-        for (const port of [22, 80, 2375, 3128]) {
-          const run = await probe(connectProbe(gw, port));
-          expect(run.stdout, `${gw}:${port}`).not.toContain('CONNECTED');
-        }
+    it('has no host address on its own network, and cannot connect to the default bridge gateway', async () => {
+      // inhibit_ipv4: the host bridge of the case network gets no IPv4 address, so there is no
+      // gateway to reach. (Docker then hands the first address, .1, to the first container,
+      // which is the proxy; reaching it is the point, so it is not probed as a gateway here.)
+      const own = ipamConfig(fetchEnv().net.name);
+      expect(own.Gateway === undefined || ipv4ToInt(own.Gateway) === null).toBe(true);
+      const gw = ipamConfig('bridge').Gateway ?? '';
+      expect(gw).toMatch(/^\d+\.\d+\.\d+\.\d+$/);
+      for (const port of [22, 80, 2375, 3128]) {
+        const run = await probe(connectProbe(gw, port));
+        expect(run.stdout, `${gw}:${port}`).not.toContain('CONNECTED');
       }
     });
 

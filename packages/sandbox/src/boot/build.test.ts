@@ -67,7 +67,10 @@ describe('the janitor', () => {
   it('makes every directory it owns readable before deleting, and reports find', () => {
     const script = JANITOR_COMMAND.at(-1) ?? '';
     expect(JANITOR_COMMAND.slice(0, 2)).toEqual(['sh', '-c']);
-    expect(script.indexOf('chmod -R u+rwX /w')).toBeGreaterThanOrEqual(0);
+    // Per directory, as find visits it (`\\;`, not `+`), so it runs before find descends.
+    expect(script).toContain('find /w -mindepth 1 -type d ! -perm -u=rwx -exec chmod u+rwx {} \\;');
+    // Busybox chmod -R stops at the host-owned /w and never reaches a locked directory below.
+    expect(script).not.toContain('chmod -R');
     expect(script.indexOf('chmod')).toBeLessThan(script.indexOf('find /w -mindepth 1 -delete'));
     // find is last, so its exit status is the janitor's.
     expect(script.trim().endsWith('-delete')).toBe(true);
