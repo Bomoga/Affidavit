@@ -1,7 +1,17 @@
-import type { CaseStore } from '@affidavit/contracts';
+import type { CaseStore, ExhibitId } from '@affidavit/contracts';
 import type { StageHandler, StageResult } from './orchestrator.js';
 import { buildVerdict, decideOutcome, finalizeVerdict } from './verdict.js';
-import type { TrialWorkspace } from './workspace.js';
+import type { PatchOutcome, TrialWorkspace } from './workspace.js';
+
+/**
+ * Seam for L3-09 (Appeals). Ids of admitted counterexamples that survived the patch, from the
+ * Judge's VerifyResult. Today a defeated patch goes straight to a `proven-unfixed` verdict (the
+ * legal verify to verdict move). L3-09 will, while appeals remain, send verify to remedy with
+ * the first of these, record an `appeal` event naming it, and charge the budget per round.
+ */
+export function survivingCounterexamples(outcome: PatchOutcome | undefined): ExhibitId[] {
+  return (outcome?.result?.counterexamples ?? []).filter((c) => c.survived).map((c) => c.exhibitId);
+}
 
 export interface VerifyDeps {
   store: CaseStore;

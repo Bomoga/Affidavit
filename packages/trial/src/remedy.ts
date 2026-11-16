@@ -30,8 +30,8 @@ export interface RemedyDeps {
   workspace: TrialWorkspace;
   config: RemedyConfig;
   /**
-   * Admissible counterexamples the patch must defeat. Prosecution (L3-08) supplies them; until it
-   * exists the list is empty.
+   * Override for the counterexamples the patch must defeat. By default they are the admissible
+   * ones Prosecution (L3-08) left in the workspace.
    */
   counterexamples?: (caseId: string) => Promise<readonly Exhibit[]>;
 }
@@ -49,7 +49,9 @@ export function createRemedyHandler(deps: RemedyDeps): StageHandler {
       const caseFile = await loadCaseFile(deps.caseFiles, ctx.caseId);
       const admitted = await workspace.getWitness(ctx.caseId);
       if (!admitted) throw new Error(`no admitted witness for case ${ctx.caseId}`);
-      const counterexamples = (await deps.counterexamples?.(ctx.caseId)) ?? [];
+      const counterexamples =
+        (await deps.counterexamples?.(ctx.caseId)) ??
+        (await workspace.getCounterexamples(ctx.caseId)).map((c) => c.exhibit);
 
       const feedback: string[] = [];
       let last: PatchOutcome = { accepted: false, reason: 'no patch was submitted' };

@@ -47,3 +47,15 @@ Proposals only. Nothing here changes `packages/contracts`; per implementation-pl
 ## Verify to verdict wiring (L3-06, no change requested)
 
 `STAGE_TRANSITIONS` allows verify to verdict only when the jury is disabled or appeals are exhausted. Until the jury (L3-11) exists, `createVerifyHandler` takes `jury: 'disabled'` and must run against a `CaseStore` wired with the jury disabled (`new FakeCaseStore({ juryEnabled: false })` in tests; the same setting on the Postgres store in apps/worker). A store with the jury enabled refuses the transition, and a test covers that. `verdict-written` is emitted in the `verify` stage by the stenographer, after `CaseStore.appendVerdict` succeeds.
+
+## CR-T8: a counterexample that carries its own ParamSpace (L3-08)
+
+- **Need:** a Prosecution counterexample is the family template run over a chosen ParamSpace (a subset of the Defense family's values, or new values of a declared parameter). The Judge runs a counterexample over the ParamSpace of the witness passed alongside it. `runCounterexample` can be given a carrier witness with the chosen space, but `verifyPatch(caseFile, patch, witness, counterexamples)` takes only `Exhibit[]` and one witness, so the chosen space has nowhere to travel.
+- **Proposal (additive):** an optional `params: ParamSpace` on the counterexample exhibit, or `counterexamples: { exhibit, params }[]` in `verifyPatch`. Related: the `submit_counterexample` tool has no schema in `schemaRegistry` (the prompt's `outputSchemaRef` is `Exhibit`, but the agent submits parameter choices, not an Exhibit); a `CounterexampleChoices` schema would let the tool schema come from the contract.
+- **Meanwhile:** the exhibit's first code line is a comment holding the canonical chosen ParamSpace, so the id and hash cover it, and `runCounterexample` gets a carrier witness (author `prosecution`) with that space. Until Lane 2's `verifyPatch` reads the header, it reruns counterexamples over the Defense family's space, so a new value is only exercised against the patch if the Judge honours the header.
+
+## CR-T9: judging a claim attack before a fix exists (L3-08)
+
+- **Need:** the plan lets Prosecution attack the claim ("the witness tests the wrong thing", "the path is unreachable"). v1.0 gives `runCounterexample` one meaning (usable evidence: passes on vulnerable, fails on safe) and no result that says a counterexample undermines the witness, and `STAGE_TRANSITIONS` has no prosecution outcome that depends on it.
+- **Proposal:** a documented `ExhibitResult` meaning, or a field, for "this counterexample weakens the witness", and a rule for what the case does then.
+- **Meanwhile:** Prosecution always advances to remedy. Admissible counterexamples are carried to `verifyPatch`; a claim attack has no separate outcome.

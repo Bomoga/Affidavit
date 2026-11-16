@@ -1,6 +1,7 @@
 import type {
   CaseId,
   Dismissal,
+  Exhibit,
   ExhibitId,
   ExhibitResult,
   PatchExhibit,
@@ -14,6 +15,12 @@ export interface AdmittedWitness {
   result: ExhibitResult;
 }
 
+/** A counterexample the Judge found admissible, with the result that says so. */
+export interface AdmittedCounterexample {
+  exhibit: Exhibit;
+  result: ExhibitResult;
+}
+
 /**
  * Hand-off between stages inside one trial. Lane-internal state, not a contract: it holds contract
  * objects built in code and results returned by the Judge, never agent claims.
@@ -24,6 +31,9 @@ export interface TrialWorkspace {
   /** Exhibit ids the Judge admitted or verified, in the order they were produced. */
   addExhibit(caseId: CaseId, exhibitId: ExhibitId): Promise<void>;
   getExhibits(caseId: CaseId): Promise<ExhibitId[]>;
+  /** Admissible counterexamples in submission order. Remedy hands them to verifyPatch. */
+  addCounterexample(caseId: CaseId, admitted: AdmittedCounterexample): Promise<void>;
+  getCounterexamples(caseId: CaseId): Promise<AdmittedCounterexample[]>;
   savePatchOutcome(caseId: CaseId, outcome: PatchOutcome): Promise<void>;
   getPatchOutcome(caseId: CaseId): Promise<PatchOutcome | undefined>;
   /** The contract Dismissal recorded for the case, so a new instance can repair its verdict. */
@@ -45,6 +55,18 @@ export class InMemoryWorkspace implements TrialWorkspace {
   private readonly patches = new Map<CaseId, PatchOutcome>();
 
   private readonly dismissals = new Map<CaseId, Dismissal>();
+  private readonly counterexamples = new Map<CaseId, AdmittedCounterexample[]>();
+
+  addCounterexample(caseId: CaseId, admitted: AdmittedCounterexample): Promise<void> {
+    const list = this.counterexamples.get(caseId) ?? [];
+    list.push(admitted);
+    this.counterexamples.set(caseId, list);
+    return Promise.resolve();
+  }
+
+  getCounterexamples(caseId: CaseId): Promise<AdmittedCounterexample[]> {
+    return Promise.resolve([...(this.counterexamples.get(caseId) ?? [])]);
+  }
 
   saveDismissal(caseId: CaseId, dismissal: Dismissal): Promise<void> {
     this.dismissals.set(caseId, dismissal);
