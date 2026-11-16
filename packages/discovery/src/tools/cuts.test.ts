@@ -124,6 +124,17 @@ describe('PrivateKeyScan', () => {
     }
   });
 
+  it('counts the 64 character minimum from after the closing dashes of the header', () => {
+    // `L` characters between the header and the close marker, with a blank line inside
+    const withGap = (gap: number) =>
+      `-----BEGIN PRIVATE KEY-----${'\n\n'}${'a'.repeat(gap - 2)}KEY-----\n`;
+    for (const gap of [60, 62, 63]) expect(scan(big(withGap(gap))).risky, `gap ${gap}`).toBe(false);
+    for (const gap of [64, 65, 66, 67, 68])
+      expect(scan(big(withGap(gap))).risky, `gap ${gap}`).toBe(true);
+    // and a header without its trailing dashes is not a header
+    expect(scan(big(`-----BEGIN PRIVATE KEY\n\n${'a'.repeat(100)}KEY-----\n`)).risky).toBe(false);
+  });
+
   it('uses constant memory: many repeated markers do not grow state', () => {
     const sink = new PrivateKeyScan();
     const chunk = Buffer.from(`${'-----BEGIN RSA PRIVATE KEY-----\n'.repeat(1000)}`);

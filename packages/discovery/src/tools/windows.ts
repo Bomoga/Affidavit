@@ -1,6 +1,6 @@
-import { lstat, mkdir, open, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readdir, writeFile } from 'node:fs/promises';
 import { dirname, join, relative, sep } from 'node:path';
-import { classifyHead } from './unscannable.js';
+import { classifyHead, neutralArchiveName } from './unscannable.js';
 import { listDir } from './walk.js';
 
 /**
@@ -20,18 +20,22 @@ import { listDir } from './walk.js';
  * unscannable.ts, which stay as defence in depth.
  *
  * Windows start and end on line boundaries when a line is short enough; otherwise they are cut
- * mid-line with the same overlap, and the window records how far into its first line it starts.
- * Each window records the line number of its first byte so findings can be mapped back.
+ * mid-line with the same overlap, always on a UTF-8 character boundary, and the window records how
+ * far into its first line it starts, in bytes. Each window records the line number of its first
+ * byte so findings can be mapped back.
  *
- * Two things protect a window from being skipped or mis-scanned:
+ * Three things protect a window from being skipped or mis-scanned:
  *  - gitleaks decides text or binary from a file's first bytes. A window that happens to start with
  *    `MZ` or `%PDF` would be skipped. So every window starts with a neutral first line, and the
  *    host also checks each window with the same signature table afterwards (offset signatures such
  *    as `ustar` at 257 can still match), reporting any hit.
  *  - Rules that match on the file path (kubernetes-secret-yaml, hashicorp-tf-password, ...) need
- *    the real name, so a window is written at \`wNNNN/pNNNN/<original path>\`. The neutral
+ *    the real name, so a window is written at `wNNNN/pNNNN/<original path>`. The neutral
  *    directories are generated and are what the mapping back uses, so a repo file name cannot
  *    forge or collide with another window.
+ *  - gitleaks drops a plain text file whose NAME looks like an archive (`a.gz`, `a.zip.js`). Such
+ *    files, of any size, are windowed too, with the archive tokens in the name neutralised
+ *    (`a.gz.yaml` becomes `a._gz.yaml`, final extension kept), so they are scanned.
  */
 export const WINDOW_BYTES = 90_000;
 export const OVERLAP_BYTES = 16_000;
@@ -46,10 +50,10 @@ const MIN_LINE_ALIGNED = 70_000;
 const MAX_ALIGN_BACK = 20_000;
 export const BIG_FILE = 100_000;
 /**
- * Upper bound on the bytes of windows written in one run. Windows duplicate every large text file
- * about 1.2 times, so a repo with many large files could otherwise fill the disk and run gitleaks
+ * Hard upper bound on the bytes of windows written in one run, counted as they are written (a file
+ * that would cross it stops there and is reported). Windows duplicate every large text file about
+ * 1.2 times, so a repo with many large files could otherwise fill the disk and keep gitleaks busy
  * for a very long time. 256 MiB is a safety limit chosen for that reason, not a measured number.
- * Files that do not fit are listed and the run is marked partial.
  */
 export const MAX_WINDOW_BYTES = 256 * 1024 * 1024;
 
@@ -66,15 +70,17 @@ export interface WindowEntry {
 
 export class WindowsDirNotFreshError extends Error {
   constructor(dir: string) {
-    super(`windows directory must not exist before a run: ${dir}`);
+    super(`windows directory must exist and be empty before a run: ${dir}`);
     this.name = 'WindowsDirNotFreshError';
   }
 }
 
 export interface WindowsResult {
   entries: WindowEntry[];
-  /** Files over the size that were not windowed because the byte budget ran out. */
+  /** Files not (fully) windowed because the byte budget ran out. */
   skippedForBudget: string[];
+  /** Files that could not be windowed because writing failed (for example a path too long). */
+  failed: { original: string; why: string }[];
   /** Bytes of windows written. */
   bytes: number;
 }
@@ -87,6 +93,25 @@ function countNewlines(buf: Uint8Array): number {
     i = buf.indexOf(0x0a, i + 1);
   }
   return n;
+}
+
+/** True for a UTF-8 continuation byte (10xxxxxx). */
+const isContinuation = (b: number | undefined): boolean => b !== undefined && (b & 0xc0) === 0x80;
+
+/**
+ * Backs a window end off so it does not split a UTF-8 character (at most 3 bytes). `len` is the
+ * proposed end inside `buf`; the file is known to continue after it.
+ */
+function trimToCharBoundary(buf: Uint8Array, len: number): number {
+  for (let back = 1; back <= 3 && back <= len; back++) {
+    const b = buf[len - back];
+    if (b === undefined) break;
+    if ((b & 0xc0) !== 0x80) {
+      const need = b >= 0xf0 ? 4 : b >= 0xe0 ? 3 : b >= 0xc0 ? 2 : 1;
+      return need > back ? len - back : len;
+    }
+  }
+  return len;
 }
 
 /** Cuts one file into windows, calling `emit` for each. Streams with one window-sized buffer. */
@@ -109,22 +134,25 @@ export async function windowFile(
       if (!last) {
         const nl = buf.subarray(0, n).lastIndexOf(0x0a);
         if (nl + 1 >= MIN_LINE_ALIGNED) wlen = nl + 1;
+        else wlen = trimToCharBoundary(buf, n);
       }
       await emit(Buffer.from(buf.subarray(0, wlen)), line, col);
       if (last && wlen === n) return;
       // The next window starts at a line start at or before (end - overlap), so the overlap is at
       // least OVERLAP_BYTES. Aligning to a line start may move the start back by at most
-      // MAX_ALIGN_BACK bytes; otherwise the start is mid-line, exactly at the target.
+      // MAX_ALIGN_BACK bytes; otherwise the start is mid-line, at the target, moved back (at most 3
+      // bytes) to a UTF-8 character boundary.
       const target = wlen - OVERLAP_BYTES;
       const nlBefore = buf.subarray(0, Math.max(target, 0)).lastIndexOf(0x0a);
-      let nextRel =
-        nlBefore >= 0 && nlBefore + 1 >= target - MAX_ALIGN_BACK
-          ? nlBefore + 1
-          : Math.max(target, 1);
-      if (nextRel <= 0) nextRel = 1;
+      let nextRel: number;
+      if (nlBefore >= 0 && nlBefore + 1 >= target - MAX_ALIGN_BACK) {
+        nextRel = nlBefore + 1;
+      } else {
+        nextRel = Math.max(target, 1);
+        for (let i = 0; i < 3 && nextRel > 1 && isContinuation(buf[nextRel]); i++) nextRel--;
+      }
       const skipped = buf.subarray(0, nextRel);
-      const nls = countNewlines(skipped);
-      line += nls;
+      line += countNewlines(skipped);
       const lastNl = skipped.lastIndexOf(0x0a);
       col = lastNl < 0 ? col + nextRel : nextRel - (lastNl + 1);
       start += nextRel;
@@ -135,23 +163,42 @@ export async function windowFile(
   }
 }
 
+class BudgetStop extends Error {}
+
+export interface WriteWindowsOptions {
+  /** Hard cap on window bytes written. Default MAX_WINDOW_BYTES. */
+  maxBytes?: number;
+  /**
+   * Relative paths (posix) of files that already carry a coverage flag. They are windowed first, so
+   * a budget that runs out spends itself where the risk is. The rest follow, smallest first, not
+   * in the order a repo chose its file names.
+   */
+  priority?: ReadonlySet<string>;
+}
+
 /**
- * Writes windows for every plain text file over 100,000 bytes in the snapshot into `windowsDir`
- * (which must not exist; it is only created if there is something to write), until `maxBytes` of
- * windows have been written. Files with a known binary signature or non-text start are not
- * windowed: gitleaks skips or reads them as a whole. Never follows symlinks.
+ * Writes windows into `windowsDir`, which must exist and be empty (the caller creates a unique
+ * one per run and removes it). Windowed files: plain text files over 100,000 bytes, and files whose
+ * name gitleaks reads as an archive although the content is not one (any size). Files with a known
+ * binary signature or non-text start are not windowed: gitleaks skips or reads them as a whole.
+ * Never follows symlinks. A write error for one file is reported in `failed` and does not stop
+ * the others.
  */
 export async function writeWindows(
   snapshotDir: string,
   windowsDir: string,
-  maxBytes: number = MAX_WINDOW_BYTES,
+  options: WriteWindowsOptions = {},
 ): Promise<WindowsResult> {
-  const entries: WindowEntry[] = [];
-  const skippedForBudget: string[] = [];
-  let created = false;
-  let fileNo = 0;
-  let bytes = 0;
+  const maxBytes = options.maxBytes ?? MAX_WINDOW_BYTES;
+  if ((await readdir(windowsDir)).length > 0) throw new WindowsDirNotFreshError(windowsDir);
 
+  interface Candidate {
+    full: string;
+    name: string;
+    original: string;
+    size: number;
+  }
+  const candidates: Candidate[] = [];
   const walk = async (dir: string): Promise<void> => {
     for (const e of await listDir(dir)) {
       const full = join(dir, e.name);
@@ -161,7 +208,6 @@ export async function writeWindows(
       }
       if (!e.isFile) continue;
       const st = await lstat(full);
-      if (st.size <= BIG_FILE) continue;
       const fh = await open(full, 'r');
       let head: Buffer;
       try {
@@ -171,44 +217,70 @@ export async function writeWindows(
       } finally {
         await fh.close();
       }
-      if (classifyHead(e.name, head) !== undefined) continue;
-
-      const original = relative(snapshotDir, full).split(sep).join('/');
-      // windows cover the file about 1.25 times at worst; leave room before starting a file
-      if (bytes + Math.ceil(st.size * 1.25) > maxBytes) {
-        skippedForBudget.push(original);
-        continue;
-      }
-      if (!created) {
-        try {
-          await mkdir(windowsDir);
-        } catch (err) {
-          if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
-            throw new WindowsDirNotFreshError(windowsDir);
-          }
-          throw err;
-        }
-        created = true;
-      }
-      const sub = `w${String(++fileNo).padStart(4, '0')}`;
-      let part = 0;
-      await windowFile(full, st.size, async (win, startLine, startColumn) => {
-        const name = `${sub}/p${String(++part).padStart(4, '0')}`;
-        const target = join(windowsDir, name, ...original.split('/'));
-        await mkdir(dirname(target), { recursive: true });
-        await writeFile(target, Buffer.concat([Buffer.from(WINDOW_PREFIX), win]));
-        bytes += win.length + WINDOW_PREFIX.length;
-        entries.push({ name, original, startLine, startColumn });
+      const kind = classifyHead(e.name, head);
+      const big = st.size > BIG_FILE && kind === undefined;
+      const archiveNamed = kind === 'archive-name-mismatch' && st.size > 0;
+      if (!big && !archiveNamed) continue;
+      candidates.push({
+        full,
+        name: e.name,
+        original: relative(snapshotDir, full).split(sep).join('/'),
+        size: st.size,
       });
     }
   };
   await walk(snapshotDir);
-  return { entries, skippedForBudget, bytes };
+
+  const flagged = options.priority ?? new Set<string>();
+  candidates.sort(
+    (a, b) =>
+      Number(flagged.has(b.original)) - Number(flagged.has(a.original)) ||
+      a.size - b.size ||
+      a.original.localeCompare(b.original),
+  );
+
+  const entries: WindowEntry[] = [];
+  const skippedForBudget: string[] = [];
+  const failed: { original: string; why: string }[] = [];
+  let bytes = 0;
+  let fileNo = 0;
+  for (const c of candidates) {
+    const sub = `w${String(++fileNo).padStart(4, '0')}`;
+    const mine: WindowEntry[] = [];
+    let part = 0;
+    try {
+      await windowFile(c.full, c.size, async (win, startLine, startColumn) => {
+        const len = win.length + WINDOW_PREFIX.length;
+        if (bytes + len > maxBytes) throw new BudgetStop();
+        const name = `${sub}/p${String(++part).padStart(4, '0')}`;
+        const segments = c.original.split('/');
+        segments[segments.length - 1] = neutralArchiveName(c.name);
+        const target = join(windowsDir, name, ...segments);
+        await mkdir(dirname(target), { recursive: true });
+        await writeFile(target, Buffer.concat([Buffer.from(WINDOW_PREFIX), win]));
+        bytes += len;
+        mine.push({ name, original: c.original, startLine, startColumn });
+      });
+      entries.push(...mine);
+    } catch (err) {
+      if (err instanceof BudgetStop) {
+        entries.push(...mine); // what was written is still valid; the rest is reported
+        skippedForBudget.push(c.original);
+      } else {
+        // a path that is too long, a full disk, a permission error: report this file and go on
+        failed.push({
+          original: c.original,
+          why: (err as NodeJS.ErrnoException).code ?? String(err),
+        });
+      }
+    }
+  }
+  return { entries, skippedForBudget, failed, bytes };
 }
 
 /** Finds the window a report path belongs to. The path may start with `/src/` or `file:///src/`. */
 export function windowPathParts(uri: string): { name: string; rest: string } | undefined {
-  const m = /^(?:file:\/\/)?\/?(?:src\/)?(w\d{4}\/p\d{4})(?:\/(.*))?$/.exec(uri);
+  const m = /^(?:file:\/\/)?\/?(?:src\/)?(w\d{4,}\/p\d{4,})(?:\/([\s\S]*))?$/.exec(uri);
   return m?.[1] ? { name: m[1], rest: m[2] ?? '' } : undefined;
 }
 
@@ -229,10 +301,20 @@ interface SarifResult {
 /**
  * Maps a gitleaks SARIF report for the windows directory back to the original files and lines,
  * and drops true duplicates (a finding in an overlap shows up in two windows). A window's first
- * line is the neutral prefix, so window line L is original line startLine + L - 2. Columns on the
- * window's first original line (window line 2) are shifted by the window's start column when it
- * starts mid-line. Two findings are duplicates only if rule, file and absolute start and end
- * positions all agree. URIs become `/src/<original path>`. Returns the number of findings kept.
+ * line is the neutral prefix, so window line L is original line startLine + L - 2.
+ *
+ * Columns, probed on the pinned gitleaks: they are counted in BYTES, and on the first line of a
+ * file they are 1-based, while on every later line they come out one higher (gitleaks counts the
+ * newline). A window's first original line is window line 2, which gitleaks reports with the
+ * later-line convention. So on window line 2 the column becomes
+ * `column + startColumn - (startLine === 1 ? 1 : 0)`: the start column is added, and one is taken
+ * off when that line is the first line of the original file, so the result equals what the
+ * snapshot pass reports for the same finding. On later lines both passes use the same convention
+ * and nothing changes. (The snapshot pass's own columns are unreliable after its first 100 KB
+ * chunk, a gitleaks bug; the remapped windows columns do not have that problem.)
+ *
+ * Two findings are duplicates only if rule, file and absolute start and end positions all agree.
+ * URIs become `/src/<original path>`. Returns the number of findings kept.
  */
 export function remapWindowReport(doc: unknown, entries: readonly WindowEntry[]): number {
   const byName = new Map(entries.map((e) => [e.name, e]));
@@ -253,7 +335,9 @@ export function remapWindowReport(doc: unknown, entries: readonly WindowEntry[])
         const r = pl.region;
         if (r !== undefined) {
           const shiftCol = (line: number | undefined, col: number | undefined) =>
-            line === 2 && col !== undefined ? col + w.startColumn : col;
+            line === 2 && col !== undefined
+              ? col + w.startColumn - (w.startLine === 1 ? 1 : 0)
+              : col;
           const startColumn = shiftCol(r.startLine, r.startColumn);
           const endColumn = shiftCol(r.endLine, r.endColumn);
           if (startColumn !== undefined) r.startColumn = startColumn;

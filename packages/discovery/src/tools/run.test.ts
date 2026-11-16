@@ -1,4 +1,11 @@
-import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { join, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import type { ToolRunnerPort } from '@affidavit/contracts';
@@ -457,6 +464,49 @@ describe('runTool', () => {
       expect(note?.message).toContain('/src/src/notes.txt');
       expect(res.windowedFiles).toEqual(['/src/src/notes.txt']);
       expect(res.reports.map((x) => x.origin)).toEqual(['snapshot', 'windows']);
+    });
+
+    it('flags plain text with an archive name and scans it in a window under a neutral name', async () => {
+      const snap = await snapshot({ 'src/app.js': 'x', 'src/config.gz.yaml': 'key: value\n' });
+      const { runner, calls } = fakeRunner((out) =>
+        writeFileSync(join(out, 'gitleaks.sarif'), sarif()),
+      );
+      const res = await runTool(runner, manifest, 'gitleaks', await options(snap));
+      expect(res.partial).toBe(true);
+      expect(
+        res.notifications.some(
+          (n) => n.id === 'archive-name-mismatch' && n.message.includes('/src/src/config.gz.yaml'),
+        ),
+      ).toBe(true);
+      expect(res.windowedFiles).toEqual(['/src/src/config.gz.yaml']);
+      expect(calls).toHaveLength(2);
+    });
+
+    it("two runs on one copy do not delete each other's windows, and a leftover directory is not touched", async () => {
+      const snap = await snapshot({ 'src/app.js': 'x' });
+      writeFileSync(join(snap.dir, 'src', 'big.txt'), bigText());
+      // an old-style or foreign directory next to the copy must survive both runs
+      const foreign = `${snap.dir}.windows`;
+      mkdirSync(foreign);
+      writeFileSync(join(foreign, 'keep.txt'), 'not ours');
+      const slowRunner = (delay: number): ToolRunnerPort => ({
+        run: async (_image, _args, mounts) => {
+          const out = mounts.find((m) => m.containerPath === '/out')?.hostPath ?? '';
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          writeFileSync(join(out, 'gitleaks.sarif'), sarif());
+          return { exitCode: 0, outputPath: out };
+        },
+      });
+      const [a, b] = await Promise.all([
+        runTool(slowRunner(30), manifest, 'gitleaks', await options(snap)),
+        runTool(slowRunner(5), manifest, 'gitleaks', await options(snap)),
+      ]);
+      expect(a.windowedFiles).toEqual(['/src/src/big.txt']);
+      expect(b.windowedFiles).toEqual(['/src/src/big.txt']);
+      expect(readFileSync(join(foreign, 'keep.txt'), 'utf8')).toBe('not ours');
+      expect(
+        readdirSync(join(snap.dir, '..')).filter((n) => n.startsWith('snap.windows-')),
+      ).toEqual([]);
     });
 
     it('marks the run partial when the window byte budget runs out', async () => {

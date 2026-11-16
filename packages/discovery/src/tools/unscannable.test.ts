@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { ChunkRisk, classifyHead } from './unscannable.js';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { ARCHIVE_NAME, ChunkRisk, classifyHead, neutralArchiveName } from './unscannable.js';
+import { repoRoot } from './manifest.js';
 
 const bytes = (...parts: (string | number[])[]): Buffer =>
   Buffer.concat(
@@ -115,5 +118,116 @@ describe('ChunkRisk', () => {
     const parts = new ChunkRisk();
     for (let i = 0; i < data.length; i += 7001) parts.feed(data.subarray(i, i + 7001));
     expect(parts.risky).toBe(whole.risky);
+  });
+});
+
+describe('archive-like names', () => {
+  // Names the pinned gitleaks dropped (or scanned) when given plain text, probed on Linux.
+  const dropped = [
+    'a.gz',
+    'a.GZ',
+    'a.Gz',
+    'a.gz.txt',
+    'a.GZ.TXT',
+    'a.zip',
+    'a.zip.js',
+    'config.zip.env',
+    'a.tar',
+    'a.tar.gz',
+    'a.tar.bz2',
+    'a.tar.zst',
+    'a.tar.foo',
+    'a.tarx',
+    'a.bz2',
+    'a.xz',
+    'a.xz.yaml',
+    'a.zst',
+    'a.zstd',
+    'a.lz4',
+    'a.br',
+    'a.sz',
+    'a.7z',
+    'a.rar',
+    'a.zipx',
+    'a.zz',
+    'a.gzip',
+    'a.gzx',
+    'a.gz2',
+    'a.lz',
+    'a.LZ',
+    'a.mz',
+    'a.MZ',
+    'dir.gz.name',
+    '.gz',
+  ];
+  const scanned = [
+    'a.txt',
+    'a.TXT',
+    'a.js',
+    'a.env',
+    'a.tgz',
+    'a.TGZ',
+    'a.tbz2',
+    'a.txz',
+    'a.tzst',
+    'a.jar',
+    'a.war',
+    'a.Z',
+    'a.lzma',
+    'a.cpio',
+    'a.lzip',
+    'a.rpm',
+    'a.deb',
+    'a.cab',
+    'a.iso',
+    'a.bz',
+    'a.lz.txt',
+    'a.mz.txt',
+    'a.lzx',
+    'a.mzx',
+    'a.mz2',
+    'agz.txt',
+    'a_gz',
+    'a-gz.txt',
+    'zip',
+    'README',
+    'a.xtar',
+  ];
+
+  it('matches exactly the names the pinned gitleaks drops', () => {
+    for (const n of dropped) expect(ARCHIVE_NAME.test(n), n).toBe(true);
+    for (const n of scanned) expect(ARCHIVE_NAME.test(n), n).toBe(false);
+  });
+
+  it('flags plain text with such a name, but leaves a real archive to the signature rules', () => {
+    const text = bytes('const k = 1;\n');
+    for (const n of dropped) expect(classifyHead(n, text), n).toBe('archive-name-mismatch');
+    for (const n of scanned) expect(classifyHead(n, text), n).toBeUndefined();
+    expect(classifyHead('a.gz', bytes([0x1f, 0x8b, 8]))).toBe('skipped-file-type');
+    expect(classifyHead('a.gz.txt', bytes([0x1f, 0x8b, 8]))).toBe('binary-header-mismatch');
+  });
+
+  it('neutralises the name so gitleaks no longer drops it, keeping the final extension', () => {
+    for (const n of dropped.filter((x) => x !== '.gz')) {
+      const neutral = neutralArchiveName(n);
+      expect(ARCHIVE_NAME.test(neutral), `${n} -> ${neutral}`).toBe(false);
+    }
+    expect(neutralArchiveName('config.gz.yaml')).toBe('config._gz.yaml');
+    expect(neutralArchiveName('a.tar.gz')).toBe('a._tar._gz');
+    expect(neutralArchiveName('notes.lz')).toBe('notes._lz');
+    expect(neutralArchiveName('plain.txt')).toBe('plain.txt');
+  });
+
+  it('loses no path-scoped gitleaks rule: none of them mentions an archive extension', () => {
+    const toml = readFileSync(
+      join(repoRoot(), 'docker', 'tools', 'config', 'gitleaks.toml'),
+      'utf8',
+    );
+    const paths = [...toml.matchAll(/^path = '''(.*)'''$/gm)].map((m) => m[1] ?? '');
+    expect(paths.length).toBeGreaterThan(3);
+    for (const p of paths)
+      expect(p, p).not.toMatch(
+        /gz|zip|tar|bz2|xz|zst|lz4|\bbr\b|\bsz\b|7z|rar|\bzz\b|\blz\b|\bmz\b/i,
+      );
   });
 });

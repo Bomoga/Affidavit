@@ -910,6 +910,149 @@ describe.skipIf(!enabled)('tool images, offline', () => {
       ).toBe(true);
     }, 300_000);
 
+    describe('names gitleaks reads as archives', () => {
+      // plain text under names that make the pinned gitleaks try to extract it and drop it. Every
+      // token of the probed rule is here, in lower and upper case, mid-name and as the extension.
+      const dropped = [
+        'a.gz',
+        'a.zip',
+        'a.tar',
+        'a.tar.gz',
+        'a.tar.bz2',
+        'a.tar.zst',
+        'a.bz2',
+        'a.xz',
+        'a.zst',
+        'a.lz4',
+        'a.lz',
+        'a.br',
+        'a.sz',
+        'a.mz',
+        'a.7z',
+        'a.rar',
+        'a.zipx',
+        'a.zz',
+        'a.gzip',
+        'a.zstd',
+        'a.tarx',
+        'a.gzx',
+        'case1.GZ',
+        'case2.Zip',
+        'case3.TAR',
+        'case4.MZ',
+        'a.gz.txt',
+        'a.zip.js',
+        'config.zip.env',
+        'a.xz.yaml',
+        'a.tar.foo',
+        'a.7z.txt',
+        'a.rar.cfg',
+        'a.br.json',
+        'a.sz.md',
+        'a.zz.py',
+      ];
+      const scanned = [
+        'a.tgz',
+        'a.tbz2',
+        'a.jar',
+        'a.war',
+        'a.Z',
+        'a.lzma',
+        'a.cpio',
+        'a.rpm',
+        'a.lz.txt',
+        'a.mz.txt',
+        'plain.txt',
+      ];
+      const secret = 'const k = "AFFIDAVIT_FAKE_KEY_0123456789ABCDEF";\n';
+
+      it('every probed name is flagged, dropped by gitleaks alone, and found in a window', async () => {
+        const sc = scenario('repo', (src) => {
+          mkdirSync(join(src, 'n'));
+          for (const n of [...dropped, ...scanned]) writeFileSync(join(src, 'n', n), secret);
+        });
+        const res = await runGitleaks(sc);
+        const main = mainFindings(sc);
+        const win = windowFindings(res);
+        const flagged = new Set(
+          res.notifications
+            .filter((x) => x.id === 'archive-name-mismatch')
+            .map((x) => x.message.split(' ')[0]),
+        );
+        for (const n of dropped) {
+          const rule = 'affidavit-fake-fixture-key';
+          expect(has(main, rule, `n/${n}`), `gitleaks alone should drop ${n}`).toBe(false);
+          expect(flagged.has(`/src/n/${n}`), `${n} should be flagged`).toBe(true);
+          expect(has(win, rule, `n/${n}`), `${n} should be found in a window`).toBe(true);
+        }
+        for (const n of scanned) {
+          expect(
+            has(main, 'affidavit-fake-fixture-key', `n/${n}`),
+            `${n} is scanned normally`,
+          ).toBe(true);
+          expect(flagged.has(`/src/n/${n}`), `${n} is not flagged`).toBe(false);
+        }
+      }, 300_000);
+    });
+
+    describe('columns of windows findings', () => {
+      const K = 'AFFIDAVIT_FAKE_KEY_0123456789ABCDEF';
+      type Region = {
+        startLine?: number;
+        endLine?: number;
+        startColumn?: number;
+        endColumn?: number;
+      };
+      const regionsOf = (raw: string, path: string): string[] => {
+        const doc = JSON.parse(raw) as {
+          runs: {
+            results?: {
+              ruleId?: string;
+              locations?: {
+                physicalLocation?: { artifactLocation?: { uri?: string }; region?: Region };
+              }[];
+            }[];
+          }[];
+        };
+        return doc.runs
+          .flatMap((r) => r.results ?? [])
+          .filter((x) => x.ruleId === 'affidavit-fake-fixture-key')
+          .flatMap((x) => x.locations ?? [])
+          .filter((l) => l.physicalLocation?.artifactLocation?.uri?.endsWith(path))
+          .map((l) => {
+            const g = l.physicalLocation?.region;
+            return `${g?.startLine}:${g?.startColumn}-${g?.endLine}:${g?.endColumn}`;
+          })
+          .sort();
+      };
+      const tail = (n: number) => `${'z'.repeat(79)}\n`.repeat(Math.ceil(n / 80));
+
+      it('remapped columns equal the snapshot pass for LF, CRLF, minified and multibyte text', async () => {
+        const cases: Record<string, string> = {
+          'lf.txt': `x = "${K}"\nline two\ny = "${K}"\n${tail(110_000)}`,
+          'crlf.txt': `x = "${K}"\r\nline two\r\ny = "${K}"\r\n${tail(110_000)}`,
+          'min.txt': `${'a'.repeat(50)} "${K}" ${'b'.repeat(40)} "${K}" end${'c'.repeat(110_000)}`,
+          'utf8.txt': `é€é€é€ "${K}"\nüñí "${K}"\n${tail(110_000)}`,
+        };
+        const sc = scenario('repo', (src) => {
+          mkdirSync(join(src, 'c'));
+          for (const [n, t] of Object.entries(cases)) writeFileSync(join(src, 'c', n), t);
+        });
+        const res = await runGitleaks(sc);
+        const snapshotRaw = readFileSync(join(sc.out('gitleaks'), 'gitleaks.sarif'), 'utf8');
+        const windowRaw = readFileSync(
+          res.reports.find((r) => r.origin === 'windows')?.file ?? '',
+          'utf8',
+        );
+        for (const n of Object.keys(cases)) {
+          const fromSnapshot = regionsOf(snapshotRaw, `c/${n}`);
+          expect(fromSnapshot.length, `${n}: findings in the snapshot pass`).toBe(2);
+          // all findings are in the first 100 KB chunk, where the snapshot pass's columns are right
+          expect(regionsOf(windowRaw, `c/${n}`), n).toEqual(fromSnapshot);
+        }
+      }, 300_000);
+    });
+
     it('seeded sweep: a decoy-wrapped key is always found or flagged, never silently missed', async () => {
       const r = rng(2024);
       const shapes = [

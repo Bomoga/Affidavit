@@ -1,6 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
+import { ARCHIVE_NAME } from './unscannable.js';
 import { cleanupTmp, tmp } from './testkit.js';
 import {
   BIG_FILE,
@@ -133,6 +134,12 @@ describe('window columns', () => {
   });
 });
 
+const wdir = (root: string): string => {
+  const d = join(root, 'snap.windows');
+  mkdirSync(d);
+  return d;
+};
+
 describe('writeWindows', () => {
   const entryFor = (
     original: string,
@@ -152,7 +159,7 @@ describe('writeWindows', () => {
     mkdirSync(snap);
     writeFileSync(join(snap, 'exact.txt'), 'x'.repeat(BIG_FILE));
     writeFileSync(join(snap, 'one-over.txt'), 'x'.repeat(BIG_FILE + 1));
-    const { entries } = await writeWindows(snap, join(root, 'snap.windows'));
+    const { entries } = await writeWindows(snap, wdir(root));
     expect(new Set(entries.map((e) => e.original))).toEqual(new Set(['one-over.txt']));
   });
 
@@ -166,7 +173,7 @@ describe('writeWindows', () => {
       join(snap, 'big.bin'),
       Buffer.concat([Buffer.from('%PDF-1.4'), Buffer.alloc(150_000, 0x61)]),
     );
-    const windowsDir = join(root, 'snap.windows');
+    const windowsDir = wdir(root);
     const { entries, skippedForBudget } = await writeWindows(snap, windowsDir);
     expect(skippedForBudget).toEqual([]);
     expect(new Set(entries.map((e) => e.original))).toEqual(new Set(['k8s/cut.yaml']));
@@ -186,7 +193,7 @@ describe('writeWindows', () => {
     mkdirSync(snap);
     // every line starts with MZ, so every later window would start with it
     writeFileSync(join(snap, 'lines.txt'), 'start\n' + `MZ${'x'.repeat(77)}\n`.repeat(2500));
-    const windowsDir = join(root, 'snap.windows');
+    const windowsDir = wdir(root);
     const { entries } = await writeWindows(snap, windowsDir);
     expect(entries.length).toBeGreaterThanOrEqual(2);
     for (const e of entries) {
@@ -201,14 +208,91 @@ describe('writeWindows', () => {
     mkdirSync(snap);
     writeFileSync(join(snap, 'a.txt'), randomText(11, 200_000, false));
     writeFileSync(join(snap, 'b.txt'), randomText(12, 200_000, false));
-    const { entries, skippedForBudget, bytes } = await writeWindows(
-      snap,
-      join(root, 'snap.windows'),
-      300_000,
-    );
+    const { entries, skippedForBudget, bytes } = await writeWindows(snap, wdir(root), {
+      maxBytes: 300_000,
+    });
     expect(new Set(entries.map((e) => e.original)).size).toBe(1);
     expect(skippedForBudget).toHaveLength(1);
+    // a hard cap on bytes actually written, not an estimate
     expect(bytes).toBeLessThanOrEqual(300_000);
+    expect(
+      readdirSync(join(root, 'snap.windows'), { recursive: true, withFileTypes: true })
+        .filter((d) => d.isFile())
+        .reduce((n, d) => n + readFileSync(join(d.parentPath, d.name)).length, 0),
+    ).toBe(bytes);
+  });
+
+  it('spends a tight budget on files that already carry a coverage flag, smallest first after that', async () => {
+    const root = tmp();
+    const snap = join(root, 'snap');
+    mkdirSync(snap);
+    writeFileSync(join(snap, 'aaa-small.txt'), randomText(21, 120_000, false));
+    writeFileSync(join(snap, 'bbb-flagged.txt'), randomText(22, 250_000, false));
+    writeFileSync(join(snap, 'ccc-medium.txt'), randomText(23, 150_000, false));
+    const { entries, skippedForBudget } = await writeWindows(snap, wdir(root), {
+      maxBytes: 330_000,
+      priority: new Set(['bbb-flagged.txt']),
+    });
+    const done = new Set(entries.map((e) => e.original));
+    expect(done.has('bbb-flagged.txt')).toBe(true);
+    expect(skippedForBudget).toContain('ccc-medium.txt');
+  });
+
+  it('windows plain text files with archive-like names under neutral names, any size', async () => {
+    const root = tmp();
+    const snap = join(root, 'snap');
+    mkdirSync(snap);
+    writeFileSync(join(snap, 'config.gz.yaml'), 'key: value\n');
+    writeFileSync(join(snap, 'notes.tar'), 'plain text, not a tar\n');
+    writeFileSync(join(snap, 'plain.txt'), 'x');
+    const windowsDir = wdir(root);
+    const { entries } = await writeWindows(snap, windowsDir);
+    expect(new Set(entries.map((e) => e.original))).toEqual(
+      new Set(['config.gz.yaml', 'notes.tar']),
+    );
+    const files = readdirSync(windowsDir, { recursive: true, withFileTypes: true })
+      .filter((d) => d.isFile())
+      .map((d) => d.name)
+      .sort();
+    expect(files).toEqual(['config._gz.yaml', 'notes._tar']);
+    for (const f of files) expect(ARCHIVE_NAME.test(f)).toBe(false);
+    // the final extension survives, so a path rule such as \.ya?ml$ still applies
+    expect(files.some((f) => f.endsWith('.yaml'))).toBe(true);
+  });
+
+  it('never cuts a UTF-8 character in two, in a mid-line cut or a restart', async () => {
+    const root = tmp();
+    const snap = join(root, 'snap');
+    mkdirSync(snap);
+    // one long line of 2 and 3 byte characters, so every cut lands inside characters unless moved
+    writeFileSync(join(snap, 'u.txt'), 'é€'.repeat(120_000));
+    const windowsDir = wdir(root);
+    const { entries } = await writeWindows(snap, windowsDir);
+    expect(entries.length).toBeGreaterThan(3);
+    for (const e of entries) {
+      const text = readFileSync(join(windowsDir, e.name, 'u.txt'));
+      // a character split by a cut would decode to U+FFFD in a non-fatal decode
+      expect(new TextDecoder('utf-8', { fatal: true }).decode(text).includes('�')).toBe(false);
+    }
+  });
+
+  it('reports a file it cannot write windows for and carries on with the others', async (ctx) => {
+    const root = tmp();
+    const snap = join(root, 'snap');
+    mkdirSync(snap);
+    // A 255 character name (the usual limit) that gitleaks reads as an archive: its neutral window
+    // name gains a character and no longer fits, so writing the window fails.
+    const long = 'a'.repeat(248) + '.gz.txt';
+    try {
+      writeFileSync(join(snap, long), randomText(31, 120_000, false));
+    } catch {
+      ctx.skip(); // this filesystem cannot hold a 255 character name
+      return;
+    }
+    writeFileSync(join(snap, 'ok.txt'), randomText(32, 120_000, false));
+    const { entries, failed } = await writeWindows(snap, wdir(root));
+    expect(new Set(entries.map((e) => e.original))).toEqual(new Set(['ok.txt']));
+    expect(failed.map((f) => f.original)).toEqual([long]);
   });
 
   it('creates nothing when there is nothing to window', async () => {
@@ -216,9 +300,9 @@ describe('writeWindows', () => {
     const snap = join(root, 'snap');
     mkdirSync(snap);
     writeFileSync(join(snap, 'small.txt'), 'x');
-    const { entries } = await writeWindows(snap, join(root, 'snap.windows'));
+    const { entries } = await writeWindows(snap, wdir(root));
     expect(entries).toEqual([]);
-    expect(existsSync(join(root, 'snap.windows'))).toBe(false);
+    expect(readdirSync(join(root, 'snap.windows'))).toEqual([]);
   });
 
   it('maps a window path back through its generated prefix, ignoring what follows it', () => {
@@ -300,6 +384,6 @@ describe('remapWindowReport', () => {
     expect(remapWindowReport(doc, [w1, w2])).toBe(2);
     expect(
       doc.runs[0]?.results.map((r) => r.locations[0]?.physicalLocation.region.startColumn),
-    ).toEqual([60_000, 80_000]);
+    ).toEqual([59_999, 79_999]);
   });
 });

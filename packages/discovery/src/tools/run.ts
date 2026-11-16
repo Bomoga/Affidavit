@@ -1,4 +1,4 @@
-import { lstat, readFile, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import type { ToolRunnerPort } from '@affidavit/contracts';
 import { buildInvocation, type ToolInvocation, type ToolRunOptions } from './invocations.js';
@@ -228,6 +228,8 @@ const KIND_TEXT: Record<Exclude<Unscannable['kind'], 'binary-media'>, string> = 
     'is not plain text (control characters at the start, or NUL bytes or invalid UTF-8 anywhere, as in UTF-16 text), so gitleaks may skip it',
   'chunk-split-risk':
     'is over 100 KB with a 25 KB stretch that has no blank line, so gitleaks may cut a chunk through a secret and miss it',
+  'archive-name-mismatch':
+    'has a name gitleaks reads as an archive (a .gz, .zip, .tar or similar, anywhere in the name) but is not one, so gitleaks drops it without scanning; it is scanned in a window under a neutral name instead',
   'multiline-split-risk':
     'holds a private-key block with a blank line inside it, in a file large enough to be cut into chunks, so gitleaks may split the key and miss it',
   unreadable:
@@ -239,6 +241,7 @@ const KIND_ORDER = [
   'non-text-content',
   'unreadable',
   'skipped-file-type',
+  'archive-name-mismatch',
   'chunk-split-risk',
   'multiline-split-risk',
 ] as const;
@@ -477,9 +480,30 @@ export async function runTool(
     }
     // Windows pass: every plain text file over 100,000 bytes again, in overlapping windows under
     // 100,000 bytes, so gitleaks reads each window in one piece and cannot cut through a secret.
-    const windowsDir = `${resolve(snapshot.dir)}.windows`;
+    // A directory unique to this call: it is created here and only what this call created is
+    // removed, so two runs on one copy (or a leftover from another run) never delete each
+    // other's windows.
+    const windowsDir = await mkdtemp(`${resolve(snapshot.dir)}.windows-`);
     try {
-      const win = await writeWindows(snapshot.dir, windowsDir, maxWindowBytes);
+      // files that already carry a coverage flag are windowed first if the budget is tight
+      const priority = new Set(
+        unscanned
+          .filter((f) =>
+            ['chunk-split-risk', 'multiline-split-risk', 'archive-name-mismatch'].includes(f.kind),
+          )
+          .map((f) => f.path),
+      );
+      const win = await writeWindows(snapshot.dir, windowsDir, {
+        maxBytes: maxWindowBytes,
+        priority,
+      });
+      for (const f of win.failed) {
+        notifications.push({
+          level: 'warning',
+          id: 'window-skipped',
+          message: `/src/${f.original} could not be windowed (${f.why}), so a secret across a gitleaks chunk cut in it may be missed`,
+        });
+      }
       for (const f of win.skippedForBudget) {
         notifications.push({
           level: 'warning',
@@ -524,8 +548,8 @@ export async function runTool(
         windowedFiles = [...new Set(win.entries.map((e) => `/src/${e.original}`))];
       }
     } finally {
-      // The windows are scratch data and can be large. Remove them even on failure so a retry does
-      // not trip over WindowsDirNotFreshError.
+      // The windows are scratch data and can be large. Remove them, on success or failure. This
+      // is the unique directory created above, never a path another run could own.
       await rm(windowsDir, { recursive: true, force: true });
     }
     const split = coverageSplit(unscanned.sort((a, b) => a.path.localeCompare(b.path)));

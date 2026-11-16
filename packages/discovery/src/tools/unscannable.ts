@@ -180,6 +180,11 @@ const SNIFF_BYTES = 100_000;
  * - `binary-header-mismatch`: a known signature (skipped type or media) on a file whose extension
  *   does not agree, for example a `.js` or `.txt` file that starts with `%PDF` or `GIF89a`. This
  *   is the hiding technique.
+ * - `archive-name-mismatch`: a file whose NAME makes gitleaks treat it as an archive but whose
+ *   content carries no known signature at all (plain text called `a.gz`, `config.zip.env`,
+ *   `notes.tar.txt`). gitleaks picks the archive format from the name, fails to extract plain
+ *   text, and drops the file with exit 0, in every pass. The matching rule was probed on the
+ *   pinned image (see ARCHIVE_NAME). The windows pass scans such files under a neutral name.
  * - `non-text-content`: no known signature, but the file is not plain text: control characters at
  *   the start, or NUL bytes or invalid UTF-8 anywhere (UTF-16 text, or text with binary bytes
  *   appended).
@@ -205,6 +210,7 @@ export type UnscannableKind =
   | 'binary-media'
   | 'skipped-file-type'
   | 'binary-header-mismatch'
+  | 'archive-name-mismatch'
   | 'non-text-content'
   | 'chunk-split-risk'
   | 'multiline-split-risk'
@@ -230,6 +236,31 @@ function hasOddControl(head: Uint8Array): boolean {
 }
 
 /**
+ * File names that make gitleaks 8.30.1 try to extract the file as an archive. Derived by probing
+ * the pinned image on a Linux filesystem with plain text under 500 names (every extension in a
+ * broad list, in lower, upper and capitalised case, with and without a trailing extension or
+ * suffix); this rule predicts all of them. It matches on the file's own name, not on directory
+ * names, in any case, and it is a PREFIX match: `.gz` also matches `.gzx` and `.gzip`.
+ *   - `.gz .zip .tar .bz2 .xz .zst .lz4 .br .sz .7z .rar .zz` anywhere in the name, followed by
+ *     anything (so `a.zip.js`, `a.tar.foo`, `a.zipx`, `a.zstd` all match);
+ *   - `.lz` and `.mz` only as the last extension.
+ * Not matched: `.tgz .tbz2 .txz .tzst .jar .war .Z .lzma .cpio .lzip .rpm .deb .cab .iso .bz`
+ * and `.txt`, `.js`, `.env` and the like.
+ */
+export const ARCHIVE_NAME = /\.(?:gz|zip|tar|bz2|xz|zst|lz4|br|sz|7z|rar|zz)|\.(?:lz|mz)$/i;
+
+/**
+ * Renames the archive tokens in a file name so gitleaks no longer treats it as an archive, while
+ * keeping its final extension (so path rules such as `\.ya?ml$` still apply): `a.gz.yaml` becomes
+ * `a._gz.yaml`. Used for windows of such files.
+ */
+export function neutralArchiveName(name: string): string {
+  return name
+    .replace(/\.(?=(?:gz|zip|tar|bz2|xz|zst|lz4|br|sz|7z|rar|zz))/gi, '._')
+    .replace(/\.(?=(?:lz|mz)$)/i, '._');
+}
+
+/**
  * Classifies a file from its extension and its first bytes (the sniff window), or returns
  * undefined if the window looks like plain text. NUL bytes and invalid UTF-8 later in the file are
  * found by the streaming scan in findGitleaksUnscannable.
@@ -237,6 +268,8 @@ function hasOddControl(head: Uint8Array): boolean {
 export function classifyHead(fileName: string, head: Uint8Array): UnscannableKind | undefined {
   const ext = extname(fileName).slice(1).toLowerCase();
   const sig = SIGS.find((x) => matches(head, x));
+  // A name gitleaks reads as an archive, with no signature to back it: the file is dropped.
+  if (sig === undefined && ARCHIVE_NAME.test(fileName)) return 'archive-name-mismatch';
   if (sig) {
     if (!sig.exts.includes(ext)) return 'binary-header-mismatch';
     return isMedia(sig) ? 'binary-media' : 'skipped-file-type';
@@ -306,9 +339,9 @@ export class ChunkRisk {
   }
 }
 
-const PK_BEGIN = /-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY/gi;
+const PK_BEGIN = /-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----/gi;
 const PK_END = /KEY(?: BLOCK)?-----/gi;
-/** Longest begin marker is 11 + 100 + 11 characters; keep a margin so no marker is cut in two. */
+/** Longest begin marker is 11 + 100 + 17 characters; keep a margin so no marker is cut in two. */
 const PK_CARRY = 160;
 const PK_MIN_BODY = 64;
 const HAS_NON_WS = /[^ \t\r]/;
