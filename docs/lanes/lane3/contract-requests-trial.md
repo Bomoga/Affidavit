@@ -20,14 +20,20 @@ Proposals only. Nothing here changes `packages/contracts`; per implementation-pl
 - **Proposal (additive):** a `halted` `TrialEventType` with payload `{ reason: 'kill-switch' }`.
 - **Meanwhile:** `Orchestrator.run` returns `{ status: 'halted', stage, reason: 'kill-switch' }`, emits nothing for the halt, and leaves the case at its current stage so running it again resumes it.
 
-## CR-T5: name a schema-rejected agent output (L3-02)
-
-- **Need:** `exhibit-inadmissible` requires an `exhibitId`, but agent output that fails schema never became an exhibit, so nothing has assigned it an id.
-- **Proposal (additive):** document a minting rule for rejected submissions in the contracts changelog, or make `exhibitId` optional when `rejectedBy` is `schema`.
-- **Meanwhile:** the orchestrator names it `exhibit-<kind>-rejected-<first 24 hex of sha256(canonical JSON of {caseId, stage, attempt, submission})>`, so the id is stable for the same output and never collides with a Judge-minted id.
-
 ## CR-T4: escalation from intake, map, and arraign (L3-01)
 
 - **Need:** `STAGE_TRANSITIONS` allows `escalated` only from defense onward.
 - **Proposal:** none for now. These stages are deterministic and never call a model, so they have no budget to exhaust and no witness to fail. Recorded so the decision is explicit.
 - **Meanwhile:** a handler in those stages that returns an escalation gets `EscalationNotAllowedError`; the case stays at its stage and the job fails loudly. `runAgent` refuses to call a model from those stages.
+
+## CR-T5: name a schema-rejected agent output (L3-02)
+
+- **Need:** `exhibit-inadmissible` requires an `exhibitId`, but agent output that fails schema never became an exhibit, so nothing has assigned it an id.
+- **Proposal (additive):** document a minting rule for rejected submissions in the contracts changelog, or make `exhibitId` optional when `rejectedBy` is `schema`.
+- **Meanwhile:** the orchestrator names it `exhibit-<kind>-rejected-<first 24 hex of sha256(canonical JSON of {caseId, stage, attempt, submission})>`, so the id is stable for the same output and never collides with a Judge-minted id. A Remedy diff that cannot be read as a patch is named the same way.
+
+## CR-T6: a rule for a patch that does not flip the family or leaves the rescan dirty (L3-05)
+
+- **Need:** `AdmissibilityRule` has `literal-only-patch`, `diff-too-large`, `suite-fails` and `counterexample-survives`, but nothing for a `VerifyResult` with `familyFlipped: false` or `rescanClean: false` and no `rejectedBy`.
+- **Proposal (additive):** `family-not-flipped` and `rescan-not-clean` appended to `AdmissibilityRule`, or a documented guarantee that `verifyPatch` always sets `rejectedBy` when it does not accept.
+- **Meanwhile:** Remedy records `exhibit-inadmissible` only when a rule applies (the Judge's own, or `suite-fails` or `counterexample-survives` derived from the flags). Otherwise it records no rule, keeps the full `VerifyResult` in the workspace, and the patch is not accepted. The Judge's acceptance itself is not in the event stream until CR-1 in `contract-requests.md` (a `verify-result` event) lands.

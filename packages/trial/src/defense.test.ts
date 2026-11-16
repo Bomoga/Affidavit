@@ -289,6 +289,7 @@ describe('Defense', () => {
         judge: new FakeJudge({ witnessResults: {} }),
         render: renderPrompt,
         config: cfg,
+        workspace: new InMemoryWorkspace(),
       });
     expect(mk({ ...config, second: { ...config.second, model: 'model-a' } })).toThrow(
       /different model/,

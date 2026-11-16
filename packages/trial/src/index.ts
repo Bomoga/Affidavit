@@ -41,4 +41,8 @@ export type {
 } from './defense.js';
 export { buildWitness, variantsFor, witnessExhibitId, witnessSha256 } from './witness.js';
 export { InMemoryWorkspace } from './workspace.js';
-export type { AdmittedWitness, TrialWorkspace } from './workspace.js';
+export type { AdmittedWitness, PatchOutcome, TrialWorkspace } from './workspace.js';
+export { createRemedyHandler } from './remedy.js';
+export type { RemedyConfig, RemedyDeps } from './remedy.js';
+export { buildPatchExhibit, diffStats, isAccepted, rejectionRule } from './patch.js';
+export type { DiffStats } from './patch.js';

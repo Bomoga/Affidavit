@@ -38,7 +38,7 @@ export interface DefenseDeps {
   render: PromptRenderer;
   config: DefenseConfig;
   /** Where an admitted witness is handed to later stages. */
-  workspace?: TrialWorkspace;
+  workspace: TrialWorkspace;
 }
 
 interface AttemptOutcome {
@@ -170,8 +170,8 @@ async function attempt(
     }
 
     if (admits(caseFile, result)) {
-      await deps.workspace?.saveWitness(ctx.caseId, { witness, result });
-      await deps.workspace?.addExhibit(ctx.caseId, result.exhibitId);
+      await deps.workspace.saveWitness(ctx.caseId, { witness, result });
+      await deps.workspace.addExhibit(ctx.caseId, result.exhibitId);
       return { admitted: true, feedback };
     }
 

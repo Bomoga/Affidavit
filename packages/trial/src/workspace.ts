@@ -1,4 +1,11 @@
-import type { CaseId, ExhibitId, ExhibitResult, Witness } from '@affidavit/contracts';
+import type {
+  CaseId,
+  ExhibitId,
+  ExhibitResult,
+  PatchExhibit,
+  VerifyResult,
+  Witness,
+} from '@affidavit/contracts';
 
 /** A witness the Judge admitted, with the result that admitted it. */
 export interface AdmittedWitness {
@@ -16,11 +23,31 @@ export interface TrialWorkspace {
   /** Exhibit ids the Judge admitted or verified, in the order they were produced. */
   addExhibit(caseId: CaseId, exhibitId: ExhibitId): Promise<void>;
   getExhibits(caseId: CaseId): Promise<ExhibitId[]>;
+  savePatchOutcome(caseId: CaseId, outcome: PatchOutcome): Promise<void>;
+  getPatchOutcome(caseId: CaseId): Promise<PatchOutcome | undefined>;
+}
+
+/** What Remedy ended with. `accepted` is true only when the Judge's VerifyResult says so. */
+export interface PatchOutcome {
+  accepted: boolean;
+  patch?: PatchExhibit;
+  result?: VerifyResult;
+  reason: string;
 }
 
 export class InMemoryWorkspace implements TrialWorkspace {
   private readonly witnesses = new Map<CaseId, AdmittedWitness>();
   private readonly exhibits = new Map<CaseId, ExhibitId[]>();
+  private readonly patches = new Map<CaseId, PatchOutcome>();
+
+  savePatchOutcome(caseId: CaseId, outcome: PatchOutcome): Promise<void> {
+    this.patches.set(caseId, outcome);
+    return Promise.resolve();
+  }
+
+  getPatchOutcome(caseId: CaseId): Promise<PatchOutcome | undefined> {
+    return Promise.resolve(this.patches.get(caseId));
+  }
 
   saveWitness(caseId: CaseId, admitted: AdmittedWitness): Promise<void> {
     this.witnesses.set(caseId, admitted);
