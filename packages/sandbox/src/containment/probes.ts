@@ -196,7 +196,7 @@ export const OUTSIDE_SCRATCH = [
   '/home/node',
   '/root',
   '/usr/local/lib',
-  '/witness',
+  '/runner/witness',
 ];
 
 const writes: Probe = {
