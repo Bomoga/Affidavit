@@ -7,8 +7,10 @@ export class ChecksumMismatchError extends Error {
 export function fetchPinned(opts: {
   repoUrl: string;
   commit: string;
+  tree: string;
   archiveSha256: string;
   dest: string;
+  patches?: { path: string; sha256: string }[];
   allowLocal?: boolean;
 }): Promise<void>;
 

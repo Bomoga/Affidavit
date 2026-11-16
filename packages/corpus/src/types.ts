@@ -1,4 +1,4 @@
-import type { BootHints, RepoId, TargetRef, VulnClass } from '@affidavit/contracts';
+import type { BootHints, RepoId, RouteInfo, TargetRef, VulnClass } from '@affidavit/contracts';
 
 /**
  * Corpus-only types. Anything that crosses a lane boundary (BootHints, TargetRef, VulnClass,
@@ -23,12 +23,6 @@ export interface CodeLocation {
   range: LineRange;
 }
 
-export interface RouteRef {
-  method: string;
-  path: string;
-  middleware: string[];
-}
-
 /** Ground truth for one real issue, located in the pinned (vulnerable) tree. */
 export interface Label {
   id: string;
@@ -38,7 +32,7 @@ export interface Label {
   file: string;
   range: LineRange;
   source: CodeLocation;
-  route: RouteRef;
+  route: RouteInfo;
   reachability: 'reachable' | 'unreachable' | 'unknown';
   notes: string;
 }
@@ -74,7 +68,10 @@ export interface SafeVariant {
 export interface NegativeControl {
   id: string;
   appId: string;
-  target: TargetRef;
+  /** Never a known-safe tree: the control is the pinned commit plus patches, role below. */
+  role: 'negative-control';
+  /** The pinned commit the patches apply to (variant 'vulnerable'); not the differential safe tree. */
+  base: TargetRef;
   /** Applied in order on the pinned commit. */
   patches: PatchRef[];
   file: string;
@@ -95,6 +92,8 @@ export interface CorpusApp {
   bootHints: BootHints;
   bootNotes: string;
   labels: Label[];
+  /** Upstream issue families deliberately not labeled, with the reason. */
+  outOfScope: { issue: string; reason: string }[];
   safeVariants: SafeVariant[];
   negativeControls: NegativeControl[];
 }

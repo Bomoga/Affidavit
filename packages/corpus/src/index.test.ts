@@ -92,6 +92,39 @@ describe('@affidavit/corpus index', () => {
     expect(() => validateCorpus(badSum)).toThrow();
   });
 
+  it('labels log injection and records out-of-scope upstream issues', () => {
+    const l = nodegoat.labels.find((x) => x.id === 'nodegoat-loginj-login-username');
+    expect(l).toMatchObject({ cls: 'injection', cwe: 'CWE-117', file: 'app/routes/session.js' });
+    expect(nodegoat.outOfScope.length).toBeGreaterThan(0);
+  });
+
+  it('tags the negative control so it cannot be mistaken for the safe variant', () => {
+    for (const n of nodegoat.negativeControls) {
+      expect(n.role).toBe('negative-control');
+      expect(n.base.variant).toBe('vulnerable');
+      expect('target' in n).toBe(false);
+    }
+  });
+
+  it('runtime-validates labels, license notes on controls and patch containment', () => {
+    const badLabel = structuredClone(corpus);
+    badLabel.apps[0]!.labels[0]!.cwe = 'nope';
+    expect(() => validateCorpus(badLabel)).toThrow(/cwe/i);
+    const badRoute = structuredClone(corpus);
+    // @ts-expect-error deliberately malformed
+    badRoute.apps[0]!.labels[0]!.route = { method: 'GET' };
+    expect(() => validateCorpus(badRoute)).toThrow();
+    const badRule = structuredClone(corpus);
+    badRule.apps[0]!.negativeControls[0]!.expectedRuleIds = [];
+    expect(() => validateCorpus(badRule)).toThrow(/expectedRuleIds/);
+    const badLicense = structuredClone(corpus);
+    badLicense.apps[0]!.negativeControls[0]!.license.note = '';
+    expect(() => validateCorpus(badLicense)).toThrow(/license|note/i);
+    const escaping = structuredClone(nodegoat);
+    escaping.safeVariants[0]!.patches[0]!.path = '../../../outside.patch';
+    expect(() => patchPath(escaping, escaping.safeVariants[0]!.patches[0]!.id)).toThrow(/escapes/);
+  });
+
   it('writes no em dashes in user-facing copy', () => {
     const text = JSON.stringify(corpus);
     expect(text.includes('—')).toBe(false);

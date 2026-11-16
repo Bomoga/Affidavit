@@ -25,12 +25,24 @@
       "title": "NoSQL (MongoDB $where) injection via the threshold query parameter",
       "cwe": "CWE-943",
       "file": "app/data/allocations-dao.js",
-      "range": { "startLine": 77, "endLine": 79 },
+      "range": {
+        "startLine": 77,
+        "endLine": 79
+      },
       "source": {
         "file": "app/routes/allocations.js",
-        "range": { "startLine": 19, "endLine": 21 }
+        "range": {
+          "startLine": 19,
+          "endLine": 21
+        }
       },
-      "route": { "method": "GET", "path": "/allocations/:userId", "middleware": ["isLoggedIn"] },
+      "route": {
+        "method": "GET",
+        "path": "/allocations/:userId",
+        "handlerFile": "app/routes/allocations.js",
+        "middleware": ["isLoggedIn"],
+        "authRequired": true
+      },
       "reachability": "reachable",
       "notes": "This is the gate case. The sink is a MongoDB $where JavaScript expression built by template string from req.query.threshold. It is NoSQL injection, not SQL. fixtures/casefiles/nodegoat-sqli-001.json names it sql-concat and gives range 70-74, which does not match the pinned source (the commented-out upstream fix occupies lines 63-76)."
     },
@@ -40,14 +52,53 @@
       "title": "Server-side JavaScript injection via eval of request body fields",
       "cwe": "CWE-95",
       "file": "app/routes/contributions.js",
-      "range": { "startLine": 32, "endLine": 34 },
+      "range": {
+        "startLine": 32,
+        "endLine": 34
+      },
       "source": {
         "file": "app/routes/contributions.js",
-        "range": { "startLine": 32, "endLine": 34 }
+        "range": {
+          "startLine": 32,
+          "endLine": 34
+        }
       },
-      "route": { "method": "POST", "path": "/contributions", "middleware": ["isLoggedIn"] },
+      "route": {
+        "method": "POST",
+        "path": "/contributions",
+        "handlerFile": "app/routes/contributions.js",
+        "middleware": ["isLoggedIn"],
+        "authRequired": true
+      },
       "reachability": "reachable",
       "notes": "eval(req.body.preTax), afterTax and roth. Source and sink are the same lines."
+    },
+    {
+      "id": "nodegoat-loginj-login-username",
+      "cls": "injection",
+      "title": "Log injection: unauthenticated userName written to the log without CRLF encoding",
+      "cwe": "CWE-117",
+      "file": "app/routes/session.js",
+      "range": {
+        "startLine": 64,
+        "endLine": 64
+      },
+      "source": {
+        "file": "app/routes/session.js",
+        "range": {
+          "startLine": 54,
+          "endLine": 57
+        }
+      },
+      "route": {
+        "method": "POST",
+        "path": "/login",
+        "handlerFile": "app/routes/session.js",
+        "middleware": [],
+        "authRequired": false
+      },
+      "reachability": "reachable",
+      "notes": "console.log of req.body.userName for an unknown user lets an attacker forge log lines with CR or LF. Upstream tutorial item A1-3. The commented-out fix is at lines 66-80."
     },
     {
       "id": "nodegoat-idor-allocations-userid",
@@ -55,12 +106,24 @@
       "title": "Insecure direct object reference: allocations looked up by URL userId, not session",
       "cwe": "CWE-639",
       "file": "app/routes/allocations.js",
-      "range": { "startLine": 16, "endLine": 18 },
+      "range": {
+        "startLine": 16,
+        "endLine": 18
+      },
       "source": {
         "file": "app/routes/allocations.js",
-        "range": { "startLine": 16, "endLine": 18 }
+        "range": {
+          "startLine": 16,
+          "endLine": 18
+        }
       },
-      "route": { "method": "GET", "path": "/allocations/:userId", "middleware": ["isLoggedIn"] },
+      "route": {
+        "method": "GET",
+        "path": "/allocations/:userId",
+        "handlerFile": "app/routes/allocations.js",
+        "middleware": ["isLoggedIn"],
+        "authRequired": true
+      },
       "reachability": "reachable",
       "notes": "Any logged-in user can read another user's allocations by changing :userId. The upstream fix (commented out at lines 12-15) reads userId from req.session."
     },
@@ -70,9 +133,24 @@
       "title": "Missing function-level access control: benefits updated for any userId in the body",
       "cwe": "CWE-639",
       "file": "app/routes/benefits.js",
-      "range": { "startLine": 29, "endLine": 35 },
-      "source": { "file": "app/routes/benefits.js", "range": { "startLine": 30, "endLine": 33 } },
-      "route": { "method": "POST", "path": "/benefits", "middleware": ["isLoggedIn"] },
+      "range": {
+        "startLine": 29,
+        "endLine": 35
+      },
+      "source": {
+        "file": "app/routes/benefits.js",
+        "range": {
+          "startLine": 30,
+          "endLine": 33
+        }
+      },
+      "route": {
+        "method": "POST",
+        "path": "/benefits",
+        "handlerFile": "app/routes/benefits.js",
+        "middleware": ["isLoggedIn"],
+        "authRequired": true
+      },
       "reachability": "reachable",
       "notes": "Upstream classes this as A7 (missing function-level access control). It is labeled idor because the contracts VulnClass has only injection and idor and the exploit is a user-supplied userId with no ownership or role check (the isAdmin variant is commented out in app/routes/index.js lines 55-60)."
     }
@@ -100,7 +178,10 @@
       "id": "nodegoat-nc-constant-where",
       "patches": ["safe-allocations-where-int", "negative-control-constant-where"],
       "file": "app/data/allocations-dao.js",
-      "range": { "startLine": 114, "endLine": 118 },
+      "range": {
+        "startLine": 114,
+        "endLine": 118
+      },
       "expectedRuleIds": ["affidavit.injection.nosql-where-template"],
       "whyNotExploitable": "countHighStockAllocations builds a $where expression with a template string, which an injection rule matches, but the only interpolated value is the module constant HIGH_STOCK_PERCENT = 50. No request data reaches it and nothing in the app calls it, so no witness can make it pass. The patches apply in order: the safe variant first (so the tree has no live injection at the gate site), then the control. The rule id is the planned L1-04 rule name, not yet implemented.",
       "bootHints": {
@@ -112,7 +193,18 @@
         "healthTimeoutMs": 60000,
         "stubs": [],
         "env": {}
-      }
+      },
+      "role": "negative-control"
+    }
+  ],
+  "outOfScope": [
+    {
+      "issue": "Cross-site scripting, CSRF, weak session and cookie settings, weak password storage, open redirect and SSRF items from the NodeGoat tutorial",
+      "reason": "VulnClass in contracts v1.0 is injection or idor only, so these have no class to be labeled under in this phase. They are not claimed to be absent."
+    },
+    {
+      "issue": "Other handlers (profile, memos, research) beyond the sinks labeled here",
+      "reason": "Not selected for the first pair; add labels when a rule or witness needs them."
     }
   ]
 }

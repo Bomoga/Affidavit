@@ -4,7 +4,7 @@
   "commit": "c5cb68a7084e4ae7dcc60e6a98768720a81841e8",
   "tree": "839d7b6856ec6da992d649b2423d5f9fcefdcf1f",
   "archiveSha256": "e5660ba80b7851e34f58579ec7acf8343c76a9cbaeed98470fa28ffb362cb29b",
-  "archiveNote": "sha256 of the uncompressed tar from `git -c core.autocrlf=false -c core.eol=lf archive --format=tar <commit>`, pinned to LF so it does not depend on the machine git config",
+  "archiveNote": "sha256 of the uncompressed tar from `git -c core.autocrlf=false -c core.eol=lf archive --format=tar <commit>`, pinned to LF so it does not depend on the machine git config. The archive hash depends on tar output and attributes, so commit plus tree hash is the primary identity and the archive hash is a second check",
   "patches": {
     "safe-allocations-where-int": {
       "path": "patches/safe-allocations-where-int.patch",
