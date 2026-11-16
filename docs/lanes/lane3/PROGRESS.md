@@ -7,7 +7,7 @@ Contracts version in use: v1.0 is on `main` (Phase 0 merged, PR 11). Lane 3 code
 
 | ID | Status (todo, doing, done, blocked) | Branch or PR | Notes |
 | --- | --- | --- | --- |
-| L3-01 | done | lane3/L3-01-orchestrator (PR 5) | Built on interim types in packages/trial/src/interim; replace at P0-03 and P0-04. Graphile job wrapper deferred to apps/worker |
+| L3-01 | done | lane3/L3-01-orchestrator (PR 5) | On contracts v1.0 ports and `@affidavit/testing` fakes; interim types and local fakes deleted. Turn budget charged before each model call; exhaustion escalates with a contract `Escalation`; kill switch halts with reason `kill-switch`; every emitted event parses as `TrialEvent`. Graphile job wrapper deferred to apps/worker. Contract requests CR-T1 to CR-T4 in `contract-requests-trial.md` |
 | L3-02 | done | lane3/L3-02-safety-envelope (stacked on PR 5) | Tool allowlists and schema admission. Validator is injected until contracts land |
 | L3-03 | done | lane3/L3-03-prompts-package (PR 2) | Prompts, untrusted wrapper, append-only version history. `PromptId` and `Role` come from `@affidavit/contracts`; tests assert the id list matches and every `outputSchemaRef` is a `schemaRegistry` key. Prompts at 1.1.0 |
 | L3-04 | done | lane3/L3-04-defense (stacked on PR 6) | Renderer injected; real L1-07 planted-instruction case file still to run |
@@ -33,7 +33,10 @@ Contracts version in use: v1.0 is on `main` (Phase 0 merged, PR 11). Lane 3 code
 - 2026-11-03: The second Defense attempt is its own prompt id (`defense-second-attempt`) so it differs in text from the first, as F3 requires. The model difference is the orchestrator's job (L3-04).
 
 - 2026-11-03: Adrian approved interim local types for L3-01 so work is not idle while Phase 0 is pending. They live only in `packages/trial/src/interim` and `src/testing`, and are deleted when contracts v1.0 and `@affidavit/testing` land.
-- 2026-11-03: Orchestrator charges a worst-case reservation before each model call and settles to actual cost after. The real `CaseStore` port needs `chargeBudget` (returns a receipt), `settleCost`, and `nextSeq`. Kill switch escalates with reason `budget-exhausted`; `escalated` must be reachable from any non-terminal stage.
+- 2026-11-03: Orchestrator charges a worst-case reservation before each model call and settles to actual cost after. The real `CaseStore` port needs `chargeBudget` (returns a receipt), `settleCost`, and `nextSeq`. Kill switch escalates with reason `budget-exhausted`; `escalated` must be reachable from any non-terminal stage. (Superseded 2026-11-15, below.)
+- 2026-11-15: Migrated to contracts v1.0. v1.0 `CaseStore.chargeBudget` returns `BudgetState` and has no settle call, so the turn budget is charged up front and never refunded (CR-T1); `Verdict.cost` reports what calls actually cost.
+- 2026-11-15: A tripped kill switch is a halt, not an escalation and not a budget exhaustion. `run` returns `{ status: 'halted', reason: 'kill-switch' }` and the case stays at its stage so it can resume (CR-T3).
+- 2026-11-15: Intake, map, and arraign never call a model and never escalate; `STAGE_TRANSITIONS` has no route from them to `escalated`, so the orchestrator throws `EscalationNotAllowedError` and the case stays put (CR-T4).
 
 ## Metrics from real runs
 
