@@ -219,7 +219,7 @@ const KIND_TEXT: Record<Exclude<Unscannable['kind'], 'binary-media'>, string> = 
   'chunk-split-risk':
     'is over 100 KB with a 25 KB stretch that has no blank line, so gitleaks may cut a chunk through a secret and miss it',
   'multiline-split-risk':
-    'holds a -----BEGIN/-----END block (a PEM key) that spans a simulated gitleaks chunk cut, so gitleaks may split it and miss it',
+    'holds a private-key block with a blank line inside it, in a file large enough to be cut into chunks, so gitleaks may split the key and miss it',
   unreadable:
     'could not be read by the host user (mode or ownership), so the jailed gitleaks may not read it either',
 };

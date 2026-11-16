@@ -163,8 +163,8 @@ const MEDIA_EXTS = new Set([
 
 const isMedia = (sig: Sig): boolean => sig.exts.some((e) => MEDIA_EXTS.has(e));
 
-/** gitleaks looks at the first chunk (about 100 KB) to decide text or binary. */
-const SNIFF_BYTES = 102_400;
+/** gitleaks reads in chunks of defaultBufferSize, 100,000 bytes, and checks the first chunk. */
+const SNIFF_BYTES = 100_000;
 
 /**
  * - `binary-media`: an image, audio or video signature on a file whose extension agrees. gitleaks
@@ -183,14 +183,20 @@ const SNIFF_BYTES = 102_400;
  * - `non-text-content`: no known signature, but the file is not plain text: control characters at
  *   the start, or NUL bytes or invalid UTF-8 anywhere (UTF-16 text, or text with binary bytes
  *   appended).
- * - `chunk-split-risk`: a text file over 100 KB with a 25 KB stretch that has no blank line.
- *   gitleaks reads about 100 KB chunks, extends a chunk up to 25 KB looking for a blank line, and
- *   otherwise cuts at a fixed offset (about 125,000 bytes), so a secret that straddles the cut is
- *   missed. Conservative: the real cut points are not computed.
- * - `multiline-split-risk`: a `-----BEGIN` ... `-----END` block (a PEM key) that spans one of the
- *   cut points of a simulated gitleaks chunking: 100,000-byte chunks, extended to the first blank
- *   line within the next 25,000 bytes, else cut at 125,000 bytes. An approximation of gitleaks'
- *   behaviour as reported by review; the real cut points were not verified byte for byte.
+ * - `chunk-split-risk`: a text file over 100 KB with a 25 KB stretch that has no blank line. A
+ *   blank line is an empty line or one holding only spaces, tabs or a carriage return. gitleaks
+ *   reads 100,000-byte chunks and looks up to 25,000 bytes further for a blank line to cut at;
+ *   if there is none the cut is at a hard limit, and every possible hard cut lies inside such a
+ *   stretch. A secret that straddles the cut is missed. gitleaks also repeats its binary check on
+ *   each chunk until it has seen a newline, which the same long no-newline stretch covers.
+ * - `multiline-split-risk`: a file over 100,000 bytes holding a private-key block (begin marker
+ *   `-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY`, close `KEY( BLOCK)?-----`, both case-insensitive,
+ *   as in gitleaks' private-key rule) with a blank-ish line `\n[ \t\r]*\n` inside it. Real cuts
+ *   are either at a blank-line boundary or at the hard limit, and the hard limit is covered by
+ *   `chunk-split-risk`. So any file that is large enough to be cut and has a blank line inside a
+ *   key block is flagged, wherever the cuts really fall. It fails safe: it flags keys that no cut
+ *   would split. Probed against the pinned gitleaks: a key with a blank line inside is missed at
+ *   some offsets and found at others; a key without one is always found.
  * - `unreadable`: could not be opened by the host user, or a directory that could not be listed. This is judged by the uid discovery runs
  *   as, so it is unreliable if the worker runs as root (root can open mode 000 files that the
  *   unprivileged jail cannot).
@@ -252,16 +258,15 @@ export function classifyHead(fileName: string, head: Uint8Array): UnscannableKin
 export const CHUNK_RISK_MIN_FILE = 100_000;
 export const CHUNK_RISK_RUN = 25_000;
 const CHUNK_SIZE = 100_000;
-const CHUNK_PEEK = 25_000;
 
 /**
  * Streaming detector for a long stretch of text with no blank line. A blank line is an empty line
- * or one holding only a carriage return. Works on newline positions (indexOf), not byte by byte.
+ * or one holding only spaces, tabs or carriage returns. Works on newline positions (indexOf).
  */
 export class ChunkRisk {
   private run = 0; // bytes since the last blank line, not counting the current partial line
   private segLen = 0; // bytes of the current line so far
-  private segFirst = -1;
+  private segWs = true; // the current line so far holds only spaces, tabs and carriage returns
   private total = 0;
   private longest = 0;
 
@@ -272,15 +277,18 @@ export class ChunkRisk {
       const nl = buf.indexOf(0x0a, pos);
       const end = nl < 0 ? buf.length : nl;
       if (end > pos) {
-        if (this.segLen === 0) this.segFirst = buf[pos] ?? -1;
         this.segLen += end - pos;
+        for (let i = pos; this.segWs && i < end; i++) {
+          const b = buf[i];
+          if (b !== 0x20 && b !== 0x09 && b !== 0x0d) this.segWs = false;
+        }
       }
       if (nl < 0) break;
-      const blank = this.segLen === 0 || (this.segLen === 1 && this.segFirst === 0x0d);
+      const blank = this.segWs;
       if (blank) this.run = 0;
       else this.run += this.segLen + 1;
       this.segLen = 0;
-      this.segFirst = -1;
+      this.segWs = true;
       if (this.run > this.longest) this.longest = this.run;
       pos = nl + 1;
     }
@@ -294,83 +302,108 @@ export class ChunkRisk {
   }
 }
 
-const BEGIN = Buffer.from('-----BEGIN ');
-const END = Buffer.from('-----END ');
+const PK_BEGIN = /-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY/gi;
+const PK_END = /KEY(?: BLOCK)?-----/gi;
+/** Longest begin marker is 11 + 100 + 11 characters; keep a margin so no marker is cut in two. */
+const PK_CARRY = 160;
+const HAS_NON_WS = /[^ \t\r]/;
 
 /**
- * Simulates how gitleaks cuts a file into chunks (as described in review): a chunk is 100,000
- * bytes, extended to the end of the first blank line within the next 25,000 bytes, otherwise cut
- * after 125,000 bytes. Records every PEM-style `-----BEGIN` .. `-----END` block and reports
- * whether a cut falls inside one, which would split a multi-line secret. Streaming: feed
- * successive buffers.
+ * Streaming detector for a private-key block with a blank-ish line inside it. O(1) state: whether
+ * a block is open, where its begin marker ended, whether a blank line was seen in it, and the tail
+ * of the previous buffer so a marker split across two reads is still found.
  */
-export class CutSimulator {
+export class PrivateKeyScan {
   private abs = 0; // absolute offset of the end of the data fed so far
-  private carry: Buffer = Buffer.alloc(0);
-  private chunkStart = 0;
-  private open = -1; // absolute offset of an unclosed BEGIN marker
-  readonly cuts: number[] = [];
-  readonly blocks: [number, number][] = [];
+  private carry = ''; // last PK_CARRY characters of the previous buffer
+  private open = false;
+  private beginEnd = 0; // absolute end of the open block's begin marker
+  private blank = false; // a blank-ish line was seen inside the open block
+  private flagged = false;
+  private total = 0;
+  // line state, carried across buffers: does the current line so far hold only whitespace, and did
+  // it start right after a newline (a blank line needs a newline on both sides)?
+  private lineWs = true;
+  private afterNewline = false;
 
   feed(buf: Uint8Array): void {
-    const data = Buffer.concat([this.carry, buf]);
+    const text = Buffer.from(buf.buffer, buf.byteOffset, buf.length).toString('latin1');
+    const joined = this.carry + text;
     const base = this.abs - this.carry.length;
-    const endAbs = this.abs + buf.length;
+    this.total += buf.length;
 
-    // anchors: only matches that end in the new bytes (earlier ones were seen last time)
-    const events: { at: number; begin: boolean }[] = [];
-    for (const [needle, begin] of [
-      [BEGIN, true],
-      [END, false],
-    ] as const) {
-      let i = data.indexOf(needle);
-      while (i >= 0) {
-        if (i + needle.length > this.carry.length) events.push({ at: base + i, begin });
-        i = data.indexOf(needle, i + 1);
-      }
+    // 1. markers, only those that end in the new text (earlier ones were handled last time)
+    const events: { at: number; kind: 'begin' | 'end' | 'blank'; end: number }[] = [];
+    for (const m of joined.matchAll(PK_BEGIN)) {
+      const end = m.index + m[0].length;
+      if (end > this.carry.length)
+        events.push({ at: base + m.index, kind: 'begin', end: base + end });
     }
+    for (const m of joined.matchAll(PK_END)) {
+      const end = m.index + m[0].length;
+      if (end > this.carry.length)
+        events.push({ at: base + m.index, kind: 'end', end: base + end });
+    }
+
+    // 2. blank-ish lines, from a per-line state machine over the new text only
+    let pos = 0;
+    while (pos <= text.length) {
+      const nl = text.indexOf('\n', pos);
+      const end = nl < 0 ? text.length : nl;
+      if (this.lineWs && end > pos && HAS_NON_WS.test(text.slice(pos, end))) this.lineWs = false;
+      if (nl < 0) break;
+      if (this.afterNewline && this.lineWs) {
+        events.push({ at: this.abs + nl, kind: 'blank', end: this.abs + nl });
+      }
+      this.afterNewline = true;
+      this.lineWs = true;
+      pos = nl + 1;
+    }
+
     events.sort((x, y) => x.at - y.at);
     for (const e of events) {
-      if (e.begin) {
-        if (this.open < 0) this.open = e.at;
-      } else if (this.open >= 0) {
-        this.blocks.push([this.open, e.at + END.length]);
-        this.open = -1;
+      if (e.kind === 'begin') {
+        if (!this.open) {
+          this.open = true;
+          this.beginEnd = e.end;
+          this.blank = false;
+        }
+      } else if (e.kind === 'blank') {
+        if (this.open) this.blank = true;
+      } else if (this.open && e.at >= this.beginEnd) {
+        if (this.blank) this.flagged = true;
+        this.open = false;
       }
     }
 
-    // cut points
-    for (;;) {
-      const winStart = this.chunkStart + CHUNK_SIZE;
-      const winEnd = winStart + CHUNK_PEEK;
-      if (winStart >= endAbs) break;
-      const lo = Math.max(winStart - base, 0);
-      const hi = Math.min(winEnd - base, data.length);
-      let found = -1;
-      for (const needle of ['\n\n', '\n\r\n']) {
-        const i = data.subarray(0, hi).indexOf(needle, lo);
-        if (i >= 0 && (found < 0 || i + needle.length < found)) found = i + needle.length;
-      }
-      if (found >= 0) {
-        this.chunkStart = base + found;
-        this.cuts.push(this.chunkStart);
-      } else if (winEnd <= endAbs) {
-        this.chunkStart = winEnd;
-        this.cuts.push(winEnd);
-      } else break; // the window is not fully read yet
-    }
-
-    this.abs = endAbs;
-    this.carry = Buffer.from(data.subarray(Math.max(0, data.length - 16)));
+    this.abs += buf.length;
+    this.carry = joined.slice(Math.max(0, joined.length - PK_CARRY));
   }
 
-  /** True if a simulated cut falls inside a BEGIN..END block. */
-  get splitsBlock(): boolean {
-    return this.blocks.some(([b, e]) => this.cuts.some((c) => c > b && c < e));
+  /** True for a file over 100,000 bytes with a blank-ish line inside a private-key block. */
+  get risky(): boolean {
+    return this.total > CHUNK_SIZE && this.flagged;
   }
 }
 
 const READ_BYTES = 64 * 1024;
+
+/** Feeds the rest of a media file to the private-key scan. Bounded memory, the worker's buffer. */
+async function mediaKeyRisk(
+  fh: Awaited<ReturnType<typeof open>>,
+  buf: Buffer,
+  from: number,
+  keys: PrivateKeyScan,
+): Promise<boolean> {
+  let pos = from;
+  for (;;) {
+    const { bytesRead } = await fh.read(buf, 0, READ_BYTES, pos);
+    if (bytesRead === 0) break;
+    keys.feed(buf.subarray(0, bytesRead));
+    pos += bytesRead;
+  }
+  return keys.risky;
+}
 
 /**
  * Streams the file once (bounded memory, using the worker's own buffer). Returns every kind that
@@ -386,7 +419,7 @@ async function inspectFile(full: string, name: string, buf: Buffer): Promise<Uns
   try {
     const decoder = new TextDecoder('utf-8', { fatal: true });
     const risk = new ChunkRisk();
-    const cuts = new CutSimulator();
+    const keys = new PrivateKeyScan();
     let pos = 0;
     let first = true;
     for (;;) {
@@ -397,6 +430,14 @@ async function inspectFile(full: string, name: string, buf: Buffer): Promise<Uns
       if (first) {
         const head = classifyHead(name, chunk);
         // A known signature or a non-text start decides it; no need to read the rest.
+        if (head === 'binary-media') {
+          // Real media has NUL bytes and long runs without blank lines, so the text and chunk
+          // checks do not apply, but a private key inside it is still checked.
+          keys.feed(chunk);
+          return (await mediaKeyRisk(fh, buf, pos + chunk.length, keys))
+            ? ['binary-media', 'multiline-split-risk']
+            : ['binary-media'];
+        }
         if (head) return [head];
         first = false;
       }
@@ -409,7 +450,7 @@ async function inspectFile(full: string, name: string, buf: Buffer): Promise<Uns
         return ['non-text-content'];
       }
       risk.feed(chunk);
-      cuts.feed(chunk);
+      keys.feed(chunk);
     }
     try {
       decoder.decode();
@@ -418,7 +459,7 @@ async function inspectFile(full: string, name: string, buf: Buffer): Promise<Uns
     }
     const kinds: UnscannableKind[] = [];
     if (risk.risky) kinds.push('chunk-split-risk');
-    if (cuts.splitsBlock) kinds.push('multiline-split-risk');
+    if (keys.risky) kinds.push('multiline-split-risk');
     return kinds;
   } finally {
     await fh.close();
@@ -488,7 +529,9 @@ export async function findGitleaksUnscannable(
       }
     }
   };
-  const workers = Math.max(1, Math.floor(options.concurrency ?? 8));
+  const asked = options.concurrency;
+  const workers =
+    typeof asked === 'number' && Number.isFinite(asked) ? Math.max(1, Math.floor(asked)) : 8;
   await Promise.all(Array.from({ length: workers }, () => worker()));
   if (hasFailed) throw failed;
   return found.sort((a, b) => a.path.localeCompare(b.path) || a.kind.localeCompare(b.kind));

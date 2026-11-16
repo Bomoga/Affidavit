@@ -635,27 +635,88 @@ describe.skipIf(!enabled)('tool images, offline', () => {
     }
   }, 240_000);
 
-  it('an encrypted PEM key that straddles a blank-line cut is flagged', async () => {
-    const pem =
-      '-----BEGIN ENCRYPTED PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0123456789ABCDEF\n\n' +
-      `${'A'.repeat(64)}\n`.repeat(5) +
-      '-----END ENCRYPTED PRIVATE KEY-----\n';
-    const line = `${'x'.repeat(79)}\n`;
-    const filler = (n: number) => line.repeat(Math.floor(n / 80)) + 'y'.repeat(n % 80);
+  it('flags every private key that the pinned gitleaks really misses because of a blank line inside', async () => {
+    // Same layout as the probe that found the misses: 300 KB of JS with a blank line every ~1.6 KB
+    // and a key with an extra line inside. gitleaks misses these keys at offsets 105,000 and
+    // 186,000 (and others), and finds the same key without the extra line.
+    const body = Array.from({ length: 4 }, (_, i) =>
+      Buffer.from(`affidavit-fake-key-body-1-${i}-`.repeat(3)).toString('base64').slice(0, 64),
+    );
+    const key = (inner: string | null, begin: string, end: string) =>
+      [begin, body[0], body[1], ...(inner === null ? [] : [inner]), body[2], body[3], end].join(
+        '\n',
+      ) + '\n';
+    const filler = (bytes: number) => {
+      let out = '';
+      let n = 0;
+      while (out.length < bytes) {
+        out += `var v${n} = '${'x'.repeat(60)}';\n`;
+        if (++n % 20 === 0) out += '\n';
+      }
+      return `${out.slice(0, bytes - 1)}\n`;
+    };
+    const RSA = ['-----BEGIN RSA PRIVATE KEY-----', '-----END RSA PRIVATE KEY-----'] as const;
+    const variants: Record<string, string> = {
+      empty: key('', ...RSA),
+      space: key(' ', ...RSA),
+      tabs: key('\t \t', ...RSA),
+      lower: key('', '-----begin rsa private key-----', '-----end rsa private key-----'),
+      under: key('', '-----BEGIN_RSA_PRIVATE KEY-----', '-----END_RSA_PRIVATE KEY-----'),
+    };
+    const files: string[] = [];
     const s = scenario('repo', (src) => {
-      writeFileSync(join(src, 'src', 'key.pem.txt'), filler(99_950) + pem + filler(40_000));
+      mkdirSync(join(src, 'k'));
+      for (const [name, k] of Object.entries(variants)) {
+        for (const off of [105_000, 186_000]) {
+          const f = `k_${name}_${off}.js`;
+          files.push(f);
+          writeFileSync(join(src, 'k', f), filler(off) + k + filler(300_000 - off - k.length));
+        }
+      }
+      // control: the same key without the extra line is found by gitleaks and not flagged
+      writeFileSync(
+        join(src, 'k', 'k_control.js'),
+        filler(105_000) + key(null, ...RSA) + filler(300_000 - 105_000 - key(null, ...RSA).length),
+      );
     });
     const snap = await quarantineSnapshot(s.src);
     const { sourceDir: _ignored, ...rest } = s.options('gitleaks');
     void _ignored;
     const res = await runTool(s.runner, manifest, 'gitleaks', { ...rest, snapshot: snap });
+    const keyFindings = JSON.parse(
+      readFileSync(join(s.out('gitleaks'), 'gitleaks.sarif'), 'utf8'),
+    ) as {
+      runs: {
+        results?: {
+          ruleId?: string;
+          locations?: { physicalLocation?: { artifactLocation?: { uri?: string } } }[];
+        }[];
+      }[];
+    };
+    const found = new Set(
+      keyFindings.runs
+        .flatMap((r) => r.results ?? [])
+        .filter((x) => x.ruleId === 'private-key')
+        .map((x) => x.locations?.[0]?.physicalLocation?.artifactLocation?.uri ?? ''),
+    );
+    const flagged = new Set(
+      res.notifications
+        .filter((n) => n.id === 'multiline-split-risk')
+        .map((n) => n.message.split(' ')[0]),
+    );
+    for (const f of files) {
+      // the pinned gitleaks really misses this key ...
+      expect(
+        [...found].some((u) => u.endsWith(`k/${f}`)),
+        `gitleaks should miss ${f}`,
+      ).toBe(false);
+      // ... and discovery says so
+      expect(flagged.has(`/src/k/${f}`), `discovery should flag ${f}`).toBe(true);
+    }
+    expect([...found].some((u) => u.endsWith('k/k_control.js'))).toBe(true);
+    expect(flagged.has('/src/k/k_control.js')).toBe(false);
     expect(res.partial).toBe(true);
-    expect(
-      res.notifications.some(
-        (n) => n.id === 'multiline-split-risk' && n.message.includes('key.pem.txt'),
-      ),
-    ).toBe(true);
-  }, 240_000);
+  }, 300_000);
 
   it('flags a secret that straddles gitleaks chunk boundary, in dense lines and in one long line', async () => {
     const secret = 'AFFIDAVIT_FAKE_KEY_0123456789ABCDEF';
