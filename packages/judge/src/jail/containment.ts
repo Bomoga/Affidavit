@@ -9,11 +9,19 @@ import { DEFAULT_POLICY } from '../rules.js';
 import { runWitnessJail, type WitnessJailOptions } from './jail.js';
 
 /**
- * A probe is top-level code with no default export, which the harness rejects at once (it fails
- * `completes`). Adding a default export that passes makes it a valid one-parameter witness, so
- * the probe's own misbehaviour (for example a timer that never stops) is what the jail sees.
+ * A probe is top-level code that reads its arguments from `process.argv[2]`. As a witness it gets
+ * those arguments set first, and one passing `witness()` call at the end so the runner sees a
+ * valid one-parameter family. Imports are hoisted in ES modules, so the appended import is legal.
+ * The probe's own misbehaviour (for example a timer that never stops) is what the jail sees.
  */
-export const asWitness = (probe: string): string => `${probe}\nexport default () => true;\n`;
+export const asWitness = (probe: string, args: unknown): string =>
+  [
+    `process.argv[2] = ${JSON.stringify(JSON.stringify(args))};`,
+    probe,
+    `import { witness as affidavitWitness } from '@affidavit/witness';`,
+    'affidavitWitness(() => {});',
+    '',
+  ].join('\n');
 
 /**
  * Runs each containment probe (L2-01) as a witness: the probe is the witness module, executed by
@@ -29,9 +37,8 @@ export class WitnessJailRunner implements JailRunner {
     try {
       const { jailed } = await runWitnessJail(
         {
-          source: asWitness(req.script),
-          input: { schemaVersion: 1, params: [], target: null },
-          argv: JSON.stringify(req.args),
+          source: asWitness(req.script, req.args),
+          input: { schemaVersion: 1, params: [], target: null, testTimeoutMs: req.timeoutMs },
           timeoutMs: req.timeoutMs,
           network: { net, hosts: {} },
         },

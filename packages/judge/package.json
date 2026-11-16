@@ -14,7 +14,8 @@
     "format:check": "prettier --check .",
     "test": "vitest run",
     "test:sandbox-host": "AFFIDAVIT_SANDBOX_HOST=1 vitest run src/jail",
-    "containment": "tsx src/jail/cli.ts"
+    "containment": "tsx src/jail/cli.ts",
+    "runner-image": "docker build --quiet --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH=0 --tag affidavit/witness-runner:local ../../docker/sandbox/witness-runner"
   },
   "dependencies": {
     "@affidavit/contracts": "workspace:*",

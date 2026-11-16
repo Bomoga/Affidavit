@@ -76,7 +76,13 @@ function fileSizeArgs(bytes: number | undefined): string[] {
   return ['--ulimit', `fsize=${bytes}:${bytes}`];
 }
 
-const isPinned = (image: string): boolean => /@sha256:[0-9a-f]{64}$/.test(image);
+/**
+ * Pinned by content: a registry digest (`name@sha256:...`) or a local image ID (`sha256:...`, the
+ * hash of the image config, which names every layer). Locally built images, such as the witness
+ * runner, only have the second.
+ */
+const isPinned = (image: string): boolean =>
+  /@sha256:[0-9a-f]{64}$/.test(image) || /^sha256:[0-9a-f]{64}$/.test(image);
 
 /**
  * Docker argv for one jailed run. Every flag here is a security control; tests pin each one.
@@ -90,7 +96,7 @@ const isPinned = (image: string): boolean => /@sha256:[0-9a-f]{64}$/.test(image)
  */
 export function buildGvisorRunArgs(spec: GvisorRunSpec): string[] {
   if (!isPinned(spec.image))
-    throw new Error(`image must be pinned by sha256 digest: ${spec.image}`);
+    throw new Error(`image must be pinned by sha256 digest or image ID: ${spec.image}`);
   const l = spec.limits ?? DEFAULT_LIMITS;
   return [
     'run',

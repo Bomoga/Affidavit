@@ -1,0 +1,9 @@
+{
+  "name": "affidavit-witness-runner",
+  "private": true,
+  "description": "Dependencies of the fixed witness runner image (L2-05). Built into the image, never run on the host.",
+  "type": "module",
+  "dependencies": {
+    "vitest": "5.1.0"
+  }
+}

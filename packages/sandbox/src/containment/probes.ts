@@ -196,7 +196,7 @@ export const OUTSIDE_SCRATCH = [
   '/home/node',
   '/root',
   '/usr/local/lib',
-  '/witness',
+  '/runner/witness',
 ];
 
 const writes: Probe = {
@@ -322,10 +322,14 @@ export const WALL_CLOCK_GRACE_MS = 5_000;
 
 const wallClock: Probe = {
   invariant: 'bounded-wall-clock',
-  description: 'Never exits on its own.',
+  description: 'Never exits on its own, even under a test runner that ends idle workers.',
   timeoutMs: 5_000,
+  // The timer keeps a bare Node process alive; the top-level await that never settles also blocks
+  // a harness that imports the probe (Vitest closes a worker with only a timer left once its
+  // tests are done, which would end the run without the jail's timeout).
   script: `${PRELUDE}
 setInterval(() => {}, 1000);
+await new Promise(() => {});
 `,
   args: () => ({}),
   assess(report, _fx, host) {

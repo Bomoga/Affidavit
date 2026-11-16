@@ -72,6 +72,15 @@ describe('buildGvisorRunArgs', () => {
   it('refuses an image that is not pinned by digest', () => {
     expect(() => buildGvisorRunArgs({ ...spec, image: 'node:22-alpine' })).toThrow(/pinned/);
     expect(() => buildGvisorRunArgs({ ...spec, image: 'node@sha256:abc' })).toThrow(/pinned/);
+    expect(() => buildGvisorRunArgs({ ...spec, image: 'sha256:abc' })).toThrow(/pinned/);
+    expect(() => buildGvisorRunArgs({ ...spec, image: `x sha256:${'a'.repeat(64)}` })).toThrow(
+      /pinned/,
+    );
+  });
+
+  it('accepts a local image ID, which is a content hash too', () => {
+    const id = `sha256:${'a'.repeat(64)}`;
+    expect(buildGvisorRunArgs({ ...spec, image: id })).toContain(id);
   });
 
   it('opens stdin only when asked', () => {

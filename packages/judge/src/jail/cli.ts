@@ -8,14 +8,20 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runAndRecord } from '@affidavit/sandbox';
 import { WitnessJailRunner } from './containment.js';
+import { buildRunnerImage } from './harness.js';
 
+const runnerImage = await buildRunnerImage();
 const workRoot = await mkdtemp(join(tmpdir(), 'affidavit-witness-'));
 try {
   const report = await runAndRecord(
     'witness',
     'pnpm --filter @affidavit/judge containment',
     (fx) =>
-      new WitnessJailRunner({ workRoot, sensitivePaths: [fx.credentialPath, fx.evidenceDir] }),
+      new WitnessJailRunner({
+        workRoot,
+        runnerImage,
+        sensitivePaths: [fx.credentialPath, fx.evidenceDir],
+      }),
   );
   if (process.argv.includes('--require-pass') && !report.allPassed) process.exitCode = 1;
 } finally {
