@@ -6,6 +6,7 @@ import {
   normalizeCompose,
   precheckCompose,
   selectServices,
+  withEmptyDockerConfig,
   type ComposeSidecar,
 } from './compose.js';
 import { envProblem, hostAliasProblem, workdirProblem } from '../gvisor/args.js';
@@ -92,7 +93,9 @@ export async function deriveRecipe(treeDir: string, hints: BootHints): Promise<R
     if (pre !== null) return fail(pre);
     let normalized: unknown;
     try {
-      normalized = await normalizeCompose(treeDir, hints.path);
+      // Compose runs on the host: its HOME, DOCKER_CONFIG and working directory are a fresh empty
+      // directory outside the tree, never the tree (which could ship `.docker/cli-plugins`).
+      normalized = await withEmptyDockerConfig((cfg) => normalizeCompose(treeDir, hints.path, cfg));
     } catch (err) {
       return fail(`compose file did not parse: ${(err as Error).message.slice(0, 500)}`);
     }

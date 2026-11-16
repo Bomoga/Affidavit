@@ -1,5 +1,6 @@
 import type { ExternalStub } from '@affidavit/contracts';
 import { PROBE_IMAGE } from '../containment/probes.js';
+import { tmpfsPathProblem } from '../gvisor/args.js';
 import { runJailed } from '../gvisor/runner.js';
 import { startJailedService, type CaseNetwork, type RunningService } from '../gvisor/network.js';
 import { imageVolumes, pinImage } from './images.js';
@@ -88,7 +89,16 @@ export async function bootTarget(
   // alias, env key or working directory is an outcome, not an exception mid-boot.
   const problem = recipeProblem(recipe);
   if (problem !== null) return { status: 'unsupported', reason: problem };
+  // Docker or the jail can still throw (a pull, a start, a teardown check). That is an outcome
+  // too: whatever was started is on the case network, which the caller removes.
+  try {
+    return await boot(net, imageId, recipe);
+  } catch (err) {
+    return { status: 'failed', reason: `boot error: ${(err as Error).message.slice(0, 800)}` };
+  }
+}
 
+async function boot(net: CaseNetwork, imageId: string, recipe: BootRecipe): Promise<BootOutcome> {
   const services: RunningService[] = [];
   const hosts: Record<string, string> = {};
   const sidecarImages: Record<string, string> = {};
@@ -109,7 +119,21 @@ export async function bootTarget(
       };
     }
     sidecarImages[sc.name] = image;
-    const volumes = await imageVolumes(image);
+    let volumes: string[];
+    try {
+      volumes = await imageVolumes(image);
+    } catch (err) {
+      return {
+        status: 'unsupported',
+        reason: `sidecar ${sc.name}: ${(err as Error).message.slice(0, 300)}`,
+      };
+    }
+    // The image is untrusted: a VOLUME the jail cannot put a tmpfs over (`/tmp`, `/etc`, ...)
+    // makes the sidecar unsupported rather than an exception while its flags are built.
+    const badVolume = volumes.map(tmpfsPathProblem).find((p) => p !== null);
+    if (badVolume !== undefined) {
+      return { status: 'unsupported', reason: `sidecar ${sc.name}: image volume ${badVolume}` };
+    }
     const svc = await startJailedService(net, {
       image,
       command: sc.command ?? [],

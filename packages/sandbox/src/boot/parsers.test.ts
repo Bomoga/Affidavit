@@ -1,5 +1,16 @@
+import { existsSync, readdirSync, statSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { findHostReadingKey, precheckCompose, selectServices } from './compose.js';
+import { SKIPPED } from './build.js';
+import {
+  COMPOSE_BIN_PATHS,
+  composeBinary,
+  composeConfigInvocation,
+  findHostReadingKey,
+  precheckCompose,
+  selectServices,
+  withEmptyDockerConfig,
+} from './compose.js';
 import { baseImageProblem, parseOnBuild } from './images.js';
 import { readDockerfile, shellWords } from './dockerfile.js';
 import { hubRefProblem } from './images.js';
@@ -304,4 +315,73 @@ describe('hubRefProblem', () => {
     'node:12 --quiet',
     `ghcr.io/x@sha256:${'a'.repeat(64)}`,
   ])('refuses %s', (r) => expect(hubRefProblem(r)).not.toBeNull());
+});
+
+describe('composeConfigInvocation (Compose runs on the host)', () => {
+  const tree = resolve('/work/build-abc/tree');
+  const cfg = resolve('/tmp-host/affidavit-docker-config-xyz');
+  const bin = '/usr/libexec/docker/cli-plugins/docker-compose';
+
+  it('never gives Compose the tree as its working directory, HOME, DOCKER_CONFIG or env', () => {
+    const inv = composeConfigInvocation(tree, 'docker-compose.yml', cfg, bin);
+    expect(inv.bin).toBe(bin);
+    expect(inv.cwd).toBe(cfg);
+    expect(inv.env).toEqual({ PATH: '/usr/bin:/bin', HOME: cfg, DOCKER_CONFIG: cfg });
+    expect(JSON.stringify(inv.env)).not.toContain(JSON.stringify(tree).slice(1, -1));
+    expect(Object.values(inv.env).some((v) => v.includes(tree))).toBe(false);
+    expect(inv.args).toEqual([
+      '--project-directory',
+      tree,
+      '-f',
+      join(tree, 'docker-compose.yml'),
+      'config',
+      '--no-interpolate',
+      '--format',
+      'json',
+    ]);
+  });
+
+  it('refuses a config directory inside the tree, or a tree inside it', () => {
+    expect(() => composeConfigInvocation(tree, 'c.yml', tree, bin)).toThrow(/outside the tree/);
+    expect(() => composeConfigInvocation(tree, 'c.yml', join(tree, '.docker'), bin)).toThrow(
+      /outside the tree/,
+    );
+    expect(() => composeConfigInvocation(tree, 'c.yml', resolve('/work'), bin)).toThrow(
+      /outside the tree/,
+    );
+  });
+
+  it('refuses a relative binary and a compose path that leaves the tree', () => {
+    expect(() => composeConfigInvocation(tree, 'c.yml', cfg, 'docker-compose')).toThrow(/absolute/);
+    expect(() => composeConfigInvocation(tree, '../c.yml', cfg, bin)).toThrow(/leaves/);
+  });
+
+  it('finds Compose only at fixed absolute paths', () => {
+    expect(composeBinary((p) => p === COMPOSE_BIN_PATHS[1])).toBe(COMPOSE_BIN_PATHS[1]);
+    expect(() => composeBinary(() => false)).toThrow(/no docker compose binary/);
+    const before = process.env.AFFIDAVIT_COMPOSE_BIN;
+    try {
+      process.env.AFFIDAVIT_COMPOSE_BIN = 'relative/docker-compose';
+      expect(composeBinary((p) => p.startsWith('relative') || p === COMPOSE_BIN_PATHS[0])).toBe(
+        COMPOSE_BIN_PATHS[0],
+      );
+    } finally {
+      if (before === undefined) delete process.env.AFFIDAVIT_COMPOSE_BIN;
+      else process.env.AFFIDAVIT_COMPOSE_BIN = before;
+    }
+    expect(COMPOSE_BIN_PATHS.every((p) => p.startsWith('/'))).toBe(true);
+  });
+
+  it('makes a fresh private config directory outside the tree and removes it', async () => {
+    let seen = '';
+    await withEmptyDockerConfig(async (dir) => {
+      seen = dir;
+      expect(readdirSync(dir)).toEqual([]);
+      if (process.platform !== 'win32') expect(statSync(dir).mode & 0o777).toBe(0o700);
+      return Promise.resolve();
+    });
+    expect(existsSync(seen)).toBe(false);
+  });
+
+  it('never stages Docker CLI config from the tree', () => expect(SKIPPED('.docker')).toBe(true));
 });

@@ -75,6 +75,20 @@ export async function resolveRegistry(
 }
 
 /**
+ * Bounds on the fetch proxy, so a hostile client on the fetch network cannot hold it open or
+ * exhaust it: concurrent connections, header size and time, the upstream dial, and idle tunnels.
+ * Configuration, not measurements; npm keeps well under 64 sockets by default (`maxsockets` 15).
+ */
+export const PROXY_LIMITS = {
+  maxConnections: 64,
+  maxHeaderBytes: 8 * 1024,
+  headersTimeoutMs: 10_000,
+  requestTimeoutMs: 15_000,
+  connectTimeoutMs: 10_000,
+  idleTimeoutMs: 60_000,
+} as const;
+
+/**
  * The fetch proxy: our code, a few lines of Node. It answers only `CONNECT <registry>:443` and
  * dials one of the addresses the host resolved and checked (it never resolves a name itself).
  * TLS stays end to end between npm and the registry, so the proxy sees no content. Anything else
@@ -88,22 +102,34 @@ const port = process.env.AFFIDAVIT_ALLOW_PORT;
 const ips = (process.env.AFFIDAVIT_ALLOW_IPS || '').split(',').filter(Boolean);
 if (!host || !port || ips.length === 0) process.exit(2);
 let next = 0;
-const server = http.createServer((req, res) => { res.statusCode = 403; res.end(); });
+const server = http.createServer(
+  { maxHeaderSize: ${PROXY_LIMITS.maxHeaderBytes} },
+  (req, res) => { res.statusCode = 403; res.end(); },
+);
+server.maxConnections = ${PROXY_LIMITS.maxConnections};
+server.headersTimeout = ${PROXY_LIMITS.headersTimeoutMs};
+server.requestTimeout = ${PROXY_LIMITS.requestTimeoutMs};
+server.on('clientError', (err, sock) => sock.destroy());
 server.on('connect', (req, sock, head) => {
   sock.on('error', () => {});
+  sock.setTimeout(${PROXY_LIMITS.idleTimeoutMs}, () => sock.destroy());
   if (String(req.url).toLowerCase() !== host + ':' + port) {
     sock.end('HTTP/1.1 403 Forbidden\\r\\n\\r\\n');
     return;
   }
   const ip = ips[next++ % ips.length];
-  const up = net.connect(Number(port), ip, () => {
+  const up = net.connect(Number(port), ip);
+  const dial = setTimeout(() => { up.destroy(); sock.destroy(); }, ${PROXY_LIMITS.connectTimeoutMs});
+  up.on('connect', () => {
+    clearTimeout(dial);
+    up.setTimeout(${PROXY_LIMITS.idleTimeoutMs}, () => { up.destroy(); sock.destroy(); });
     sock.write('HTTP/1.1 200 Connection Established\\r\\n\\r\\n');
     if (head && head.length) up.write(head);
     up.pipe(sock);
     sock.pipe(up);
   });
-  up.on('error', () => sock.destroy());
-  sock.on('close', () => up.destroy());
+  up.on('error', () => { clearTimeout(dial); sock.destroy(); });
+  sock.on('close', () => { clearTimeout(dial); up.destroy(); });
 });
 server.listen(${PROXY_PORT}, '0.0.0.0');
 `;
@@ -208,12 +234,15 @@ export async function createFetchEnv(ips: readonly string[]): Promise<FetchEnv> 
     await waitListening(name);
     return { net, egress, fetch: { name: net.name, proxy: { host: PROXY_ALIAS, ip } } };
   } catch (err) {
-    await removeFetchEnv({
+    const cleanup = await removeFetchEnv({
       net,
       egress,
       fetch: { name: net.name, proxy: { host: PROXY_ALIAS, ip: '0.0.0.0' } },
-    });
-    throw err;
+    }).then(
+      () => '',
+      (e: Error) => `; cleanup also failed: ${e.message}`,
+    );
+    throw new Error(`${(err as Error).message}${cleanup}`, { cause: err });
   }
 }
 
@@ -237,6 +266,19 @@ export async function removeFetchEnv(env: FetchEnv): Promise<void> {
   const { stdout } = await exec('docker', ['ps', '--all', '--quiet', '--filter', filter]);
   const ids = stdout.split('\n').filter((l) => l !== '');
   if (ids.length > 0) await exec('docker', ['rm', '--force', '--volumes', ...ids]);
-  await exec('docker', ['network', 'rm', env.egress]).catch(() => undefined);
+  const removeError = await exec('docker', ['network', 'rm', env.egress]).then(
+    () => null,
+    (err: Error) => err,
+  );
+  // `network rm` fails both when the network is already gone and when it could not be removed;
+  // only an inspect that also fails means it is gone.
+  const stillThere = await exec('docker', ['network', 'inspect', '--format', '{{.Id}}', env.egress])
+    .then(() => true)
+    .catch(() => false);
   await removeCaseNetwork(env.net);
+  if (stillThere) {
+    throw new Error(
+      `egress network ${env.egress} was not removed: ${removeError?.message.slice(0, 300) ?? 'unknown'}`,
+    );
+  }
 }

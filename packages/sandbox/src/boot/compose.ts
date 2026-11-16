@@ -1,5 +1,9 @@
 import { execFile } from 'node:child_process';
+import { statSync } from 'node:fs';
+import { chmod, mkdtemp, rm } from 'node:fs/promises';
 import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { shellWords } from './dockerfile.js';
 
@@ -105,32 +109,115 @@ export function precheckCompose(text: string): string | null {
 }
 
 /**
- * Normalizes a compose file to JSON with `docker compose config`, which parses the YAML but runs
- * nothing. `--no-interpolate` leaves `${VAR}` unresolved, and the clean environment means no
- * COMPOSE_* variable or host value leaks in. Call only on a staged tree that has no `.env`.
+ * Fixed host paths of the Compose v2 binary, in the order the Docker CLI's system plugin
+ * directories are searched. `AFFIDAVIT_COMPOSE_BIN` (an absolute path, set by the host's own
+ * configuration) comes first. The binary is never looked up through `PATH`, `$HOME/.docker` or
+ * `$DOCKER_CONFIG`, which a target could otherwise supply.
  */
-export async function normalizeCompose(treeDir: string, file: string): Promise<unknown> {
-  const { stdout } = await exec(
-    'docker',
-    [
-      'compose',
+export const COMPOSE_BIN_PATHS = [
+  '/usr/libexec/docker/cli-plugins/docker-compose',
+  '/usr/lib/docker/cli-plugins/docker-compose',
+  '/usr/local/lib/docker/cli-plugins/docker-compose',
+  '/usr/local/libexec/docker/cli-plugins/docker-compose',
+];
+
+/** The first Compose binary found at a fixed absolute path. Throws if there is none. */
+export function composeBinary(
+  exists: (path: string) => boolean = (p) => {
+    try {
+      return statSync(p).isFile();
+    } catch {
+      return false;
+    }
+  },
+): string {
+  const override = process.env.AFFIDAVIT_COMPOSE_BIN;
+  const candidates = [
+    ...(override !== undefined && isAbsolute(override) ? [override] : []),
+    ...COMPOSE_BIN_PATHS,
+  ];
+  const found = candidates.find(exists);
+  if (found === undefined) {
+    throw new Error(`no docker compose binary at a fixed path (${candidates.join(', ')})`);
+  }
+  return found;
+}
+
+const inside = (child: string, parent: string): boolean => {
+  const r = relative(resolve(parent), resolve(child));
+  return r === '' || (!r.startsWith('..') && !isAbsolute(r));
+};
+
+/**
+ * The exact process `normalizeCompose` runs. Pure, for tests. `configDir` must be a fresh, empty,
+ * private directory outside the tree: it is the process's working directory, `HOME` and
+ * `DOCKER_CONFIG`, so no CLI plugin, `config.json`, context or proxy setting can come from the
+ * tree. Nothing else from the host environment is passed, so no `COMPOSE_*` or `DOCKER_*`
+ * variable leaks in either.
+ */
+export function composeConfigInvocation(
+  treeDir: string,
+  file: string,
+  configDir: string,
+  bin: string,
+): { bin: string; args: string[]; cwd: string; env: Record<string, string> } {
+  if (!isAbsolute(bin)) throw new Error(`compose binary must be an absolute path: ${bin}`);
+  if (!isAbsolute(configDir)) throw new Error('config directory must be absolute');
+  if (inside(configDir, treeDir) || inside(treeDir, configDir)) {
+    throw new Error('the Docker config directory must be outside the tree');
+  }
+  if (file.startsWith('/') || file.split('/').includes('..')) {
+    throw new Error(`compose file leaves the tree: ${file}`);
+  }
+  return {
+    bin,
+    // Standalone Compose v2: the same parser as `docker compose`, without the Docker CLI's plugin
+    // lookup in front of it.
+    args: [
       '--project-directory',
       treeDir,
       '-f',
-      file,
+      join(treeDir, file),
       'config',
       '--no-interpolate',
       '--format',
       'json',
     ],
-    {
-      cwd: treeDir,
-      timeout: 30_000,
-      maxBuffer: 4 * 1024 * 1024,
-      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: treeDir },
-    },
-  );
+    cwd: configDir,
+    env: { PATH: '/usr/bin:/bin', HOME: configDir, DOCKER_CONFIG: configDir },
+  };
+}
+
+/**
+ * Normalizes a compose file to JSON with Compose's `config` command, which parses the YAML but
+ * runs nothing. It runs on the host, so it is given nothing from the tree but the file to read:
+ * see `composeConfigInvocation`. `--no-interpolate` leaves `${VAR}` unresolved. Call only on a
+ * staged tree (no `.env`, no `.docker`, no symlinks).
+ */
+export async function normalizeCompose(
+  treeDir: string,
+  file: string,
+  configDir: string,
+): Promise<unknown> {
+  const inv = composeConfigInvocation(treeDir, file, configDir, composeBinary());
+  const { stdout } = await exec(inv.bin, inv.args, {
+    cwd: inv.cwd,
+    env: inv.env,
+    timeout: 30_000,
+    maxBuffer: 4 * 1024 * 1024,
+  });
   return JSON.parse(stdout) as unknown;
+}
+
+/** Runs `fn` with a fresh, empty, 0700 directory outside the tree, removed afterwards. */
+export async function withEmptyDockerConfig<T>(fn: (dir: string) => Promise<T>): Promise<T> {
+  const dir = await mkdtemp(join(tmpdir(), 'affidavit-docker-config-'));
+  try {
+    await chmod(dir, 0o700);
+    return await fn(dir);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 }
 
 type Obj = Record<string, unknown>;

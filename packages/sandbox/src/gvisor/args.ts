@@ -162,20 +162,28 @@ const positiveMb = (n: number, what: string): number => {
   return n;
 };
 
+/** Null when `p` may carry an extra tmpfs (for an image volume), else why not. Non-throwing. */
+export function tmpfsPathProblem(p: string): string | null {
+  const path = p.replace(/\/+$/, '');
+  if (
+    !TMPFS_PATH.test(path) ||
+    path.split('/').includes('..') ||
+    RESERVED_TMPFS.some((r) => path === r || (r !== '/' && path.startsWith(`${r}/`)))
+  ) {
+    return `bad tmpfs path: ${p}`;
+  }
+  return null;
+}
+
 function tmpfsArgs(spec: GvisorRunSpec): string[] {
   const tmp =
     spec.writableTmpMb === undefined
       ? 'type=tmpfs,destination=/tmp,readonly'
       : `type=tmpfs,destination=/tmp,tmpfs-size=${positiveMb(spec.writableTmpMb, 'writableTmpMb') * 1024 * 1024},tmpfs-mode=1777`;
   const extra = (spec.tmpfs ?? []).flatMap((t) => {
+    const problem = tmpfsPathProblem(t.path);
+    if (problem !== null) throw new Error(problem);
     const path = t.path.replace(/\/+$/, '');
-    if (
-      !TMPFS_PATH.test(path) ||
-      path.split('/').includes('..') ||
-      RESERVED_TMPFS.some((r) => path === r || (r !== '/' && path.startsWith(`${r}/`)))
-    ) {
-      throw new Error(`bad tmpfs path: ${t.path}`);
-    }
     const bytes = positiveMb(t.sizeMb, 'tmpfs size') * 1024 * 1024;
     return ['--mount', `type=tmpfs,destination=${path},tmpfs-size=${bytes},tmpfs-mode=1777`];
   });

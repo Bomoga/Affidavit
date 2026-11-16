@@ -1,10 +1,13 @@
+import { Script } from 'node:vm';
 import { describe, expect, it } from 'vitest';
-import { PLAIN_RUNTIME, RUN_LABEL } from '../gvisor/args.js';
+import { PLAIN_RUNTIME, RUN_LABEL, tmpfsPathProblem } from '../gvisor/args.js';
 import {
   FETCH_ALLOW,
   FETCH_IMAGE,
   PROXY_ALIAS,
+  PROXY_LIMITS,
   PROXY_PORT,
+  PROXY_SCRIPT,
   egressNetworkArgs,
   npmProxyEnv,
   proxyCreateArgs,
@@ -25,6 +28,23 @@ describe('fetch image and allowlist', () => {
     const env = npmProxyEnv();
     expect(env.npm_config_proxy).toBe(`http://${PROXY_ALIAS}:${PROXY_PORT}`);
     expect(env.npm_config_https_proxy).toBe(`http://${PROXY_ALIAS}:${PROXY_PORT}`);
+  });
+});
+
+describe('PROXY_SCRIPT', () => {
+  it('is valid JavaScript with every limit applied', () => {
+    expect(() => new Script(PROXY_SCRIPT)).not.toThrow();
+    expect(PROXY_SCRIPT).toContain(`server.maxConnections = ${PROXY_LIMITS.maxConnections}`);
+    expect(PROXY_SCRIPT).toContain(`server.headersTimeout = ${PROXY_LIMITS.headersTimeoutMs}`);
+    expect(PROXY_SCRIPT).toContain(`server.requestTimeout = ${PROXY_LIMITS.requestTimeoutMs}`);
+    expect(PROXY_SCRIPT).toContain(`maxHeaderSize: ${PROXY_LIMITS.maxHeaderBytes}`);
+    expect(PROXY_SCRIPT).toContain(`${PROXY_LIMITS.connectTimeoutMs});`);
+    expect(PROXY_SCRIPT).toContain(`sock.setTimeout(${PROXY_LIMITS.idleTimeoutMs}`);
+    expect(PROXY_SCRIPT).toContain(`up.setTimeout(${PROXY_LIMITS.idleTimeoutMs}`);
+  });
+
+  it('never resolves a name itself', () => {
+    expect(PROXY_SCRIPT).not.toMatch(/\bdns\b|lookup/);
   });
 });
 
@@ -117,4 +137,14 @@ describe('proxyCreateArgs', () => {
     expect(() => proxyCreateArgs('p', RUN, EGRESS, ['172.17.0.1'])).toThrow(/non-public/);
     expect(() => proxyCreateArgs('p', RUN, EGRESS, [])).toThrow(/at least one/);
   });
+});
+
+describe('tmpfsPathProblem (sidecar image volumes)', () => {
+  it.each(['/data/db', '/data/configdb/', '/var/lib/postgresql/data'])('accepts %s', (p) =>
+    expect(tmpfsPathProblem(p)).toBeNull(),
+  );
+  it.each(['/tmp', '/tmp/x', '/', '/etc', '/proc/1', '/dev/shm', '/scratch', 'data', '/a/../etc'])(
+    'refuses %s, so bootTarget reports the sidecar unsupported instead of throwing',
+    (p) => expect(tmpfsPathProblem(p)).not.toBeNull(),
+  );
 });

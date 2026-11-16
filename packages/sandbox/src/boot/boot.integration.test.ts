@@ -1,5 +1,15 @@
 import { execFileSync } from 'node:child_process';
-import { cpSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BootHints } from '@affidavit/contracts';
@@ -9,6 +19,7 @@ import { createCaseNetwork, removeCaseNetwork } from '../gvisor/network.js';
 import { runJailed } from '../gvisor/runner.js';
 import { bootTarget, type BootOutcome } from './boot.js';
 import { buildTarget, type BuildOutcome } from './build.js';
+import { normalizeCompose, withEmptyDockerConfig } from './compose.js';
 import {
   FETCH_IMAGE,
   PROXY_PORT,
@@ -171,6 +182,41 @@ describe.runIf(onSandboxHost)('boot recipes on a sandbox host', { timeout: 900_0
   it('reports a target that never becomes healthy, without egress, as failed', async () => {
     const src = tinyApp(root, 'never-listens', 'setInterval(() => {}, 1000);');
     expect((await buildAndBoot(src, tinyHints())).boot).toMatchObject({ status: 'failed' });
+  });
+
+  it('never runs a Docker CLI plugin or config shipped in the tree, on the host', async () => {
+    const src = tinyApp(root, 'ships-docker-plugin', LISTEN);
+    const marker = join(root, 'plugin-ran');
+    const plugins = join(src, '.docker', 'cli-plugins');
+    mkdirSync(plugins, { recursive: true });
+    const fake = `#!/bin/sh\ntouch ${JSON.stringify(marker)}\necho '{"services":{}}'\n`;
+    for (const name of ['docker-compose', 'docker-buildx']) {
+      writeFileSync(join(plugins, name), fake);
+      chmodSync(join(plugins, name), 0o755);
+    }
+    writeFileSync(
+      join(src, '.docker', 'config.json'),
+      JSON.stringify({ cliPluginsExtraDirs: [plugins], currentContext: 'evil' }),
+    );
+    writeFileSync(join(src, 'docker-compose.yml'), 'services:\n  app:\n    build: .\n');
+
+    // Straight on the unstaged tree: the fixed binary and empty config must ignore `.docker`.
+    const normalized = await withEmptyDockerConfig((cfg) =>
+      normalizeCompose(src, 'docker-compose.yml', cfg),
+    );
+    expect(normalized).toMatchObject({ services: { app: { build: { context: src } } } });
+    expect(existsSync(marker)).toBe(false);
+
+    // Through the whole build: staging also drops `.docker`.
+    const hints: BootHints = {
+      ...tinyHints(),
+      kind: 'compose',
+      path: 'docker-compose.yml',
+      service: 'app',
+    };
+    const { build } = await buildAndBoot(src, hints);
+    expect(build.ok).toBe(true);
+    expect(existsSync(marker)).toBe(false);
   });
 
   it('refuses a base image outside the allowlist before pulling it', async () => {

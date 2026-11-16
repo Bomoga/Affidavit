@@ -45,10 +45,15 @@ const SCRIPTS_TIMEOUT_MS = 10 * 60_000;
 const MAX_TREE_FILES = 50_000;
 const MAX_TREE_BYTES = 512 * 1024 * 1024;
 
-/** Never copied into a staged tree: VCS data, installed modules, real env files, npm config. */
-const SKIPPED = (name: string): boolean =>
+/**
+ * Never copied into a staged tree: VCS data, installed modules, real env files, npm config, and
+ * Docker CLI config (`.docker` can carry `cli-plugins/` binaries and a `config.json` that picks
+ * plugin directories, contexts and proxies for any Docker CLI pointed at it).
+ */
+export const SKIPPED = (name: string): boolean =>
   name === '.git' ||
   name === 'node_modules' ||
+  name === '.docker' ||
   name === '.npmrc' ||
   name === '.env' ||
   name.startsWith('.env.');
@@ -198,36 +203,57 @@ export async function buildTarget(
       },
     };
 
-    await pullPinned(FETCH_IMAGE);
     const install = recipe.buildScript
       ? ['npm', 'ci', '--ignore-scripts']
       : ['npm', 'ci', '--ignore-scripts', '--omit=dev'];
-    const fetchEnv = await createFetchEnv(await resolveRegistry());
+    // Pulling, resolving, the fetch setup and its teardown check can all throw; each is a
+    // `failed` fetch step, never an exception out of buildTarget.
     let fetched: JailedRun;
     try {
-      fetched = await runJailed(
-        {
-          ...common,
-          image: FETCH_IMAGE,
-          env: { ...common.env, ...npmProxyEnv() },
-          command: install,
-          timeoutMs: FETCH_TIMEOUT_MS,
-          fetch: fetchEnv.fetch,
-        },
-        { trace: false, limits },
-      );
-    } finally {
-      await removeFetchEnv(fetchEnv);
+      await pullPinned(FETCH_IMAGE);
+      const fetchEnv = await createFetchEnv(await resolveRegistry());
+      try {
+        fetched = await runJailed(
+          {
+            ...common,
+            image: FETCH_IMAGE,
+            env: { ...common.env, ...npmProxyEnv() },
+            command: install,
+            timeoutMs: FETCH_TIMEOUT_MS,
+            fetch: fetchEnv.fetch,
+          },
+          { trace: false, limits },
+        );
+      } finally {
+        await removeFetchEnv(fetchEnv);
+      }
+    } catch (err) {
+      return {
+        ok: false,
+        unsupported: false,
+        step: 'fetch',
+        reason: (err as Error).message.slice(0, 1500),
+      };
     }
     if (failed(fetched))
       return { ok: false, unsupported: false, step: 'fetch', reason: tail(fetched) };
 
     const scripts = [['npm', 'rebuild'], ...(recipe.buildScript ? [['npm', 'run', 'build']] : [])];
     for (const command of scripts) {
-      const run = await runJailed(
-        { ...common, image: baseImage, command, timeoutMs: SCRIPTS_TIMEOUT_MS },
-        { trace: false, limits },
-      );
+      let run: JailedRun;
+      try {
+        run = await runJailed(
+          { ...common, image: baseImage, command, timeoutMs: SCRIPTS_TIMEOUT_MS },
+          { trace: false, limits },
+        );
+      } catch (err) {
+        return {
+          ok: false,
+          unsupported: false,
+          step: 'scripts',
+          reason: `${command.join(' ')}: ${(err as Error).message.slice(0, 1500)}`,
+        };
+      }
       if (failed(run)) {
         return {
           ok: false,

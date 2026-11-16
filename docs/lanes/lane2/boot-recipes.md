@@ -31,6 +31,15 @@ Each build gets its own setup, created and removed by `createFetchEnv` and `remo
 
 The proxy is attached to the internal network with `docker network connect` before `docker start`. That two-network start under runsc has unit tests for its arguments only; it has not yet run on a sandbox host.
 
+The proxy is bounded (`PROXY_LIMITS`, configuration): 64 concurrent connections, 8 KiB of headers within 10 s, 15 s per request, a 10 s upstream dial, and 60 s idle on either side of a tunnel. Teardown removes the proxy, then the egress bridge, then the internal network, and throws if `docker network inspect` still finds the egress bridge afterwards.
+
+Every failure in this step (pulling `FETCH_IMAGE`, resolving the registry, creating or removing the setup) is a `failed` outcome at step `fetch`, never an exception out of `buildTarget`.
+
+### Residual risks (need the lead's acceptance)
+
+1. **The proxy's own network reach is not firewalled.** The egress bridge is an ordinary Docker bridge, so at the network layer the proxy container could reach the host's bridge gateway, RFC 1918 addresses and `169.254.169.254`. What stops that today is the proxy's code: it dials only the checked public addresses, on 443, and takes no address from the client. A bug in Node's HTTP parser that gave the client code execution inside the proxy would remove that check. The fix is host firewall rules in the `DOCKER-USER` chain that let traffic from each egress bridge reach only the resolved registry addresses on 443. The orchestrator runs as an unprivileged member of the docker group and cannot write iptables rules, so this needs a privileged host-setup helper (sandbox host setup, P0-10). Not done in this PR.
+2. **Domain fronting.** The proxy checks the CONNECT target, not what travels inside the TLS tunnel. The registry sits behind a shared CDN, so a client that controls TLS could ask the CDN for another hostname (a different SNI or `Host`) through a tunnel opened to `registry.npmjs.org:443`. In the fetch step the only client is Lane 2's npm, with install scripts off and a lockfile that names only registry URLs, so no repository or package code is running that could do this. The risk is that npm itself is steered (a bug, or a crafted registry response), which would give a channel to other sites on the same CDN, but no route into the host or the case network.
+
 ### Why a Lane 2 npm image
 
 The target's base image is untrusted. Running npm from it would let the target choose the npm (or a `node` binary) that runs on the one step with a route out. `FETCH_IMAGE` is `node:22.11.0-bookworm-slim` pinned by its index digest, owned by Lane 2 and bumped deliberately. It is Debian (glibc), so a target on an Alpine (musl) base may get glibc builds of platform-specific optional packages. `npm rebuild` in step 4 runs with the target's base and rebuilds native modules from source where they ship it. Packages that ship only prebuilt binaries for one libc are a known gap.
@@ -57,7 +66,11 @@ If the target never becomes healthy, it runs once more under the syscall trace. 
 
 `healthTimeoutMs` comes from the boot hints, which are untrusted. The recipe clamps it to `MAX_HEALTH_TIMEOUT_MS` (180 000 ms, configuration, not a measurement). The seed run, the health probe and the diagnosis run all derive their waits from the clamped value. `buildTarget` and `bootTarget` both check the recipe with `recipeProblem`, so a bad working directory, environment key, host alias, port or timeout is an `unsupported` outcome, never an exception thrown while a run is set up.
 
+Docker or jail errors during boot (a pull, a start, a teardown check) are a `failed` outcome, not an exception out of `bootTarget`.
+
 ### Volumes
+
+A sidecar whose image declares a volume the jail cannot put a tmpfs over (`/tmp`, `/etc`, `/`, and the other reserved paths) is `unsupported`.
 
 `main` refuses any image that declares a `VOLUME`, because Docker would create an anonymous, host-backed volume that can outlive the container (`sandbox-runner.md`, "No volumes"). Witness runs and build steps keep that rule unchanged. Sidecars are the one exception, and only in `startJailedService`: an image's declared volumes are accepted only when a tmpfs from the recipe covers each one exactly (`uncoveredVolumes`). After `docker run --detach` the container's mounts are read back, and if Docker created any volume anyway, the container is removed with its volumes and the boot throws.
 
@@ -85,7 +98,17 @@ Compose values written in the file are used as is; `${...}` values are never res
 
 Before Compose sees the file, it is parsed into a tree with `js-yaml` (core schema) and walked to any depth. Keys that read other files are refused wherever they appear: `include`, `extends`, `env_file`, `label_file`, `secrets`, `configs`, `ssh` and `additional_contexts`. That covers `x-` extension blocks, anchors and aliases, merge keys (`<<: *base`), flow style (`{env_file: x}`) and quoted or escaped keys. Custom tags (Compose's `!reset` and `!override`), duplicate keys, several documents and unparseable text are refused (fail closed). An empty value (`secrets: []`) names no file and is allowed.
 
-`js-yaml` and Compose are different parsers and could disagree on an edge case. So the normalized output of `docker compose config --no-interpolate` is walked again with the same check, and the recipe is refused if Compose's own reading has any of those keys. Compose has then read the file, but nothing it read reaches a container.
+`js-yaml` and Compose are different parsers and could disagree on an edge case. So the normalized output of Compose's `config --no-interpolate` is walked again with the same check, and the recipe is refused if Compose's own reading has any of those keys. Compose has then read the file, but nothing it read reaches a container.
+
+### Compose runs on the host, with nothing from the tree
+
+Normalizing is the one step that runs a CLI on the host against the tree. The Docker CLI loads plugins from `$DOCKER_CONFIG` or `$HOME/.docker` (`cli-plugins/`, and `cliPluginsExtraDirs` in `config.json`), and `config.json` can also choose a context and proxies. An earlier version ran it with the tree as `HOME` and working directory, so a repository shipping an executable `.docker/cli-plugins/docker-compose` would have had it run on the host, outside any jail. Now:
+
+- The Compose v2 binary is run directly from a fixed absolute path (`COMPOSE_BIN_PATHS`, the Docker CLI's system plugin directories, or `AFFIDAVIT_COMPOSE_BIN` set by the host), never found through `PATH`, `HOME` or `DOCKER_CONFIG`. A host with Compose only under a user's `~/.docker` (Docker Desktop) must set `AFFIDAVIT_COMPOSE_BIN`.
+- Its working directory, `HOME` and `DOCKER_CONFIG` are a fresh, empty, 0700 directory made with `mkdtemp` outside the tree and removed afterwards (`withEmptyDockerConfig`). `composeConfigInvocation` refuses a config directory inside the tree. The tree reaches Compose only as `--project-directory` and the `-f` path. No other host variable is passed.
+- Staging drops `.docker` along with `.git`, `.env*` and `.npmrc`.
+
+The only other host-side CLI call that touches the tree is the assemble step's `docker build`. It runs with the host's own environment and working directory, and the tree is only its build context (the generated Dockerfile's own ignore file takes precedence over the tree's).
 
 ## Limits of the MVP
 
@@ -95,7 +118,7 @@ Before Compose sees the file, it is parsed into a tree with `js-yaml` (core sche
 
 ## Verified on the sandbox host (2026-11-15, owner's workstation)
 
-This evidence predates the hardening above (the fetch proxy, the Lane 2 npm image, the base allowlist, ONBUILD refusal, the YAML precheck, the timeout clamp, and `main`'s volume refusal). It must be re-run on the hardened code before it counts, together with the new sandbox-host tests: the fetch step cannot reach an IP literal, cloud metadata or the bridge gateway; the proxy refuses other hosts; ONBUILD is detected; and a non-node base is refused.
+This evidence predates the hardening above (the fetch proxy, the Lane 2 npm image, the base allowlist, ONBUILD refusal, the YAML precheck, the timeout clamp, and `main`'s volume refusal). It must be re-run on the hardened code before it counts, together with the new sandbox-host tests: the fetch step cannot reach an IP literal, cloud metadata or the bridge gateway; the proxy refuses other hosts; ONBUILD is detected; a non-node base is refused; and a `.docker/cli-plugins/docker-compose` shipped in the tree never runs.
 
 `pnpm --filter @affidavit/sandbox test:sandbox-host` with `AFFIDAVIT_NODEGOAT_DIR` pointing at OWASP NodeGoat `c5cb68a7`:
 
