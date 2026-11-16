@@ -51,7 +51,10 @@ describePg('kill and resume with a real process kill', () => {
     const child = spawn(process.execPath, ['--import', 'tsx', 'src/kill-child.ts'], {
       cwd,
       env: {
-        ...process.env,
+        // The child gets only its own role URLs, never the superuser one.
+        ...Object.fromEntries(
+          Object.entries(process.env).filter(([k]) => k !== 'AFFIDAVIT_TEST_DATABASE_URL'),
+        ),
         CHILD_MODE: mode,
         CHILD_CASE: caseId,
         CHILD_TENANT: A,
@@ -128,7 +131,7 @@ describePg('kill and resume with a real process kill', () => {
     const file = await newCase();
     const p = pay(file.id);
     await enqueueStage(db().app, p);
-    const c1 = spawnChild('work-then-hang', file.id, 3);
+    const c1 = spawnChild('work-then-hang', file.id, 6);
     await until(() => c1.lines.includes('WORKED'));
     expect(c1.lines, c1.stderr()).toContain('WORKED');
     await c1.kill();

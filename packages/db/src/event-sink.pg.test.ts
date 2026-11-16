@@ -152,6 +152,53 @@ describePg('PgEventSink', () => {
     expect(await count('events', file.id)).toBe(1);
   });
 
+  it('a ballot row needs an event of the right type carrying that very ballot', async () => {
+    const { file, sink } = await setup(2);
+    await sink.emit(
+      TrialEvent.parse({
+        ...base(file.id, 0),
+        stage: 'map',
+        actor: 'judge',
+        type: 'stage-entered',
+        payload: {},
+      }),
+    );
+    await sink.emit(
+      TrialEvent.parse({
+        ...base(file.id, 1),
+        stage: 'jury',
+        actor: 'juror',
+        type: 'ballot-cast',
+        payload: { ballot: samples.Ballot },
+      }),
+    );
+    const insert = async (seq: number, ballot: object) => {
+      const c = await db().app.connect();
+      try {
+        await c.query('begin');
+        await c.query(`select set_config('app.tenant_id', $1, true)`, [T]);
+        await c.query(
+          `insert into ballots (tenant_id, case_id, seq, juror_id, question, ballot)
+           values ($1, $2, $3, $4, $5, $6::jsonb)`,
+          [T, file.id, seq, 'juror-security', 'severity', JSON.stringify(ballot)],
+        );
+        return 'no error';
+      } catch (err) {
+        return (err as Error).message;
+      } finally {
+        await c.query('rollback');
+        c.release();
+      }
+    };
+    const real = samples.Ballot as object;
+    // Seq 0 holds a stage-entered event, not a ballot-cast one.
+    expect(await insert(0, real)).toMatch(/needs a matching/);
+    // Seq 1 holds a ballot, but not this one.
+    expect(await insert(1, { ...real, confidence: 0.1 })).toMatch(/needs a matching/);
+    // The sink already wrote the real one for seq 1, so a duplicate fails on the key, not the guard.
+    expect(await insert(1, real)).toMatch(/duplicate key/);
+  });
+
   it('ballot and escalation rows need their event, even through raw SQL as the application role', async () => {
     const { file } = await setup(1);
     for (const q of [

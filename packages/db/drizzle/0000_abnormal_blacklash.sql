@@ -7,7 +7,9 @@ CREATE TABLE "ballots" (
 	"ballot" jsonb NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	CONSTRAINT "ballots_tenant_id_case_id_seq_pk" PRIMARY KEY("tenant_id","case_id","seq"),
-	CONSTRAINT "ballots_blob_matches" CHECK ("ballots"."ballot"->>'jurorId' = "ballots"."juror_id" and "ballots"."ballot"->>'question' = "ballots"."question")
+	CONSTRAINT "ballots_blob_matches" CHECK (jsonb_typeof("ballots"."ballot") = 'object'
+        and "ballots"."ballot"->>'jurorId' is not distinct from "ballots"."juror_id"
+        and "ballots"."ballot"->>'question' is not distinct from "ballots"."question")
 );
 --> statement-breakpoint
 ALTER TABLE "ballots" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
@@ -29,10 +31,11 @@ CREATE TABLE "cases" (
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL,
 	CONSTRAINT "cases_tenant_id_id_pk" PRIMARY KEY("tenant_id","id"),
 	CONSTRAINT "cases_stage_valid" CHECK ("cases"."stage" in ('intake', 'map', 'arraign', 'defense', 'prosecution', 'remedy', 'verify', 'jury', 'verdict', 'dismissed', 'escalated')),
-	CONSTRAINT "cases_file_matches" CHECK ("cases"."case_file"->>'id' = "cases"."id"
-        and "cases"."case_file"->>'tenantId' = "cases"."tenant_id"
-        and ("cases"."case_file"->'candidate'->>'score')::double precision = "cases"."candidate_score"
-        and ("cases"."case_file"->>'escalationFloor')::double precision = "cases"."escalation_floor"),
+	CONSTRAINT "cases_file_matches" CHECK (jsonb_typeof("cases"."case_file") = 'object'
+        and "cases"."case_file"->>'id' is not distinct from "cases"."id"
+        and "cases"."case_file"->>'tenantId' is not distinct from "cases"."tenant_id"
+        and ("cases"."case_file"->'candidate'->>'score')::double precision is not distinct from "cases"."candidate_score"
+        and ("cases"."case_file"->>'escalationFloor')::double precision is not distinct from "cases"."escalation_floor"),
 	CONSTRAINT "cases_budget_finite" CHECK ("cases"."remaining_usd" <> 'NaN'::numeric)
 );
 --> statement-breakpoint
@@ -63,7 +66,9 @@ CREATE TABLE "escalations" (
 	"escalation" jsonb NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	CONSTRAINT "escalations_tenant_id_case_id_seq_pk" PRIMARY KEY("tenant_id","case_id","seq"),
-	CONSTRAINT "escalations_blob_matches" CHECK ("escalations"."escalation"->>'caseId' = "escalations"."case_id" and "escalations"."escalation"->>'reason' = "escalations"."reason")
+	CONSTRAINT "escalations_blob_matches" CHECK (jsonb_typeof("escalations"."escalation") = 'object'
+        and "escalations"."escalation"->>'caseId' is not distinct from "escalations"."case_id"
+        and "escalations"."escalation"->>'reason' is not distinct from "escalations"."reason")
 );
 --> statement-breakpoint
 ALTER TABLE "escalations" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
@@ -75,8 +80,10 @@ CREATE TABLE "events" (
 	"event" jsonb NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	CONSTRAINT "events_tenant_id_case_id_seq_pk" PRIMARY KEY("tenant_id","case_id","seq"),
-	CONSTRAINT "events_blob_matches" CHECK ("events"."event"->>'type' = "events"."type" and "events"."event"->>'caseId' = "events"."case_id"
-        and ("events"."event"->>'seq')::int = "events"."seq")
+	CONSTRAINT "events_blob_matches" CHECK (jsonb_typeof("events"."event") = 'object'
+        and "events"."event"->>'type' is not distinct from "events"."type"
+        and "events"."event"->>'caseId' is not distinct from "events"."case_id"
+        and ("events"."event"->>'seq')::int is not distinct from "events"."seq")
 );
 --> statement-breakpoint
 ALTER TABLE "events" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
@@ -92,10 +99,14 @@ CREATE TABLE "exhibits" (
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	CONSTRAINT "exhibits_tenant_id_case_id_id_pk" PRIMARY KEY("tenant_id","case_id","id"),
 	CONSTRAINT "exhibits_kind_valid" CHECK ("exhibits"."kind" in ('witness', 'counterexample', 'patch')),
-	CONSTRAINT "exhibits_blob_matches" CHECK ("exhibits"."exhibit"->>'id' = "exhibits"."id" and "exhibits"."exhibit"->>'caseId' = "exhibits"."case_id"
-        and "exhibits"."exhibit"->>'kind' = "exhibits"."kind" and "exhibits"."exhibit"->>'author' = "exhibits"."author"
-        and "exhibits"."exhibit"->>'sha256' = "exhibits"."sha256"),
-	CONSTRAINT "exhibits_result_valid" CHECK ("exhibits"."result" is null or (jsonb_typeof("exhibits"."result") = 'object' and "exhibits"."result"->>'exhibitId' = "exhibits"."id"))
+	CONSTRAINT "exhibits_blob_matches" CHECK (jsonb_typeof("exhibits"."exhibit") = 'object'
+        and "exhibits"."exhibit"->>'id' is not distinct from "exhibits"."id"
+        and "exhibits"."exhibit"->>'caseId' is not distinct from "exhibits"."case_id"
+        and "exhibits"."exhibit"->>'kind' is not distinct from "exhibits"."kind"
+        and "exhibits"."exhibit"->>'author' is not distinct from "exhibits"."author"
+        and "exhibits"."exhibit"->>'sha256' is not distinct from "exhibits"."sha256"),
+	CONSTRAINT "exhibits_result_valid" CHECK ("exhibits"."result" is null or (jsonb_typeof("exhibits"."result") = 'object'
+        and "exhibits"."result"->>'exhibitId' is not distinct from "exhibits"."id"))
 );
 --> statement-breakpoint
 ALTER TABLE "exhibits" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
@@ -165,7 +176,9 @@ CREATE TABLE "verdicts" (
 	"verdict" jsonb NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	CONSTRAINT "verdicts_tenant_id_case_id_pk" PRIMARY KEY("tenant_id","case_id"),
-	CONSTRAINT "verdicts_blob_matches" CHECK ("verdicts"."verdict"->>'caseId' = "verdicts"."case_id" and "verdicts"."verdict"->>'outcome' = "verdicts"."outcome")
+	CONSTRAINT "verdicts_blob_matches" CHECK (jsonb_typeof("verdicts"."verdict") = 'object'
+        and "verdicts"."verdict"->>'caseId' is not distinct from "verdicts"."case_id"
+        and "verdicts"."verdict"->>'outcome' is not distinct from "verdicts"."outcome")
 );
 --> statement-breakpoint
 ALTER TABLE "verdicts" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint

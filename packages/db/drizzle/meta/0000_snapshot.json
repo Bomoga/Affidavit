@@ -1,5 +1,5 @@
 {
-  "id": "9756362d-a314-4d20-87c1-18c310e9bd5f",
+  "id": "95abb91c-d9c9-43d7-9d3b-8cdc9ebfe980",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "version": "7",
   "dialect": "postgresql",
@@ -75,7 +75,7 @@
       "checkConstraints": {
         "ballots_blob_matches": {
           "name": "ballots_blob_matches",
-          "value": "\"ballots\".\"ballot\"->>'jurorId' = \"ballots\".\"juror_id\" and \"ballots\".\"ballot\"->>'question' = \"ballots\".\"question\""
+          "value": "jsonb_typeof(\"ballots\".\"ballot\") = 'object'\n        and \"ballots\".\"ballot\"->>'jurorId' is not distinct from \"ballots\".\"juror_id\"\n        and \"ballots\".\"ballot\"->>'question' is not distinct from \"ballots\".\"question\""
         }
       },
       "isRLSEnabled": true
@@ -208,7 +208,7 @@
         },
         "cases_file_matches": {
           "name": "cases_file_matches",
-          "value": "\"cases\".\"case_file\"->>'id' = \"cases\".\"id\"\n        and \"cases\".\"case_file\"->>'tenantId' = \"cases\".\"tenant_id\"\n        and (\"cases\".\"case_file\"->'candidate'->>'score')::double precision = \"cases\".\"candidate_score\"\n        and (\"cases\".\"case_file\"->>'escalationFloor')::double precision = \"cases\".\"escalation_floor\""
+          "value": "jsonb_typeof(\"cases\".\"case_file\") = 'object'\n        and \"cases\".\"case_file\"->>'id' is not distinct from \"cases\".\"id\"\n        and \"cases\".\"case_file\"->>'tenantId' is not distinct from \"cases\".\"tenant_id\"\n        and (\"cases\".\"case_file\"->'candidate'->>'score')::double precision is not distinct from \"cases\".\"candidate_score\"\n        and (\"cases\".\"case_file\"->>'escalationFloor')::double precision is not distinct from \"cases\".\"escalation_floor\""
         },
         "cases_budget_finite": {
           "name": "cases_budget_finite",
@@ -397,7 +397,7 @@
       "checkConstraints": {
         "escalations_blob_matches": {
           "name": "escalations_blob_matches",
-          "value": "\"escalations\".\"escalation\"->>'caseId' = \"escalations\".\"case_id\" and \"escalations\".\"escalation\"->>'reason' = \"escalations\".\"reason\""
+          "value": "jsonb_typeof(\"escalations\".\"escalation\") = 'object'\n        and \"escalations\".\"escalation\"->>'caseId' is not distinct from \"escalations\".\"case_id\"\n        and \"escalations\".\"escalation\"->>'reason' is not distinct from \"escalations\".\"reason\""
         }
       },
       "isRLSEnabled": true
@@ -489,7 +489,7 @@
       "checkConstraints": {
         "events_blob_matches": {
           "name": "events_blob_matches",
-          "value": "\"events\".\"event\"->>'type' = \"events\".\"type\" and \"events\".\"event\"->>'caseId' = \"events\".\"case_id\"\n        and (\"events\".\"event\"->>'seq')::int = \"events\".\"seq\""
+          "value": "jsonb_typeof(\"events\".\"event\") = 'object'\n        and \"events\".\"event\"->>'type' is not distinct from \"events\".\"type\"\n        and \"events\".\"event\"->>'caseId' is not distinct from \"events\".\"case_id\"\n        and (\"events\".\"event\"->>'seq')::int is not distinct from \"events\".\"seq\""
         }
       },
       "isRLSEnabled": true
@@ -581,11 +581,11 @@
         },
         "exhibits_blob_matches": {
           "name": "exhibits_blob_matches",
-          "value": "\"exhibits\".\"exhibit\"->>'id' = \"exhibits\".\"id\" and \"exhibits\".\"exhibit\"->>'caseId' = \"exhibits\".\"case_id\"\n        and \"exhibits\".\"exhibit\"->>'kind' = \"exhibits\".\"kind\" and \"exhibits\".\"exhibit\"->>'author' = \"exhibits\".\"author\"\n        and \"exhibits\".\"exhibit\"->>'sha256' = \"exhibits\".\"sha256\""
+          "value": "jsonb_typeof(\"exhibits\".\"exhibit\") = 'object'\n        and \"exhibits\".\"exhibit\"->>'id' is not distinct from \"exhibits\".\"id\"\n        and \"exhibits\".\"exhibit\"->>'caseId' is not distinct from \"exhibits\".\"case_id\"\n        and \"exhibits\".\"exhibit\"->>'kind' is not distinct from \"exhibits\".\"kind\"\n        and \"exhibits\".\"exhibit\"->>'author' is not distinct from \"exhibits\".\"author\"\n        and \"exhibits\".\"exhibit\"->>'sha256' is not distinct from \"exhibits\".\"sha256\""
         },
         "exhibits_result_valid": {
           "name": "exhibits_result_valid",
-          "value": "\"exhibits\".\"result\" is null or (jsonb_typeof(\"exhibits\".\"result\") = 'object' and \"exhibits\".\"result\"->>'exhibitId' = \"exhibits\".\"id\")"
+          "value": "\"exhibits\".\"result\" is null or (jsonb_typeof(\"exhibits\".\"result\") = 'object'\n        and \"exhibits\".\"result\"->>'exhibitId' is not distinct from \"exhibits\".\"id\")"
         }
       },
       "isRLSEnabled": true
@@ -984,7 +984,7 @@
       "checkConstraints": {
         "verdicts_blob_matches": {
           "name": "verdicts_blob_matches",
-          "value": "\"verdicts\".\"verdict\"->>'caseId' = \"verdicts\".\"case_id\" and \"verdicts\".\"verdict\"->>'outcome' = \"verdicts\".\"outcome\""
+          "value": "jsonb_typeof(\"verdicts\".\"verdict\") = 'object'\n        and \"verdicts\".\"verdict\"->>'caseId' is not distinct from \"verdicts\".\"case_id\"\n        and \"verdicts\".\"verdict\"->>'outcome' is not distinct from \"verdicts\".\"outcome\""
         }
       },
       "isRLSEnabled": true

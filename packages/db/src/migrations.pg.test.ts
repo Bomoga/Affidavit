@@ -112,8 +112,8 @@ describePg('migrations on a fresh Postgres', () => {
       { proname: 'record_stage_entry', owner: OWNER_ROLE },
       { proname: 'stage_run_complete', owner: OWNER_ROLE },
       { proname: 'stage_run_fail', owner: OWNER_ROLE },
-      { proname: 'stage_run_has_live_lease', owner: OWNER_ROLE },
       { proname: 'stage_run_heartbeat', owner: OWNER_ROLE },
+      { proname: 'stage_run_job_alive', owner: OWNER_ROLE },
     ]);
     const pol = await db().admin.query<{ tablename: string; roles: string[] }>(
       `select tablename, roles::text[] as roles from pg_policies

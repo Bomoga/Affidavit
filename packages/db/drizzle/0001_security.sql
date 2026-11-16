@@ -49,6 +49,10 @@ $$;
 --> statement-breakpoint
 GRANT USAGE ON SCHEMA public TO affidavit_app, affidavit_worker;
 --> statement-breakpoint
+-- Functions this owner creates from now on are not executable by PUBLIC; each is granted to the
+-- role that needs it.
+ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+--> statement-breakpoint
 
 -- The tenant for the current transaction. Unset or empty yields NULL, and `tenant_id = NULL` is
 -- never true, so a missing setting returns no rows rather than all rows.
@@ -489,6 +493,11 @@ BEGIN
     SELECT 1 FROM public.events e
     WHERE e.tenant_id = NEW.tenant_id AND e.case_id = NEW.case_id AND e.seq = NEW.seq
       AND e.type = ANY (TG_ARGV)
+      -- The row must be the event's own payload, not a different blob under the same seq.
+      AND CASE TG_TABLE_NAME
+            WHEN 'ballots' THEN e.event->'payload'->'ballot' IS NOT DISTINCT FROM to_jsonb(NEW)->'ballot'
+            ELSE e.event->'payload'->'escalation' IS NOT DISTINCT FROM to_jsonb(NEW)->'escalation'
+          END
   ) THEN
     RAISE EXCEPTION '% needs a matching % event', TG_TABLE_NAME, TG_ARGV[0] USING ERRCODE = 'check_violation';
   END IF;
@@ -535,6 +544,7 @@ CREATE TRIGGER cases_record_stage_update AFTER UPDATE OF stage ON public.cases
 CREATE FUNCTION enqueue_stage(p_case_id text, p_stage text, p_attempt integer) RETURNS boolean
   LANGUAGE plpgsql SECURITY DEFINER
   SET search_path = pg_catalog, public, pg_temp
+  SET lock_timeout = '5s'
   AS $$
 DECLARE
   v_tenant text := public.app_tenant_id();
@@ -556,7 +566,7 @@ BEGIN
   END IF;
   -- Serialise enqueue and claim for one case and stage (one lock key, shared with claim_stage_run),
   -- so the existence check, the record and the queue insert cannot interleave with another caller.
-  PERFORM pg_advisory_xact_lock(hashtextextended(v_tenant || '/' || p_case_id || '/' || p_stage, 0));
+  PERFORM pg_advisory_xact_lock(hashtextextended(json_build_array(v_tenant, p_case_id, p_stage)::text, 0));
   SELECT stage INTO v_current FROM public.cases WHERE tenant_id = v_tenant AND id = p_case_id;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'unknown case %', p_case_id USING ERRCODE = 'no_data_found';
@@ -604,6 +614,7 @@ CREATE FUNCTION claim_stage_run(p_tenant text, p_case_id text, p_stage text, p_a
                                 p_worker_id text, p_lease_seconds integer) RETURNS text
   LANGUAGE plpgsql SECURITY DEFINER
   SET search_path = pg_catalog, public, pg_temp
+  SET lock_timeout = '5s'
   AS $$
 DECLARE
   v_job_visit integer;
@@ -615,7 +626,7 @@ BEGIN
      OR p_lease_seconds < 1 OR p_lease_seconds > 3600 THEN
     RAISE EXCEPTION 'invalid claim' USING ERRCODE = 'invalid_parameter_value';
   END IF;
-  PERFORM pg_advisory_xact_lock(hashtextextended(p_tenant || '/' || p_case_id || '/' || p_stage, 0));
+  PERFORM pg_advisory_xact_lock(hashtextextended(json_build_array(p_tenant, p_case_id, p_stage)::text, 0));
   SELECT visit INTO v_job_visit FROM public.stage_jobs
     WHERE tenant_id = p_tenant AND case_id = p_case_id AND stage = p_stage AND attempt = p_attempt;
   IF NOT FOUND THEN
@@ -759,10 +770,10 @@ GRANT EXECUTE ON FUNCTION stage_run_complete(text, text, integer, text) TO affid
 GRANT EXECUTE ON FUNCTION stage_run_fail(text, text, integer, text, text) TO affidavit_app;
 --> statement-breakpoint
 
--- For the worker role's dead-job detection: is there an open attempt with a live lease for this
--- queue job? (The worker role cannot read stage_runs.) A job whose attempt still holds a live
--- lease is running, however old its Graphile lock is.
-CREATE FUNCTION stage_run_has_live_lease(p_tenant text, p_case_id text, p_stage text, p_attempt integer)
+-- For the worker role's dead-job detection (it cannot read stage_runs): does this queue job's
+-- attempt show signs of life? A completed attempt, or an open one holding a live lease, is not a
+-- dead job however old its Graphile lock is.
+CREATE FUNCTION stage_run_job_alive(p_tenant text, p_case_id text, p_stage text, p_attempt integer)
   RETURNS boolean
   LANGUAGE sql STABLE SECURITY DEFINER
   SET search_path = pg_catalog, public, pg_temp
@@ -770,10 +781,10 @@ CREATE FUNCTION stage_run_has_live_lease(p_tenant text, p_case_id text, p_stage 
   SELECT EXISTS (
     SELECT 1 FROM public.stage_runs
     WHERE tenant_id = p_tenant AND case_id = p_case_id AND stage = p_stage AND attempt = p_attempt
-      AND completed_at IS NULL AND failed_at IS NULL AND lease_expires_at > now()
+      AND (completed_at IS NOT NULL OR (failed_at IS NULL AND lease_expires_at > now()))
   )
 $$;
 --> statement-breakpoint
-REVOKE ALL ON FUNCTION stage_run_has_live_lease(text, text, text, integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION stage_run_job_alive(text, text, text, integer) FROM PUBLIC;
 --> statement-breakpoint
-GRANT EXECUTE ON FUNCTION stage_run_has_live_lease(text, text, text, integer) TO affidavit_worker;
+GRANT EXECUTE ON FUNCTION stage_run_job_alive(text, text, text, integer) TO affidavit_worker;

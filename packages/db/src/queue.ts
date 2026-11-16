@@ -117,9 +117,9 @@ export async function listFailedStageJobs(
     `select key, attempts, last_error, (locked_at is not null) as stale
      from graphile_worker._private_jobs j
      where attempts >= max_attempts
-       and ((last_error is not null and locked_at is null)
+       and ((locked_at is null)
          or (locked_at is not null and locked_at < now() - make_interval(secs => $1)
-             and not coalesce(public.stage_run_has_live_lease(
+             and not coalesce(public.stage_run_job_alive(
                j.payload->>'tenantId', j.payload->>'caseId', j.payload->>'stage',
                case when (j.payload->>'attempt') ~ '^[0-9]{1,9}$'
                     then (j.payload->>'attempt')::int end), false)))
@@ -158,14 +158,14 @@ export async function stageJobState(
   }>(
     `select attempts, max_attempts, last_error, (locked_at is not null) as locked,
             coalesce(locked_at < now() - make_interval(secs => $2), false) as stale,
-            coalesce(public.stage_run_has_live_lease($3, $4, $5, $6), false) as live
+            coalesce(public.stage_run_job_alive($3, $4, $5, $6), false) as live
      from graphile_worker._private_jobs where key = $1`,
     [stageJobKey(p), staleLockSeconds, p.tenantId, p.caseId, p.stage, p.attempt],
   );
   const r = rows[0];
   if (!r) return 'none';
   if (r.locked) return r.stale && r.attempts >= r.max_attempts && !r.live ? 'stale' : 'running';
-  if (r.attempts >= r.max_attempts && r.last_error !== null) return 'failed';
+  if (r.attempts >= r.max_attempts) return 'failed';
   return 'queued';
 }
 
@@ -238,6 +238,7 @@ export function stageTaskList(
     list[stageTaskIdentifier(stage)] = async (raw) => {
       const job = parseStagePayload(raw);
       if (job.stage !== stage) throw new Error(`payload stage ${job.stage} on task for ${stage}`);
+      const claimStartedAt = Date.now();
       const token = await claimStageRun(options.workerPool, job, workerId, leaseSeconds);
       if (token === null) return;
       const abort = new AbortController();
@@ -245,7 +246,7 @@ export function stageTaskList(
       // confirmed it started). If we cannot confirm a heartbeat before it, the lease may be gone,
       // so the signal aborts: once that expiry has passed, or after three failures in a row,
       // whether the database answered no, errored, or did not answer at all.
-      let confirmedUntil = Date.now() + leaseSeconds * 1000;
+      let confirmedUntil = claimStartedAt + leaseSeconds * 1000;
       let failures = 0;
       const lose = (why: string) => {
         if (!abort.signal.aborted) abort.abort(new Error(why));

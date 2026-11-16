@@ -679,6 +679,43 @@ describePg('stage queue (Graphile Worker)', () => {
     expect(await completeStageRun(db().app, p)).toBe(true);
   });
 
+  it('a job whose lock Graphile reset (attempts used up, no lock, no error) is failed, not queued forever', async () => {
+    const file = await newCaseA();
+    const p = pay(A, file.id, 'intake');
+    await enqueueStage(db().app, p);
+    // What graphile-worker 0.18 leaves after resetLockedAt on a job locked for over 4 hours.
+    await db().admin.query(
+      `update graphile_worker._private_jobs
+       set attempts = max_attempts, locked_at = null, locked_by = null, last_error = null
+       where key = $1`,
+      [stageJobKey(p)],
+    );
+    expect(await stageJobState(db().worker, p)).toBe('failed');
+    expect(
+      (await listFailedStageJobs(db().worker)).find((j) => j.key === stageJobKey(p))?.reason,
+    ).toBe('failed');
+    expect(await resumeDecision(pools(), p)).toBe('next-attempt');
+    expect(await enqueueStage(db().app, p)).toBe(false);
+    expect(await enqueueStage(db().app, { ...p, attempt: 2 })).toBe(true);
+  });
+
+  it('a stale-locked job whose attempt completed is not listed as dead', async () => {
+    const file = await newCaseA();
+    const p = pay(A, file.id, 'intake');
+    await enqueueStage(db().app, p);
+    const token = await claimStageRun(db().worker, p, 'w', 60);
+    await completeStageRun(db().app, p, token!);
+    await db().admin.query(
+      `update graphile_worker._private_jobs
+       set attempts = 1, locked_at = now() - interval '2 hours', locked_by = 'x' where key = $1`,
+      [stageJobKey(p)],
+    );
+    expect((await listFailedStageJobs(db().worker, 60)).some((j) => j.key === stageJobKey(p))).toBe(
+      false,
+    );
+    expect(await stageJobState(db().worker, p, 60)).toBe('running');
+  });
+
   it('a malformed job payload does not break the failed-job list', async () => {
     await db().worker.query(
       `select graphile_worker.add_job('case-stage:intake',

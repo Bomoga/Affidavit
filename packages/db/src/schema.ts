@@ -75,10 +75,12 @@ export const cases = pgTable(
     // F3 cannot be dodged by a row whose score or floor column differs from its case file.
     check(
       'cases_file_matches',
-      sql`${t.caseFile}->>'id' = ${t.id}
-        and ${t.caseFile}->>'tenantId' = ${t.tenantId}
-        and (${t.caseFile}->'candidate'->>'score')::double precision = ${t.candidateScore}
-        and (${t.caseFile}->>'escalationFloor')::double precision = ${t.escalationFloor}`,
+      // IS NOT DISTINCT FROM: a missing key is NULL, and `NULL = x` would let the check pass.
+      sql`jsonb_typeof(${t.caseFile}) = 'object'
+        and ${t.caseFile}->>'id' is not distinct from ${t.id}
+        and ${t.caseFile}->>'tenantId' is not distinct from ${t.tenantId}
+        and (${t.caseFile}->'candidate'->>'score')::double precision is not distinct from ${t.candidateScore}
+        and (${t.caseFile}->>'escalationFloor')::double precision is not distinct from ${t.escalationFloor}`,
     ),
     check('cases_budget_finite', sql`${t.remainingUsd} <> 'NaN'::numeric`),
   ],
@@ -126,13 +128,17 @@ export const exhibits = pgTable(
     // null would otherwise freeze the write-once column).
     check(
       'exhibits_blob_matches',
-      sql`${t.exhibit}->>'id' = ${t.id} and ${t.exhibit}->>'caseId' = ${t.caseId}
-        and ${t.exhibit}->>'kind' = ${t.kind} and ${t.exhibit}->>'author' = ${t.author}
-        and ${t.exhibit}->>'sha256' = ${t.sha256}`,
+      sql`jsonb_typeof(${t.exhibit}) = 'object'
+        and ${t.exhibit}->>'id' is not distinct from ${t.id}
+        and ${t.exhibit}->>'caseId' is not distinct from ${t.caseId}
+        and ${t.exhibit}->>'kind' is not distinct from ${t.kind}
+        and ${t.exhibit}->>'author' is not distinct from ${t.author}
+        and ${t.exhibit}->>'sha256' is not distinct from ${t.sha256}`,
     ),
     check(
       'exhibits_result_valid',
-      sql`${t.result} is null or (jsonb_typeof(${t.result}) = 'object' and ${t.result}->>'exhibitId' = ${t.id})`,
+      sql`${t.result} is null or (jsonb_typeof(${t.result}) = 'object'
+        and ${t.result}->>'exhibitId' is not distinct from ${t.id})`,
     ),
   ],
 ).enableRLS();
@@ -154,7 +160,9 @@ export const ballots = pgTable(
     caseRef(t),
     check(
       'ballots_blob_matches',
-      sql`${t.ballot}->>'jurorId' = ${t.jurorId} and ${t.ballot}->>'question' = ${t.question}`,
+      sql`jsonb_typeof(${t.ballot}) = 'object'
+        and ${t.ballot}->>'jurorId' is not distinct from ${t.jurorId}
+        and ${t.ballot}->>'question' is not distinct from ${t.question}`,
     ),
   ],
 ).enableRLS();
@@ -174,7 +182,9 @@ export const verdicts = pgTable(
     caseRef(t),
     check(
       'verdicts_blob_matches',
-      sql`${t.verdict}->>'caseId' = ${t.caseId} and ${t.verdict}->>'outcome' = ${t.outcome}`,
+      sql`jsonb_typeof(${t.verdict}) = 'object'
+        and ${t.verdict}->>'caseId' is not distinct from ${t.caseId}
+        and ${t.verdict}->>'outcome' is not distinct from ${t.outcome}`,
     ),
   ],
 ).enableRLS();
@@ -221,7 +231,9 @@ export const escalations = pgTable(
     caseRef(t),
     check(
       'escalations_blob_matches',
-      sql`${t.escalation}->>'caseId' = ${t.caseId} and ${t.escalation}->>'reason' = ${t.reason}`,
+      sql`jsonb_typeof(${t.escalation}) = 'object'
+        and ${t.escalation}->>'caseId' is not distinct from ${t.caseId}
+        and ${t.escalation}->>'reason' is not distinct from ${t.reason}`,
     ),
   ],
 ).enableRLS();
@@ -243,8 +255,10 @@ export const events = pgTable(
     index('events_case_idx').on(t.tenantId, t.caseId),
     check(
       'events_blob_matches',
-      sql`${t.event}->>'type' = ${t.type} and ${t.event}->>'caseId' = ${t.caseId}
-        and (${t.event}->>'seq')::int = ${t.seq}`,
+      sql`jsonb_typeof(${t.event}) = 'object'
+        and ${t.event}->>'type' is not distinct from ${t.type}
+        and ${t.event}->>'caseId' is not distinct from ${t.caseId}
+        and (${t.event}->>'seq')::int is not distinct from ${t.seq}`,
     ),
   ],
 ).enableRLS();

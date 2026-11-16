@@ -380,6 +380,75 @@ describePg('database guards behind the store', () => {
       ).rejects.toThrow(/cost_rows_values_valid/);
     });
 
+    it('a JSON blob that lacks a key is rejected (a NULL comparison must not pass the check)', async () => {
+      const { store, file } = await openCase();
+      await store.nextSeq(file.id);
+      await store.nextSeq(file.id);
+      await store.putExhibit(Exhibit.parse({ ...(samples.Exhibit as object), caseId: file.id }));
+      const rejected = async (text: string, params: unknown[], re: RegExp) => {
+        const c = await db().admin.connect();
+        try {
+          await c.query('begin');
+          // The projection triggers would object first; this isolates the CHECK constraints.
+          await c.query('alter table ballots disable trigger user');
+          await c.query('alter table escalations disable trigger user');
+          await expect(c.query(text, params), text).rejects.toThrow(re);
+        } finally {
+          await c.query('rollback');
+          c.release();
+        }
+      };
+      await rejected(
+        `insert into events (tenant_id, case_id, seq, type, event) values ($1, $2, 0, 'stage-entered', '{}')`,
+        [T, file.id],
+        /events_blob_matches/,
+      );
+      await rejected(
+        `insert into verdicts (tenant_id, case_id, outcome, verdict) values ($1, $2, 'proven-fixed', '{}')`,
+        [T, file.id],
+        /verdicts_blob_matches/,
+      );
+      await rejected(
+        `insert into ballots (tenant_id, case_id, seq, juror_id, question, ballot) values ($1, $2, 0, 'j', 'severity', '{}')`,
+        [T, file.id],
+        /ballots_blob_matches/,
+      );
+      await rejected(
+        `insert into escalations (tenant_id, case_id, seq, reason, detail, escalation) values ($1, $2, 0, 'split-jury', 'd', '{}')`,
+        [T, file.id],
+        /escalations_blob_matches/,
+      );
+      await rejected(
+        `insert into exhibits (tenant_id, case_id, id, kind, author, sha256, exhibit) values ($1, $2, 'ex-3', 'witness', 'defense', 'a', '{}')`,
+        [T, file.id],
+        /exhibits_blob_matches/,
+      );
+      await rejected(
+        `update exhibits set result = '{"passed": true}'::jsonb where case_id = $1`,
+        [file.id],
+        /exhibits_result_valid/,
+      );
+      await rejected(
+        `insert into cases (tenant_id, id, repo_id, case_file, candidate_score, escalation_floor,
+           remaining_input_tokens, remaining_output_tokens, remaining_usd)
+         values ($1, 'cf-nokeys', $2, '{"note": "no keys"}'::jsonb, 0.5, 0.1, 1, 1, 1)`,
+        [T, file.target.repo],
+        /cases_file_matches/,
+      );
+    });
+
+    it('functions are not executable by PUBLIC, and the app role cannot ALTER ROLE its own settings', async () => {
+      const { rows } = await db().admin.query<{ proname: string }>(`
+        select p.proname from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+        where n.nspname = 'public'
+          and (p.proacl is null
+               or exists (select 1 from aclexplode(p.proacl) a where a.grantee = 0))`);
+      expect(rows).toEqual([]);
+      expect(await asApp(`alter role affidavit_app set app.tenant_id = 'tenant-evil'`)).toMatch(
+        /permission denied|must have/,
+      );
+    });
+
     it('case exhaustion never clears', async () => {
       const { store, file } = await openCase();
       await store.chargeBudget(file.id, {
