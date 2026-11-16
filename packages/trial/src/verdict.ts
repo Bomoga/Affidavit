@@ -68,7 +68,10 @@ export function renderSummary(v: StructuredVerdict): string {
   if (v.severity) lines.push(`Severity: ${v.severity}.`);
   if (v.exhibits.length > 0) lines.push(`Evidence cited: ${v.exhibits.join(', ')}.`);
   if (v.cost.length > 0) {
-    const rows = v.cost.map((c) => `${c.stage} attempt ${c.attempt} $${c.usd}`);
+    // Plain decimal, never exponent form, so the printed digits parse back to the same number.
+    const plain = (n: number): string =>
+      n.toLocaleString('en-US', { useGrouping: false, maximumFractionDigits: 20 });
+    const rows = v.cost.map((c) => `${c.stage} attempt ${c.attempt} $${plain(c.usd)}`);
     lines.push(`Recorded cost by stage: ${rows.join('; ')}.`);
   }
   return lines.join(' ');

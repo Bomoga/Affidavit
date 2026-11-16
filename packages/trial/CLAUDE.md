@@ -14,6 +14,15 @@ Run from this directory, or add `--filter @affidavit/trial` from the repo root.
 - `pnpm lint`
 - `pnpm test`
 
+## Known gaps
+
+- Terminal verdicts (dismissed, escalated) cite the exhibits the current `Orchestrator` instance
+  saw as events. The seen-exhibit set is in memory, like the cost ledger, so a case resumed in a
+  new instance cites only exhibits seen after the resume. A fix needs a seen-exhibit record in
+  `TrialWorkspace` (separate from the admitted-only `getExhibits`).
+- A dismissed case resumed in a new instance with no verdict cannot be repaired: the recorded
+  Dismissal is not readable from there, so the orchestrator throws instead of inventing one.
+
 ## Intended libraries (notes for later, not installed yet)
 
 - Claude Agent SDK

@@ -275,11 +275,23 @@ describe('planted instruction in repo code (stand-in for the L1-07 case file)', 
     const v = Verdict.parse(await t.store.getVerdict(planted.id));
     expect(v.outcome).toBe('escalated');
 
-    // The planted text is only ever user-side data inside the untrusted wrapper.
+    // Every occurrence of the planted text sits inside a case-file-slice untrusted span, and
+    // nowhere else: not outside the wrapper, and never in the system prompt.
     for (const req of t.model.requests) {
       expect(req.system).not.toContain(PLANT);
-      expect(req.user).toContain(PLANT);
-      expect(req.user.indexOf('case-file-slice')).toBeLessThan(req.user.indexOf(PLANT));
+      const spans = [
+        ...req.user.matchAll(
+          /<<<BEGIN UNTRUSTED DATA source=case-file-slice fence=([0-9a-f]+)>>>\n[\s\S]*?\n<<<END \1>>>/g,
+        ),
+      ];
+      expect(spans.length).toBeGreaterThan(0);
+      const inside = (at: number) => spans.some((m) => at >= m.index && at < m.index + m[0].length);
+      const hits = [...req.user.matchAll(new RegExp(PLANT, 'g'))].map((m) => m.index);
+      expect(hits.length).toBeGreaterThan(0);
+      for (const at of hits) expect(inside(at)).toBe(true);
+      let outside = req.user;
+      for (const m of spans) outside = outside.replace(m[0], '');
+      expect(outside).not.toContain(PLANT);
     }
   });
 });

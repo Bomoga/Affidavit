@@ -191,7 +191,13 @@ function overdrawn(b: BudgetState): boolean {
 export class Orchestrator {
   private readonly ledgers = new Map<CaseId, StageCost[]>();
   private readonly runInfos = new Map<CaseId, RunInfo>();
-  /** Every exhibit id this run saw submitted, resulted, or rejected, in first-seen order. */
+  private readonly dismissed = new Set<CaseId>();
+  /**
+   * Every exhibit id this run saw submitted, resulted, or rejected, in first-seen order.
+   * KNOWN GAP: in memory only, like the cost ledger. A case resumed in a new Orchestrator cites
+   * only the exhibits seen after the resume. Fixing it needs a seen-exhibit record in the
+   * TrialWorkspace (separate from the admitted-only getExhibits); not done here.
+   */
   private readonly exhibitsSeen = new Map<CaseId, ExhibitId[]>();
 
   constructor(private readonly deps: OrchestratorDeps) {}
@@ -204,7 +210,14 @@ export class Orchestrator {
 
     for (;;) {
       await this.emit(caseId, stage, 'stage-entered', from === undefined ? {} : { from });
-      if (isTerminal(stage)) return { status: 'terminal', stage };
+      if (isTerminal(stage)) {
+        // A terminal case must carry a verdict. If an earlier run reached this stage but failed
+        // before writing it, write it now rather than leave the case closed with no verdict.
+        if (stage === 'dismissed' || stage === 'escalated') {
+          await this.writeTerminalVerdict(caseId, stage, stage);
+        }
+        return { status: 'terminal', stage };
+      }
 
       if (await config.killSwitch()) return { status: 'halted', stage, reason: 'kill-switch' };
       const handler = handlers[stage];
@@ -445,7 +458,20 @@ export class Orchestrator {
     stage: CaseStage,
     outcome: 'dismissed' | 'escalated',
   ): Promise<void> {
-    if ((await this.deps.store.getVerdict(caseId)) !== null) return;
+    const existing = await this.deps.store.getVerdict(caseId);
+    if (existing !== null) {
+      if (existing.outcome === outcome) return;
+      throw new Error(
+        `case ${caseId} ended ${outcome} but already has a ${existing.outcome} verdict`,
+      );
+    }
+    // A dismissed verdict needs the recorded contract Dismissal it summarizes. Without one in
+    // this run (a dismissal in an earlier run is not readable from here) refuse to invent it.
+    if (outcome === 'dismissed' && !this.dismissed.has(caseId)) {
+      throw new Error(
+        `case ${caseId} is dismissed but no dismissal was recorded in this run; not writing a dismissed verdict`,
+      );
+    }
     const { promptVersions, modelIds } = this.info(caseId);
     const verdict = finalizeVerdict(
       buildVerdict({
@@ -462,6 +488,7 @@ export class Orchestrator {
   }
 
   private noteExhibits(event: TrialEvent): void {
+    if (event.type === 'dismissed') this.dismissed.add(event.caseId);
     let id: ExhibitId | undefined;
     if (event.type === 'exhibit-submitted' || event.type === 'exhibit-inadmissible') {
       id = event.payload.exhibitId;
