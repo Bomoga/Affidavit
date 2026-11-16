@@ -17,6 +17,7 @@ import {
 import { digestOf } from './canonical.js';
 import type { SubmissionSpec } from './envelope.js';
 import { assertAllowedTools, type ModelRole } from './roles.js';
+import { buildVerdict, finalizeVerdict } from './verdict.js';
 
 export type ModelTurnRequest = Parameters<ModelPort['runTurn']>[0];
 export type ModelTurnResult = Awaited<ReturnType<ModelPort['runTurn']>>;
@@ -190,6 +191,8 @@ function overdrawn(b: BudgetState): boolean {
 export class Orchestrator {
   private readonly ledgers = new Map<CaseId, StageCost[]>();
   private readonly runInfos = new Map<CaseId, RunInfo>();
+  /** Every exhibit id this run saw submitted, resulted, or rejected, in first-seen order. */
+  private readonly exhibitsSeen = new Map<CaseId, ExhibitId[]>();
 
   constructor(private readonly deps: OrchestratorDeps) {}
 
@@ -214,6 +217,7 @@ export class Orchestrator {
       if (outcome.kind === 'advance') {
         next = outcome.next;
         await store.transition(caseId, next);
+        if (next === 'dismissed') await this.writeTerminalVerdict(caseId, stage, 'dismissed');
       } else {
         next = 'escalated';
         await this.escalate(caseId, stage, outcome.reason, outcome.detail);
@@ -428,6 +432,44 @@ export class Orchestrator {
       await this.emit(caseId, stage, 'budget-exhausted', { escalation });
     }
     await this.emit(caseId, stage, 'escalated', { escalation }, 'stenographer');
+    await this.writeTerminalVerdict(caseId, stage, 'escalated');
+  }
+
+  /**
+   * A case that ends dismissed or escalated still gets a contract Verdict, built structurally
+   * from what actually happened: every exhibit seen (inadmissible ones included), the prompts and
+   * models that ran, and the recorded cost. The summary is generated from it and checked.
+   */
+  private async writeTerminalVerdict(
+    caseId: CaseId,
+    stage: CaseStage,
+    outcome: 'dismissed' | 'escalated',
+  ): Promise<void> {
+    if ((await this.deps.store.getVerdict(caseId)) !== null) return;
+    const { promptVersions, modelIds } = this.info(caseId);
+    const verdict = finalizeVerdict(
+      buildVerdict({
+        caseId,
+        outcome,
+        exhibits: this.exhibitsSeen.get(caseId) ?? [],
+        promptVersions,
+        modelIds,
+        cost: this.ledger(caseId),
+      }),
+    );
+    await this.deps.store.appendVerdict(verdict);
+    await this.emit(caseId, stage, 'verdict-written', { verdict }, 'stenographer');
+  }
+
+  private noteExhibits(event: TrialEvent): void {
+    let id: ExhibitId | undefined;
+    if (event.type === 'exhibit-submitted' || event.type === 'exhibit-inadmissible') {
+      id = event.payload.exhibitId;
+    } else if (event.type === 'exhibit-result') id = event.payload.result.exhibitId;
+    if (id === undefined) return;
+    const list = this.exhibitsSeen.get(event.caseId) ?? [];
+    if (!list.includes(id)) list.push(id);
+    this.exhibitsSeen.set(event.caseId, list);
   }
 
   private async emit<T extends TrialEventType>(
@@ -451,5 +493,6 @@ export class Orchestrator {
       payload,
     });
     await sink.emit(event);
+    this.noteExhibits(event);
   }
 }
