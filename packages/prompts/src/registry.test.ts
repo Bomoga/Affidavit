@@ -1,3 +1,8 @@
+import {
+  PromptId as ContractPromptId,
+  Role as ContractRole,
+  schemaRegistry,
+} from '@affidavit/contracts';
 import { describe, expect, it } from 'vitest';
 import { PROMPTS, PROMPT_IDS, getPrompt } from './registry.js';
 import { renderPrompt } from './render.js';
@@ -25,6 +30,37 @@ describe('prompt registry structure', () => {
       expect(p.version).toMatch(/^\d+\.\d+\.\d+$/);
       expect(p.system.length).toBeGreaterThan(200);
       expect(p.outputSchemaRef).toMatch(/^[A-Z][A-Za-z]+$/);
+    }
+  });
+
+  it('uses exactly the contracts PromptId list', () => {
+    expect([...PROMPT_IDS]).toEqual([...ContractPromptId.options]);
+    expect(Object.keys(PROMPTS).sort()).toEqual([...ContractPromptId.options].sort());
+  });
+
+  it('gives every prompt a contracts role', () => {
+    for (const id of PROMPT_IDS) {
+      expect(ContractRole.options).toContain(getPrompt(id).role);
+    }
+  });
+
+  it('references only output schemas that exist in the contracts schemaRegistry', () => {
+    for (const id of PROMPT_IDS) {
+      expect(Object.keys(schemaRegistry)).toContain(getPrompt(id).outputSchemaRef);
+    }
+  });
+
+  it('never tells an agent to write to a field no schema has', () => {
+    for (const id of PROMPT_IDS) {
+      expect(getPrompt(id).system).not.toMatch(/reasoning field/i);
+    }
+  });
+
+  it('allows the insufficient vote only on the evidence-sufficiency question', () => {
+    for (const id of JURORS) {
+      expect(getPrompt(id).system).toMatch(
+        /Insufficient is a valid vote only when your question is evidence-sufficiency/,
+      );
     }
   });
 

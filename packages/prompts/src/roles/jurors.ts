@@ -3,12 +3,12 @@ import type { PromptDefinition } from '../types.js';
 
 const JUROR_COMMON = `You are one juror on a panel of three. You vote alone and never see the other ballots. You rule only on judgment questions: severity, fix-minimality, merge-risk, and evidence-sufficiency. You never rule on whether a witness passed, whether an exploit landed, or whether tests passed. Those mechanical outcomes come only from the Judge's recorded results, which you may cite as given.
 
-Cast one ballot with the submit tool. Give your vote, a confidence between 0 and 1, and the exhibit ids you relied on. A ballot that cites no exhibit is not valid. If the evidence you were shown cannot support a vote, vote that the evidence is insufficient and say why.`;
+Cast one ballot with the submit tool. Give your vote, a confidence between 0 and 1, and the exhibit ids you relied on. A ballot that cites no exhibit is not valid. Vote only within the question you are given, using only the answers that question allows. Insufficient is a valid vote only when your question is evidence-sufficiency; on any other question, give your best vote on that question and lower your confidence if the evidence is thin.`;
 
 export const JUROR_SECURITY: PromptDefinition = {
   id: 'juror-security',
   role: 'juror',
-  version: '1.0.0',
+  version: '1.1.0',
   outputSchemaRef: 'Ballot',
   system: `${JUROR_COMMON}
 
@@ -20,7 +20,7 @@ ${SAFETY_RULES}`,
 export const JUROR_MAINTAINABILITY: PromptDefinition = {
   id: 'juror-maintainability',
   role: 'juror',
-  version: '1.0.0',
+  version: '1.1.0',
   outputSchemaRef: 'Ballot',
   system: `${JUROR_COMMON}
 
@@ -32,7 +32,7 @@ ${SAFETY_RULES}`,
 export const JUROR_BLAST_RADIUS: PromptDefinition = {
   id: 'juror-blast-radius',
   role: 'juror',
-  version: '1.0.0',
+  version: '1.1.0',
   outputSchemaRef: 'Ballot',
   system: `${JUROR_COMMON}
 

@@ -36,12 +36,18 @@ describe('prompt version history', () => {
     expect(problems[0]).toContain(promptDigest(bumped.remedy));
   });
 
-  it('rejects rewriting a past version in the history', () => {
+  it('rejects rewriting the recorded digest of the current version', () => {
+    // Older entries cannot be recomputed (their text is gone), so the check pins the
+    // current version's digest. Rolling a prompt back is caught by the next test.
     const tampered = JSON.parse(JSON.stringify(VERSION_HISTORY)) as typeof VERSION_HISTORY;
-    const entry = tampered.prosecution;
-    const v = Object.keys(entry)[0]!;
-    entry[v] = 'f'.repeat(64);
+    tampered.prosecution[PROMPTS.prosecution.version] = 'f'.repeat(64);
     expect(checkVersionHistory(PROMPTS, tampered).length).toBeGreaterThan(0);
+  });
+
+  it('rejects a prompt whose version is older than the newest history entry', () => {
+    const rolledBack = { ...PROMPTS, defense: { ...PROMPTS.defense, version: '1.0.0' } };
+    const problems = checkVersionHistory(rolledBack, VERSION_HISTORY);
+    expect(problems.some((p) => p.includes('defense') && p.includes('newer'))).toBe(true);
   });
 
   it('accepts a properly bumped prompt once its new version is appended', () => {

@@ -1,18 +1,11 @@
-// Prompt-package types only. Contract objects (Role, Witness, Ballot, ...) live in
-// @affidavit/contracts and are referenced here by name, never redefined.
-// TODO(P0-03): once contracts v1.0 lands, type `role` as the contracts `Role` subset
-// and check `outputSchemaRef` against the exported schema names.
+// Prompt-package types only. Contract objects (Role, PromptId, Witness, Ballot, ...) live in
+// @affidavit/contracts and are imported from there, never redefined.
+import type { PromptId, Role } from '@affidavit/contracts';
 
-export type PromptRole = 'defense' | 'prosecution' | 'remedy' | 'juror';
+export type { PromptId };
 
-export type PromptId =
-  | 'defense'
-  | 'defense-second-attempt'
-  | 'prosecution'
-  | 'remedy'
-  | 'juror-security'
-  | 'juror-maintainability'
-  | 'juror-blast-radius';
+/** The contract roles that run a prompt. Judge and stenographer are code, not agents. */
+export type PromptRole = Extract<Role, 'defense' | 'prosecution' | 'remedy' | 'juror'>;
 
 export interface PromptDefinition {
   readonly id: PromptId;
@@ -21,7 +14,7 @@ export interface PromptDefinition {
   readonly version: string;
   /** Static text. Never interpolated with case-file or app content. */
   readonly system: string;
-  /** Name of the contracts schema the agent's submit tool validates against. */
+  /** Key in the contracts `schemaRegistry` that the agent's submit tool validates against. */
   readonly outputSchemaRef: string;
 }
 
