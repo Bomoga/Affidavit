@@ -1,9 +1,9 @@
-import type { Role, SubmitToolName } from './interim/types.js';
+import type { Role, SubmitToolName } from '@affidavit/contracts';
 
 /**
  * The only tools any role may be given. Each is a schema-validated submit tool.
- * There is no shell, file, or network tool anywhere in this table or in the
- * SubmitToolName union, so an agent cannot execute code or reach a host.
+ * There is no shell, file, or network tool anywhere in this table or in the contract's
+ * closed SubmitToolName union, so an agent cannot execute code or reach a host.
  */
 export const ROLE_TOOLS = {
   defense: ['submit_witness'],
@@ -12,9 +12,9 @@ export const ROLE_TOOLS = {
   juror: ['submit_ballot'],
 } as const satisfies Record<string, readonly SubmitToolName[]>;
 
-type ModelRole = keyof typeof ROLE_TOOLS;
+export type ModelRole = keyof typeof ROLE_TOOLS;
 
-function isModelRole(role: Role): role is ModelRole {
+export function isModelRole(role: Role): role is ModelRole {
   return Object.hasOwn(ROLE_TOOLS, role);
 }
 

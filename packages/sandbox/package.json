@@ -12,13 +12,15 @@
     "lint": "eslint src",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "containment": "tsx src/containment/cli.ts"
   },
   "dependencies": {
     "@affidavit/contracts": "workspace:*",
     "dockerode": "5.0.1"
   },
   "devDependencies": {
+    "@affidavit/testing": "workspace:*",
     "@types/dockerode": "4.0.2"
   }
 }
