@@ -12,7 +12,9 @@
     "lint": "eslint src",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:network": "node scripts/test-network.mjs",
+    "fetch": "node scripts/fetch-pinned.mjs"
   },
   "dependencies": {
     "@affidavit/contracts": "workspace:*"
