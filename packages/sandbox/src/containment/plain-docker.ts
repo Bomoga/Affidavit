@@ -2,13 +2,10 @@ import { execFile, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { promisify } from 'node:util';
 import { buildDockerRunArgs } from '@affidavit/testing';
+import { PROBE_IMAGE } from './probes.js';
 import type { JailRunner, JailRunReport, JailRunRequest } from './types.js';
 
 const exec = promisify(execFile);
-
-/** node:22-alpine, multi-arch index digest resolved 2026-11-13 with `docker pull`. */
-export const PROBE_IMAGE =
-  'node:22-alpine@sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a';
 
 /** Output beyond this is dropped, so a probe cannot exhaust the harness's memory. */
 const MAX_CAPTURE = 2 * 1024 * 1024;
@@ -79,7 +76,7 @@ export class PlainDockerRunner implements JailRunner {
     const durationMs = Date.now() - started;
 
     const state = await readState(name);
-    await exec('docker', ['rm', '--force', name]).catch(() => undefined);
+    await exec('docker', ['rm', '--force', '--volumes', name]).catch(() => undefined);
 
     return {
       exitCode: timedOut || state === null ? null : state.exitCode,

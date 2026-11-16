@@ -1,5 +1,9 @@
 import type { JailRunReport, Probe } from './types.js';
 
+/** node:22-alpine, multi-arch index digest resolved 2026-11-13 with `docker pull`. */
+export const PROBE_IMAGE =
+  'node:22-alpine@sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a';
+
 export const PROBE_MARKER = 'AFFIDAVIT_PROBE ';
 /** Printed first, so a probe that never ran is not mistaken for one that was stopped. */
 export const STARTED_MARKER = 'AFFIDAVIT_PROBE_STARTED';
