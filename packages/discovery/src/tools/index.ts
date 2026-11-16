@@ -11,3 +11,4 @@ export * from './quarantine.js';
 export * from './lockfiles.js';
 export * from './run.js';
 export * from './unscannable.js';
+export { NonUtf8NameError } from './walk.js';

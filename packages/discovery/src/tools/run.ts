@@ -6,11 +6,12 @@ import { findOsvLockfiles } from './lockfiles.js';
 import { isEmptyExit, isOkExit, type ToolManifest, type ToolName } from './manifest.js';
 import {
   assertSnapshotClean,
+  gitDirExtraContent,
   prepareOutput,
   prepareScratch,
   type QuarantinedSnapshot,
 } from './quarantine.js';
-import { findGitleaksUnscannable } from './unscannable.js';
+import { findGitleaksUnscannable, type Unscannable } from './unscannable.js';
 
 export type RunToolOptions = Omit<ToolRunOptions, 'sourceDir'> & {
   /** The quarantined scan copy. Its removed-path list is passed through on the result. */
@@ -165,23 +166,34 @@ function osvMissingLockfiles(doc: unknown, lockfiles: readonly string[]): string
   const report = doc as { results?: { source?: { path?: string } }[] };
   const sources = (report.results ?? []).map((r) => r.source?.path ?? '');
   return lockfiles.filter(
-    (lf) => !sources.some((s) => s === lf || s === `/src/${lf}` || s.endsWith(`/${lf}`)),
+    // Exact paths only: a suffix match would let a good extra/package-lock.json hide a malformed
+    // package-lock.json at the root.
+    (lf) => !sources.some((s) => s === `/src/${lf}` || s === lf),
   );
 }
 
 const MAX_FILE_NOTES = 200;
 
-function binaryNotes(paths: readonly string[]): ToolNotification[] {
-  const notes = paths.slice(0, MAX_FILE_NOTES).map((p) => ({
+const KIND_TEXT: Record<Unscannable['kind'], string> = {
+  'binary-asset': 'is a binary file, which gitleaks does not scan',
+  'binary-header-mismatch':
+    'starts with a binary file signature that does not match its extension, so gitleaks may skip it; a secret could be hidden behind that header',
+  'non-text-header':
+    'does not start like plain text (NUL bytes, invalid UTF-8 or control characters, or UTF-16), so gitleaks may skip it',
+  unreadable: 'could not be read (mode or ownership), so the jailed gitleaks cannot read it either',
+};
+
+function binaryNotes(files: readonly Unscannable[]): ToolNotification[] {
+  const notes = files.slice(0, MAX_FILE_NOTES).map((f) => ({
     level: 'warning',
-    id: 'binary-looking-file',
-    message: `/src/${p}: leading bytes look binary or UTF-16, so gitleaks may skip it without saying so`,
+    id: f.kind,
+    message: `/src/${f.path} ${KIND_TEXT[f.kind]}`,
   }));
-  if (paths.length > MAX_FILE_NOTES) {
+  if (files.length > MAX_FILE_NOTES) {
     notes.push({
       level: 'warning',
-      id: 'binary-looking-file',
-      message: `${paths.length - MAX_FILE_NOTES} more files not listed`,
+      id: 'binary-asset',
+      message: `${files.length - MAX_FILE_NOTES} more files not listed`,
     });
   }
   return notes;
@@ -239,7 +251,14 @@ async function execute(
   // The runner's returned outputPath is deliberately not compared with options.outputDir: the
   // runners in use return a directory fixed at construction and ignore the /out mount. What counts
   // is that the tool wrote its report into the mount, which readJsonReport verifies.
-  const res = await runner.run(inv.image, inv.args, inv.mounts);
+  let res;
+  try {
+    res = await runner.run(inv.image, inv.args, inv.mounts);
+  } catch (e) {
+    // Runners reject mounts, time out or crash in ways of their own. Always surface a typed error.
+    const why = e instanceof Error ? e.message : String(e);
+    throw new ToolFailedError(name, -1, `the runner threw: ${why}`, quarantined, pass);
+  }
   if (!isOkExit(manifest, name, res.exitCode)) {
     throw new ToolFailedError(name, res.exitCode, 'unexpected exit code', quarantined, pass);
   }
@@ -312,6 +331,18 @@ export async function runTool(
 
   if (name === 'semgrep') notifications.push(...semgrepNotifications(doc));
 
+  if (name === 'semgrep' || name === 'osv-scanner') {
+    // .git directories are moved aside and never scanned by these tools. Anything in one that is
+    // not git metadata was hidden from them.
+    for (const extra of await gitDirExtraContent(snapshot)) {
+      notifications.push({
+        level: 'warning',
+        id: 'git-dir-extra-content',
+        message: `/src/${extra} sits inside a quarantined .git directory and was not scanned by ${name}`,
+      });
+    }
+  }
+
   if (name === 'osv-scanner') {
     const missing = osvMissingLockfiles(doc, lockfiles);
     for (const lf of missing) {
@@ -327,11 +358,12 @@ export async function runTool(
     const unscanned = await findGitleaksUnscannable(snapshot.dir);
     if (snapshot.sidecarDir !== null) {
       const side = await findGitleaksUnscannable(snapshot.sidecarDir);
-      for (const p of side) {
-        const original = mapSidecarPath(p, snapshot.mapping);
-        // git history (packed objects) is an accepted gap, not a per-file signal
-        if (original !== undefined && !/(?:^|\/)\.git(?:\/|$)/i.test(original)) {
-          unscanned.push(original);
+      for (const f of side) {
+        const original = mapSidecarPath(f.path, snapshot.mapping);
+        // Git history (objects and packs) is an accepted gap, not a per-file signal. Other files
+        // inside a quarantined .git directory are still checked.
+        if (original !== undefined && !/(?:^|\/)\.git\/objects(?:\/|$)/i.test(original)) {
+          unscanned.push({ path: original, kind: f.kind });
         }
       }
     }
@@ -356,7 +388,7 @@ export async function runTool(
       await rewriteSidecarReport(sideFile, sideDoc, snapshot.mapping);
       reports.push({ file: sideFile, origin: 'quarantine' });
     }
-    notifications.push(...binaryNotes(unscanned.sort()));
+    notifications.push(...binaryNotes(unscanned.sort((a, b) => a.path.localeCompare(b.path))));
   }
 
   return { ...base, empty: false, partial: notifications.length > 0, notifications, reports };

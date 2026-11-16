@@ -10,6 +10,7 @@ import {
   loadToolManifest,
   parseToolManifest,
   repoRoot,
+  ToolSelectionError,
   toolVersions,
 } from './index.js';
 
@@ -171,6 +172,8 @@ describe('BundleManifest.toolVersions', () => {
 
   it('lists only the tools that actually ran, and refuses disabled ones', () => {
     expect(Object.keys(toolVersions(manifest, ['semgrep']))).toEqual(['semgrep']);
-    expect(() => toolVersions(manifest, ['codeql'])).toThrow();
+    expect(() => toolVersions(manifest, ['codeql'])).toThrow(ToolSelectionError);
+    expect(() => toolVersions(manifest, ['nope' as never])).toThrow(/not in the manifest/);
+    expect(() => toolVersions(manifest, ['codeql'])).toThrow(/disabled/);
   });
 });

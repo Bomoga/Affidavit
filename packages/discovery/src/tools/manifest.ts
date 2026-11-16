@@ -33,6 +33,16 @@ const TOOL_NAMES: readonly string[] = ['semgrep', 'osv-scanner', 'gitleaks', 'co
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
 const DIGEST_REF = /^[a-z0-9][a-z0-9./_-]*@sha256:[0-9a-f]{64}$/;
 
+/** A caller asked for the version of a tool that is unknown or disabled (a caller mistake). */
+export class ToolSelectionError extends Error {
+  readonly tool: string;
+  constructor(tool: string, why: string) {
+    super(`cannot record a version for ${tool}: ${why}`);
+    this.name = 'ToolSelectionError';
+    this.tool = tool;
+  }
+}
+
 function fail(msg: string): never {
   throw new Error(`invalid tool manifest: ${msg}`);
 }
@@ -160,7 +170,10 @@ export function toolVersions(
   const out: Record<string, string> = {};
   for (const name of new Set<ToolName>(ran)) {
     const t = manifest.tools.find((x) => x.name === name);
-    if (!t?.enabled || !t.version || !t.digest) fail(`${name} is not an enabled tool`);
+    if (!t) throw new ToolSelectionError(name, 'it is not in the manifest');
+    if (!t.enabled || !t.version || !t.digest) {
+      throw new ToolSelectionError(name, 'it is disabled, so it cannot have run');
+    }
     out[name] = `${t.version}@${t.digest}`;
   }
   return out;

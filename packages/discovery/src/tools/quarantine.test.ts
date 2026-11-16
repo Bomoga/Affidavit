@@ -12,6 +12,7 @@ import { join, resolve } from 'node:path';
 import type { ToolRunnerPort } from '@affidavit/contracts';
 import { afterAll, describe, expect, it } from 'vitest';
 import {
+  NonUtf8NameError,
   OutputNotFreshError,
   QuarantinedSnapshot,
   ScratchNotFreshError,
@@ -25,6 +26,7 @@ import {
   isToolControlName,
   loadToolManifest,
   prepareScratch,
+  resolveQuarantinedUri,
   quarantineSnapshot,
   runTool,
 } from './index.js';
@@ -529,6 +531,116 @@ describe('runTool', () => {
     }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ToolFailedError);
     expect((err as Error).message).toMatch(/lockfile/);
+  });
+
+  it('does not let a good nested lockfile hide a malformed root lockfile', async () => {
+    const snap = await snapshot({ 'package-lock.json': '{ bad', 'extra/package-lock.json': '{}' });
+    const { runner } = fakeRunner(
+      (out) =>
+        writeFileSync(
+          join(out, 'osv-scanner.json'),
+          JSON.stringify({ results: [{ source: { path: '/src/extra/package-lock.json' } }] }),
+        ),
+      1,
+    );
+    const res = await runTool(runner, manifest, 'osv-scanner', {
+      ...(await options(snap)),
+      osvDatabaseDir: tmp(),
+    });
+    expect(res.partial).toBe(true);
+    const messages = res.notifications.map((n) => n.message);
+    expect(messages.some((m) => m.startsWith('/src/package-lock.json '))).toBe(true);
+    expect(messages.some((m) => m.startsWith('/src/extra/package-lock.json '))).toBe(false);
+  });
+
+  it('turns any error thrown by the runner into a typed ToolFailedError', async () => {
+    const runner: ToolRunnerPort = {
+      run: () => Promise.reject(new Error('mount /tmp is reserved')),
+    };
+    const err = await runTool(runner, manifest, 'gitleaks', await options()).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ToolFailedError);
+    expect((err as Error).message).toMatch(/runner threw: mount \/tmp is reserved/);
+  });
+
+  it('flags loose files inside a quarantined .git, but not its objects', async () => {
+    const snap = await snapshot({
+      'src/app.js': 'x',
+      '.git/config': '[core]',
+      '.git/doc.pdf': '%PDF-1.4 hidden',
+      '.git/objects/ab/cdef': 'x\0y',
+    });
+    const { runner } = fakeRunner((out) => writeFileSync(join(out, 'gitleaks.sarif'), sarif()));
+    const res = await runTool(runner, manifest, 'gitleaks', await options(snap));
+    const messages = res.notifications.map((n) => n.message).join('\n');
+    expect(messages).toContain('/src/.git/doc.pdf');
+    expect(messages).not.toContain('objects');
+  });
+
+  it('marks Semgrep and OSV partial when a quarantined .git holds more than git metadata', async () => {
+    const snap = await snapshot({
+      'src/app.js': 'x',
+      '.git/config': '[core]',
+      '.git/objects/ab/cdef': 'x',
+      '.git/payload.js': 'eval(x)',
+    });
+    const semgrep = fakeRunner((out) => writeFileSync(join(out, 'semgrep.sarif'), sarif()));
+    const s = await runTool(semgrep.runner, manifest, 'semgrep', {
+      ...(await options(snap)),
+      rulesDir: tmp(),
+    });
+    expect(s.partial).toBe(true);
+    expect(s.notifications.map((n) => n.id)).toContain('git-dir-extra-content');
+    expect(s.notifications[0]?.message).toContain('/src/.git/payload.js');
+
+    const plain = await snapshot({
+      'src/app.js': 'x',
+      '.git/config': '[core]',
+      '.git/HEAD': 'ref',
+    });
+    const ok = await runTool(semgrep.runner, manifest, 'semgrep', {
+      ...(await options(plain)),
+      rulesDir: tmp(),
+    });
+    expect(ok.partial).toBe(false);
+  });
+
+  it('names the kind of each file gitleaks may skip', async () => {
+    const snap = await snapshot({
+      'img/logo.png': '\u0089PNG\r\n\u001a\n',
+      'src/notes.txt': '%PDF-1.4 secret',
+      'src/blob.dat': '\u0001\u0002\u0003',
+    });
+    const { runner } = fakeRunner((out) => writeFileSync(join(out, 'gitleaks.sarif'), sarif()));
+    const res = await runTool(runner, manifest, 'gitleaks', await options(snap));
+    const byPath: Record<string, string | undefined> = {};
+    for (const n of res.notifications) byPath[n.message.split(' ')[0] ?? ''] = n.id;
+    expect(byPath['/src/src/notes.txt']).toBe('binary-header-mismatch');
+    expect(byPath['/src/src/blob.dat']).toBe('non-text-header');
+    expect(
+      res.notifications.some((n) => n.id === 'binary-asset' || n.id === 'binary-header-mismatch'),
+    ).toBe(true);
+  });
+
+  it('resolves a rewritten /src/<original> URI back to the sidecar file', async () => {
+    const snap = await snapshot({
+      'src/app.js': 'x',
+      '.gitignore': 'hello',
+      'sub/.git/config': 'c',
+    });
+    const resolved = resolveQuarantinedUri(snap, '/src/.gitignore');
+    expect(resolved && readFileSync(resolved, 'utf8')).toBe('hello');
+    const nested = resolveQuarantinedUri(snap, '/src/sub/.git/config');
+    expect(nested && readFileSync(nested, 'utf8')).toBe('c');
+    expect(resolveQuarantinedUri(snap, '/src/src/app.js')).toBeUndefined();
+    expect(resolveQuarantinedUri(snap, '/src/.gitignore/../../etc/passwd')).toBeUndefined();
+  });
+
+  it.skipIf(!rawNames)('stops with a typed error on a non-UTF-8 name in a host walk', async () => {
+    const root = snapDir();
+    mkdirSync(Buffer.concat([Buffer.from(root + '/'), Buffer.from([0x66, 0xff, 0xfe, 0x6f])]));
+    await expect(findOsvLockfiles(root)).rejects.toBeInstanceOf(NonUtf8NameError);
   });
 
   it('marks a Semgrep run partial and attaches its notifications', async () => {

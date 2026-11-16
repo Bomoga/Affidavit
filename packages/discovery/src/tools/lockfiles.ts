@@ -1,4 +1,4 @@
-import { readdir } from 'node:fs/promises';
+import { listDir } from './walk.js';
 import { join, relative, sep } from 'node:path';
 
 /**
@@ -63,9 +63,9 @@ export function isOsvLockfileName(name: string): boolean {
 export async function findOsvLockfiles(snapshotDir: string): Promise<string[]> {
   const found: string[] = [];
   const walk = async (dir: string): Promise<void> => {
-    for (const e of await readdir(dir, { withFileTypes: true })) {
+    for (const e of await listDir(dir)) {
       const full = join(dir, e.name);
-      if (e.isDirectory()) await walk(full);
+      if (e.isDirectory) await walk(full);
       else if (isOsvLockfileName(e.name)) {
         found.push(relative(snapshotDir, full).split(sep).join('/'));
       }

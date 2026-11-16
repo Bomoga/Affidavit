@@ -89,18 +89,13 @@ function makeRunner(): ToolRunnerPort {
     run(image, args, mounts) {
       const out = mounts.find((m) => m.containerPath === '/out')?.hostPath ?? '';
       return new Promise((resolve) => {
-        execFile(
-          'docker',
-          dockerRunArgs(image, args, mounts),
-          { maxBuffer: 16 * 1024 * 1024 },
-          (error, _out, stderr) => {
-            const exitCode = error ? (typeof error.code === 'number' ? error.code : 1) : 0;
-            stderrByImage.set(image, stderr);
-            // Like the real runners, report a directory unrelated to the /out mount.
-            void out;
-            resolve({ exitCode, outputPath: tmpdir() });
-          },
-        );
+        execFile('docker', dockerRunArgs(image, args, mounts), (error, _out, stderr) => {
+          const exitCode = error ? (typeof error.code === 'number' ? error.code : 1) : 0;
+          stderrByImage.set(image, stderr);
+          // Like the real runners, report a directory unrelated to the /out mount.
+          void out;
+          resolve({ exitCode, outputPath: tmpdir() });
+        });
       });
     },
   };
@@ -276,6 +271,9 @@ describe.skipIf(!enabled)('tool images, offline', () => {
       join(src, 'src', 'utf16.txt'),
       Buffer.from('AFFIDAVIT_FAKE_KEY_99AABBCCDDEEFF00', 'utf16le'),
     );
+    // Loose files inside the quarantined .git: a secret behind a PDF header, and non-metadata.
+    writeFileSync(join(src, '.git', 'doc.pdf'), '%PDF-1.4\nAFFIDAVIT_FAKE_KEY_0011223344556677\n');
+    writeFileSync(join(src, '.git', 'payload.js'), 'export const run = (x) => eval(x);\n');
     // A secret hidden inside a gzip archive.
     writeFileSync(
       join(src, 'src', 'secret.txt.gz'),
@@ -382,6 +380,7 @@ describe.skipIf(!enabled)('tool images, offline', () => {
     // A fully parsed, text-only repo is not partial for OSV or gitleaks.
     expect(results['osv-scanner']?.partial).toBe(false);
     expect(results.gitleaks?.partial).toBe(false);
+    expect(results.semgrep?.partial).toBe(false);
     expect(
       sarifFindings(read(s, 'semgrep', 'semgrep.sarif')).some((f) =>
         f.ruleId?.endsWith('affidavit.smoke.no-eval'),
@@ -407,6 +406,11 @@ describe.skipIf(!enabled)('tool images, offline', () => {
       expect(skipped).toContain(`/src/${f}`);
     // OSV drops the malformed second lockfile without failing; discovery notices.
     expect(results['osv-scanner']?.partial).toBe(true);
+    // Code hidden inside the quarantined .git was never seen by Semgrep or OSV.
+    for (const tool of ['semgrep', 'osv-scanner'] as const) {
+      expect(results[tool]?.notifications.some((n) => n.id === 'git-dir-extra-content')).toBe(true);
+    }
+    expect(skipped).toContain('/src/.git/doc.pdf');
     expect(
       results['osv-scanner']?.notifications.some((n) =>
         n.message.includes('/src/extra/package-lock.json'),
@@ -467,6 +471,59 @@ describe.skipIf(!enabled)('tool images, offline', () => {
     await expect(
       runTool(s.runner, manifest, 'osv-scanner', { ...rest, snapshot: snap }),
     ).rejects.toBeInstanceOf(ToolFailedError);
+  }, 240_000);
+
+  it('flags every file header gitleaks is known to skip, so none is silently clean', async () => {
+    const secret = 'AFFIDAVIT_FAKE_KEY_0123456789ABCDEF';
+    const headers: Record<string, Buffer> = {
+      mz: Buffer.concat([Buffer.from('MZ'), Buffer.from([0x90, 0x00, 0x03, 0x00])]),
+      rtf: Buffer.from('{\\rtf1\\ansi'),
+      ps: Buffer.from('%!PS-Adobe-3.0'),
+      ar: Buffer.from('!<arch>\n'),
+      crx: Buffer.from('Cr24'),
+      zstd: Buffer.from([0x28, 0xb5, 0x2f, 0xfd]),
+      cab: Buffer.concat([Buffer.from('MSCF'), Buffer.from([0, 0, 0, 0])]),
+      swf: Buffer.concat([Buffer.from('FWS'), Buffer.from([9])]),
+      nes: Buffer.from('NES\x1a'),
+      elf: Buffer.from([0x7f, 0x45, 0x4c, 0x46]),
+      pdf: Buffer.from('%PDF-1.4'),
+      xz: Buffer.from([0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]),
+      sevenz: Buffer.from([0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]),
+      wasm: Buffer.from([0x00, 0x61, 0x73, 0x6d]),
+      java: Buffer.from([0xca, 0xfe, 0xba, 0xbe]),
+    };
+    const s = scenario('repo', (src) => {
+      mkdirSync(join(src, 'hdr'));
+      for (const [name, head] of Object.entries(headers)) {
+        writeFileSync(join(src, 'hdr', name), Buffer.concat([head, Buffer.from(`\n${secret}\n`)]));
+      }
+    });
+    const snap = await quarantineSnapshot(s.src);
+    const { sourceDir: _ignored, ...rest } = s.options('gitleaks');
+    void _ignored;
+    const res = await runTool(s.runner, manifest, 'gitleaks', { ...rest, snapshot: snap });
+    expect(res.partial).toBe(true);
+    const messages = res.notifications.map((n) => n.message).join('\n');
+    for (const name of Object.keys(headers)) expect(messages).toContain(`/src/hdr/${name} `);
+  }, 240_000);
+
+  it('a malformed root lockfile is not hidden by a good nested one', async () => {
+    const s = scenario('repo', (src) => {
+      writeFileSync(join(src, 'package-lock.json'), '{ not json');
+      mkdirSync(join(src, 'extra'));
+      cpSync(
+        join(smoke, 'repo', 'package-lock.json.fixture'),
+        join(src, 'extra', 'package-lock.json'),
+      );
+    });
+    const snap = await quarantineSnapshot(s.src);
+    const { sourceDir: _ignored, ...rest } = s.options('osv-scanner');
+    void _ignored;
+    const res = await runTool(s.runner, manifest, 'osv-scanner', { ...rest, snapshot: snap });
+    expect(res.partial).toBe(true);
+    const messages = res.notifications.map((n) => n.message);
+    expect(messages.some((m) => m.startsWith('/src/package-lock.json '))).toBe(true);
+    expect(messages.some((m) => m.startsWith('/src/extra/package-lock.json '))).toBe(false);
   }, 240_000);
 
   it('OSV-Scanner exits 128 with no report when there is nothing to scan, which runTool reports as empty', async () => {

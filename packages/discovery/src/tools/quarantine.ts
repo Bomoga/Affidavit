@@ -200,3 +200,83 @@ export async function prepareOutput(outputDir: string): Promise<void> {
   await requireNewOrEmpty(outputDir, () => new OutputNotFreshError(outputDir));
   await mkdir(outputDir, { recursive: true });
 }
+
+/**
+ * Maps a report URI such as `/src/.gitignore` (as rewritten for quarantine-pass reports, or taken
+ * from any report) back to the file in the sidecar that holds it, or undefined if that path was
+ * not quarantined. L1-01 uses this to read a quarantined file, for example to build its redaction
+ * map for a secret found there. The result is an absolute host path inside `sidecarDir`.
+ */
+export function resolveQuarantinedUri(
+  snapshot: QuarantinedSnapshot,
+  uri: string,
+): string | undefined {
+  if (snapshot.sidecarDir === null) return undefined;
+  const path = uri.replace(/^file:\/\//, '').replace(/^\/src\//, '');
+  if (path.split('/').includes('..')) return undefined;
+  for (const [neutral, original] of snapshot.mapping) {
+    if (path === original) return join(snapshot.sidecarDir, neutral);
+    if (path.startsWith(`${original}/`)) {
+      return join(snapshot.sidecarDir, neutral, path.slice(original.length + 1));
+    }
+  }
+  return undefined;
+}
+
+const GIT_METADATA = new Set([
+  'head',
+  'config',
+  'config.worktree',
+  'description',
+  'hooks',
+  'info',
+  'objects',
+  'refs',
+  'logs',
+  'packed-refs',
+  'index',
+  'orig_head',
+  'fetch_head',
+  'merge_head',
+  'merge_msg',
+  'merge_mode',
+  'cherry_pick_head',
+  'revert_head',
+  'commit_editmsg',
+  'auto_merge',
+  'bisect_log',
+  'shallow',
+  'modules',
+  'worktrees',
+  'lfs',
+  'branches',
+  'commondir',
+  'gitdir',
+  'gc.log',
+  'gc.pid',
+  'sequencer',
+  'rebase-merge',
+  'rebase-apply',
+]);
+
+/**
+ * `.git` directories are moved aside and never scanned by Semgrep or OSV-Scanner. If one holds
+ * anything other than git metadata, that content (application code, lockfiles) was hidden from
+ * them, so the caller marks their results partial. Returns original-relative paths of such
+ * entries (top level of the `.git` directory only).
+ */
+export async function gitDirExtraContent(snapshot: QuarantinedSnapshot): Promise<string[]> {
+  if (snapshot.sidecarDir === null) return [];
+  const extras: string[] = [];
+  for (const [neutral, original] of snapshot.mapping) {
+    if (basename(original).toLowerCase() !== '.git') continue;
+    const dir = join(snapshot.sidecarDir, neutral);
+    const st = await lstat(dir);
+    if (!st.isDirectory()) continue;
+    for (const name of await readdir(dir)) {
+      const lower = name.toLowerCase();
+      if (!GIT_METADATA.has(lower) && !lower.endsWith('.lock')) extras.push(`${original}/${name}`);
+    }
+  }
+  return extras.sort();
+}
