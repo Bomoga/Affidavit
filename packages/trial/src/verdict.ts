@@ -7,7 +7,7 @@ export type VerdictOutcome = Verdict['outcome'];
 const EM_DASH = '—';
 // A standalone number: not part of a word, a hex string, or an id.
 const NUMBER = /(?<![\w.])\d+(?:\.\d+)?(?!\w)/g;
-const EXHIBIT_ID = /\bexhibit-[A-Za-z0-9-]+\b/g;
+const EXHIBIT_PREFIX = /^exhibit-/;
 
 export interface VerdictInput {
   caseId: Verdict['caseId'];
@@ -101,11 +101,34 @@ export function checkSummary(v: Verdict): string[] {
   for (const m of summary.matchAll(NUMBER)) {
     if (!numbers.has(Number(m[0]))) problems.push(`summary has number ${m[0]} not in the verdict`);
   }
-  const ids = new Set<string>(structured.exhibits);
-  for (const m of summary.matchAll(EXHIBIT_ID)) {
-    if (!ids.has(m[0])) problems.push(`summary has exhibit id ${m[0]} not in the verdict`);
+  for (const id of exhibitIdsIn(summary, structured.exhibits)) {
+    if (!structured.exhibits.includes(id as ExhibitId)) {
+      problems.push(`summary has exhibit id ${id} not in the verdict`);
+    }
   }
   return problems;
+}
+
+/** Id family of an exhibit id: everything up to its last separator, e.g. `exhibit-witness-`. */
+function familyOf(id: string): string {
+  const cut = Math.max(id.lastIndexOf('-'), id.lastIndexOf('_'));
+  return cut > 0 ? id.slice(0, cut + 1) : id;
+}
+
+/**
+ * Tokens in the summary that read as exhibit ids: anything starting `exhibit-`, plus anything in
+ * the same id family as an id the verdict actually cites. Checked against the verdict's own list,
+ * not a hard-coded pattern, so a near-miss of a real id is caught too.
+ */
+function exhibitIdsIn(summary: string, cited: readonly string[]): string[] {
+  const families = new Set(cited.map(familyOf));
+  const tokens = summary
+    .split(/[\s,;()[\]]+/)
+    .map((t) => t.replace(/[.:]+$/, ''))
+    .filter((t) => t.length > 0);
+  return tokens.filter(
+    (t) => EXHIBIT_PREFIX.test(t) || [...families].some((f) => f !== t && t.startsWith(f)),
+  );
 }
 
 /** Step two: attach the summary, refuse anything that breaks the rules, and validate the contract. */

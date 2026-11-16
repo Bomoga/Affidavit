@@ -1,5 +1,6 @@
 import {
   Escalation,
+  PromptId,
   TERMINAL_STAGES,
   TrialEvent,
   isLegalTransition,
@@ -67,6 +68,13 @@ export interface StageContext {
   record<T extends TrialEventType>(type: T, payload: EventPayload<T>, actor?: Role): Promise<void>;
   /** What model calls actually cost so far in this case, as reported by the model port. */
   costs(): readonly StageCost[];
+  /** Prompt versions and model ids of every model call so far in this case, keyed by prompt id. */
+  runInfo(): RunInfo;
+}
+
+export interface RunInfo {
+  promptVersions: Partial<Record<PromptId, string>>;
+  modelIds: Partial<Record<PromptId, string>>;
 }
 
 export interface StageHandler {
@@ -181,6 +189,7 @@ function overdrawn(b: BudgetState): boolean {
 
 export class Orchestrator {
   private readonly ledgers = new Map<CaseId, StageCost[]>();
+  private readonly runInfos = new Map<CaseId, RunInfo>();
 
   constructor(private readonly deps: OrchestratorDeps) {}
 
@@ -244,6 +253,10 @@ export class Orchestrator {
       runAgentValidated: (req, spec) => this.runAgentValidated(caseId, stage, attempt, req, spec),
       record: (type, payload, actor) => this.emit(caseId, stage, type, payload, actor),
       costs: () => [...this.ledger(caseId)],
+      runInfo: () => {
+        const i = this.info(caseId);
+        return { promptVersions: { ...i.promptVersions }, modelIds: { ...i.modelIds } };
+      },
     };
   }
 
@@ -294,6 +307,15 @@ export class Orchestrator {
     return { outcome: 'inadmissible', rule: 'schema', exhibitId, errors: check.errors, result };
   }
 
+  private info(caseId: CaseId): RunInfo {
+    let i = this.runInfos.get(caseId);
+    if (!i) {
+      i = { promptVersions: {}, modelIds: {} };
+      this.runInfos.set(caseId, i);
+    }
+    return i;
+  }
+
   private ledger(caseId: CaseId): StageCost[] {
     let l = this.ledgers.get(caseId);
     if (!l) {
@@ -313,6 +335,19 @@ export class Orchestrator {
     const now = config.now ?? Date.now;
     const role = this.roleFor(stage, req);
     assertAllowedTools(role, req.tools);
+    const promptId = PromptId.safeParse(req.promptId);
+    if (!promptId.success) throw new Error(`unknown prompt id ${req.promptId}`);
+    const info = this.info(caseId);
+    const seenVersion = info.promptVersions[promptId.data];
+    const seenModel = info.modelIds[promptId.data];
+    if (
+      (seenVersion !== undefined && seenVersion !== req.promptVersion) ||
+      (seenModel !== undefined && seenModel !== req.model)
+    ) {
+      throw new Error(
+        `prompt ${promptId.data} already ran as ${seenVersion} on ${seenModel} in this case; a verdict can record only one`,
+      );
+    }
     if (await config.killSwitch()) throw new KillSwitchError();
 
     // Charge the turn's whole budget before the call, so a retry cannot spend unrecorded money.
@@ -344,6 +379,9 @@ export class Orchestrator {
       maxTurns: req.maxTurns,
       budget: req.budget,
     };
+    // Recorded per call, keyed by prompt id, so the verdict lists exactly the prompts that ran.
+    info.promptVersions[promptId.data] = req.promptVersion;
+    info.modelIds[promptId.data] = req.model;
     const started = now();
     const result = await model.runTurn(turn);
     const actual: StageCost = {

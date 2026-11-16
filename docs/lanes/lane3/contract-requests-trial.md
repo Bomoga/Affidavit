@@ -37,3 +37,13 @@ Proposals only. Nothing here changes `packages/contracts`; per implementation-pl
 - **Need:** `AdmissibilityRule` has `literal-only-patch`, `diff-too-large`, `suite-fails` and `counterexample-survives`, but nothing for a `VerifyResult` with `familyFlipped: false` or `rescanClean: false` and no `rejectedBy`.
 - **Proposal (additive):** `family-not-flipped` and `rescan-not-clean` appended to `AdmissibilityRule`, or a documented guarantee that `verifyPatch` always sets `rejectedBy` when it does not accept.
 - **Meanwhile:** Remedy records `exhibit-inadmissible` only when a rule applies (the Judge's own, or `suite-fails` or `counterexample-survives` derived from the flags). Otherwise it records no rule, keeps the full `VerifyResult` in the workspace, and the patch is not accepted. The Judge's acceptance itself is not in the event stream until CR-1 in `contract-requests.md` (a `verify-result` event) lands.
+
+## CR-T7: an escalation reason for missing evidence at verify (L3-06)
+
+- **Need:** the verify stage must not write a `proven-*` verdict without an admitted witness exhibit. When that happens it is a pipeline fault, not a weak finding, and `Escalation.reason` has no member for it.
+- **Proposal (additive):** `missing-admitted-witness` appended to `Escalation.reason`.
+- **Meanwhile:** verify escalates with `no-admissible-witness-above-floor`, the closest v1.0 reason, and says what happened in `detail`.
+
+## Verify to verdict wiring (L3-06, no change requested)
+
+`STAGE_TRANSITIONS` allows verify to verdict only when the jury is disabled or appeals are exhausted. Until the jury (L3-11) exists, `createVerifyHandler` takes `jury: 'disabled'` and must run against a `CaseStore` wired with the jury disabled (`new FakeCaseStore({ juryEnabled: false })` in tests; the same setting on the Postgres store in apps/worker). A store with the jury enabled refuses the transition, and a test covers that. `verdict-written` is emitted in the `verify` stage by the stenographer, after `CaseStore.appendVerdict` succeeds.

@@ -57,3 +57,4 @@ export {
 export type { StructuredVerdict, VerdictInput, VerdictOutcome } from './verdict.js';
 export { createVerifyHandler } from './verify.js';
 export type { VerifyDeps } from './verify.js';
+export type { RunInfo } from './orchestrator.js';

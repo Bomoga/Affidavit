@@ -1,7 +1,7 @@
 # Lane 3 progress
 
 Owner: Adrian
-Contracts version in use: v1.0 is on `main` (Phase 0 merged, PR 11). Lane 3 code still runs on interim local types; migration to `@affidavit/contracts` and `@affidavit/testing` is the next task.
+Contracts version in use: v1.0. `packages/trial` imports `@affidavit/contracts` and tests on `@affidavit/testing` fakes; the interim types are gone (PRs 5 to 9). Open contract requests from trial are in `contract-requests-trial.md`.
 
 ## Tasks
 
@@ -12,7 +12,7 @@ Contracts version in use: v1.0 is on `main` (Phase 0 merged, PR 11). Lane 3 code
 | L3-03 | done | lane3/L3-03-prompts-package (PR 2) | Prompts, untrusted wrapper, append-only version history. `PromptId` and `Role` come from `@affidavit/contracts`; tests assert the id list matches and every `outputSchemaRef` is a `schemaRegistry` key. Prompts at 1.1.0 |
 | L3-04 | done | lane3/L3-04-defense (PR 7) | Contract `CaseFile` via `CaseFileSource`; real `renderPrompt`. The contract `Witness` is built in code (id, caseId, cls, author `defense`, sha256 over canonical template plus params, schemaVersion), never from the agent. `runWitness` gets `['vulnerable', 'safe']` when `safeVariant` exists, and a result without `safeVariantFail` is not admitted then. Events: `exhibit-submitted {exhibitId, kind}` (Judge id recipe), `exhibit-result {result}`, `exhibit-inadmissible {exhibitId, rejectedBy}`, `dismissed {dismissal}`. Real L1-07 planted-instruction case file still to run |
 | L3-05 | done | lane3/L3-05-remedy (PR 8) | Agent submits only the diff; `filesTouched` and `linesChanged` are computed from it in code (hunk-aware, unsafe paths refused) and a contract `PatchExhibit` is built (id, sha256, author `remedy`). `verifyPatch(caseFile, patch, witness, counterexamples)` on the real port with the contract `Witness`. Events: `exhibit-submitted {kind: 'patch'}`, `exhibit-inadmissible {exhibitId, rejectedBy}`; no invented `patch-*` types. Defense `workspace` is now required. Counterexamples empty until L3-08. CR-T6 and CR-1 for the missing verify event and rules |
-| L3-06 | done | lane3/L3-06-verdict (stacked on PR 8) | Interim Verdict and exhibit id pattern; dismissed and escalated verdicts not wired yet |
+| L3-06 | done | lane3/L3-06-verdict (PR 9) | Contract `Verdict`, appended through `CaseStore.appendVerdict` and emitted as `verdict-written {verdict}`. No proven outcome without an admitted witness exhibit; verify escalates instead (CR-T7). Prompt versions and model ids recorded per `runAgent` call, keyed by `PromptId`. `checkSummary` checks exhibit ids against the verdict's own list. Verify goes straight to verdict with the jury disabled (`jury: 'disabled'`, store wired with `juryEnabled: false`) until L3-11. Dismissed and escalated verdicts not written yet |
 | L3-07 | doing | lane3/L3-07a-design-tokens, lane3/L3-07b-case-view-model (partial) | Tokens and contrast done (PR 3). View model and fake SSE source done (PR 10) on contracts `TrialEvent` and `fixtures/trials/` via `@affidavit/testing`. VERIFIED stamp needs CR-1 (`contract-requests.md`); until then the gate fixture renders as unverified. React, Vite, TanStack Router and Query, and Testing Library are installed in `apps/web` (P0-02); shell, router and case view are next |
 | L3-08 | todo | | Phase 2 |
 | L3-09 | todo | | Phase 2 |
