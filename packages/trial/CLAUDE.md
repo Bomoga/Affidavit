@@ -30,6 +30,10 @@ Run from this directory, or add `--filter @affidavit/trial` from the repo root.
 - A crash between the escalation transition and its events leaves no `escalated` event; only the
   verdict is repaired on rerun.
 
+## Prosecution counterexample rule (L3-08)
+
+The agent submits `{ choices: [{ name, indices?, values? }] }`, never code. A counterexample is sent to the Judge only if every chosen name is declared by the Defense witness family and chosen once, indices are in range, new values are JSON of a kind the family already uses for that parameter and at most 1024 characters, and the product of the resulting space is at most 64 (placeholders; `DEFAULT_PARAM_LIMITS`). Anything else is recorded as `exhibit-inadmissible` with rule `schema` and not run. Prose with no choices fails the same way. See `counterexample.ts`. CR-T8 and CR-T9 list the contract gaps.
+
 ## Intended libraries (notes for later, not installed yet)
 
 - Claude Agent SDK

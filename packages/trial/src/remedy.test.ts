@@ -42,7 +42,10 @@ const diff = (added: string): string =>
 const DIFF1 = diff('const q = db.prepare("select ?", [id]);');
 const DIFF2 = diff('const q = db.prepare("select ? limit 1", [id]);');
 
-const PASS = VerifyResult.parse(readFixtureJson('exhibit-results/verify-pass.json'));
+const PASS = VerifyResult.parse({
+  ...(readFixtureJson('exhibit-results/verify-pass.json') as object),
+  counterexamples: [],
+});
 const FAIL = VerifyResult.parse(readFixtureJson('exhibit-results/verify-fail.json'));
 const reject = (rule: VerifyResult['rejectedBy']): VerifyResult => ({
   ...FAIL,

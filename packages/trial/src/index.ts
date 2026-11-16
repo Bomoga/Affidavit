@@ -25,12 +25,7 @@ export { ActorMismatchError } from './orchestrator.js';
 export type { ValidatedAgentResult } from './orchestrator.js';
 export { ROLE_TOOLS, assertAllowedTools, isModelRole } from './roles.js';
 export type { ModelRole } from './roles.js';
-export {
-  CounterexampleSubmission,
-  PatchSubmission,
-  SUBMISSIONS,
-  WitnessSubmission,
-} from './envelope.js';
+export { PatchSubmission, SUBMISSIONS, WitnessSubmission } from './envelope.js';
 export type { BallotSubmission, SubmissionCheck, SubmissionSpec } from './envelope.js';
 export { createDefenseHandler, loadCaseFile } from './defense.js';
 export type {
@@ -41,7 +36,31 @@ export type {
 } from './defense.js';
 export { buildWitness, variantsFor, witnessExhibitId, witnessSha256 } from './witness.js';
 export { InMemoryWorkspace } from './workspace.js';
-export type { AdmittedWitness, PatchOutcome, TrialWorkspace } from './workspace.js';
+export type {
+  AdmittedCounterexample,
+  AdmittedWitness,
+  PatchOutcome,
+  TrialWorkspace,
+} from './workspace.js';
+export {
+  DEFAULT_PARAM_LIMITS,
+  buildCounterexample,
+  checkCounterexampleSubmission,
+  counterexampleCode,
+  counterexampleExhibitId,
+  paramsHeader,
+  resolveCounterexample,
+} from './counterexample.js';
+export type {
+  BuiltCounterexample,
+  CounterexampleChoice,
+  CounterexampleSubmission,
+  ParamLimits,
+  ResolvedCounterexample,
+} from './counterexample.js';
+export { createProsecutionHandler } from './prosecution.js';
+export type { ProsecutionConfig, ProsecutionDeps } from './prosecution.js';
+export { survivingCounterexamples } from './verify.js';
 export { createRemedyHandler } from './remedy.js';
 export type { RemedyConfig, RemedyDeps } from './remedy.js';
 export { buildPatchExhibit, diffStats, isAccepted, rejectionRule } from './patch.js';
