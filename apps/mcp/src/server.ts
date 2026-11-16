@@ -1,7 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { ApiRoutes, CaseId, TERMINAL_STAGES, type Verdict } from '@affidavit/contracts';
-import { ApiError, ApiSchemaError, errorText, type AffidavitApi } from './api-client.js';
+import { ApiError, ApiSchemaError, SAFE_ID, errorText, type AffidavitApi } from './api-client.js';
 
 export const TOOL_NAME = 'request_verdict';
 
@@ -16,7 +16,7 @@ const TOOL_DESCRIPTION =
 
 /** Contract POST /cases request, plus an optional reference to an existing case. */
 const RequestVerdictInput = ApiRoutes.createCase.request.partial().extend({
-  caseId: CaseId.optional(),
+  caseId: CaseId.regex(SAFE_ID).optional(),
 });
 
 const NO_BUNDLE_MESSAGE = 'No bundle yet: this verdict has no evidence bundle attached.';
@@ -34,10 +34,25 @@ function success(body: Record<string, unknown>): CallToolResult {
   return { content: [{ type: 'text', text: JSON.stringify(body) }], structuredContent: body };
 }
 
+function isHttps(url: string): boolean {
+  try {
+    return new URL(url).protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 async function bundleField(api: AffidavitApi, verdict: Verdict): Promise<Record<string, unknown>> {
   if (!verdict.bundleSha256) return { status: 'none', message: NO_BUNDLE_MESSAGE };
   try {
     const b = await api.getBundle(verdict.bundleSha256);
+    if (!isHttps(b.url)) {
+      return {
+        status: 'unavailable',
+        sha256: verdict.bundleSha256,
+        message: 'Bundle link was withheld because it is not an https link.',
+      };
+    }
     return { status: 'available', sha256: b.sha256, url: b.url, expiresAt: b.expiresAt };
   } catch (err) {
     return {
@@ -59,12 +74,18 @@ async function run(
     const created = await api.createCase(
       ApiRoutes.createCase.request.parse({ repoUrl: input.repoUrl, commit: input.commit }),
     );
+    if (!SAFE_ID.test(created.caseId)) {
+      throw new ApiSchemaError('POST /cases returned a caseId with unsafe characters');
+    }
     caseId = created.caseId;
   } else {
     return failure('invalid-input', 'Provide either caseId, or both repoUrl and commit.');
   }
 
   const found = await api.getCase(caseId);
+  if (found.caseId !== caseId) {
+    throw new ApiSchemaError('GET /cases/:id returned a different caseId than requested');
+  }
   let verdict = found.verdict;
   if (!verdict) {
     if (!TERMINAL_STAGES.includes(found.stage)) {
@@ -75,21 +96,21 @@ async function run(
     }
     verdict = await api.getVerdict(caseId);
   }
-
-  const base = { caseId, outcome: verdict.outcome, summary: verdict.summary };
-  if (verdict.outcome === 'escalated' || verdict.outcome === 'dismissed') {
-    return failure(
-      verdict.outcome,
-      verdict.outcome === 'escalated'
-        ? 'The case was escalated and needs a second attempt or human review. No final verdict exists.'
-        : 'The candidate was dismissed. No verdict on a fix exists.',
-      base,
-    );
+  if (verdict.caseId !== caseId) {
+    throw new ApiSchemaError('The verdict carries a different caseId than requested');
   }
+
+  // Escalated and dismissed are legitimate verdicts, not tool failures. The contract Verdict and
+  // GetCaseResponse carry no machine-readable reason; the generated summary is the only text.
+  const status =
+    verdict.outcome === 'escalated' || verdict.outcome === 'dismissed' ? verdict.outcome : 'ok';
   return success({
-    status: 'ok',
-    ...base,
+    status,
+    caseId,
+    outcome: verdict.outcome,
+    summary: verdict.summary,
     ...(verdict.severity ? { severity: verdict.severity } : {}),
+    ...(status === 'escalated' ? { needsHumanReview: true } : {}),
     bundle: await bundleField(api, verdict),
   });
 }
