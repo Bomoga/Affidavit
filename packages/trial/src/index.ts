@@ -21,3 +21,14 @@ export type {
   StageResult,
   TrialEventType,
 } from './orchestrator.js';
+export { ActorMismatchError } from './orchestrator.js';
+export type { ValidatedAgentResult } from './orchestrator.js';
+export { ROLE_TOOLS, assertAllowedTools, isModelRole } from './roles.js';
+export type { ModelRole } from './roles.js';
+export {
+  CounterexampleSubmission,
+  PatchSubmission,
+  SUBMISSIONS,
+  WitnessSubmission,
+} from './envelope.js';
+export type { BallotSubmission, SubmissionCheck, SubmissionSpec } from './envelope.js';

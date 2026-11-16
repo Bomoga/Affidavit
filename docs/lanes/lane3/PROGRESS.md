@@ -8,7 +8,7 @@ Contracts version in use: v1.0 is on `main` (Phase 0 merged, PR 11). Lane 3 code
 | ID | Status (todo, doing, done, blocked) | Branch or PR | Notes |
 | --- | --- | --- | --- |
 | L3-01 | done | lane3/L3-01-orchestrator (PR 5) | On contracts v1.0 ports and `@affidavit/testing` fakes; interim types and local fakes deleted. Turn budget charged before each model call; exhaustion escalates with a contract `Escalation`; kill switch halts with reason `kill-switch`; every emitted event parses as `TrialEvent`. Graphile job wrapper deferred to apps/worker. Contract requests CR-T1 to CR-T4 in `contract-requests-trial.md` |
-| L3-02 | done | lane3/L3-02-safety-envelope (stacked on PR 5) | Tool allowlists and schema admission. Validator is injected until contracts land |
+| L3-02 | done | lane3/L3-02-safety-envelope (PR 6) | Tool allowlists checked before any spend. Actor derived from the stage (`MODEL_ROLE_FOR_STAGE`); a mismatched handler-supplied actor is refused. Agent output validated against shapes cut from the contract Zod schemas (`envelope.ts`); system-owned fields are stripped. Schema failures emit `exhibit-inadmissible {exhibitId, rejectedBy: 'schema'}` with a content-derived id (CR-T5) |
 | L3-03 | done | lane3/L3-03-prompts-package (PR 2) | Prompts, untrusted wrapper, append-only version history. `PromptId` and `Role` come from `@affidavit/contracts`; tests assert the id list matches and every `outputSchemaRef` is a `schemaRegistry` key. Prompts at 1.1.0 |
 | L3-04 | done | lane3/L3-04-defense (stacked on PR 6) | Renderer injected; real L1-07 planted-instruction case file still to run |
 | L3-05 | done | lane3/L3-05-remedy (stacked on PR 7) | Interim VerifyResult and TrialWorkspace; counterexamples empty until L3-08 |

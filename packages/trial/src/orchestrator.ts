@@ -8,10 +8,14 @@ import {
   type CaseStage,
   type CaseStore,
   type EventSink,
+  type ExhibitId,
   type ModelPort,
   type Role,
   type StageCost,
 } from '@affidavit/contracts';
+import { digestOf } from './canonical.js';
+import type { SubmissionSpec } from './envelope.js';
+import { assertAllowedTools, type ModelRole } from './roles.js';
 
 export type ModelTurnRequest = Parameters<ModelPort['runTurn']>[0];
 export type ModelTurnResult = Awaited<ReturnType<ModelPort['runTurn']>>;
@@ -19,14 +23,29 @@ export type EscalationReason = Escalation['reason'];
 export type TrialEventType = TrialEvent['type'];
 export type EventPayload<T extends TrialEventType> = Extract<TrialEvent, { type: T }>['payload'];
 
-/** A request for one agent turn. Same shape as the model port's, plus who is acting. */
+/**
+ * A request for one agent turn: the model port's request. The acting role is derived from the
+ * stage (`MODEL_ROLE_FOR_STAGE`), never taken from the handler. A handler may name the actor it
+ * expects; a mismatch is refused before any spend.
+ */
 export interface AgentRequest extends ModelTurnRequest {
-  actor: Role;
+  actor?: Role;
 }
 
 export type StageResult =
   | { kind: 'advance'; next: CaseStage }
   | { kind: 'escalate'; reason: EscalationReason; detail: string };
+
+export type ValidatedAgentResult<T> =
+  | { outcome: 'admitted'; value: T; result: ModelTurnResult }
+  | {
+      outcome: 'inadmissible';
+      rule: 'schema';
+      exhibitId: ExhibitId;
+      errors: string[];
+      result: ModelTurnResult;
+    }
+  | { outcome: 'no-submission'; result: ModelTurnResult };
 
 export interface StageContext {
   readonly caseId: CaseId;
@@ -35,6 +54,17 @@ export interface StageContext {
   readonly attempt: number;
   /** The only way a handler reaches a model. Charges the budget before the call. */
   runAgent(req: AgentRequest): Promise<ModelTurnResult>;
+  /**
+   * runAgent plus validation of the submission against the role's contract-derived schema.
+   * Output that fails is recorded as an `exhibit-inadmissible` event with rule `schema` and
+   * returned; it is never retried here.
+   */
+  runAgentValidated<R extends ModelRole, T>(
+    req: AgentRequest,
+    spec: SubmissionSpec<R, T>,
+  ): Promise<ValidatedAgentResult<T>>;
+  /** Append a schema-valid trial event for this stage. */
+  record<T extends TrialEventType>(type: T, payload: EventPayload<T>, actor?: Role): Promise<void>;
   /** What model calls actually cost so far in this case, as reported by the model port. */
   costs(): readonly StageCost[];
 }
@@ -104,8 +134,20 @@ export class EscalationNotAllowedError extends Error {
   }
 }
 
+/** A handler named an actor that is not the role this stage runs. Refused before any spend. */
+export class ActorMismatchError extends Error {
+  constructor(
+    readonly stage: CaseStage,
+    readonly expected: Role,
+    readonly supplied: Role,
+  ) {
+    super(`stage ${stage} acts as ${expected}; handler asked to act as ${supplied}`);
+    this.name = 'ActorMismatchError';
+  }
+}
+
 /** Stages whose handlers may call a model, and the role that acts for each. */
-export const MODEL_ROLE_FOR_STAGE: Readonly<Partial<Record<CaseStage, Role>>> = {
+export const MODEL_ROLE_FOR_STAGE: Readonly<Partial<Record<CaseStage, ModelRole>>> = {
   defense: 'defense',
   prosecution: 'prosecution',
   remedy: 'remedy',
@@ -199,8 +241,57 @@ export class Orchestrator {
       stage,
       attempt,
       runAgent: (req) => this.runAgent(caseId, stage, attempt, req),
+      runAgentValidated: (req, spec) => this.runAgentValidated(caseId, stage, attempt, req, spec),
+      record: (type, payload, actor) => this.emit(caseId, stage, type, payload, actor),
       costs: () => [...this.ledger(caseId)],
     };
+  }
+
+  private roleFor(stage: CaseStage, req: AgentRequest): ModelRole {
+    const role = MODEL_ROLE_FOR_STAGE[stage];
+    if (!role) throw new Error(`stage ${stage} never calls a model`);
+    if (req.actor !== undefined && req.actor !== role) {
+      throw new ActorMismatchError(stage, role, req.actor);
+    }
+    return role;
+  }
+
+  private async runAgentValidated<R extends ModelRole, T>(
+    caseId: CaseId,
+    stage: CaseStage,
+    attempt: number,
+    req: AgentRequest,
+    spec: SubmissionSpec<R, T>,
+  ): Promise<ValidatedAgentResult<T>> {
+    const role = this.roleFor(stage, req);
+    if (spec.role !== role) throw new ActorMismatchError(stage, role, spec.role);
+    if (req.outputSchemaRef !== spec.schemaRef) {
+      throw new Error(
+        `prompt output schema ${req.outputSchemaRef} does not match ${role} submissions (${spec.schemaRef})`,
+      );
+    }
+
+    const result = await this.runAgent(caseId, stage, attempt, req);
+    if (result.outcome !== 'submitted') return { outcome: 'no-submission', result };
+
+    const check = spec.check(result.submission);
+    if (check.ok) return { outcome: 'admitted', value: check.value, result };
+
+    // Name the rejected output by its content, so the record points at exactly what was refused.
+    const exhibitId = `exhibit-${spec.exhibitKind}-rejected-${digestOf({
+      caseId,
+      stage,
+      attempt,
+      submission: result.submission,
+    }).slice(0, 24)}` as ExhibitId;
+    await this.emit(
+      caseId,
+      stage,
+      'exhibit-inadmissible',
+      { exhibitId, rejectedBy: 'schema' },
+      'judge',
+    );
+    return { outcome: 'inadmissible', rule: 'schema', exhibitId, errors: check.errors, result };
   }
 
   private ledger(caseId: CaseId): StageCost[] {
@@ -220,8 +311,8 @@ export class Orchestrator {
   ): Promise<ModelTurnResult> {
     const { store, model, config } = this.deps;
     const now = config.now ?? Date.now;
-    const role = MODEL_ROLE_FOR_STAGE[stage];
-    if (!role) throw new Error(`stage ${stage} never calls a model`);
+    const role = this.roleFor(stage, req);
+    assertAllowedTools(role, req.tools);
     if (await config.killSwitch()) throw new KillSwitchError();
 
     // Charge the turn's whole budget before the call, so a retry cannot spend unrecorded money.

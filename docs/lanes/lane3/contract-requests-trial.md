@@ -20,6 +20,12 @@ Proposals only. Nothing here changes `packages/contracts`; per implementation-pl
 - **Proposal (additive):** a `halted` `TrialEventType` with payload `{ reason: 'kill-switch' }`.
 - **Meanwhile:** `Orchestrator.run` returns `{ status: 'halted', stage, reason: 'kill-switch' }`, emits nothing for the halt, and leaves the case at its current stage so running it again resumes it.
 
+## CR-T5: name a schema-rejected agent output (L3-02)
+
+- **Need:** `exhibit-inadmissible` requires an `exhibitId`, but agent output that fails schema never became an exhibit, so nothing has assigned it an id.
+- **Proposal (additive):** document a minting rule for rejected submissions in the contracts changelog, or make `exhibitId` optional when `rejectedBy` is `schema`.
+- **Meanwhile:** the orchestrator names it `exhibit-<kind>-rejected-<first 24 hex of sha256(canonical JSON of {caseId, stage, attempt, submission})>`, so the id is stable for the same output and never collides with a Judge-minted id.
+
 ## CR-T4: escalation from intake, map, and arraign (L3-01)
 
 - **Need:** `STAGE_TRANSITIONS` allows `escalated` only from defense onward.
