@@ -1,6 +1,13 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
-import { ApiRoutes, BudgetState, CaseId, TERMINAL_STAGES, Verdict } from '@affidavit/contracts';
+import {
+  ApiRoutes,
+  BudgetState,
+  CaseId,
+  CaseStage,
+  TERMINAL_STAGES,
+  Verdict,
+} from '@affidavit/contracts';
 import { ApiError, ApiSchemaError, SAFE_ID, errorText, type AffidavitApi } from './api-client.js';
 
 export const TOOL_NAME = 'request_verdict';
@@ -59,7 +66,8 @@ export const VerdictOutput = Verdict.pick({
   summary: true,
   severity: true,
 }).extend({
-  status: Str,
+  /** 'verdict' for a final verdict, otherwise 'dismissed' or 'escalated'. */
+  status: CaseStage.extract(['verdict', 'dismissed', 'escalated']),
   needsHumanReview: BudgetState.shape.exhausted.optional(),
   bundle: BundleOutput,
 });
@@ -136,7 +144,9 @@ async function run(
   // Escalated and dismissed are legitimate verdicts, not tool failures. The contract Verdict and
   // GetCaseResponse carry no machine-readable reason; the generated summary is the only text.
   const status =
-    verdict.outcome === 'escalated' || verdict.outcome === 'dismissed' ? verdict.outcome : 'ok';
+    verdict.outcome === 'escalated' || verdict.outcome === 'dismissed'
+      ? verdict.outcome
+      : 'verdict';
   return success({
     status,
     caseId,

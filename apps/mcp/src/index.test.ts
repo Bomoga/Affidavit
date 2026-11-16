@@ -14,6 +14,7 @@ import {
   configFromEnv,
   createAffidavitMcpServer,
   createHttpApi,
+  errorText,
   type AffidavitApi,
 } from './index.js';
 
@@ -137,7 +138,7 @@ describe('request_verdict over an in-memory MCP transport', () => {
     expect(res.isError).toBe(false);
     expect(calls.slice(0, 2)).toEqual(['createCase', 'getCase']);
     expect(res.structured).toMatchObject({
-      status: 'ok',
+      status: 'verdict',
       caseId: CASE_ID,
       outcome: baseVerdict['outcome'],
       summary: SUMMARY,
@@ -506,6 +507,134 @@ describe('http client', () => {
     }
     const res = await call(await connect(failures[0] as AffidavitApi), { caseId: CASE_ID });
     expect(JSON.stringify(res.data)).not.toContain(token);
+  });
+});
+
+type Handler = (path: string) => { status?: number; body: unknown };
+
+/** Runs a local node:http server for the duration of `fn`. */
+async function withServer(handler: Handler, fn: (baseUrl: string) => Promise<void>): Promise<void> {
+  const server = createServer((req, res) => {
+    const out = handler(req.url ?? '');
+    res.statusCode = out.status ?? 200;
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify(out.body));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    await fn(`http://127.0.0.1:${(server.address() as AddressInfo).port}`);
+  } finally {
+    server.close();
+  }
+}
+
+/** The token itself, its JSON-escaped form, and every 8 character slice of either. */
+function leakNeedles(token: string): string[] {
+  const forms = [token, JSON.stringify(token).slice(1, -1)];
+  const needles = new Set(forms);
+  for (const f of forms) {
+    for (let i = 0; i + 8 <= f.length; i += 1) needles.add(f.slice(i, i + 8));
+  }
+  return [...needles];
+}
+
+describe('reflected token regression', () => {
+  const TOKEN = 'ab"c\\d-SECRET-token-"\\xyz';
+
+  it('never leaks a token that the API reflects as an object key', async () => {
+    for (const pad of [0, 1, 100, 470, 480, 490, 495, 499, 500, 505, 600]) {
+      const key = 'k'.repeat(pad) + TOKEN;
+      const bad = { ...baseVerdict, promptVersions: { [key]: 'v1' } };
+      await withServer(
+        (path) => ({
+          body: path.endsWith('/verdict')
+            ? bad
+            : { schemaVersion: 1, caseId: CASE_ID, stage: 'verdict', verdict: bad },
+        }),
+        async (baseUrl) => {
+          const api = createHttpApi({ baseUrl, token: TOKEN });
+          const res = await call(await connect(api), { caseId: CASE_ID });
+          expect(res.isError).toBe(true);
+          expect(res.data['kind']).toBe('invalid-api-response');
+          const text = JSON.stringify(res);
+          for (const needle of leakNeedles(TOKEN)) expect(text).not.toContain(needle);
+          const direct: unknown = await api.getCase(CASE_ID).catch((e: unknown) => e);
+          expect(direct).toBeInstanceOf(ApiSchemaError);
+          for (const needle of leakNeedles(TOKEN)) {
+            expect((direct as Error).message).not.toContain(needle);
+          }
+        },
+      );
+    }
+  });
+
+  it('errorText reduces schema errors to codes, and unknown errors to a fixed message', () => {
+    const parsed = ApiRoutes.getVerdict.response.safeParse({
+      ...baseVerdict,
+      promptVersions: { [TOKEN]: 'v1' },
+    });
+    expect(parsed.success).toBe(false);
+    const text = errorText(parsed.error);
+    for (const needle of leakNeedles(TOKEN)) expect(text).not.toContain(needle);
+    expect(text).toMatch(/issues?: /);
+    expect(errorText(new Error(`secret ${TOKEN}`))).toBe('unexpected error');
+  });
+});
+
+describe('MCP client against the real http client', () => {
+  const serveFixture: Handler = (path) => ({
+    body: path.endsWith('/verdict')
+      ? baseVerdict
+      : { schemaVersion: 1, caseId: CASE_ID, stage: 'verdict', verdict: baseVerdict },
+  });
+
+  it('validates the result against the output schema after listTools', async () => {
+    await withServer(serveFixture, async (baseUrl) => {
+      const client = await connect(createHttpApi({ baseUrl, token: 'tok' }));
+      await client.listTools();
+      const res = await call(client, { caseId: CASE_ID });
+      expect(res.isError).toBe(false);
+      expect(VerdictOutput.safeParse(res.structured).success).toBe(true);
+      expect(res.structured).toMatchObject({ status: 'verdict', summary: SUMMARY });
+    });
+  });
+
+  it('reports an output validation error when the structured shape is bad', async () => {
+    // A fake that skips contract parsing, so a bad outcome reaches the output schema.
+    const sloppy: AffidavitApi = {
+      createCase: () => Promise.reject(new Error('unused')),
+      getCase: () =>
+        Promise.resolve({
+          schemaVersion: 1,
+          caseId: CASE_ID,
+          stage: 'verdict',
+          verdict: { ...baseVerdict, outcome: 'weird' },
+        } as never),
+      getVerdict: () => Promise.reject(new Error('unused')),
+      getBundle: () => Promise.reject(new Error('unused')),
+    };
+    const client = await connect(sloppy);
+    await client.listTools();
+    const text = await call(client, { caseId: CASE_ID }).then(
+      (res) => JSON.stringify(res),
+      (err: unknown) => (err instanceof Error ? err.message : ''),
+    );
+    expect(text).toMatch(/output validation|structured content|schema/i);
+  });
+
+  it('cancels the body of a non-2xx response before throwing', async () => {
+    let cancelled = false;
+    const res = new Response(
+      new ReadableStream({
+        cancel() {
+          cancelled = true;
+        },
+      }),
+      { status: 500 },
+    );
+    const api = createHttpApi({ baseUrl: 'https://api.test', fetch: () => Promise.resolve(res) });
+    await expect(api.getVerdict(CASE_ID)).rejects.toBeInstanceOf(ApiError);
+    expect(cancelled).toBe(true);
   });
 });
 

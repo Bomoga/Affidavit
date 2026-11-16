@@ -105,8 +105,33 @@ export function configFromEnv(env: Record<string, string | undefined>): HttpApiC
   return config;
 }
 
+/**
+ * Schema failure summary: a count and the distinct issue codes only. Zod messages and paths can
+ * contain API-supplied keys, and so could contain a reflected token, so they are never passed on.
+ */
+export function describeSchemaError(err: unknown): string {
+  const issues =
+    typeof err === 'object' && err !== null && 'issues' in err && Array.isArray(err.issues)
+      ? (err.issues as unknown[])
+      : [];
+  const codes = new Set<string>();
+  for (const issue of issues) {
+    const code = (issue as { code?: unknown } | null)?.code;
+    if (typeof code === 'string' && /^[a-z_]{1,40}$/.test(code)) codes.add(code);
+  }
+  return `${issues.length} issues: ${[...codes].join(', ')}`;
+}
+
+/**
+ * The only way an error becomes text for a client. Our own errors carry fixed messages; schema
+ * errors are reduced to codes; anything else is not described at all.
+ */
 export function errorText(err: unknown): string {
-  return err instanceof Error ? err.message.slice(0, 500) : 'unknown error';
+  if (err instanceof ApiError || err instanceof ApiSchemaError) return err.message;
+  if (typeof err === 'object' && err !== null && 'issues' in err) {
+    return `response did not match the contract (${describeSchemaError(err)})`;
+  }
+  return 'unexpected error';
 }
 
 /** Thin fetch wrapper. Every response body is parsed with its contract schema. */
@@ -116,8 +141,6 @@ export function createHttpApi(config: HttpApiConfig): AffidavitApi {
   const base = normalizeBaseUrl(config.baseUrl);
   if (config.token !== undefined) checkToken(config.token);
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const redact = (text: string): string =>
-    config.token ? text.replaceAll(config.token, '[redacted]') : text;
   const isAbort = (err: unknown): boolean =>
     err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError');
 
@@ -153,7 +176,10 @@ export function createHttpApi(config: HttpApiConfig): AffidavitApi {
       if (isAbort(err)) throw new ApiError(`${method} ${path} timed out after ${timeoutMs} ms`);
       throw new ApiError(`request to ${method} ${path} failed: network error`);
     }
-    if (!res.ok) throw new ApiError(`${method} ${path} returned HTTP ${res.status}`, res.status);
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => undefined);
+      throw new ApiError(`${method} ${path} returned HTTP ${res.status}`, res.status);
+    }
     let json: unknown;
     try {
       json = await res.json();
@@ -165,7 +191,7 @@ export function createHttpApi(config: HttpApiConfig): AffidavitApi {
       return schema.parse(json);
     } catch (err) {
       throw new ApiSchemaError(
-        `${method} ${path} returned a body that does not match the contract: ${redact(errorText(err))}`,
+        `${method} ${path} returned a body that does not match the contract (${describeSchemaError(err)})`,
       );
     }
   }
