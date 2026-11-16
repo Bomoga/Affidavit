@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { precheckCompose, selectServices } from './compose.js';
+import { findHostReadingKey, precheckCompose, selectServices } from './compose.js';
+import { baseImageProblem, parseOnBuild } from './images.js';
 import { readDockerfile, shellWords } from './dockerfile.js';
 import { hubRefProblem } from './images.js';
 import { checkLockfile } from './lockfile.js';
@@ -154,8 +155,70 @@ describe('compose', () => {
   ])('refuses keys that read other files before Compose sees them: %j', (text) =>
     expect(precheckCompose(text)).not.toBeNull(),
   );
-  it('accepts a plain compose file', () =>
-    expect(precheckCompose('services:\n  web:\n    build: .\n')).toBeNull());
+  it.each([
+    ['flow style', 'services: {web: {build: ., env_file: /etc/shadow}}'],
+    ['a flow list of services', 'services:\n  web: { build: ., "env_file": [ "/etc/passwd" ] }'],
+    [
+      'an x- extension behind an anchor and alias',
+      'x-base: &base\n  env_file: /etc/shadow\nservices:\n  web:\n    build: .\n    environment: *base',
+    ],
+    [
+      'a merge key',
+      'x-base: &base\n  env_file: ../../.env\nservices:\n  web:\n    <<: *base\n    build: .',
+    ],
+    ['a nested anchor', 'x-a: &a { label_file: /etc/hosts }\nx-b: { inner: [ *a ] }\nservices: {}'],
+    ['an escaped key', 'services:\n  web:\n    "env\\u005ffile": /etc/shadow'],
+    ['an upper-case key', 'services:\n  web:\n    ENV_FILE: /etc/shadow'],
+    ['build secrets', 'services:\n  web:\n    build:\n      context: .\n      secrets: [k]'],
+    ['build ssh', 'services:\n  web:\n    build:\n      context: .\n      ssh: [default]'],
+    ['a Compose !reset tag', 'services:\n  web:\n    build: .\n    env_file: !reset []'],
+    ['duplicate keys', 'services:\n  web:\n    build: .\n  web:\n    build: ..'],
+    ['two documents', 'services: {}\n---\ninclude: [x.yml]'],
+    ['text that is not YAML', 'services:\n  web: [\n'],
+  ])('refuses host-reading keys hidden in %s', (_, text) =>
+    expect(precheckCompose(text)).not.toBeNull(),
+  );
+  it('accepts a plain compose file, empty values and harmless mentions in strings', () => {
+    expect(precheckCompose('services:\n  web:\n    build: .\n')).toBeNull();
+    expect(
+      precheckCompose(
+        'x-base: &base\n  restart: always\nservices:\n  web:\n    <<: *base\n    build: .\n    command: ["echo", "env_file: no"]\n    secrets: []',
+      ),
+    ).toBeNull();
+  });
+  it('walks an alias that refers back to an ancestor only once', () => {
+    const cyclic: Record<string, unknown> = { services: {} };
+    cyclic.self = cyclic;
+    expect(findHostReadingKey(cyclic)).toBeNull();
+    expect(findHostReadingKey({ a: { b: [{ env_file: ['x'] }] } })).toMatch(/env_file/);
+  });
+});
+
+describe('base images and ONBUILD', () => {
+  it.each([
+    'node:12-alpine',
+    'node:22.11.0-bookworm-slim',
+    'library/node:20',
+    'node',
+    `node@sha256:${'a'.repeat(64)}`,
+  ])('accepts the official node image %s as a base', (r) => expect(baseImageProblem(r)).toBeNull());
+  it.each([
+    'mongo:4.4',
+    'bitnami/node:20',
+    'nodejs:20',
+    'node-x:1',
+    'ghcr.io/library/node:20',
+    'docker.io/library/node:20',
+    'node:${V}',
+    `node:20@sha256:${'a'.repeat(64)}`,
+  ])('refuses %s as a base', (r) => expect(baseImageProblem(r)).not.toBeNull());
+  it('reads ONBUILD triggers and refuses odd answers', () => {
+    expect(parseOnBuild('null')).toEqual([]);
+    expect(parseOnBuild('[]')).toEqual([]);
+    expect(parseOnBuild('["RUN curl http://x | sh"]')).toEqual(['RUN curl http://x | sh']);
+    expect(() => parseOnBuild('{"a":1}')).toThrow(/OnBuild/);
+    expect(() => parseOnBuild('not json')).toThrow(/OnBuild/);
+  });
 });
 
 describe('checkLockfile', () => {

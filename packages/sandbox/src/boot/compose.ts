@@ -1,8 +1,16 @@
 import { execFile } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { promisify } from 'node:util';
 import { shellWords } from './dockerfile.js';
 
 const exec = promisify(execFile);
+
+// js-yaml 4.3.2 ships no types. It is loaded through require with the one signature used here,
+// so packages that compile this file (the Judge) need no ambient declaration.
+const { CORE_SCHEMA, load } = createRequire(import.meta.url)('js-yaml') as {
+  CORE_SCHEMA: unknown;
+  load: (text: string, opts: { schema: unknown }) => unknown;
+};
 
 /** A service from the compose file that the target needs: started from its image, never built. */
 export interface ComposeSidecar {
@@ -27,14 +35,73 @@ export interface ComposeTarget {
 export type ComposeRead = { ok: true; target: ComposeTarget } | { ok: false; reason: string };
 
 /**
- * Keys that make `docker compose config` read files outside the compose file, possibly outside
- * the tree. Checked on the raw text before Compose ever sees it, and refused (fail closed).
+ * Keys that make Compose read files outside the compose file, possibly outside the tree (and
+ * possibly put their contents into a service's environment). Refused at any depth.
  */
-const READS_FILES = /^\s*-?\s*["']?(include|extends|env_file|secrets|configs)["']?\s*:/m;
+export const READS_FILES = new Set([
+  'include',
+  'extends',
+  'env_file',
+  'label_file',
+  'secrets',
+  'configs',
+  'ssh',
+  'additional_contexts',
+]);
 
+const MAX_DEPTH = 64;
+
+/** An empty value (`null`, `[]`, `{}`) names no file; Compose's own output can carry these. */
+const isEmpty = (v: unknown): boolean =>
+  v === null ||
+  v === undefined ||
+  (Array.isArray(v) && v.length === 0) ||
+  (typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length === 0);
+
+/** The first host-reading key anywhere in a parsed tree, or a reason the tree is refused. */
+export function findHostReadingKey(tree: unknown): string | null {
+  const seen = new WeakSet<object>();
+  const walk = (v: unknown, depth: number): string | null => {
+    if (typeof v !== 'object' || v === null) return null;
+    if (depth > MAX_DEPTH) return 'compose file is nested too deeply';
+    // An alias points at a node already walked; each node is checked once.
+    if (seen.has(v)) return null;
+    seen.add(v);
+    if (Array.isArray(v)) {
+      for (const x of v) {
+        const p = walk(x, depth + 1);
+        if (p !== null) return p;
+      }
+      return null;
+    }
+    for (const [k, x] of Object.entries(v)) {
+      if (READS_FILES.has(k.toLowerCase()) && !isEmpty(x)) {
+        return `compose key "${k}" reads other files`;
+      }
+      const p = walk(x, depth + 1);
+      if (p !== null) return p;
+    }
+    return null;
+  };
+  return walk(tree, 0);
+}
+
+/**
+ * Parses the compose YAML into a tree, before Compose ever sees the file, and refuses any key
+ * that reads other files, at any depth: inside `x-` extension blocks, behind anchors and aliases,
+ * through merge keys (`<<: *base`, whose aliased map is walked), in flow style (`{env_file: x}`),
+ * or quoted or escaped (`"env_file"` parses to `env_file`). The parser uses the YAML core
+ * schema: custom tags (Compose's `!reset`, `!override`) and duplicate keys fail to parse, and an
+ * unparseable file is refused (fail closed).
+ */
 export function precheckCompose(text: string): string | null {
-  const m = READS_FILES.exec(text);
-  return m ? `compose key "${m[1]}" reads other files` : null;
+  let tree: unknown;
+  try {
+    tree = load(text, { schema: CORE_SCHEMA });
+  } catch (err) {
+    return `compose file is not plain YAML: ${(err as Error).message.split('\n')[0] ?? ''}`;
+  }
+  return findHostReadingKey(tree);
 }
 
 /**

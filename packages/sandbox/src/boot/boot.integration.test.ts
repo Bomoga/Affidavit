@@ -6,8 +6,18 @@ import type { BootHints } from '@affidavit/contracts';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { RUN_LABEL } from '../gvisor/args.js';
 import { createCaseNetwork, removeCaseNetwork } from '../gvisor/network.js';
+import { runJailed } from '../gvisor/runner.js';
 import { bootTarget, type BootOutcome } from './boot.js';
 import { buildTarget, type BuildOutcome } from './build.js';
+import {
+  FETCH_IMAGE,
+  PROXY_PORT,
+  createFetchEnv,
+  removeFetchEnv,
+  resolveRegistry,
+  type FetchEnv,
+} from './fetch.js';
+import { imageOnBuild, pullPinned } from './images.js';
 
 // Needs a sandbox host (docs/lanes/lane2/sandbox-runner.md) and pulls images from Docker Hub.
 // Run with `pnpm --filter @affidavit/sandbox test:sandbox-host`. The NodeGoat cases also need
@@ -163,6 +173,16 @@ describe.runIf(onSandboxHost)('boot recipes on a sandbox host', { timeout: 900_0
     expect((await buildAndBoot(src, tinyHints())).boot).toMatchObject({ status: 'failed' });
   });
 
+  it('refuses a base image outside the allowlist before pulling it', async () => {
+    const src = tinyApp(root, 'not-node', LISTEN);
+    writeFileSync(join(src, 'Dockerfile'), 'FROM bitnami/node:22\nCMD ["node", "server.js"]\n');
+    expect((await buildAndBoot(src, tinyHints())).build).toMatchObject({
+      ok: false,
+      unsupported: true,
+      step: 'base',
+    });
+  });
+
   it('refuses a lockfile that fetches from outside the registry, before any build step', async () => {
     const src = tinyApp(root, 'git-dep', LISTEN);
     writeFileSync(
@@ -180,5 +200,107 @@ describe.runIf(onSandboxHost)('boot recipes on a sandbox host', { timeout: 900_0
       unsupported: true,
       step: 'recipe',
     });
+  });
+});
+
+/** Exits 0 and prints CONNECTED if a TCP connection opens, else prints why and exits 3. */
+const connectProbe = (host: string, port: number): string =>
+  `const s = require('net').connect(${port}, ${JSON.stringify(host)});
+s.setTimeout(5000);
+s.on('connect', () => { console.log('CONNECTED'); process.exit(0); });
+s.on('error', (e) => { console.log(e.code); process.exit(3); });
+s.on('timeout', () => { console.log('TIMEOUT'); process.exit(3); });`;
+
+/** Sends `CONNECT target` to the proxy and prints the status line. */
+const connectVia = (proxy: string, target: string): string =>
+  `const s = require('net').connect(${PROXY_PORT}, ${JSON.stringify(proxy)}, () =>
+  s.write('CONNECT ${target} HTTP/1.1\\r\\nHost: ${target}\\r\\n\\r\\n'));
+s.setTimeout(10000);
+s.once('data', (d) => { console.log(String(d).split('\\r\\n')[0]); process.exit(0); });
+s.on('error', (e) => { console.log(e.code); process.exit(3); });
+s.on('timeout', () => { console.log('TIMEOUT'); process.exit(3); });`;
+
+describe.runIf(onSandboxHost)(
+  'the fetch step network on a sandbox host',
+  { timeout: 300_000 },
+  () => {
+    let env: FetchEnv | undefined;
+    const fetchEnv = (): FetchEnv => env as FetchEnv;
+    const probe = async (code: string) =>
+      runJailed(
+        {
+          image: FETCH_IMAGE,
+          command: ['node', '-e', code],
+          mounts: [],
+          timeoutMs: 60_000,
+          fetch: fetchEnv().fetch,
+        },
+        { trace: false },
+      );
+    const gateway = (net: string): string =>
+      execFileSync(
+        'docker',
+        ['network', 'inspect', '--format', '{{(index .IPAM.Config 0).Gateway}}', net],
+        { encoding: 'utf8' },
+      ).trim();
+
+    beforeAll(async () => {
+      await pullPinned(FETCH_IMAGE);
+      env = await createFetchEnv(await resolveRegistry());
+    });
+    afterAll(async () => {
+      if (env !== undefined) await removeFetchEnv(env);
+      const left = execFileSync(
+        'docker',
+        ['network', 'ls', '--quiet', '--filter', `label=${RUN_LABEL}`],
+        { encoding: 'utf8' },
+      );
+      expect(left.trim()).toBe('');
+    });
+
+    it.each([
+      ['a public IP literal', '1.1.1.1', 443],
+      ['a documentation address', '203.0.113.10', 443],
+      ['cloud metadata', '169.254.169.254', 80],
+    ])('cannot connect directly to %s from the fetch step', async (_, host, port) => {
+      const run = await probe(connectProbe(host, port));
+      expect(run.stdout).not.toContain('CONNECTED');
+      expect(run.exitCode).not.toBe(0);
+    });
+
+    it('cannot connect to the bridge gateway of its own network or of the default bridge', async () => {
+      for (const gw of [gateway(fetchEnv().net.name), gateway('bridge')]) {
+        expect(gw).toMatch(/^\d+\.\d+\.\d+\.\d+$/);
+        for (const port of [22, 80, 2375, 3128]) {
+          const run = await probe(connectProbe(gw, port));
+          expect(run.stdout, `${gw}:${port}`).not.toContain('CONNECTED');
+        }
+      }
+    });
+
+    it('reaches the registry through the proxy, and the proxy refuses anything else', async () => {
+      const proxy = fetchEnv().fetch.proxy.host;
+      expect((await probe(connectVia(proxy, 'registry.npmjs.org:443'))).stdout).toMatch(/ 200 /);
+      for (const target of ['example.com:443', '1.1.1.1:443', 'registry.npmjs.org:80']) {
+        expect((await probe(connectVia(proxy, target))).stdout, target).toMatch(/ 403 /);
+      }
+    });
+  },
+);
+
+describe.runIf(onSandboxHost)('ONBUILD detection on a sandbox host', { timeout: 300_000 }, () => {
+  const tag = `affidavit-onbuild-test:${process.pid}`;
+  afterAll(() => {
+    execFileSync('docker', ['image', 'rm', '--force', tag], { stdio: 'ignore' });
+  });
+
+  it('reads ONBUILD triggers from an image and none from the official node image', async () => {
+    execFileSync('docker', ['pull', '--quiet', 'node:22-alpine'], { stdio: 'ignore' });
+    execFileSync('docker', ['build', '--quiet', '--tag', tag, '-'], {
+      input: 'FROM node:22-alpine\nONBUILD RUN echo from-the-base\n',
+      stdio: ['pipe', 'ignore', 'inherit'],
+    });
+    expect(await imageOnBuild(tag)).toEqual(['RUN echo from-the-base']);
+    expect(await imageOnBuild('node:22-alpine')).toEqual([]);
   });
 });

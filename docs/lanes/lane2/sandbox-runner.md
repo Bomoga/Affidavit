@@ -75,6 +75,8 @@ The runner throws, rather than reporting a clean run, when Docker or the runtime
 
 An image that declares `VOLUME` gets an anonymous Docker volume per container, and that volume can outlive the container. The runner refuses such images before starting anything (`docker image inspect` on `Config.Volumes`, which must be empty), since the jail never needs one: `/scratch` is a tmpfs. An image that is not present locally cannot be inspected and is refused too, so images must be pulled (by digest) before a run, never implicitly by `docker run`. Teardown also reads the container's mounts before removing it, removes it with `docker rm --force --volumes`, and fails if any volume it had still exists.
 
+One exception, for L2-04 sidecars only (`startJailedService`): an image such as `mongo` that declares volumes is accepted when the boot recipe puts a capped tmpfs exactly over each one, so Docker creates no volume. The service's mounts are read back after it starts, and a container that got a volume anyway is removed and the boot fails. See `boot-recipes.md`, "Volumes".
+
 ### The trace is capped while the run goes
 
 gVisor writes the trace to the host's disk during the run. Measured on 2026-11-14: one thread opening files in a loop wrote 67 MiB in 5 s, so a witness left to run to its 120 s timeout could write well over a gigabyte per attempt. The runner checks the trace size every 250 ms and kills the run when it passes 64 MiB (`DEFAULT_MAX_TRACE_BYTES`). The largest trace from a normal containment run was 1.4 MiB. A run cut off this way is reported as `tampered`: it cannot be shown to be clean, so a witness fails, and the containment runner refuses it.

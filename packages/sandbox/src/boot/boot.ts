@@ -3,7 +3,7 @@ import { PROBE_IMAGE } from '../containment/probes.js';
 import { runJailed } from '../gvisor/runner.js';
 import { startJailedService, type CaseNetwork, type RunningService } from '../gvisor/network.js';
 import { imageVolumes, pinImage } from './images.js';
-import type { BootRecipe } from './recipe.js';
+import { recipeProblem, type BootRecipe } from './recipe.js';
 
 /** Configuration, not measurements. */
 const SERVICE_TMP_MB = 64;
@@ -84,6 +84,11 @@ export async function bootTarget(
   imageId: string,
   recipe: BootRecipe,
 ): Promise<BootOutcome> {
+  // The recipe is plain data and may not have come from deriveRecipe: check it again, so a bad
+  // alias, env key or working directory is an outcome, not an exception mid-boot.
+  const problem = recipeProblem(recipe);
+  if (problem !== null) return { status: 'unsupported', reason: problem };
+
   const services: RunningService[] = [];
   const hosts: Record<string, string> = {};
   const sidecarImages: Record<string, string> = {};
@@ -126,6 +131,10 @@ export async function bootTarget(
     writableTmpMb: SERVICE_TMP_MB,
   };
 
+  // The seed is a script from the target's own repository, run with the target's image on the
+  // case network before the target starts. It is untrusted code under the same jail as the
+  // target (gVisor, no route out, no host path); accepting it at all is a lead decision pending
+  // sign-off (boot-recipes.md, "Seeding").
   if (recipe.seedScript !== undefined) {
     const seed = await runJailed(
       {

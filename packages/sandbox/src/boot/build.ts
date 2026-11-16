@@ -1,5 +1,4 @@
 import { execFile } from 'node:child_process';
-import { lookup } from 'node:dns/promises';
 import {
   chmod,
   copyFile,
@@ -13,22 +12,23 @@ import {
 } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import type { BootHints } from '@affidavit/contracts';
+import { BootHints } from '@affidavit/contracts';
 import { PROBE_IMAGE } from '../containment/probes.js';
-import { FETCH_NETWORK, type Limits } from '../gvisor/args.js';
-import { validateMounts } from '../gvisor/mounts.js';
+import type { Limits } from '../gvisor/args.js';
+import { validateMounts, type Mount } from '../gvisor/mounts.js';
 import { runJailed, type JailedRun } from '../gvisor/runner.js';
-import { pinImage } from './images.js';
+import {
+  FETCH_IMAGE,
+  createFetchEnv,
+  npmProxyEnv,
+  removeFetchEnv,
+  resolveRegistry,
+} from './fetch.js';
+import { baseImageProblem, imageOnBuild, pinImage, pullPinned } from './images.js';
 import { NPM_REGISTRY } from './lockfile.js';
 import { deriveRecipe, type BootRecipe } from './recipe.js';
 
 const exec = promisify(execFile);
-
-/**
- * Label on the fetch network. Deliberately not RUN_LABEL: the network is shared and outlives
- * every run, so teardown checks for leftover runs must not see it.
- */
-export const FETCH_LABEL = 'affidavit.sandbox.fetch';
 
 /** Label on every image the split build makes, so they can be listed and removed. */
 export const IMAGE_LABEL = 'affidavit.sandbox.image';
@@ -105,57 +105,37 @@ export interface BuildOptions {
   limits?: Readonly<Limits>;
 }
 
-/** The fetch network: a plain bridge, with egress, joined only by the dependency download. */
-export async function ensureFetchNetwork(): Promise<void> {
-  const { stdout } = await exec('docker', [
-    'network',
-    'ls',
-    '--quiet',
-    '--filter',
-    `name=^${FETCH_NETWORK}$`,
-  ]);
-  if (stdout.trim() !== '') return;
-  await exec('docker', [
-    'network',
-    'create',
-    '--driver',
-    'bridge',
-    '--label',
-    FETCH_LABEL,
-    FETCH_NETWORK,
-  ]).catch(async (err: unknown) => {
-    const again = await exec('docker', [
-      'network',
-      'ls',
-      '--quiet',
-      '--filter',
-      `name=^${FETCH_NETWORK}$`,
-    ]);
-    if (again.stdout.trim() === '') throw err;
-  });
-}
-
 const tail = (r: JailedRun): string => `${r.stderr}\n${r.stdout}`.trim().slice(-1500);
 const failed = (r: JailedRun): boolean => r.exitCode !== 0;
 
 /**
  * The split build (L2-04). Nothing from the repository runs outside gVisor, and nothing runs with
- * network access except npm itself, from the pinned base image, with install scripts off:
+ * a route out except npm itself, from Lane 2's pinned image (`FETCH_IMAGE`), with install scripts
+ * off, through a per-build proxy that forwards only to the registry:
  *
  * 1. Stage the checkout (regular files only, no `.git`, `.env*`, `.npmrc`, `node_modules`).
  * 2. Derive the recipe from boot hints, compose file and Dockerfile, without running them, and
  *    check the lockfile only points at the npm registry.
- * 3. Fetch: `npm ci --ignore-scripts` in gVisor on the fetch network, where the registry is the
- *    only name that resolves.
- * 4. Scripts: `npm rebuild` (dependency install scripts) and the `build` script, offline.
- * 5. Assemble: `docker build --network=none` from a generated Dockerfile with only FROM (pinned)
+ * 3. Base: the final stage's base must be an official `node` image; it is pinned by digest, and
+ *    refused when it carries ONBUILD triggers.
+ * 4. Fetch: `npm ci --ignore-scripts` in gVisor on a fresh internal network whose only peer is
+ *    the fetch proxy (fetch.ts). The proxy allows only CONNECT to the registry on 443, at
+ *    addresses the host resolved and checked are public.
+ * 5. Scripts: `npm rebuild` (dependency install scripts) and the `build` script, offline, on the
+ *    pinned base.
+ * 6. Assemble: `docker build --network=none` from a generated Dockerfile with only FROM (pinned)
  *    and COPY, so no RUN step exists to execute.
  */
 export async function buildTarget(
   srcDir: string,
-  hints: BootHints,
+  bootHints: BootHints,
   opts: BuildOptions,
 ): Promise<BuildOutcome> {
+  const parsedHints = BootHints.safeParse(bootHints);
+  if (!parsedHints.success) {
+    return { ok: false, unsupported: false, step: 'recipe', reason: 'boot hints do not parse' };
+  }
+  const hints = parsedHints.data;
   const dir = await mkdtemp(join(opts.workRoot, 'build-'));
   const tree = join(dir, 'tree');
   const limits = opts.limits ?? BUILD_LIMITS;
@@ -170,9 +150,15 @@ export async function buildTarget(
     if (!r.ok) return { ok: false, unsupported: true, step: 'recipe', reason: r.reason };
     const recipe = r.recipe;
 
+    const baseProblem = baseImageProblem(recipe.base);
+    if (baseProblem !== null) {
+      return { ok: false, unsupported: true, step: 'base', reason: baseProblem };
+    }
     let baseImage: string;
+    let onBuild: string[];
     try {
       baseImage = await pinImage(recipe.base);
+      onBuild = await imageOnBuild(baseImage);
     } catch (err) {
       return {
         ok: false,
@@ -181,13 +167,25 @@ export async function buildTarget(
         reason: (err as Error).message.slice(0, 500),
       };
     }
+    if (onBuild.length > 0) {
+      return {
+        ok: false,
+        unsupported: true,
+        step: 'base',
+        reason: `base image ${recipe.base} has ONBUILD triggers, which would run inside the build`,
+      };
+    }
 
-    const mounts = validateMounts(
-      [{ hostPath: tree, containerPath: recipe.workdir, readOnly: false }],
-      [dir],
-    );
+    let mounts: Mount[];
+    try {
+      mounts = validateMounts(
+        [{ hostPath: tree, containerPath: recipe.workdir, readOnly: false }],
+        [dir],
+      );
+    } catch (err) {
+      return { ok: false, unsupported: true, step: 'recipe', reason: (err as Error).message };
+    }
     const common = {
-      image: baseImage,
       mounts,
       workdir: recipe.workdir,
       writableTmpMb: 256,
@@ -200,27 +198,34 @@ export async function buildTarget(
       },
     };
 
-    await ensureFetchNetwork();
-    const registryIp = (await lookup(NPM_REGISTRY, { family: 4 })).address;
+    await pullPinned(FETCH_IMAGE);
     const install = recipe.buildScript
       ? ['npm', 'ci', '--ignore-scripts']
-      : ['npm', 'ci', '--ignore-scripts', '--production'];
-    const fetched = await runJailed(
-      {
-        ...common,
-        command: install,
-        timeoutMs: FETCH_TIMEOUT_MS,
-        fetch: { name: FETCH_NETWORK, hosts: { [NPM_REGISTRY]: registryIp } },
-      },
-      { trace: false, limits },
-    );
+      : ['npm', 'ci', '--ignore-scripts', '--omit=dev'];
+    const fetchEnv = await createFetchEnv(await resolveRegistry());
+    let fetched: JailedRun;
+    try {
+      fetched = await runJailed(
+        {
+          ...common,
+          image: FETCH_IMAGE,
+          env: { ...common.env, ...npmProxyEnv() },
+          command: install,
+          timeoutMs: FETCH_TIMEOUT_MS,
+          fetch: fetchEnv.fetch,
+        },
+        { trace: false, limits },
+      );
+    } finally {
+      await removeFetchEnv(fetchEnv);
+    }
     if (failed(fetched))
       return { ok: false, unsupported: false, step: 'fetch', reason: tail(fetched) };
 
     const scripts = [['npm', 'rebuild'], ...(recipe.buildScript ? [['npm', 'run', 'build']] : [])];
     for (const command of scripts) {
       const run = await runJailed(
-        { ...common, command, timeoutMs: SCRIPTS_TIMEOUT_MS },
+        { ...common, image: baseImage, command, timeoutMs: SCRIPTS_TIMEOUT_MS },
         { trace: false, limits },
       );
       if (failed(run)) {

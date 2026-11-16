@@ -5,3 +5,4 @@ export * from './dockerfile.js';
 export * from './images.js';
 export * from './lockfile.js';
 export * from './recipe.js';
+export * from './fetch.js';

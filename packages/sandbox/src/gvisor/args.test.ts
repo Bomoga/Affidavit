@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { PROBE_IMAGE } from '../containment/probes.js';
-import { AUDIT_RUNTIME, FETCH_NETWORK, RUN_LABEL, buildGvisorRunArgs } from './args.js';
+import {
+  AUDIT_RUNTIME,
+  RUN_LABEL,
+  buildGvisorRunArgs,
+  envProblem,
+  hostAliasProblem,
+  workdirProblem,
+} from './args.js';
 
 const spec = {
   name: 'affidavit-test',
@@ -196,30 +203,47 @@ describe('buildGvisorRunArgs: service and build options (L2-04)', () => {
     expect(() => buildGvisorRunArgs({ ...spec, workdir: '/a/../..' })).toThrow(/workdir/);
   });
 
-  it('joins the fetch network with no resolver and only the listed hosts', () => {
-    const f = buildGvisorRunArgs({
-      ...spec,
-      fetch: { name: FETCH_NETWORK, hosts: { 'registry.npmjs.org': '104.16.0.34' } },
-    });
-    expect(after(f, '--network', FETCH_NETWORK)).toBe(true);
+  it('runs the fetch step on a per-build network with no resolver and only the proxy', () => {
+    const proxy = { host: 'affidavit-proxy', ip: '172.18.0.2' };
+    const f = buildGvisorRunArgs({ ...spec, fetch: { name: net, proxy } });
+    expect(after(f, '--network', net)).toBe(true);
     expect(after(f, '--dns', '0.0.0.0')).toBe(true);
-    expect(after(f, '--add-host', 'registry.npmjs.org:104.16.0.34')).toBe(true);
+    expect(after(f, '--add-host', 'affidavit-proxy:172.18.0.2')).toBe(true);
+    // The registry itself is never a host entry: only the proxy is reachable.
+    expect(f.filter((a) => a === '--add-host')).toHaveLength(1);
+    expect(f.join(' ')).not.toContain('registry.npmjs.org');
+    for (const name of ['bridge', 'host', 'affidavit-fetch', 'affidavit-egress-0123456789abcdef'])
+      expect(() => buildGvisorRunArgs({ ...spec, fetch: { name, proxy } })).toThrow(
+        /per-build network/,
+      );
     expect(() =>
-      buildGvisorRunArgs({ ...spec, fetch: { name: FETCH_NETWORK, hosts: {} } }),
-    ).toThrow(/at least one/);
+      buildGvisorRunArgs({ ...spec, fetch: { name: net, proxy: { host: 'p', ip: 'x' } } }),
+    ).toThrow(/proxy entry/);
     expect(() =>
-      buildGvisorRunArgs({
-        ...spec,
-        fetch: { name: 'bridge' as typeof FETCH_NETWORK, hosts: { a: '1.2.3.4' } },
-      }),
-    ).toThrow(/fetch network/);
-    expect(() =>
-      buildGvisorRunArgs({
-        ...spec,
-        network: { name: net },
-        fetch: { name: FETCH_NETWORK, hosts: { a: '1.2.3.4' } },
-      }),
-    ).toThrow(/not both/);
+      buildGvisorRunArgs({ ...spec, network: { name: net }, fetch: { name: net, proxy } }),
+    ).toThrow(/one of/);
+  });
+
+  it('puts only the fetch proxy on a per-build egress bridge, with no resolver', () => {
+    const egress = 'affidavit-egress-0123456789abcdef';
+    const e = buildGvisorRunArgs({ ...spec, egress });
+    expect(after(e, '--network', egress)).toBe(true);
+    expect(after(e, '--dns', '0.0.0.0')).toBe(true);
+    for (const bad of ['bridge', 'host', 'affidavit-egress-x', net])
+      expect(() => buildGvisorRunArgs({ ...spec, egress: bad })).toThrow(/egress network/);
+    expect(() => buildGvisorRunArgs({ ...spec, egress, network: { name: net } })).toThrow(/one of/);
+  });
+
+  it('reports bad untrusted values without throwing', () => {
+    expect(hostAliasProblem('mongo')).toBeNull();
+    expect(hostAliasProblem('a_b')).toMatch(/host name/);
+    expect(envProblem({ NODE_ENV: 'x' })).toBeNull();
+    expect(envProblem({ HOME: '/' })).toMatch(/not allowed/);
+    expect(envProblem({ 'A B': 'x' })).toMatch(/not allowed/);
+    expect(envProblem({ A: 'x\ny' })).toMatch(/line break/);
+    expect(workdirProblem('/usr/src/app')).toBeNull();
+    for (const w of ['/', '/tmp', '/scratch/x', '/proc', '/etc/app', '/a/../b', 'rel', '/a,b'])
+      expect(workdirProblem(w)).not.toBeNull();
   });
 
   it('accepts dotted stub names on a case network', () => {

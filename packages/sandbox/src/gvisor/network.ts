@@ -12,6 +12,7 @@ import {
 } from './args.js';
 import { inCidr, inCidr6, ipv4ToInt, isIpv4Cidr, isIpv6Cidr, mappedIpv4 } from './cidr.js';
 import type { Mount } from './mounts.js';
+import { parseContainerVolumes, parseImageVolumes, uncoveredVolumes } from './volumes.js';
 
 const exec = promisify(execFile);
 
@@ -162,6 +163,27 @@ export async function startJailedService(
   spec: ServiceSpec,
 ): Promise<RunningService> {
   if (!CASE_NETWORK.test(net.name)) throw new Error(`not a case network: ${net.name}`);
+  // Main's volume rule (runner.ts, refuseImageVolumes): no Docker volume may exist for a jailed
+  // container. A service image may declare VOLUME only if every path is covered by a tmpfs.
+  let declared: string[];
+  try {
+    const { stdout } = await exec('docker', [
+      'image',
+      'inspect',
+      '--format',
+      '{{json .Config.Volumes}}',
+      spec.image,
+    ]);
+    declared = parseImageVolumes(stdout);
+  } catch (e) {
+    throw new Error(`cannot inspect image ${spec.image}`, { cause: e });
+  }
+  const uncovered = uncoveredVolumes(declared, spec.tmpfs ?? []);
+  if (uncovered.length > 0) {
+    throw new Error(
+      `image ${spec.image} declares volumes without a tmpfs over them (${uncovered.join(', ')}); an anonymous volume could keep state after teardown`,
+    );
+  }
   const name = `affidavit-svc-${randomBytes(8).toString('hex')}`;
   const args = buildGvisorRunArgs({
     name,
@@ -178,6 +200,12 @@ export async function startJailedService(
     writableTmpMb: spec.writableTmpMb,
   });
   await exec('docker', [args[0] ?? 'run', '--detach', ...args.slice(1)]);
+  const mounts = await exec('docker', ['inspect', '--format', '{{json .Mounts}}', name]);
+  const volumes = parseContainerVolumes(mounts.stdout);
+  if (volumes.length > 0) {
+    await exec('docker', ['rm', '--force', '--volumes', name]).catch(() => undefined);
+    throw new Error(`service ${name} got Docker volumes (${volumes.join(', ')}); refused`);
+  }
   const { stdout } = await exec('docker', [
     'inspect',
     '--format',

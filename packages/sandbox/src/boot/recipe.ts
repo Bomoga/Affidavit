@@ -2,11 +2,13 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { BootHints, ExternalStub } from '@affidavit/contracts';
 import {
+  findHostReadingKey,
   normalizeCompose,
   precheckCompose,
   selectServices,
   type ComposeSidecar,
 } from './compose.js';
+import { envProblem, hostAliasProblem, workdirProblem } from '../gvisor/args.js';
 import { readDockerfile } from './dockerfile.js';
 import { checkLockfile } from './lockfile.js';
 
@@ -34,6 +36,13 @@ export interface BootRecipe {
 }
 
 export type RecipeRead = { ok: true; recipe: BootRecipe } | { ok: false; reason: string };
+
+/**
+ * Longest health wait Lane 2 grants, whatever the boot hints ask for. The seed script, the health
+ * probe and the boot diagnosis all derive their timeouts from the clamped value. Configuration,
+ * not a measurement.
+ */
+export const MAX_HEALTH_TIMEOUT_MS = 180_000;
 
 /** Value given to every environment variable the hints mark synthetic and nothing else sets. */
 export const SYNTHETIC_VALUE = 'affidavit-synthetic';
@@ -87,6 +96,10 @@ export async function deriveRecipe(treeDir: string, hints: BootHints): Promise<R
     } catch (err) {
       return fail(`compose file did not parse: ${(err as Error).message.slice(0, 500)}`);
     }
+    // Second layer: Compose's own reading of the file must not contain them either (a parser
+    // difference between js-yaml and Compose). Nothing it read reaches a container.
+    const post = findHostReadingKey(normalized);
+    if (post !== null) return fail(post);
     const sel = selectServices(normalized, hints.service ?? 'app', treeDir);
     if (!sel.ok) return sel;
     dockerfilePath = sel.target.dockerfile;
@@ -130,20 +143,45 @@ export async function deriveRecipe(treeDir: string, hints: BootHints): Promise<R
     seedScript = hints.seed.path;
   }
 
-  return {
-    ok: true,
-    recipe: {
-      base: stage.base,
-      workdir: stage.workdir === '/' ? '/app' : stage.workdir,
-      command,
-      env,
-      port: hints.ports[0] as number,
-      healthRoute: hints.healthRoute,
-      healthTimeoutMs: hints.healthTimeoutMs,
-      sidecars,
-      stubs: hints.stubs,
-      ...(seedScript === undefined ? {} : { seedScript }),
-      buildScript: typeof scripts.build === 'string',
-    },
+  const workdir = stage.workdir === '/' ? '/app' : stage.workdir;
+  const recipe: BootRecipe = {
+    base: stage.base,
+    workdir,
+    command,
+    env,
+    port: hints.ports[0] as number,
+    healthRoute: hints.healthRoute,
+    // The hints are untrusted; every wait derived from this (seed, health probe, diagnosis) is
+    // bounded by Lane 2's own maximum.
+    healthTimeoutMs: Math.min(hints.healthTimeoutMs, MAX_HEALTH_TIMEOUT_MS),
+    sidecars,
+    stubs: hints.stubs,
+    ...(seedScript === undefined ? {} : { seedScript }),
+    buildScript: typeof scripts.build === 'string',
   };
+  const problem = recipeProblem(recipe);
+  return problem === null ? { ok: true, recipe } : fail(problem);
+}
+
+/**
+ * Checks the values in a recipe that end up as jail flags (working directory, environment, host
+ * aliases, timeouts), so a bad value from the target is an `unsupported` outcome rather than an
+ * exception thrown while a run is being set up. `buildTarget` and `bootTarget` both call it.
+ */
+export function recipeProblem(r: BootRecipe): string | null {
+  if (!Number.isSafeInteger(r.healthTimeoutMs) || r.healthTimeoutMs <= 0) {
+    return 'health timeout is not a positive integer';
+  }
+  if (r.healthTimeoutMs > MAX_HEALTH_TIMEOUT_MS) {
+    return `health timeout is over the ${MAX_HEALTH_TIMEOUT_MS} ms maximum`;
+  }
+  if (!Number.isSafeInteger(r.port) || r.port < 1 || r.port > 65535) return 'bad port';
+  if (!r.healthRoute.startsWith('/') || /[\s\0]/.test(r.healthRoute)) return 'bad health route';
+  return (
+    workdirProblem(r.workdir) ??
+    envProblem(r.env) ??
+    r.sidecars.map((s) => hostAliasProblem(s.name) ?? envProblem(s.env)).find((p) => p !== null) ??
+    r.stubs.map((s) => hostAliasProblem(s.hostAlias)).find((p) => p !== null) ??
+    null
+  );
 }

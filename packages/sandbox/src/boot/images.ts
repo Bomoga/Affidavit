@@ -27,6 +27,58 @@ export function hubRefProblem(ref: string): string | null {
   return null;
 }
 
+/**
+ * Base images a target may be assembled on. The base is the root filesystem the target runs in,
+ * and its `npm rebuild` and build script run on it, so it is held to an allowlist rather than any
+ * Hub name: only the official `node` images (`node:<tag>`, `library/node:<tag>`, or either pinned
+ * by digest). Sidecars (databases) are separate: they run as their own services and keep the
+ * plain Hub rule above. Widen deliberately, one official image at a time.
+ */
+const BASE_REF = /^(?:library\/)?node(?::[\w][\w.-]{0,127}|@sha256:[0-9a-f]{64})?$/;
+
+export function baseImageProblem(ref: string): string | null {
+  return BASE_REF.test(ref) && hubRefProblem(ref) === null
+    ? null
+    : `base image ${ref} is not on the allowlist (official node images only)`;
+}
+
+/**
+ * `ONBUILD` instructions in an image's config, from
+ * `docker image inspect --format '{{json .Config.OnBuild}}'`. A base with ONBUILD triggers would
+ * run repository-controlled steps (`ONBUILD RUN`) inside our generated build, so it is refused.
+ * Throws on anything unreadable, so an odd answer never counts as "none".
+ */
+export function parseOnBuild(json: string): string[] {
+  let value: unknown;
+  try {
+    value = JSON.parse(json.trim());
+  } catch {
+    throw new Error(`cannot read the image's Config.OnBuild: ${json.slice(0, 200)}`);
+  }
+  if (value === null) return [];
+  if (!Array.isArray(value) || !value.every((x) => typeof x === 'string')) {
+    throw new Error(`unexpected Config.OnBuild: ${json.slice(0, 200)}`);
+  }
+  return value;
+}
+
+export async function imageOnBuild(image: string): Promise<string[]> {
+  const { stdout } = await exec('docker', [
+    'image',
+    'inspect',
+    '--format',
+    '{{json .Config.OnBuild}}',
+    image,
+  ]);
+  return parseOnBuild(stdout);
+}
+
+/** Pulls an image Lane 2 pinned itself (`name:tag@sha256:...`), so the jail can inspect it. */
+export async function pullPinned(ref: string): Promise<void> {
+  if (!/@sha256:[0-9a-f]{64}$/.test(ref)) throw new Error(`not pinned by digest: ${ref}`);
+  await exec('docker', ['pull', '--quiet', ref], { timeout: 600_000 });
+}
+
 /** Repository name as Docker reports it in RepoDigests (`node`, `library/x` is shown as `x`). */
 function repoOf(ref: string): string {
   const noDigest = ref.split('@')[0] as string;

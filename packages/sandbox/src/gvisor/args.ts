@@ -38,17 +38,24 @@ export interface JailNetwork {
 }
 
 /**
- * The one network with a route out, used only by the dependency fetch step of a split build
- * (boot/build.ts). Nothing on it can resolve a name: DNS points nowhere and only the hosts the
- * caller lists (the package registry) are written into /etc/hosts.
+ * The dependency fetch step of a split build (boot/fetch.ts). It joins a per-build network made
+ * by `createCaseNetwork` (internal, no host address, IPv6 off), so it has no route out at all:
+ * an IP literal or the bridge gateway is unreachable. Its only peer is the forward proxy, the one
+ * name in its /etc/hosts; DNS points nowhere. The proxy decides what the fetch can reach.
  */
-export const FETCH_NETWORK = 'affidavit-fetch';
-
 export interface FetchNetwork {
-  name: typeof FETCH_NETWORK;
-  /** Host name to IPv4 address; the only names the fetch step can reach. */
-  hosts: Readonly<Record<string, string>>;
+  /** A per-build case network (`CASE_NETWORK`), never shared across builds or cases. */
+  name: string;
+  /** The forward proxy on that network: the only host the fetch step can name. */
+  proxy: { host: string; ip: string };
 }
+
+/**
+ * A per-build bridge with a route out, joined only by the fetch proxy (boot/fetch.ts), which
+ * forwards nothing but CONNECT to the registry on 443. Never joined by anything that runs
+ * repository or package code.
+ */
+export const EGRESS_NETWORK = /^affidavit-egress-[0-9a-f]{16}$/;
 
 /** An extra writable tmpfs, for example over an image's declared VOLUME. Memory-backed, capped. */
 export interface TmpfsMount {
@@ -84,6 +91,8 @@ export interface GvisorRunSpec {
    * download uses it, and that step runs no package or repository code.
    */
   fetch?: FetchNetwork;
+  /** A per-build egress bridge (`EGRESS_NETWORK`). Only the fetch proxy, our own code, joins one. */
+  egress?: string;
   /** Environment for the process. HOME and TMPDIR are always /scratch and cannot be overridden. */
   env?: Readonly<Record<string, string>>;
   workdir?: string;
@@ -111,18 +120,33 @@ function networkArgs(network: JailNetwork | undefined): string[] {
   return ['--network', network.name, '--dns-search', '.', ...hosts];
 }
 
+/** `--dns 0.0.0.0`: no resolver, so only the names written into /etc/hosts resolve. */
+const NO_DNS = ['--dns', '0.0.0.0', '--dns-search', '.'];
+
 function fetchArgs(fetch: FetchNetwork): string[] {
-  if (fetch.name !== FETCH_NETWORK)
-    throw new Error(`not the fetch network: ${fetch.name as string}`);
-  const hosts = Object.entries(fetch.hosts).flatMap(([host, ip]) => {
-    if (!/^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$/.test(host) || ipv4ToInt(ip) === null) {
-      throw new Error(`bad fetch host entry: ${host} ${ip}`);
-    }
-    return ['--add-host', `${host}:${ip}`];
-  });
-  if (hosts.length === 0) throw new Error('the fetch network needs at least one host');
-  // `--dns 0.0.0.0`: no resolver, so only the names written into /etc/hosts resolve.
-  return ['--network', FETCH_NETWORK, '--dns', '0.0.0.0', '--dns-search', '.', ...hosts];
+  if (!CASE_NETWORK.test(fetch.name)) {
+    throw new Error(`the fetch step joins only a per-build network: ${fetch.name}`);
+  }
+  const { host, ip } = fetch.proxy;
+  if (!HOST_ALIAS.test(host) || ipv4ToInt(ip) === null) {
+    throw new Error(`bad fetch proxy entry: ${host} ${ip}`);
+  }
+  return ['--network', fetch.name, ...NO_DNS, '--add-host', `${host}:${ip}`];
+}
+
+function egressArgs(egress: string): string[] {
+  if (!EGRESS_NETWORK.test(egress)) throw new Error(`not a per-build egress network: ${egress}`);
+  return ['--network', egress, ...NO_DNS];
+}
+
+function anyNetworkArgs(spec: GvisorRunSpec): string[] {
+  const chosen = [spec.network, spec.fetch, spec.egress].filter((n) => n !== undefined);
+  if (chosen.length > 1) {
+    throw new Error('a run joins one of a case network, the fetch network or an egress network');
+  }
+  if (spec.fetch !== undefined) return fetchArgs(spec.fetch);
+  if (spec.egress !== undefined) return egressArgs(spec.egress);
+  return networkArgs(spec.network);
 }
 
 function envArgs(env: Readonly<Record<string, string>> | undefined): string[] {
@@ -170,6 +194,38 @@ function checkWorkdir(w: string): string {
 }
 
 /**
+ * Non-throwing checks for values that come from an untrusted target (boot recipes), so a bad
+ * value becomes an `unsupported` outcome instead of an exception deep inside a run.
+ */
+export function hostAliasProblem(alias: string): string | null {
+  return HOST_ALIAS.test(alias) ? null : `host alias ${JSON.stringify(alias)} is not a host name`;
+}
+
+export function envProblem(env: Readonly<Record<string, string>>): string | null {
+  for (const [k, v] of Object.entries(env)) {
+    if (!ENV_KEY.test(k) || k === 'HOME' || k === 'TMPDIR') {
+      return `environment key ${JSON.stringify(k)} is not allowed`;
+    }
+    if (/[\n\r\0]/.test(v)) return `environment value of ${k} has a line break or NUL`;
+  }
+  return null;
+}
+
+/** Container paths a target's working directory (a bind mount target) may not be or sit under. */
+const RESERVED_WORKDIR = ['/', '/proc', '/sys', '/dev', '/scratch', '/tmp', '/etc'];
+
+export function workdirProblem(w: string): string | null {
+  if (!TMPFS_PATH.test(w) || w.split('/').includes('..') || /[,:=]/.test(w)) {
+    return `working directory ${JSON.stringify(w)} is not a plain absolute path`;
+  }
+  const p = w.replace(/\/+$/, '') || '/';
+  if (RESERVED_WORKDIR.some((r) => p === r || (r !== '/' && p.startsWith(`${r}/`)))) {
+    return `working directory ${p} is reserved by the jail`;
+  }
+  return null;
+}
+
+/**
  * Pinned by content: a registry digest (`name@sha256:...`) or a local image ID (`sha256:...`, the
  * hash of the image config, which names every layer). Locally built images, such as the witness
  * runner, only have the second.
@@ -187,7 +243,8 @@ const isPinned = (image: string): boolean =>
  * - Memory with swap equal to memory, so the limit cannot be stretched with swap (L2-01 finding).
  * - `/tmp` and `/dev/shm` are read-only tmpfs and `/scratch` is the only writable path, unless the
  *   caller asks for a capped writable `/tmp` or extra capped tmpfs mounts (services only).
- * - Only a per-case network, or the registry-only fetch network for a dependency download.
+ * - Only a per-case network; for a dependency download, a per-build internal network whose only
+ *   peer is the fetch proxy; for the fetch proxy alone, a per-build egress bridge.
  */
 export function buildGvisorRunArgs(spec: GvisorRunSpec): string[] {
   if (!isPinned(spec.image))
@@ -204,13 +261,7 @@ export function buildGvisorRunArgs(spec: GvisorRunSpec): string[] {
     spec.runtime ?? AUDIT_RUNTIME,
     '--security-opt',
     'label=disable',
-    ...(spec.fetch === undefined
-      ? networkArgs(spec.network)
-      : spec.network === undefined
-        ? fetchArgs(spec.fetch)
-        : (() => {
-            throw new Error('a run joins a case network or the fetch network, not both');
-          })()),
+    ...anyNetworkArgs(spec),
     '--read-only',
     '--cap-drop',
     'ALL',
