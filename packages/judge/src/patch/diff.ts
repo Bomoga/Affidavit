@@ -20,6 +20,12 @@ export interface DiffFile {
   status: 'modified' | 'added' | 'deleted';
   added: string[];
   removed: string[];
+  /**
+   * This file's section of the diff exactly as submitted (file headers and hunks), one entry per
+   * line. `renderDiff` joins sections back into a diff, so a workbench can apply a subset of the
+   * files (for example the patch without its test files) with `git apply`.
+   */
+  raw: string[];
 }
 
 export interface ParsedDiff {
@@ -61,6 +67,7 @@ export function parseUnifiedDiff(diff: string): DiffParse {
   let i = 0;
 
   while (i < lines.length) {
+    const start = i;
     const header = lines[i] ?? '';
     let gitPath: string | null = null;
     if (header.startsWith('diff --git ')) {
@@ -105,7 +112,7 @@ export function parseUnifiedDiff(diff: string): DiffParse {
     if (seen.has(path)) return fail(`file appears twice: ${path}`);
     seen.add(path);
 
-    const file: DiffFile = { path, status, added: [], removed: [] };
+    const file: DiffFile = { path, status, added: [], removed: [], raw: [] };
     let hunks = 0;
     while (i < lines.length && (lines[i] ?? '').startsWith('@@')) {
       const m = HUNK.exec(lines[i] ?? '');
@@ -140,6 +147,7 @@ export function parseUnifiedDiff(diff: string): DiffParse {
     }
     if (hunks === 0) return fail(`no hunk for ${path}`);
     if (file.added.length + file.removed.length === 0) return fail(`no change in ${path}`);
+    file.raw = lines.slice(start, i);
     files.push(file);
   }
 
@@ -156,6 +164,17 @@ function stripTimestamp(name: string): string {
 function stripPrefix(name: string, prefix: string): string {
   return name.startsWith(prefix) ? name.slice(prefix.length) : name;
 }
+
+/** The diff restricted to some of its files, with `linesChanged` recounted. */
+export function selectFiles(diff: ParsedDiff, keep: (f: DiffFile) => boolean): ParsedDiff {
+  const files = diff.files.filter(keep);
+  const linesChanged = files.reduce((n, f) => n + f.added.length + f.removed.length, 0);
+  return { files, linesChanged };
+}
+
+/** Joins file sections back into unified diff text. Empty when the diff has no files. */
+export const renderDiff = (diff: ParsedDiff): string =>
+  diff.files.map((f) => `${f.raw.join('\n')}\n`).join('');
 
 /** Every added line, tagged with its file. */
 export const addedLines = (diff: ParsedDiff): DiffLine[] =>

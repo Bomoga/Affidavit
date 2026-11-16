@@ -12,10 +12,10 @@ import {
   startJailedService,
   type CaseNetwork,
 } from '@affidavit/sandbox';
-import { Witness, type ParamSpace } from '@affidavit/contracts';
+import { Exhibit, Witness, type ParamSpace } from '@affidavit/contracts';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { ExecutionRequest } from '../executor.js';
-import { Judge } from '../judge.js';
+import { Judge, counterexampleExhibitId, patchExhibitId } from '../judge.js';
 import { DEFAULT_POLICY } from '../rules.js';
 import {
   GATE_PATCH_DIFF,
@@ -221,7 +221,7 @@ describe.runIf(onSandboxHost)('witness jail on a sandbox host', { timeout: 300_0
   });
 
   describe('L2-07: verifyPatch in the jail', () => {
-    const verify = async (stub: StubName) => {
+    const verify = async (stub: StubName, counterexamples: Exhibit[] = []) => {
       patchedStub = stub;
       const workbench = new ScriptedWorkbench();
       const rescan = new RecordingRescan();
@@ -230,22 +230,49 @@ describe.runIf(onSandboxHost)('witness jail on a sandbox host', { timeout: 300_0
         gateCaseFile(),
         patchExhibit(GATE_PATCH_DIFF),
         witness(SQLI_WITNESS),
-        [],
+        counterexamples,
       );
       expect(workbench.released).toBe(1);
       expect(rescan.paths).toEqual([PATCHED.workspacePath]);
       return r;
     };
+    const counter = (code: string): Exhibit =>
+      Exhibit.parse({
+        schemaVersion: 1,
+        id: 'exhibit-counter-it',
+        caseId: gateCaseFile().id,
+        author: 'prosecution',
+        kind: 'counterexample',
+        code,
+        sha256: '9'.repeat(64),
+      });
 
     it('flips the whole witness family on a patched target', async () => {
       expect(await verify('patched')).toEqual({
         schemaVersion: 1,
-        patchExhibitId: 'exhibit-patch-001',
+        patchExhibitId: patchExhibitId(patchExhibit(GATE_PATCH_DIFF)),
         familyFlipped: true,
         suitePassed: true,
         rescanClean: true,
         counterexamples: [],
       });
+    });
+
+    it('uses only admissible counterexamples against the patch', async () => {
+      // The SQLi family as a counterexample is admissible (passes vulnerable, fails safe) and
+      // beats the partial fix. The health check passes on every variant, so it is not used.
+      const sqli = counter(SQLI_WITNESS);
+      const health = counter(
+        `${HEADER} witness(async (_p, { target }) => {
+           expect((await fetch(target!.url + '/health')).ok).toBe(true);
+         });`,
+      );
+      const params = witness(SQLI_WITNESS).params;
+      const r = await verify('patched-partial', [sqli, health]);
+      expect(r.counterexamples).toEqual([
+        { exhibitId: counterexampleExhibitId(sqli, params), survived: true },
+        { exhibitId: counterexampleExhibitId(health, params), survived: false },
+      ]);
     });
 
     it('does not flip when the patch only blocks one payload', async () => {
@@ -254,6 +281,35 @@ describe.runIf(onSandboxHost)('witness jail on a sandbox host', { timeout: 300_0
         rejectedBy: 'differential',
       });
     });
+  });
+
+  it('creates case networks with IPv6 off and only IPv4 subnets', () => {
+    for (const net of nets) {
+      const out = execFileSync(
+        'docker',
+        [
+          'network',
+          'inspect',
+          '--format',
+          '{{.EnableIPv6}} {{range .IPAM.Config}}{{.Subnet}} {{end}}',
+          net.name,
+        ],
+        { encoding: 'utf8' },
+      ).trim();
+      const [ipv6, ...subnets] = out.split(/\s+/);
+      expect(ipv6).toBe('false');
+      expect(subnets.every((s) => !s.includes(':'))).toBe(true);
+    }
+  });
+
+  it("rejects a witness that queries Docker's embedded DNS resolver (no-egress)", async () => {
+    const r = await run(
+      `${HEADER}
+        import dns from 'node:dns/promises';
+        witness(async () => { await dns.resolve4('example.com').catch(() => {}); });`,
+    );
+    expect(r).toMatchObject({ admissible: false, rejectedBy: 'no-egress' });
+    expect(r.egressAttempts).toBeGreaterThan(0);
   });
 
   it('rejects a witness that passes on both variants (differential)', async () => {

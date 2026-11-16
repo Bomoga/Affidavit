@@ -18,7 +18,7 @@ Code: `packages/judge/src/rules.ts` (the rules, pure), `judge.ts` (the `JudgePor
 | 5     | `time-budget`  | Any completed attempt took longer than `timeBudgetMs` (a soft budget below the hard kill timeout)                                        |
 | 6     | `differential` | Some parameter did not pass on `vulnerable`, or, with a safe variant, some parameter did not fail on `safe`                              |
 
-Patch rules (`literal-only-patch`, `diff-too-large`, `suite-fails`, `counterexample-survives`) belong to `verifyPatch`, task L2-07.
+Patch rules (`literal-only-patch`, `diff-too-large`, `suite-fails`, `counterexample-survives`) belong to `verifyPatch`, task L2-07; see `patch-verification.md`.
 
 ## Semantics other lanes rely on
 
@@ -26,11 +26,54 @@ Patch rules (`literal-only-patch`, `diff-too-large`, `suite-fails`, `counterexam
 - **`vulnPass` is only credited to evidence that got as far as `differential`.** A witness rejected by an earlier rule reports `vulnPass: false` even if its runs passed.
 - **`safeVariantFail` is absent when no safe variant was run.** An admitted witness without it rests on the vulnerable runs alone, and the trial must lean on the Prosecution counterexample (plan.md, F2 risk row).
 - **`familyResults`** are reported once evidence reaches `differential`, from vulnerable attempt 1 (all three are equal by then).
-- **Exhibit ids are minted by the Judge.** A witness gets `exhibit-witness-<24 hex>` from a SHA-256 over canonical JSON of its template and parameter space, so the same witness always gets the same id. A counterexample keeps its own `Exhibit.id`.
-- **Counterexamples** run under the same rules as witnesses, over the witness's parameter space.
-- **stdout and stderr are hashed, never stored** in the result.
+- **Exhibit ids are minted by the Judge**, for witnesses and counterexamples alike, from the exhibit's case, code and parameter space, and for patches from the case and diff (see "Exhibit ids" below). The submitted `Witness.id` and `Exhibit.id` are never echoed back, in `runWitness`, `runCounterexample` or `verifyPatch`.
+- **Counterexamples** run under the same rules as witnesses, over the witness's parameter space, on `vulnerable` and (when it exists) `safe`.
+- **What `admissible` and `passed` mean for a counterexample.** `admissible` means the counterexample is usable evidence: it passed every rule above, so the whole family passes on `vulnerable` and, when a safe variant exists, fails on `safe`. `passed` always equals `admissible`. Neither says anything about a patch. Whether a counterexample defeats a patch is `VerifyResult.counterexamples[].survived`, decided by `verifyPatch` (L2-07), which reruns only admissible counterexamples. An inadmissible counterexample cannot be used against a patch.
+- **The vulnerable and safe variants are indistinguishable to the witness.** The executor boots the variant it is asked for, but the witness never learns which one it is talking to: both are reached at the same internal hostname and port, with the same environment variables, mounts, parameters and limits. The variant name and the target ref stay outside the jail. A witness that could tell the variants apart could pass the differential rule by branching on the variant instead of exploiting the bug, so any executor that leaks the variant (a different hostname, an env var, a label visible inside the jail) is a bug.
+- **stdout and stderr are hashed, never stored** in the result. The executor caps each stream at `maxOutputBytes` while the run goes; output over the cap means the executor did not, and the Judge throws instead of judging.
 - **A run that never exited** is recorded with exit code `-1`.
 - **Executor failures throw.** An infrastructure failure is never turned into a rejection that blames the witness. The same goes for an executor that returns nonsense (a NaN or negative egress count, a negative duration): the Judge throws instead of judging, so an executor bug cannot slip a witness past `no-egress`.
+
+## Exhibit ids
+
+Lane 3 needs these ids (to match an `ExhibitResult` to the exhibit it submitted, and to name a counterexample in an appeal) without importing `@affidavit/judge`. The recipe is part of the contract:
+
+1. Build an object with exactly four keys:
+   - `caseId`: `Witness.caseId`, or `Exhibit.caseId` for a counterexample.
+   - `kind`: `"witness"` or `"counterexample"`.
+   - `params`: the `ParamSpace` the exhibit runs over. For a witness, `Witness.params`. For a counterexample, the `params` of the witness passed to `runCounterexample` alongside it.
+   - `template`: `Witness.template`, or `Exhibit.code` for a counterexample.
+2. Serialize it as canonical JSON: no whitespace, object keys sorted by UTF-16 code unit order (JavaScript's default `Array.prototype.sort`) at every level, array order kept, strings and numbers exactly as `JSON.stringify` writes them.
+3. Take the SHA-256 of the UTF-8 bytes, in lowercase hex.
+4. The id is `exhibit-<kind>-<first 24 hex digits>`.
+
+`Witness.sha256` and `Exhibit.sha256` are not inputs. The Judge does not trust a hash the caller computed, so the id is derived only from the fields that decide what runs.
+
+Test vectors (asserted in `judge.test.ts`), for `caseId: "case-x"`, `template` or `code` `"t"`, and `params: [{"name":"p","values":[1]}]`:
+
+| Kind           | Canonical JSON                                                                                    | Id                                                |
+| -------------- | ------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| witness        | `{"caseId":"case-x","kind":"witness","params":[{"name":"p","values":[1]}],"template":"t"}`        | `exhibit-witness-065ed82f887fd688aef7d3a3`        |
+| counterexample | `{"caseId":"case-x","kind":"counterexample","params":[{"name":"p","values":[1]}],"template":"t"}` | `exhibit-counterexample-acffdfb8b1fadd693641b6d2` |
+
+Because `caseId` is an input, the same code submitted to two cases gets two ids, and a witness and a counterexample with the same code and family never share an id. An exhibit too malformed to read its fields gets `exhibit-<kind>-invalid-<24 hex>`, hashed from the raw input, and is always rejected by `schema`.
+
+### Patch exhibit ids
+
+`verifyPatch` (L2-07) mints the patch id the same way, and never echoes `PatchExhibit.id`. Lane 3 builds the PatchExhibit with the same recipe (`packages/trial/src/patch.ts`):
+
+1. Build an object with exactly three keys: `caseId` (`PatchExhibit.caseId`), `diff` (`PatchExhibit.diff`) and `kind: "patch"`.
+2. Serialize it as canonical JSON, as above.
+3. Take the SHA-256 of the UTF-8 bytes, in lowercase hex.
+4. The id is `exhibit-patch-<first 24 hex digits>`.
+
+The Judge also refuses a patch with `schema` when `PatchExhibit.sha256` is not the SHA-256 of `diff`, or when `PatchExhibit.code` is not exactly `diff`, so the fields cannot describe two different patches.
+
+Test vector (asserted in `verify.test.ts`), for `caseId: "case-x"` and `diff: "d"`:
+
+| Canonical JSON                                  | Id                                       |
+| ----------------------------------------------- | ---------------------------------------- |
+| `{"caseId":"case-x","diff":"d","kind":"patch"}` | `exhibit-patch-4252faa67f9f45500b6a7ce8` |
 
 ## Result artifact format
 
@@ -46,14 +89,15 @@ The runner side is `docker/sandbox/witness-runner/run.mjs` (L2-05, `witness-prot
 
 These are configuration placeholders, not measurements. Tune them per corpus app once real runs exist.
 
-| Setting            | Default |
-| ------------------ | ------- |
-| `hardTimeoutMs`    | 120000  |
-| `timeBudgetMs`     | 60000   |
-| `maxArtifactBytes` | 65536   |
-| `maxFamilySize`    | 64      |
-| `maxSourceBytes`   | 262144  |
-| `maxParamsBytes`   | 65536   |
+| Setting            | Default                                          |
+| ------------------ | ------------------------------------------------ |
+| `hardTimeoutMs`    | 120000                                           |
+| `timeBudgetMs`     | 60000                                            |
+| `maxArtifactBytes` | 65536                                            |
+| `maxFamilySize`    | 64                                               |
+| `maxSourceBytes`   | 262144                                           |
+| `maxParamsBytes`   | 65536                                            |
+| `maxOutputBytes`   | 1048576 (each of stdout and stderr, per attempt) |
 
 ## Open questions for the contracts owner
 

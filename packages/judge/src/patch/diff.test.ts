@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { addedLines, parseUnifiedDiff, unsafePathReason } from './diff.js';
+import { addedLines, parseUnifiedDiff, renderDiff, selectFiles, unsafePathReason } from './diff.js';
 
 const GOOD = `diff --git a/app/data/allocations-dao.js b/app/data/allocations-dao.js
 index 1111111..2222222 100644
@@ -12,6 +12,19 @@ index 1111111..2222222 100644
 +            return { $and: [{ userId: parsedUserId }, { stocks: { $gt: t } }] };
          }
 `;
+
+describe('selectFiles and renderDiff', () => {
+  it('rebuilds the diff text, and a subset of its files', () => {
+    const two = `${GOOD}--- /dev/null\n+++ b/test/a.js\n@@ -0,0 +1 @@\n+it('x');\n`;
+    const r = parseUnifiedDiff(two);
+    if (!r.ok) throw new Error(r.reason);
+    expect(renderDiff(r.diff)).toBe(two);
+    const code = selectFiles(r.diff, (f) => !f.path.startsWith('test/'));
+    expect(renderDiff(code)).toBe(GOOD);
+    expect(code.linesChanged).toBe(3);
+    expect(renderDiff(selectFiles(r.diff, () => false))).toBe('');
+  });
+});
 
 describe('parseUnifiedDiff', () => {
   it('reads a git diff and counts added plus removed lines', () => {

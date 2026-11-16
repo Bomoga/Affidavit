@@ -39,7 +39,8 @@ jobs:
       - run: pnpm --filter @affidavit/contracts export:schema
 
   osv:
-    # Dogfooding: scan our own lockfile with the tool we ship. Image pinned by digest.
+    # Dogfooding: scan our own lockfiles (the workspace and the witness runner image) with the
+    # tool we ship. Image pinned by digest.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,3 +48,4 @@ jobs:
           docker run --rm -v "$PWD:/src:ro"
           ghcr.io/google/osv-scanner@sha256:4f3b7e2c64b9d38a5febc5a7e4a3dfef1d1362f726dea7a2ef4762b46469fcd0
           scan source --lockfile=/src/pnpm-lock.yaml
+          --lockfile=/src/docker/sandbox/witness-runner/package-lock.json

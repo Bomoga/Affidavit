@@ -20,6 +20,7 @@ import {
 import { validateMounts, type Mount } from './mounts.js';
 import type { CaseNetwork } from './network.js';
 import { parseTrace, type TraceObservations } from './trace.js';
+import { assertNoImageVolumes, parseContainerVolumes } from './volumes.js';
 
 const exec = promisify(execFile);
 
@@ -163,8 +164,41 @@ const UNTRACED: TraceObservations = {
   tampered: false,
 };
 
-/** Fails unless every container labelled with this run id is gone. */
-export async function verifyTeardown(runId: string): Promise<void> {
+/**
+ * Refuses an image that declares `VOLUME`. Docker would give each container an anonymous volume
+ * that can outlive it; the jail never needs one (`/scratch` is a tmpfs). The image must be present
+ * locally: an image that cannot be inspected is refused too.
+ */
+export async function refuseImageVolumes(image: string): Promise<void> {
+  let stdout: string;
+  try {
+    ({ stdout } = await exec('docker', [
+      'image',
+      'inspect',
+      '--format',
+      '{{json .Config.Volumes}}',
+      image,
+    ]));
+  } catch (e) {
+    throw new Error(`cannot inspect image ${image}`, { cause: e });
+  }
+  assertNoImageVolumes(image, stdout);
+}
+
+/** Volumes mounted in a container, read before it is removed. */
+async function containerVolumes(name: string): Promise<string[]> {
+  const { stdout } = await exec('docker', ['inspect', '--format', '{{json .Mounts}}', name]);
+  return parseContainerVolumes(stdout);
+}
+
+/**
+ * Fails unless every container labelled with this run id is gone, and every volume those
+ * containers had (normally none, since images with volumes are refused) is gone as well.
+ */
+export async function verifyTeardown(
+  runId: string,
+  volumes: readonly string[] = [],
+): Promise<void> {
   const { stdout } = await exec('docker', [
     'ps',
     '--all',
@@ -173,6 +207,17 @@ export async function verifyTeardown(runId: string): Promise<void> {
     `label=${RUN_LABEL}=${runId}`,
   ]);
   if (stdout.trim() !== '') throw new Error(`containers left behind for run ${runId}: ${stdout}`);
+  const left: string[] = [];
+  for (const v of volumes) {
+    const exists = await exec('docker', ['volume', 'inspect', v]).then(
+      () => true,
+      () => false,
+    );
+    if (exists) left.push(v);
+  }
+  if (left.length > 0) {
+    throw new Error(`volumes left behind for run ${runId}: ${left.join(', ')}`);
+  }
 }
 
 /**
@@ -184,6 +229,7 @@ export async function runJailed(
   input: JailedRunInput,
   opts: GvisorOptions = {},
 ): Promise<JailedRun> {
+  await refuseImageVolumes(input.image);
   const runId = randomBytes(8).toString('hex');
   const name = `affidavit-${runId}`;
   const args = buildGvisorRunArgs({
@@ -258,12 +304,26 @@ export async function runJailed(
   const durationMs = Date.now() - started;
 
   const state = await inspect(name);
-  await exec('docker', ['rm', '--force', name]).catch(() => undefined);
+  // Read the container's volumes before removing it, so teardown can prove they are gone too.
+  let volumeError: unknown = null;
+  const volumes =
+    state === null
+      ? []
+      : await containerVolumes(name).catch((e: unknown) => {
+          volumeError = e;
+          return [];
+        });
+  await exec('docker', ['rm', '--force', '--volumes', name]).catch(() => undefined);
   if (state === null) {
     throw new Error(`container ${name} was never created: ${stderr().slice(0, 2000)}`);
   }
+  if (volumeError !== null) {
+    throw new Error(`cannot list the volumes of ${name}, so teardown cannot be verified`, {
+      cause: volumeError,
+    });
+  }
   const text = opts.trace === false ? null : await collectTrace(traceRoot, state.id, maxTraceBytes);
-  await verifyTeardown(runId);
+  await verifyTeardown(runId, volumes);
 
   let trace: TraceObservations;
   if (opts.trace === false) trace = UNTRACED;

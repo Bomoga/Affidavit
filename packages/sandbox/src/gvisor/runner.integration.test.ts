@@ -149,4 +149,23 @@ describe.runIf(onSandboxHost)('gVisor runner on a sandbox host', { timeout: 120_
       tools.run(PROBE_IMAGE, ['true'], [{ hostPath: '/run', containerPath: '/x', readOnly: true }]),
     ).rejects.toThrow(/outside the allowed roots/);
   });
+
+  it('refuses an image that declares a VOLUME before starting anything', async () => {
+    const tag = 'affidavit-it-volume-image:latest';
+    const ctx = join(base, 'volume-image');
+    mkdirSync(ctx);
+    writeFileSync(join(ctx, 'Dockerfile'), `FROM ${PROBE_IMAGE}\nVOLUME /data\n`);
+    execFileSync('docker', ['build', '--quiet', '--tag', tag, ctx], { encoding: 'utf8' });
+    const volumesBefore = execFileSync('docker', ['volume', 'ls', '--quiet'], { encoding: 'utf8' });
+    try {
+      const tools = new GvisorToolRunner({ outputDir: base, allowedRoots: [workspace] });
+      await expect(tools.run(tag, ['true'], [])).rejects.toThrow(/declares volumes/);
+      expect(leftovers()).toBe('');
+      expect(execFileSync('docker', ['volume', 'ls', '--quiet'], { encoding: 'utf8' })).toBe(
+        volumesBefore,
+      );
+    } finally {
+      execFileSync('docker', ['image', 'rm', '--force', tag]);
+    }
+  });
 });
