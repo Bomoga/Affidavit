@@ -31,6 +31,12 @@ export interface JudgePolicy {
   maxSourceBytes: number;
   /** Largest parameter space, as canonical JSON in UTF-8 bytes. */
   maxParamsBytes: number;
+  /**
+   * Largest stdout or stderr, each in UTF-8 bytes, an executor may hand back for one attempt.
+   * The executor must cap the streams at this size while the run goes; output over it means the
+   * executor did not, and the Judge throws instead of judging.
+   */
+  maxOutputBytes: number;
 }
 
 export const DEFAULT_POLICY: Readonly<JudgePolicy> = {
@@ -40,6 +46,7 @@ export const DEFAULT_POLICY: Readonly<JudgePolicy> = {
   maxFamilySize: 64,
   maxSourceBytes: 256 * 1024,
   maxParamsBytes: 64 * 1024,
+  maxOutputBytes: 1024 * 1024,
 };
 
 export interface ObservedAttempt extends RawAttempt {
@@ -69,8 +76,12 @@ const isCount = (n: unknown): boolean => Number.isSafeInteger(n) && (n as number
  * The executor is our code, but a bug there must never turn into a wrong verdict: an attempt
  * with a NaN egress count would otherwise slip past `no-egress`. Bad input throws.
  */
-function checkAttempt(a: ObservedAttempt): void {
+function checkAttempt(a: ObservedAttempt, policy: Readonly<JudgePolicy>): void {
   const problems: string[] = [];
+  const tooLong = (s: unknown): boolean =>
+    typeof s === 'string' && Buffer.byteLength(s, 'utf8') > policy.maxOutputBytes;
+  if (tooLong(a.stdout)) problems.push('stdout over maxOutputBytes');
+  if (tooLong(a.stderr)) problems.push('stderr over maxOutputBytes');
   if (a.exitCode !== null && !Number.isSafeInteger(a.exitCode)) problems.push('exitCode');
   if (typeof a.timedOut !== 'boolean') problems.push('timedOut');
   if (typeof a.oomKilled !== 'boolean') problems.push('oomKilled');
@@ -86,8 +97,8 @@ function checkAttempt(a: ObservedAttempt): void {
   }
 }
 
-function checkShape(attempts: readonly ObservedAttempt[]): void {
-  attempts.forEach(checkAttempt);
+function checkShape(attempts: readonly ObservedAttempt[], policy: Readonly<JudgePolicy>): void {
+  attempts.forEach((a) => checkAttempt(a, policy));
   const variants = new Set(attempts.map((a) => a.variant));
   if (!variants.has('vulnerable')) throw new Error('evidence has no vulnerable runs');
   for (const v of variants) {
@@ -142,7 +153,7 @@ export function rejectBeforeRunning(exhibitId: ExhibitId, rule: AdmissibilityRul
  */
 export function judgeEvidence(evidence: Evidence, policy: Readonly<JudgePolicy>): ExhibitResult {
   const { exhibitId, familySize, attempts } = evidence;
-  checkShape(attempts);
+  checkShape(attempts, policy);
 
   const parsed = attempts.map((a) => ({
     a,

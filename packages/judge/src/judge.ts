@@ -9,14 +9,31 @@ import type {
   VerifyResult,
 } from '@affidavit/contracts';
 import { familySize } from './artifact.js';
-import { exhibitDigest, sha256Hex, canonicalJson } from './canonical.js';
+import { canonicalJson, mintExhibitId, sha256Hex } from './canonical.js';
 import type { EvidenceVariant, WitnessExecutor } from './executor.js';
 import { ATTEMPTS, DEFAULT_POLICY, judgeEvidence, rejectBeforeRunning } from './rules.js';
 import type { JudgePolicy, ObservedAttempt } from './rules.js';
 
-/** Exhibit id the Judge assigns to a witness: stable for the same template and family. */
-export function witnessExhibitId(witness: Pick<Witness, 'template' | 'params'>): ExhibitId {
-  return `exhibit-witness-${exhibitDigest('witness', witness.template, witness.params).slice(0, 24)}` as ExhibitId;
+/**
+ * Exhibit id the Judge assigns to a witness: stable for the same case, template and family.
+ * Lane 3 can recompute it from the Witness fields (rules-of-evidence.md, "Exhibit ids").
+ */
+export function witnessExhibitId(
+  witness: Pick<Witness, 'caseId' | 'template' | 'params'>,
+): ExhibitId {
+  return mintExhibitId('witness', witness.caseId, witness.template, witness.params);
+}
+
+/**
+ * Exhibit id the Judge assigns to a counterexample, minted the same way as a witness id: from the
+ * counterexample's case and code over the family it runs on (the witness's parameter space). The
+ * submitted `Exhibit.id` is never echoed back, so a caller cannot choose the id of its own result.
+ */
+export function counterexampleExhibitId(
+  counterexample: Pick<Exhibit, 'caseId' | 'code'>,
+  params: ParamSpace,
+): ExhibitId {
+  return mintExhibitId('counterexample', counterexample.caseId, counterexample.code, params);
 }
 
 interface Runnable {
@@ -37,6 +54,9 @@ export class Judge implements JudgePort {
   constructor(executor: WitnessExecutor, policy: Readonly<JudgePolicy> = DEFAULT_POLICY) {
     if (policy.timeBudgetMs >= policy.hardTimeoutMs) {
       throw new Error('timeBudgetMs must be below hardTimeoutMs');
+    }
+    if (!Number.isSafeInteger(policy.maxOutputBytes) || policy.maxOutputBytes < 0) {
+      throw new Error('maxOutputBytes must be a non-negative integer');
     }
     this.#executor = executor;
     this.#policy = policy;
@@ -62,6 +82,12 @@ export class Judge implements JudgePort {
   /**
    * Runs a Prosecution counterexample under the same rules as a witness, over the witness's
    * parameter space so it is not limited to the one input Defense used.
+   *
+   * For a counterexample, `admissible` (and `passed`, which always equals it) means the
+   * counterexample is usable evidence: it passed every rule, so the whole family passes on
+   * `vulnerable` and, when a safe variant exists, fails on `safe`. It says nothing about any
+   * patch. Whether a counterexample defeats a patch is `VerifyResult.counterexamples[].survived`
+   * from `verifyPatch` (L2-07), which only ever reruns admissible counterexamples.
    */
   async runCounterexample(
     caseFile: CaseFile,
@@ -75,17 +101,23 @@ export class Judge implements JudgePort {
       return rejectBeforeRunning(fallbackId('counterexample', counterexample), 'schema');
     }
     const w = safely(() => Witness.safeParse(witness));
+    if (!w?.success) {
+      return rejectBeforeRunning(fallbackId('counterexample', counterexample), 'schema');
+    }
+    const exhibitId = safely(() => counterexampleExhibitId(c.data, w.data.params));
+    if (exhibitId === undefined) {
+      return rejectBeforeRunning(fallbackId('counterexample', counterexample), 'schema');
+    }
     if (
       c.data.kind !== 'counterexample' ||
       c.data.caseId !== cf.id ||
       utf8Bytes(c.data.code) > this.#policy.maxSourceBytes ||
-      !w?.success ||
       !this.#witnessFits(cf, w.data)
     ) {
-      return rejectBeforeRunning(c.data.id, 'schema');
+      return rejectBeforeRunning(exhibitId, 'schema');
     }
     return this.#run(cf, targets, {
-      exhibitId: c.data.id,
+      exhibitId,
       template: c.data.code,
       params: w.data.params,
     });
@@ -137,6 +169,7 @@ export class Judge implements JudgePort {
     for (const [variant, target] of targets) {
       for (const attempt of ATTEMPTS) {
         const raw = await this.#executor.execute({
+          maxOutputBytes: this.#policy.maxOutputBytes,
           caseFile,
           variant,
           target,

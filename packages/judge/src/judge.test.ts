@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { CaseFile, Exhibit, Witness } from '@affidavit/contracts';
-import { Judge, witnessExhibitId } from './judge.js';
+import { createHash } from 'node:crypto';
+import { Judge, counterexampleExhibitId, witnessExhibitId } from './judge.js';
 import { DEFAULT_POLICY } from './rules.js';
 import {
   ScriptedExecutor,
@@ -196,9 +197,20 @@ describe('Judge.runWitness', () => {
 describe('witnessExhibitId', () => {
   it('is stable for the same template and family and ignores key order', () => {
     const w = gateWitness();
-    const reordered = { params: [{ values: [1, 2, 3], name: 'threshold' }], template: w.template };
+    const reordered = {
+      params: [{ values: [1, 2, 3], name: 'threshold' }],
+      template: w.template,
+      caseId: w.caseId,
+    };
     expect(witnessExhibitId(w)).toBe(witnessExhibitId(reordered));
     expect(witnessExhibitId(w)).toMatch(/^exhibit-witness-[0-9a-f]{24}$/);
+  });
+
+  it('changes when the case changes, so one witness in two cases gets two ids', () => {
+    const w = gateWitness();
+    expect(witnessExhibitId({ ...w, caseId: 'case-other' as Witness['caseId'] })).not.toBe(
+      witnessExhibitId(w),
+    );
   });
 
   it('changes when the template or the family changes', () => {
@@ -229,7 +241,10 @@ describe('Judge.runCounterexample', () => {
       true,
     );
     expect(exec.requests[0]?.params).toEqual(gateWitness().params);
-    expect(result).toMatchObject({ exhibitId: 'exhibit-counter-001', admissible: true });
+    expect(result).toMatchObject({
+      exhibitId: counterexampleExhibitId(counterexample(), gateWitness().params),
+      admissible: true,
+    });
   });
 
   it('applies the same rules as a witness', async () => {
@@ -268,8 +283,131 @@ describe('Judge.runCounterexample', () => {
       badWitness,
       counterexample(),
     );
-    expect(result).toMatchObject({ exhibitId: 'exhibit-counter-001', rejectedBy: 'schema' });
+    expect(result.rejectedBy).toBe('schema');
+    expect(result.exhibitId).toMatch(/^exhibit-counterexample-invalid-[0-9a-f]{24}$/);
     expect(exec.requests).toHaveLength(0);
+  });
+
+  it('mints its own id instead of echoing the submitted Exhibit.id', async () => {
+    const exec = new ScriptedExecutor(differentialTarget(3));
+    const judge = new Judge(exec);
+    const a = await judge.runCounterexample(gateCaseFile(), gateWitness(), counterexample());
+    const b = await judge.runCounterexample(
+      gateCaseFile(),
+      gateWitness(),
+      counterexample({ id: 'exhibit-witness-chosen-by-caller' as Exhibit['id'] }),
+    );
+    expect(a.exhibitId).toMatch(/^exhibit-counterexample-[0-9a-f]{24}$/);
+    expect(b.exhibitId).toBe(a.exhibitId);
+  });
+
+  it('reports the minted id on a schema rejection too', async () => {
+    const exec = new ScriptedExecutor(differentialTarget(3));
+    const ex = counterexample({ caseId: 'case-other' as Exhibit['caseId'] });
+    const result = await new Judge(exec).runCounterexample(gateCaseFile(), gateWitness(), ex);
+    expect(result).toMatchObject({
+      rejectedBy: 'schema',
+      exhibitId: counterexampleExhibitId(ex, gateWitness().params),
+    });
+  });
+
+  it('never collides with a witness id for the same code and family', () => {
+    const w = gateWitness();
+    const ex = counterexample({ code: w.template });
+    expect(counterexampleExhibitId(ex, w.params).slice('exhibit-counterexample-'.length)).not.toBe(
+      witnessExhibitId(w).slice('exhibit-witness-'.length),
+    );
+  });
+
+  it('changes with the family it runs over', () => {
+    const ex = counterexample();
+    expect(counterexampleExhibitId(ex, [{ name: 'threshold', values: [1] }])).not.toBe(
+      counterexampleExhibitId(ex, gateWitness().params),
+    );
+  });
+});
+
+describe('exhibit id recipe (the documented contract with Lane 3)', () => {
+  // Recomputed with node:crypto from the recipe in rules-of-evidence.md, not from canonical.ts.
+  const recipe = (kind: string, caseId: string, template: string, params: unknown): string => {
+    const json = `{"caseId":${JSON.stringify(caseId)},"kind":${JSON.stringify(kind)},"params":${JSON.stringify(params)},"template":${JSON.stringify(template)}}`;
+    return `exhibit-${kind}-${createHash('sha256').update(json).digest('hex').slice(0, 24)}`;
+  };
+  const params = [{ name: 'p', values: [1] }];
+
+  it('matches the documented test vectors', () => {
+    expect(witnessExhibitId({ caseId: 'case-x' as Witness['caseId'], template: 't', params })).toBe(
+      'exhibit-witness-065ed82f887fd688aef7d3a3',
+    );
+    expect(
+      counterexampleExhibitId({ caseId: 'case-x' as Exhibit['caseId'], code: 't' }, params),
+    ).toBe('exhibit-counterexample-acffdfb8b1fadd693641b6d2');
+  });
+
+  it('matches the recipe for the gate witness and a counterexample', () => {
+    const w = gateWitness();
+    expect(witnessExhibitId(w)).toBe(recipe('witness', w.caseId, w.template, w.params));
+    const ex = counterexample();
+    expect(counterexampleExhibitId(ex, w.params)).toBe(
+      recipe('counterexample', ex.caseId, ex.code, w.params),
+    );
+  });
+});
+
+describe('output size policy', () => {
+  it('passes maxOutputBytes to the executor', async () => {
+    const exec = new ScriptedExecutor(differentialTarget(3));
+    await new Judge(exec).runWitness(gateCaseFile(), gateWitness(), ['vulnerable']);
+    expect(exec.requests.every((r) => r.maxOutputBytes === DEFAULT_POLICY.maxOutputBytes)).toBe(
+      true,
+    );
+  });
+
+  it.each(['stdout', 'stderr'] as const)(
+    'throws when the executor returns %s over the cap, instead of judging',
+    async (stream) => {
+      const policy = { ...DEFAULT_POLICY, maxOutputBytes: 8 };
+      const exec = new ScriptedExecutor((req) => ({
+        ...differentialTarget(3)(req),
+        [stream]: 'x'.repeat(9),
+      }));
+      await expect(
+        new Judge(exec, policy).runWitness(gateCaseFile(), gateWitness(), ['vulnerable']),
+      ).rejects.toThrow(new RegExp(`${stream} over maxOutputBytes`));
+    },
+  );
+
+  it('counts the cap in UTF-8 bytes, not characters', async () => {
+    const policy = { ...DEFAULT_POLICY, maxOutputBytes: 8 };
+    const exec = new ScriptedExecutor((req) => ({
+      ...differentialTarget(3)(req),
+      stdout: 'é'.repeat(5),
+    }));
+    await expect(
+      new Judge(exec, policy).runWitness(gateCaseFile(), gateWitness(), ['vulnerable']),
+    ).rejects.toThrow(/stdout over maxOutputBytes/);
+  });
+
+  it('accepts output exactly at the cap', async () => {
+    const policy = { ...DEFAULT_POLICY, maxOutputBytes: 8 };
+    const exec = new ScriptedExecutor((req) => ({
+      ...differentialTarget(3)(req),
+      stdout: 'x'.repeat(8),
+    }));
+    const result = await new Judge(exec, policy).runWitness(gateCaseFile(), gateWitness(), [
+      'vulnerable',
+    ]);
+    expect(result.admissible).toBe(true);
+  });
+
+  it('refuses a policy with a negative or fractional output cap', () => {
+    const exec = new ScriptedExecutor(differentialTarget(3));
+    expect(() => new Judge(exec, { ...DEFAULT_POLICY, maxOutputBytes: -1 })).toThrow(
+      /maxOutputBytes/,
+    );
+    expect(() => new Judge(exec, { ...DEFAULT_POLICY, maxOutputBytes: 1.5 })).toThrow(
+      /maxOutputBytes/,
+    );
   });
 });
 
