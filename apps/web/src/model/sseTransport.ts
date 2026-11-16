@@ -1,4 +1,9 @@
-import { SAFE_CASE_ID, type StreamTransport } from './liveStream.js';
+import {
+  isNonRetryableStatus,
+  NonRetryableStreamError,
+  SAFE_CASE_ID,
+  type StreamTransport,
+} from './liveStream.js';
 
 export const MAX_SSE_LINE_CHARS = 1024 * 1024;
 export const MAX_SSE_MESSAGE_CHARS = 1024 * 1024;
@@ -30,10 +35,12 @@ export async function* sseMessages(
     data = [];
     dataChars = 0;
   };
-  for await (const chunk of body) {
-    buffer += decoder.decode(chunk, { stream: true });
+  // Pulls complete lines out of the buffer. A '\r' that ends the buffer may be the first half of
+  // a '\r\n' split across chunks, so it waits for the next chunk (or the end of the stream).
+  const lines = function* (final: boolean) {
     let nl: number;
     while ((nl = buffer.search(/\r\n|\n|\r/)) !== -1) {
+      if (!final && nl === buffer.length - 1 && buffer[nl] === '\r') return;
       if (nl > maxLine) throw new Error('SSE line too long');
       const line = buffer.slice(0, nl);
       buffer = buffer.slice(nl + (buffer.startsWith('\r\n', nl) ? 2 : 1));
@@ -45,8 +52,14 @@ export async function* sseMessages(
         data.push(value);
       }
     }
+  };
+  for await (const chunk of body) {
+    buffer += decoder.decode(chunk, { stream: true });
+    yield* lines(false);
     if (buffer.length > maxLine) throw new Error('SSE line too long');
   }
+  buffer += decoder.decode();
+  yield* lines(true);
 }
 
 async function* chunks(body: ReadableStream<Uint8Array>): AsyncGenerator<Uint8Array> {
@@ -121,6 +134,7 @@ export function createSseTransport(options: SseTransportOptions): StreamTranspor
       if (afterSeq !== undefined) options.applyResume?.({ url, headers }, afterSeq);
       // Credentials are omitted until API auth is designed (L1-12).
       const res = await doFetch(url, { headers, signal, credentials: 'omit' });
+      if (isNonRetryableStatus(res.status)) throw new NonRetryableStreamError(res.status);
       if (!res.ok || !res.body) throw new Error(`Event stream refused with status ${res.status}`);
       return sseMessages(chunks(res.body), options.limits);
     },

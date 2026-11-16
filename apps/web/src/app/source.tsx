@@ -17,7 +17,7 @@ import {
  */
 export type SourceConfig =
   | { mode: 'fake' }
-  | { mode: 'live'; transport: StreamTransport; backoff?: BackoffPolicy }
+  | { mode: 'live'; transport: StreamTransport; backoff?: BackoffPolicy; maxEvents?: number }
   /** Live was requested but the API URL is missing or not allowed. */
   | { mode: 'config-error' };
 
@@ -55,10 +55,17 @@ export function useTrialStream(
   caseId: string,
   transport: StreamTransport,
   backoff?: BackoffPolicy,
+  maxEvents?: number,
 ) {
   const stream = useMemo(
-    () => createTrialStream({ caseId, transport, ...(backoff ? { backoff } : {}) }),
-    [caseId, transport, backoff],
+    () =>
+      createTrialStream({
+        caseId,
+        transport,
+        ...(backoff ? { backoff } : {}),
+        ...(maxEvents ? { maxEvents } : {}),
+      }),
+    [caseId, transport, backoff, maxEvents],
   );
   useEffect(() => {
     stream.start();

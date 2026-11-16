@@ -1,4 +1,4 @@
-import { TrialEvent } from '@affidavit/contracts';
+import { TERMINAL_STAGES, TrialEvent } from '@affidavit/contracts';
 
 /** Ids go into URL paths. Same rule as the MCP server: anything outside this set is refused. */
 export const SAFE_CASE_ID = /^[A-Za-z0-9_-]{1,128}$/;
@@ -8,8 +8,23 @@ export type ConnectionStatus =
   | 'live'
   | 'reconnecting'
   | 'disconnected'
-  /** The stream ended cleanly after a terminal event; nothing more is expected. */
+  /** The server refused the stream (404 or another non-retryable 4xx). Retrying cannot help. */
+  | 'not-found'
+  /** The verdict and the end of the trial have been applied; nothing more is expected. */
   | 'complete';
+
+/** The server answered with a 4xx other than 408 and 429, so reconnecting would only repeat it. */
+export class NonRetryableStreamError extends Error {
+  constructor(readonly status: number) {
+    super(`Event stream refused with status ${status}`);
+    this.name = 'NonRetryableStreamError';
+  }
+}
+
+/** True for a 4xx status that will not change on retry. 408 and 429 are worth retrying. */
+export function isNonRetryableStatus(status: number): boolean {
+  return status >= 400 && status < 500 && status !== 408 && status !== 429;
+}
 
 /**
  * One connection to the event stream. `open` resolves once the connection is established and
@@ -48,9 +63,15 @@ export interface BackoffPolicy {
   capMs: number;
   /** Consecutive failed attempts before the stream gives up and reports `disconnected`. */
   maxAttempts: number;
+  /**
+   * Consecutive connections that opened fine and closed cleanly without a single new event
+   * (an idle proxy timing out a long stage) before the stream gives up. Defaults to 20.
+   */
+  maxIdleOpens?: number;
 }
 
 export const DEFAULT_BACKOFF: BackoffPolicy = { baseMs: 500, capMs: 15_000, maxAttempts: 8 };
+const DEFAULT_MAX_IDLE_OPENS = 20;
 
 export function backoffDelay(attempt: number, policy: BackoffPolicy): number {
   return Math.min(policy.capMs, policy.baseMs * 2 ** Math.max(0, attempt - 1));
@@ -69,9 +90,23 @@ export interface TrialStreamOptions {
 
 /**
  * Trial always writes a verdict after a dismissal, escalation or budget exhaustion, so the verdict
- * is the only event that ends the stream. A clean close before it is a drop, not completion.
+ * is what ends a case. But trial emits `verdict-written` before the stage's final `stage-exited`
+ * and the terminal `stage-entered`, so the verdict alone is not the end of the record. The stream
+ * is finished once a verdict has been applied and either the terminal stage was entered (in any
+ * order, or the verdict itself was written in a terminal stage), or the server closes the
+ * connection cleanly. A clean close before any verdict is a drop, not completion.
  */
-const FINAL_EVENT: TrialEvent['type'] = 'verdict-written';
+function finished(events: readonly TrialEvent[]): boolean {
+  const verdict = events.find((e) => e.type === 'verdict-written');
+  if (!verdict) return false;
+  return (
+    TERMINAL_STAGES.includes(verdict.stage) ||
+    events.some((e) => e.type === 'stage-entered' && TERMINAL_STAGES.includes(e.stage))
+  );
+}
+
+const hasVerdict = (events: readonly TrialEvent[]) =>
+  events.some((e) => e.type === 'verdict-written');
 
 /** No case in the corpus comes near this; a longer record is refused rather than rendered. */
 export const DEFAULT_MAX_EVENTS = 5000;
@@ -158,7 +193,10 @@ export function createTrialStream(options: TrialStreamOptions): TrialStream {
   }
 
   async function run(id: number, signal: AbortSignal): Promise<void> {
+    // Errors and gaps since the last progress, and clean closes that brought nothing new.
     let failures = 0;
+    let idle = 0;
+    const maxIdle = policy.maxIdleOpens ?? DEFAULT_MAX_IDLE_OPENS;
     let first = true;
     while (!signal.aborted && id === runId) {
       set({ status: first ? 'connecting' : 'reconnecting' });
@@ -167,28 +205,33 @@ export function createTrialStream(options: TrialStreamOptions): TrialStream {
         const messages = await options.transport.open(options.caseId, lastSeq, signal);
         if (signal.aborted) return;
         set({ status: 'live' });
+        let progressed = false;
         for await (const raw of messages) {
           if (signal.aborted) return;
-          const before = snapshot.events.length;
           if (accept(raw, signal) === 'applied') {
+            progressed = true;
             failures = 0;
+            idle = 0;
             // Leaving the loop closes the connection, so a server that keeps it open is fine.
-            if (snapshot.events[before]?.type === FINAL_EVENT)
-              return void set({ status: 'complete' });
+            if (finished(snapshot.events)) return void set({ status: 'complete' });
           }
         }
         if (signal.aborted) return;
-        failures += 1;
+        // The server closed the connection cleanly.
+        if (hasVerdict(snapshot.events)) return void set({ status: 'complete' });
+        if (!progressed) idle += 1;
       } catch (error) {
         if (signal.aborted) return;
         if (error instanceof RecordTooLong)
           return void set({ status: 'disconnected', tooLong: true });
+        if (error instanceof NonRetryableStreamError) return void set({ status: 'not-found' });
         // A dropped connection and a gap are recovered the same way: reconnect from lastSeq.
         failures += 1;
       }
-      if (failures >= policy.maxAttempts) return void set({ status: 'disconnected' });
+      if (failures >= policy.maxAttempts || idle >= maxIdle)
+        return void set({ status: 'disconnected' });
       set({ status: 'reconnecting' });
-      await sleep(backoffDelay(failures, policy), signal);
+      await sleep(backoffDelay(Math.max(failures, idle, 1), policy), signal);
     }
   }
 

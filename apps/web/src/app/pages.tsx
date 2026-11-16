@@ -77,6 +77,7 @@ export function CasePage() {
         caseId={caseId}
         transport={source.transport}
         {...(source.backoff ? { backoff: source.backoff } : {})}
+        {...(source.maxEvents ? { maxEvents: source.maxEvents } : {})}
       />
     ) : (
       <NotFoundPage />
@@ -89,14 +90,22 @@ function LiveCasePage({
   caseId,
   transport,
   backoff,
+  maxEvents,
 }: {
   caseId: string;
   transport: StreamTransport;
   backoff?: BackoffPolicy;
+  maxEvents?: number;
 }) {
-  const { snapshot, retry } = useTrialStream(caseId, transport, backoff);
+  const { snapshot, retry } = useTrialStream(caseId, transport, backoff, maxEvents);
   const view = useMemo(() => buildCaseView(snapshot.events), [snapshot.events]);
-  useDocumentTitle(`${view.headline} - Affidavit`);
+  useDocumentTitle(
+    snapshot.status === 'not-found'
+      ? 'Case file not found - Affidavit'
+      : `${view.headline} - Affidavit`,
+  );
+  // The server said no such case (or no access to it); say so plainly and do not retry.
+  if (snapshot.status === 'not-found') return <NotFoundPage />;
   return (
     <CaseFile
       view={view}
