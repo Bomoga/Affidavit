@@ -96,23 +96,45 @@ export function createEvalRun(input: {
     if (b.runId !== runId)
       throw new Error(`baseline for ${b.caseId} is tagged ${b.runId}, not ${runId}`);
   }
-  return { manifest: input.manifest, labels: input.labels, replays: input.replays, baseline };
+  const run: EvalRun = Object.freeze({
+    manifest: input.manifest,
+    labels: Object.freeze([...input.labels]),
+    replays: Object.freeze([...input.replays]),
+    baseline: Object.freeze([...baseline]),
+  });
+  created.add(run);
+  return run;
 }
 
+/** Runs built by `createEvalRun`; metric functions refuse anything else. */
+const created = new WeakSet<object>();
+
 export type Metric =
-  | { status: 'measured'; value: number; n: number; runId: RunId; synthetic: boolean }
+  | {
+      status: 'measured';
+      value: number;
+      /** Observations (for example juror pairs). */
+      n: number;
+      /** Distinct cases behind the value; the sample-size gate uses this, not `n`. */
+      cases: number;
+      runId: RunId;
+      synthetic: boolean;
+    }
   | { status: 'unmeasured'; reason: string };
 
 function unmeasured(reason: string): Metric {
   return { status: 'unmeasured', reason };
 }
 
-function measured(run: EvalRun, value: number, n: number): Metric {
-  if (n <= 0 || !Number.isFinite(value)) return unmeasured('no observations');
+function measured(run: EvalRun, value: number, n: number, cases = n): Metric {
+  if (!created.has(run)) throw new Error('EvalRun must be built with createEvalRun');
+  if (!Number.isFinite(value)) return unmeasured('non-finite value');
+  if (n <= 0) return unmeasured('no observations');
   return {
     status: 'measured',
     value,
     n,
+    cases,
     runId: run.manifest.runId,
     synthetic: run.manifest.labelsSource.kind === 'synthetic',
   };
@@ -137,6 +159,10 @@ export function juryAccuracy(run: EvalRun): Metric {
 /** Same as `juryAccuracy` for the single-reviewer baseline. */
 export function baselineAccuracy(run: EvalRun): Metric {
   if (run.baseline.length === 0) return unmeasured('no baseline decisions');
+  const covered = new Set<string>(run.baseline.map((b) => b.caseId));
+  if (run.labels.some((l) => !covered.has(l.caseId))) {
+    return unmeasured('baseline does not cover every labelled case');
+  }
   const byCase = new Map(run.baseline.map((b) => [b.caseId, b.outcome]));
   return accuracyOf(run, (id) => byCase.get(id));
 }
@@ -168,6 +194,7 @@ function numericVote(b: Ballot): number {
 
 /** One unordered juror pair on one question. */
 interface PairObs {
+  caseId: CaseId;
   question: Ballot['question'];
   ia: number;
   ib: number;
@@ -189,6 +216,7 @@ function pairObservations(run: EvalRun, onlyWrong: boolean): PairObs[] {
         if (x === undefined || y === undefined) continue;
         if (x.jurorId === y.jurorId || x.question !== y.question) continue;
         obs.push({
+          caseId: result.caseId,
           question: x.question,
           ia: voteIndex(x),
           ib: voteIndex(y),
@@ -206,7 +234,12 @@ function pairObservations(run: EvalRun, onlyWrong: boolean): PairObs[] {
 export function jurorAgreement(run: EvalRun, opts: { onlyWrong?: boolean } = {}): Metric {
   const obs = pairObservations(run, opts.onlyWrong ?? false);
   if (obs.length === 0) return unmeasured('no juror pairs');
-  return measured(run, obs.filter((o) => o.agree).length / obs.length, obs.length);
+  return measured(
+    run,
+    obs.filter((o) => o.agree).length / obs.length,
+    obs.length,
+    new Set(obs.map((o) => o.caseId)).size,
+  );
 }
 
 /**
@@ -245,12 +278,23 @@ export function jurorCorrelation(run: EvalRun, opts: { onlyWrong?: boolean } = {
     variance += ca * ca + cb * cb;
   }
   if (variance < 1e-12) return unmeasured('votes have no variance');
-  return measured(run, Math.max(-1, Math.min(1, cov / variance)), obs.length);
+  return measured(
+    run,
+    Math.max(-1, Math.min(1, cov / variance)),
+    obs.length,
+    new Set(obs.map((o) => o.caseId)).size,
+  );
 }
 
 /** Mean USD over replays that ended in a written verdict. */
 export function costPerVerdict(run: EvalRun): Metric {
-  const withVerdict = run.replays.filter((r) => r.result.verdict !== undefined);
+  // Escalated and dismissed cases can carry a closing verdict; their spend is not verdict cost.
+  const withVerdict = run.replays.filter(
+    (r) =>
+      r.result.verdict !== undefined &&
+      r.result.outcome !== 'escalated' &&
+      r.result.outcome !== 'dismissed',
+  );
   if (withVerdict.length === 0) return unmeasured('no verdicts');
   const total = withVerdict.reduce((s, r) => s + r.result.cost.usd, 0);
   return measured(run, total / withVerdict.length, withVerdict.length);
@@ -268,7 +312,7 @@ export type JuryVsBaseline = 'supported' | 'not-supported' | 'undetermined' | 'u
 /** Policy parameters for the jury-versus-baseline call. These are choices, not measurements. */
 export interface ComparisonPolicy {
   maxWrongCaseCorrelation: number;
-  /** Minimum cases (and juror pairs on wrong cases) before `supported` may be claimed. */
+  /** Minimum labelled cases, and distinct wrong cases, before `supported` may be claimed. */
   minCases: number;
 }
 
@@ -304,12 +348,16 @@ export function compareToBaseline(
 ): JuryVsBaseline {
   const real = (m: Metric): m is Extract<Metric, { status: 'measured' }> =>
     m.status === 'measured' && !m.synthetic;
-  if (!real(jury) || !real(baseline)) return 'unmeasured';
+  if (!real(jury)) return 'unmeasured';
+  // A baseline that is absent or does not cover every labelled case cannot be compared against.
+  if (!real(baseline)) return 'undetermined';
   if (jury.value <= baseline.value) return 'not-supported';
   // Accuracy is higher, so the verdict now rests on juror independence. If that cannot be
   // assessed (for example the jury made no errors) or the sample is small, say undetermined.
   if (!real(wrongCorrelation)) return 'undetermined';
-  if (jury.n < policy.minCases || wrongCorrelation.n < policy.minCases) return 'undetermined';
+  if (jury.cases < policy.minCases || wrongCorrelation.cases < policy.minCases) {
+    return 'undetermined';
+  }
   return wrongCorrelation.value <= policy.maxWrongCaseCorrelation ? 'supported' : 'not-supported';
 }
 

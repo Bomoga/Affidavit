@@ -129,6 +129,15 @@ describe('replayEvents rejects bad streams', () => {
     expect(codeOf(() => replayEvents(events))).toBe('case-mismatch');
   });
 
+  it('requires the stream to open with stage-entered at intake or from a legal predecessor', () => {
+    const noOpen = load('nodegoat-sqli-001').slice(1);
+    expect(failOf(() => replayEvents(noOpen))).toEqual({ code: 'bad-first-event', index: 0 });
+    const events = load('nodegoat-sqli-001').map((e) => structuredClone(e));
+    const e0 = events[0] as { stage: string };
+    e0.stage = 'map';
+    expect(codeOf(() => replayEvents(events))).toBe('bad-first-event');
+  });
+
   it('reports the failing index', () => {
     const gap = load('nodegoat-sqli-001').filter((e) => e['seq'] !== 5);
     expect(failOf(() => replayEvents(gap))).toEqual({ code: 'seq-gap', index: 5 });

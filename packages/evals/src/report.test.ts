@@ -113,6 +113,19 @@ describe('renderReport', () => {
     expect(md).not.toContain('run-other');
   });
 
+  it('does not trust a stored supported call', () => {
+    const run = makeRun({
+      kind: 'corpus',
+      runId: 'run-forge',
+      labels: [['a', 'proven-fixed']],
+      replays: [replay('a', 'proven-fixed', ['low', 'high'])],
+    });
+    const forged = { ...computeReport(run), juryVsBaseline: 'supported' as const };
+    const md = renderReport(forged);
+    expect(md).not.toContain('jury scored higher');
+    expect(md).toContain('undetermined');
+  });
+
   it('notes that cost per verdict excludes escalated and dismissed spend', () => {
     const run = makeRun({
       kind: 'corpus',

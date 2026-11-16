@@ -1,4 +1,9 @@
-import type { CalibrationReport, Metric, RunId } from './calibration.js';
+import {
+  compareToBaseline,
+  type CalibrationReport,
+  type Metric,
+  type RunId,
+} from './calibration.js';
 
 const PLACEHOLDER = '[metric]';
 
@@ -32,16 +37,28 @@ export function renderReport(r: CalibrationReport): string {
   const anyBacked = metrics.some((m) => isBacked(m, runId));
   const synthetic = r.manifest.labelsSource.kind === 'synthetic';
 
+  // Never trust the stored call: recompute it from metrics that belong to this report's run.
+  const sameRun = (m: Metric): Metric =>
+    m.status === 'measured' && m.runId !== runId
+      ? { status: 'unmeasured', reason: 'run id mismatch' }
+      : m;
+  const call = compareToBaseline(
+    sameRun(r.juryAccuracy),
+    sameRun(r.baselineAccuracy),
+    sameRun(r.correlationWrong),
+    r.policy,
+  );
+
   let comparison: string;
-  if (r.juryVsBaseline === 'supported') {
+  if (call === 'supported') {
     comparison =
       'On this run the jury scored higher than the single reviewer and its jurors were not highly correlated on cases it got wrong. Both conditions held.';
-  } else if (r.juryVsBaseline === 'not-supported') {
+  } else if (call === 'not-supported') {
     comparison =
       'The jury does not beat the single reviewer on this run, because accuracy and juror independence together do not support it. The simpler single-reviewer design is recommended.';
-  } else if (r.juryVsBaseline === 'undetermined') {
+  } else if (call === 'undetermined') {
     comparison =
-      'The comparison is undetermined. Juror independence on wrong cases could not be assessed from enough observations, so no claim is made that the jury beats the single reviewer.';
+      'The comparison is undetermined. Either the baseline does not cover every labelled case, or juror independence on wrong cases could not be assessed from enough cases, so no claim is made that the jury beats the single reviewer.';
   } else {
     comparison =
       'No run-backed comparison exists yet, so no claim is made about the jury versus a single reviewer.';

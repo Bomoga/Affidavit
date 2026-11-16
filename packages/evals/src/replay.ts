@@ -20,6 +20,7 @@ export type ReplayErrorCode =
   | 'stage-mismatch'
   | 'event-after-terminal'
   | 'verdict-outcome-mismatch'
+  | 'bad-first-event'
   | 'no-terminal-event';
 
 export class ReplayError extends Error {
@@ -154,6 +155,20 @@ export function replayEvents(raw: readonly unknown[]): ReplayResult {
 
   const first = events[0];
   if (first === undefined) throw new ReplayError('empty-stream', -1, 'event stream is empty');
+  // A stream opens with stage-entered at intake (no `from`), or, for a recorded partial case,
+  // with stage-entered declaring a `from` that legally leads to its stage.
+  const openOk =
+    first.type === 'stage-entered' &&
+    (first.payload.from === undefined
+      ? first.stage === 'intake'
+      : isLegalTransition(first.payload.from, first.stage));
+  if (!openOk) {
+    throw new ReplayError(
+      'bad-first-event',
+      0,
+      'stream must open with stage-entered at intake, or stage-entered from a legal predecessor stage',
+    );
+  }
 
   let prev: Parsed | undefined;
   let expectedSeq = 0;

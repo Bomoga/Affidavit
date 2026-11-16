@@ -4,6 +4,7 @@ import {
   baselineAccuracy,
   compareToBaseline,
   computeReport,
+  costPerCase,
   costPerVerdict,
   createEvalRun,
   juryAccuracy,
@@ -214,6 +215,19 @@ describe('cost per verdict', () => {
     expect(value(costPerVerdict(run))).toBe(2);
   });
 
+  it('excludes escalated and dismissed replays even when they carry a closing verdict', () => {
+    const run = makeRun({
+      labels: [],
+      replays: [
+        replay('a', 'proven-fixed', [], 2),
+        replay('b', 'escalated', [], 50),
+        replay('c', 'dismissed', [], 50),
+      ],
+    });
+    expect(value(costPerVerdict(run))).toBe(2);
+    expect(value(costPerCase(run))).toBe(34);
+  });
+
   it('is unmeasured with no verdicts', () => {
     expect(costPerVerdict(makeRun({ labels: [], replays: [] })).status).toBe('unmeasured');
   });
@@ -224,6 +238,7 @@ describe('compareToBaseline', () => {
     status: 'measured',
     value: v,
     n: 10,
+    cases: 10,
     runId: asRunId('r'),
     synthetic,
   });
@@ -246,7 +261,55 @@ describe('compareToBaseline', () => {
 
   it('is unmeasured for synthetic or missing inputs', () => {
     expect(compareToBaseline(m(0.9, true), m(0.8), m(0.1), policy)).toBe('unmeasured');
-    expect(compareToBaseline(m(0.9), none, m(0.1), policy)).toBe('unmeasured');
+    expect(compareToBaseline(none, m(0.8), m(0.1), policy)).toBe('unmeasured');
+  });
+
+  it('is undetermined when the baseline is missing', () => {
+    expect(compareToBaseline(m(0.9), none, m(0.1), policy)).toBe('undetermined');
+  });
+
+  it('a partial baseline never yields a win', () => {
+    const ids = Array.from({ length: 12 }, (_, i) => `c${i}`);
+    const run = makeRun({
+      kind: 'corpus',
+      labels: ids.map((id) => [id, 'proven-fixed']),
+      replays: ids.map((id, i) =>
+        replay(id, i < 6 ? 'proven-fixed' : 'not-proven', ['low', 'critical']),
+      ),
+      baseline: [['c0', 'proven-fixed']],
+    });
+    expect(baselineAccuracy(run).status).toBe('unmeasured');
+    expect(computeReport(run).juryVsBaseline).toBe('undetermined');
+  });
+
+  it('gates on distinct wrong cases, not juror pairs', () => {
+    const ids = Array.from({ length: 12 }, (_, i) => `c${i}`);
+    const run = makeRun({
+      kind: 'corpus',
+      labels: ids.map((id) => [id, 'proven-fixed']),
+      replays: ids.map((id, i) =>
+        i === 0
+          ? replay(id, 'not-proven', ['low', 'critical', 'low', 'critical', 'medium'])
+          : replay(id, 'proven-fixed', ['high', 'high']),
+      ),
+      baseline: ids.map((id) => [id, 'not-proven']),
+    });
+    const corr = jurorCorrelation(run, { onlyWrong: true });
+    expect(corr.status === 'measured' && corr.n).toBe(10);
+    expect(corr.status === 'measured' && corr.cases).toBe(1);
+    expect(computeReport(run).juryVsBaseline).toBe('undetermined');
+  });
+
+  it('refuses runs not built by createEvalRun', () => {
+    const real = makeRun({ labels: [['a', 'proven-fixed']], replays: [] });
+    const forged = { ...real };
+    expect(() => juryAccuracy(forged)).toThrow(/createEvalRun/);
+  });
+
+  it('labels non-finite values distinctly', () => {
+    const run = makeRun({ labels: [], replays: [replay('a', 'proven-fixed', [], Number.NaN)] });
+    const m = costPerCase(run);
+    expect(m.status === 'unmeasured' && m.reason).toBe('non-finite value');
   });
 
   it('reports undetermined when the jury makes no errors', () => {
