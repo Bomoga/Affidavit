@@ -12,7 +12,7 @@ RUN test -n "$CODEQL_BUNDLE_URL" && test -n "$CODEQL_BUNDLE_SHA256" \
     || (echo "CodeQL is disabled: set CODEQL_BUNDLE_URL and CODEQL_BUNDLE_SHA256 after P0-10" >&2; exit 1)
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl zstd \
     && curl -fsSL "$CODEQL_BUNDLE_URL" -o /tmp/codeql.tar.zst \
     && echo "$CODEQL_BUNDLE_SHA256  /tmp/codeql.tar.zst" | sha256sum -c - \
     && mkdir /opt/codeql && tar --zstd -xf /tmp/codeql.tar.zst -C /opt/codeql --strip-components=1 \

@@ -1,23 +1,33 @@
+import { join } from 'node:path';
 import type { ToolRunnerPort } from '@affidavit/contracts';
-import type { ToolManifest, ToolName } from './manifest.js';
+import { repoRoot, type ToolManifest, type ToolName } from './manifest.js';
 
 type Mount = Parameters<ToolRunnerPort['run']>[2][number];
 
 export interface ToolRunOptions {
-  /** Host path of the source snapshot. Mounted read-only at /src. */
+  /**
+   * Host path of the scan snapshot: a private copy of the repo, quarantined with
+   * quarantineToolControlPaths. Mounted read-only at /src.
+   */
   sourceDir: string;
-  /** Host path for results. Mounted writable at /out. */
+  /** Host path for results. Mounted writable at /out. Use a new directory per run. */
   outputDir: string;
-  /** Host path of a throwaway scratch dir. Its `tmp` (and `semgrep-home`) subdirs are mounted writable. */
+  /**
+   * Host path of a scratch dir that is new and empty for this run, never shared between runs or
+   * cases. Its `tmp` (and `semgrep-home`) subdirs are mounted writable.
+   */
   scratchDir: string;
-  /** Host path of our own rules (Semgrep rules, or a gitleaks config). Mounted read-only at /rules. */
+  /** Host path of OUR Semgrep rules. Mounted read-only at /rules. Required for semgrep. */
   rulesDir?: string | undefined;
-  /** File name inside rulesDir for gitleaks, optional. A plain name, never a path. */
+  /**
+   * Host path of OUR tool configs (gitleaks.toml, osv-scanner.toml). Mounted read-only at
+   * /tool-config. Defaults to docker/tools/config in this repo.
+   */
+  configDir?: string | undefined;
+  /** gitleaks config file name inside configDir. Plain name only. Defaults to gitleaks.toml. */
   gitleaksConfigFile?: string | undefined;
   /** Host path of a vendored OSV database laid out as <dir>/<ecosystem>/all.zip. Mounted read-only. */
   osvDatabaseDir?: string | undefined;
-  /** Reserved. CodeQL stays disabled whatever this says until it has a recorded digest. */
-  enableFlag?: boolean | undefined;
 }
 
 export interface ToolInvocation {
@@ -28,7 +38,7 @@ export interface ToolInvocation {
   mounts: Mount[];
   /** File name written under the mounted /out. */
   outputFile: string;
-  /** Subdirectories of scratchDir the caller must create before running. */
+  /** Subdirectories of scratchDir that runTool creates before running. */
   scratchSubdirs: string[];
 }
 
@@ -56,6 +66,13 @@ function need(value: string | undefined, label: string): string {
   return value;
 }
 
+function plainName(value: string, label: string): string {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value) || value.includes('..')) {
+    throw new ToolOptionError(`${label} must be a plain file name`);
+  }
+  return value;
+}
+
 function baseMounts(o: ToolRunOptions, extra: Mount[]): Mount[] {
   return [
     { hostPath: o.sourceDir, containerPath: '/src', readOnly: true },
@@ -65,8 +82,20 @@ function baseMounts(o: ToolRunOptions, extra: Mount[]): Mount[] {
   ];
 }
 
+function configMount(o: ToolRunOptions): Mount {
+  const hostPath = o.configDir ?? join(repoRoot(), 'docker', 'tools', 'config');
+  return { hostPath, containerPath: '/tool-config', readOnly: true };
+}
+
 /**
  * Builds the image, argv and mounts for one tool run. The result feeds ToolRunnerPort.run directly.
+ *
+ * Nothing from inside the scanned repo reaches argv: the tools walk /src themselves. Every
+ * repo-controlled knob that has an off switch is switched off here (ignore files, inline
+ * suppressions, per-repo configs), and our own config is always passed explicitly. What has no
+ * flag (git metadata, .gitleaksignore and friends) is removed from the snapshot by
+ * quarantineToolControlPaths, which runTool enforces.
+ *
  * Network is never needed: the jail denies egress and every tool is invoked in its offline mode.
  */
 export function buildInvocation(
@@ -89,12 +118,18 @@ export function buildInvocation(
         image,
         // The image has no entrypoint, so argv starts with the binary. Only our own rules are used:
         // no registry config, no auto, metrics and version check off.
+        // --no-git-ignore: never run git in /src (a hostile .git/config can execute commands) and
+        //   ignore .gitignore. --disable-nosem: inline "nosemgrep" cannot hide a finding.
+        // --x-ignore-semgrepignore-files: .semgrepignore at any depth is not honored.
         args: [
           'semgrep',
           'scan',
           '--metrics=off',
           '--disable-version-check',
           '--no-rewrite-rule-ids',
+          '--no-git-ignore',
+          '--disable-nosem',
+          '--x-ignore-semgrepignore-files',
           '--config',
           '/rules',
           '--sarif',
@@ -116,15 +151,21 @@ export function buildInvocation(
     }
     case 'osv-scanner': {
       const db = need(o.osvDatabaseDir, 'osvDatabaseDir');
-      const outputFile = 'osv-scanner.sarif';
+      const outputFile = 'osv-scanner.json';
       return {
         image,
+        // --config: our empty config, so a repo osv-scanner.toml cannot ignore vulnerabilities.
+        // --no-ignore: lockfiles hidden by a repo .gitignore are still scanned.
+        // JSON output because the normalizer (L1-03) reads OSV JSON.
         args: [
           'scan',
           'source',
           '--offline',
+          '--config',
+          '/tool-config/osv-scanner.toml',
+          '--no-ignore',
           '--format',
-          'sarif',
+          'json',
           '--output-file',
           `/out/${outputFile}`,
           '-r',
@@ -133,6 +174,7 @@ export function buildInvocation(
         // osv-scanner looks for its offline database under $TMPDIR/osv-scalibr.
         mounts: baseMounts(o, [
           { hostPath: db, containerPath: '/tmp/osv-scalibr', readOnly: true },
+          configMount(o),
         ]),
         outputFile,
         scratchSubdirs: ['tmp'],
@@ -140,22 +182,12 @@ export function buildInvocation(
     }
     case 'gitleaks': {
       const outputFile = 'gitleaks.sarif';
-      const config: string[] = [];
-      const extra: Mount[] = [];
-      if (o.gitleaksConfigFile !== undefined) {
-        const f = o.gitleaksConfigFile;
-        if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(f) || f.includes('..')) {
-          throw new ToolOptionError('gitleaksConfigFile must be a plain file name');
-        }
-        config.push('--config', `/rules/${f}`);
-        extra.push({
-          hostPath: need(o.rulesDir, 'rulesDir'),
-          containerPath: '/rules',
-          readOnly: true,
-        });
-      }
+      const configFile = plainName(o.gitleaksConfigFile ?? 'gitleaks.toml', 'gitleaksConfigFile');
       return {
         image,
+        // --config: ours, mandatory, so a repo .gitleaks.toml is never loaded.
+        // --gitleaks-ignore-path: points at our config dir, which holds no .gitleaksignore.
+        // --ignore-gitleaks-allow: inline "gitleaks:allow" cannot hide a finding.
         // --redact keeps secret values out of the report; --exit-code 0 so findings are not failures.
         args: [
           'dir',
@@ -165,13 +197,17 @@ export function buildInvocation(
           '--redact',
           '--exit-code',
           '0',
-          ...config,
+          '--config',
+          `/tool-config/${configFile}`,
+          '--gitleaks-ignore-path',
+          '/tool-config',
+          '--ignore-gitleaks-allow',
           '--report-format',
           'sarif',
           '--report-path',
           `/out/${outputFile}`,
         ],
-        mounts: baseMounts(o, extra),
+        mounts: baseMounts(o, [configMount(o)]),
         outputFile,
         scratchSubdirs: ['tmp'],
       };

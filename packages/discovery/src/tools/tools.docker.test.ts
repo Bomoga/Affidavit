@@ -1,33 +1,38 @@
 /**
- * Docker smoke tests. Skipped unless AFFIDAVIT_DOCKER_TESTS=1, so plain `pnpm test` (and CI, which
- * has no tool images) never runs them. Run with:
+ * Docker smoke tests. The Docker half is skipped unless AFFIDAVIT_DOCKER_TESTS=1, so plain
+ * `pnpm test` (and CI, which has no tool images) never runs it. Run with:
  *   AFFIDAVIT_DOCKER_TESTS=1 pnpm --filter @affidavit/discovery test:docker
  * PowerShell: $env:AFFIDAVIT_DOCKER_TESTS = '1'; pnpm --filter @affidavit/discovery test:docker
  *
  * Each tool runs from its pinned digest with --network none against fixtures/corpus/tool-smoke and
- * writes SARIF into the mounted output dir. The docker flags mirror LocalDockerToolRunner in
- * @affidavit/testing (no network, read-only root, no capabilities).
+ * writes its report into the mounted output dir.
  */
 import { execFile } from 'node:child_process';
-import { crc32 } from 'node:zlib';
 import {
   cpSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { crc32 } from 'node:zlib';
+import type { ToolRunnerPort } from '@affidavit/contracts';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   buildInvocation,
   isOkExit,
   loadToolManifest,
+  prepareScratch,
+  quarantineToolControlPaths,
   repoRoot,
-  type ToolInvocation,
+  runTool,
   type ToolName,
   type ToolRunOptions,
 } from './index.js';
@@ -35,6 +40,73 @@ import {
 const enabled = process.env['AFFIDAVIT_DOCKER_TESTS'] === '1';
 const manifest = loadToolManifest();
 const smoke = join(repoRoot(), 'fixtures', 'corpus', 'tool-smoke');
+
+/**
+ * The jail flags this test uses. They mirror buildDockerRunArgs in packages/testing/src/infra.ts,
+ * which discovery cannot import (it is not a dependency). The pin test below fails if the two
+ * drift apart, so the smoke run keeps testing what the fake runner actually does.
+ */
+const JAIL_FLAGS: readonly string[] = [
+  '--rm',
+  '--network',
+  'none',
+  '--read-only',
+  '--cap-drop',
+  'ALL',
+  '--security-opt',
+  'no-new-privileges',
+  '--pids-limit',
+  '256',
+  '--memory',
+  '1g',
+];
+
+function dockerRunArgs(
+  image: string,
+  args: readonly string[],
+  mounts: readonly { hostPath: string; containerPath: string; readOnly: boolean }[],
+): string[] {
+  return [
+    'run',
+    ...JAIL_FLAGS,
+    ...mounts.flatMap((m) => ['-v', `${m.hostPath}:${m.containerPath}${m.readOnly ? ':ro' : ''}`]),
+    image,
+    ...args,
+  ];
+}
+
+function makeRunner(outputDir: string): ToolRunnerPort {
+  return {
+    run(image, args, mounts) {
+      return new Promise((resolve) => {
+        execFile(
+          'docker',
+          dockerRunArgs(image, args, mounts),
+          { maxBuffer: 16 * 1024 * 1024 },
+          (error, _out, stderr) => {
+            const exitCode = error ? (typeof error.code === 'number' ? error.code : 1) : 0;
+            if (exitCode !== 0) process.stderr.write(stderr);
+            resolve({ exitCode, outputPath: outputDir });
+          },
+        );
+      });
+    },
+  };
+}
+
+describe('smoke test jail flags', () => {
+  it('match the flags the fake ToolRunner uses', () => {
+    const infra = readFileSync(join(repoRoot(), 'packages', 'testing', 'src', 'infra.ts'), 'utf8');
+    for (const flag of JAIL_FLAGS) expect(infra).toContain(`'${flag}'`);
+    expect(JAIL_FLAGS).toEqual(expect.arrayContaining(['--network', 'none', '--read-only']));
+    expect(dockerRunArgs('img@sha256:x', ['a'], [])).toEqual([
+      'run',
+      ...JAIL_FLAGS,
+      'img@sha256:x',
+      'a',
+    ]);
+  });
+});
 
 /** A one-entry stored (uncompressed) zip, the layout osv-scanner reads for an offline database. */
 function storedZip(name: string, data: Buffer): Buffer {
@@ -65,94 +137,186 @@ function storedZip(name: string, data: Buffer): Buffer {
   return Buffer.concat([body, central, n, end]);
 }
 
-function dockerRun(inv: ToolInvocation): Promise<{ code: number; stderr: string }> {
-  const args = [
-    'run',
-    '--rm',
-    '--network',
-    'none',
-    '--read-only',
-    '--cap-drop',
-    'ALL',
-    '--security-opt',
-    'no-new-privileges',
-    '--pids-limit',
-    '256',
-    '--memory',
-    '1g',
-    ...inv.mounts.flatMap((m) => [
-      '-v',
-      `${m.hostPath}:${m.containerPath}${m.readOnly ? ':ro' : ''}`,
-    ]),
-    inv.image,
-    ...inv.args,
-  ];
-  return new Promise((resolve) => {
-    execFile('docker', args, { maxBuffer: 16 * 1024 * 1024 }, (error, _out, stderr) => {
-      const code = error ? (typeof error.code === 'number' ? error.code : 1) : 0;
-      resolve({ code, stderr });
-    });
-  });
+/**
+ * Copies a fixture tree and restores names that are kept inert in the repo: a `.fixture` suffix is
+ * dropped (so .json data does not look like a contract fixture) and a `dot-` prefix becomes `.`
+ * (so planted .git, .gitignore and friends are not live files inside this repository).
+ */
+function materialize(from: string, to: string): void {
+  cpSync(from, to, { recursive: true });
+  const fix = (dir: string): void => {
+    for (const entry of readdirSync(dir)) {
+      let p = join(dir, entry);
+      const name = entry.replace(/\.fixture$/, '').replace(/^dot-/, '.');
+      if (name !== entry) {
+        renameSync(p, join(dir, name));
+        p = join(dir, name);
+      }
+      if (statSync(p).isDirectory()) fix(p);
+    }
+  };
+  fix(to);
+  if (existsSync(join(to, '.git'))) {
+    mkdirSync(join(to, '.git', 'refs'), { recursive: true });
+    mkdirSync(join(to, '.git', 'objects'), { recursive: true });
+  }
 }
 
-describe.skipIf(!enabled)('tool images, offline smoke run', () => {
+interface Finding {
+  ruleId?: string;
+  uri: string;
+}
+
+function sarifFindings(raw: string): Finding[] {
+  const sarif = JSON.parse(raw) as {
+    runs: {
+      results?: {
+        ruleId?: string;
+        locations?: { physicalLocation?: { artifactLocation?: { uri?: string } } }[];
+      }[];
+    }[];
+  };
+  return sarif.runs.flatMap((r) =>
+    (r.results ?? []).map((x) => ({
+      ruleId: x.ruleId,
+      uri: x.locations?.[0]?.physicalLocation?.artifactLocation?.uri ?? '',
+    })),
+  );
+}
+
+describe.skipIf(!enabled)('tool images, offline', () => {
   let work: string;
-  let opts: ToolRunOptions;
+  let osvDb: string;
+  let counter = 0;
 
   beforeAll(() => {
     work = mkdtempSync(join(tmpdir(), 'affidavit-tools-'));
-    const osvDb = join(work, 'osv-db');
+    osvDb = join(work, 'osv-db');
     mkdirSync(join(osvDb, 'npm'), { recursive: true });
     const advisory = readFileSync(
       join(smoke, 'osv-advisories', 'AFFIDAVIT-SMOKE-0001.json.fixture'),
     );
     writeFileSync(join(osvDb, 'npm', 'all.zip'), storedZip('AFFIDAVIT-SMOKE-0001.json', advisory));
-    // Data files carry a .fixture suffix so repo-wide fixture walkers do not treat them as contracts.
-    const src = join(work, 'src');
-    cpSync(join(smoke, 'repo'), src, { recursive: true });
-    for (const f of ['package.json', 'package-lock.json'])
-      renameSync(join(src, f + '.fixture'), join(src, f));
-    mkdirSync(join(work, 'out'));
-    opts = {
-      sourceDir: src,
-      outputDir: join(work, 'out'),
-      scratchDir: join(work, 'scratch'),
-      osvDatabaseDir: osvDb,
-    };
   });
 
   afterAll(() => {
     rmSync(work, { recursive: true, force: true });
   });
 
-  async function run(name: ToolName, extra: Partial<ToolRunOptions>) {
-    const inv = buildInvocation(manifest, name, { ...opts, ...extra });
-    for (const sub of inv.scratchSubdirs)
-      mkdirSync(join(opts.scratchDir, sub), { recursive: true });
-    const res = await dockerRun(inv);
-    expect(isOkExit(manifest, name, res.code), `exit ${res.code}: ${res.stderr}`).toBe(true);
-    const raw = readFileSync(join(opts.outputDir, inv.outputFile), 'utf8');
-    const sarif = JSON.parse(raw) as { runs: { results?: { ruleId?: string }[] }[] };
-    return { raw, results: sarif.runs.flatMap((r) => r.results ?? []) };
+  /** A fresh snapshot, output dir and per-tool scratch dirs for one scenario. */
+  function scenario(fixture: string) {
+    const id = `s${++counter}`;
+    const src = join(work, id, 'src');
+    const out = join(work, id, 'out');
+    materialize(join(smoke, fixture), src);
+    mkdirSync(out, { recursive: true });
+    const options = (tool: ToolName): ToolRunOptions => ({
+      sourceDir: src,
+      outputDir: out,
+      scratchDir: join(work, id, `scratch-${tool}`),
+      rulesDir: join(smoke, 'rules', 'semgrep'),
+      // Our committed config plus the fixture rule that recognises the obviously fake key.
+      configDir: tool === 'gitleaks' ? join(smoke, 'rules', 'gitleaks') : undefined,
+      gitleaksConfigFile: tool === 'gitleaks' ? 'affidavit-fixture.toml' : undefined,
+      osvDatabaseDir: osvDb,
+    });
+    return { src, out, options, runner: makeRunner(out) };
   }
 
-  it('semgrep finds the planted eval using only our rule file', async () => {
-    const { results } = await run('semgrep', { rulesDir: join(smoke, 'rules', 'semgrep') });
-    expect(results.some((r) => r.ruleId?.endsWith('affidavit.smoke.no-eval'))).toBe(true);
-  }, 180_000);
+  const read = (out: string, file: string) => readFileSync(join(out, file), 'utf8');
 
-  it('osv-scanner matches the vendored advisory without network', async () => {
-    const { raw, results } = await run('osv-scanner', {});
-    expect(results.length).toBeGreaterThan(0);
-    expect(raw).toContain('AFFIDAVIT-SMOKE-0001');
-  }, 180_000);
+  function expectHostileFindingsSurvive(out: string) {
+    const semgrep = sarifFindings(read(out, 'semgrep.sarif')).map((f) => f.uri);
+    for (const file of [
+      'src/app.js',
+      'src/ignored/hidden.js',
+      'src/nested/deep.js',
+      'src/nosem.js',
+      'src/hidden-by-gitignore.js',
+    ]) {
+      expect(
+        semgrep.some((u) => u.endsWith(file)),
+        `semgrep finding in ${file}`,
+      ).toBe(true);
+    }
 
-  it('gitleaks finds the fake key and redacts it in the report', async () => {
-    const { raw, results } = await run('gitleaks', {
-      rulesDir: join(smoke, 'rules', 'gitleaks'),
-      gitleaksConfigFile: 'affidavit-fixture.toml',
-    });
-    expect(results.some((r) => r.ruleId === 'affidavit-fake-fixture-key')).toBe(true);
-    expect(raw).not.toContain('AFFIDAVIT_FAKE_KEY_0123456789ABCDEF');
-  }, 180_000);
+    const leaks = sarifFindings(read(out, 'gitleaks.sarif')).map((f) => f.uri);
+    expect(leaks.some((u) => u.endsWith('src/config.js'))).toBe(true);
+    expect(leaks.some((u) => u.endsWith('src/allowed.js'))).toBe(true);
+    expect(read(out, 'gitleaks.sarif')).not.toContain('AFFIDAVIT_FAKE_KEY_0123456789ABCDEF');
+
+    const osv = read(out, 'osv-scanner.json');
+    expect(osv).toContain('AFFIDAVIT-SMOKE-0001');
+
+    expect(existsSync(join(out, 'canary'))).toBe(false);
+  }
+
+  it('benign fixture: each tool runs offline and writes its report to the mounted output', async () => {
+    const s = scenario('repo');
+    for (const tool of ['semgrep', 'osv-scanner', 'gitleaks'] as const) {
+      const res = await runTool(s.runner, manifest, tool, s.options(tool));
+      expect(res.ok, `${tool} exit ${res.exitCode}`).toBe(true);
+    }
+    expect(
+      sarifFindings(read(s.out, 'semgrep.sarif')).some((f) =>
+        f.ruleId?.endsWith('affidavit.smoke.no-eval'),
+      ),
+    ).toBe(true);
+    expect(read(s.out, 'osv-scanner.json')).toContain('AFFIDAVIT-SMOKE-0001');
+    expect(
+      sarifFindings(read(s.out, 'gitleaks.sarif')).some(
+        (f) => f.ruleId === 'affidavit-fake-fixture-key',
+      ),
+    ).toBe(true);
+  }, 240_000);
+
+  it('hostile repo, after quarantine: no finding is hidden and no canary is written', async () => {
+    const s = scenario('hostile');
+    const removed = await quarantineToolControlPaths(s.src);
+    expect(removed).toEqual(
+      expect.arrayContaining([
+        '.git',
+        '.gitignore',
+        '.gitleaks.toml',
+        '.gitleaksignore',
+        '.semgrepignore',
+        'osv-scanner.toml',
+        'src/nested/.semgrepignore',
+      ]),
+    );
+    for (const tool of ['semgrep', 'osv-scanner', 'gitleaks'] as const) {
+      const res = await runTool(s.runner, manifest, tool, s.options(tool));
+      expect(res.ok, `${tool} exit ${res.exitCode}`).toBe(true);
+    }
+    expectHostileFindingsSurvive(s.out);
+  }, 240_000);
+
+  async function runWithoutGate(s: ReturnType<typeof scenario>, tool: ToolName) {
+    const o = s.options(tool);
+    const inv = buildInvocation(manifest, tool, o);
+    await prepareScratch(o.scratchDir, inv.scratchSubdirs);
+    // Deliberately bypasses runTool's snapshot gate to see what the flags alone achieve.
+    const res = await s.runner.run(inv.image, inv.args, inv.mounts);
+    expect(isOkExit(manifest, tool, res.exitCode)).toBe(true);
+  }
+
+  it('hostile repo, flags alone (no quarantine, minus .gitleaksignore): findings survive, no canary', async () => {
+    const s = scenario('hostile');
+    // gitleaks has no flag that stops it reading a repo .gitleaksignore (next test), so that one
+    // file is only ever handled by quarantine. Everything else must be covered by flags.
+    rmSync(join(s.src, '.gitleaksignore'));
+    for (const tool of ['semgrep', 'osv-scanner', 'gitleaks'] as const)
+      await runWithoutGate(s, tool);
+    expectHostileFindingsSurvive(s.out);
+  }, 240_000);
+
+  it('gitleaks still honors a repo .gitleaksignore despite our flags, which is why runTool demands quarantine', async () => {
+    const s = scenario('hostile');
+    await runWithoutGate(s, 'gitleaks');
+    const leaks = sarifFindings(read(s.out, 'gitleaks.sarif')).map((f) => f.uri);
+    expect(leaks.some((u) => u.endsWith('src/config.js'))).toBe(false);
+    await expect(runTool(s.runner, manifest, 'gitleaks', s.options('gitleaks'))).rejects.toThrow(
+      /quarantine/,
+    );
+  }, 240_000);
 });

@@ -1,0 +1,6 @@
+# Our own gitleaks config. Always passed with --config so a config planted in the scanned repo is
+# never loaded. Default rules only, nothing suppressed.
+title = "Affidavit gitleaks config"
+
+[extend]
+useDefault = true

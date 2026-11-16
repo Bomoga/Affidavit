@@ -24,7 +24,7 @@
       "reference": "ghcr.io/google/osv-scanner@sha256:4f3b7e2c64b9d38a5febc5a7e4a3dfef1d1362f726dea7a2ef4762b46469fcd0",
       "resolvedVia": "digest already pinned in .github/workflows/ci.yml; docker buildx imagetools inspect ghcr.io/google/osv-scanner:v2.7.0 returns the same digest; version confirmed with osv-scanner --version",
       "resolvedOn": "2026-11-15",
-      "outputFormat": "sarif",
+      "outputFormat": "json",
       "okExitCodes": [0, 1]
     },
     {
