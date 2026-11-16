@@ -1,0 +1,10 @@
+title = "Affidavit smoke-test rules (fixture only)"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "affidavit-fake-fixture-key"
+description = "Obviously fake key used only by the tool smoke fixture"
+regex = '''AFFIDAVIT_FAKE_KEY_[0-9A-F]{16}'''
+keywords = ["affidavit_fake_key_"]

@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "tools": [
+    {
+      "name": "semgrep",
+      "enabled": true,
+      "version": "1.184.0",
+      "image": "docker.io/semgrep/semgrep",
+      "tag": "1.184.0",
+      "digest": "sha256:cc1b68266f267878b39739373ea9985b9a78e5d64497dd875c8de100b22695ed",
+      "reference": "docker.io/semgrep/semgrep@sha256:cc1b68266f267878b39739373ea9985b9a78e5d64497dd875c8de100b22695ed",
+      "resolvedVia": "docker buildx imagetools inspect docker.io/semgrep/semgrep:1.184.0; version confirmed with semgrep --version",
+      "resolvedOn": "2026-11-15",
+      "outputFormat": "sarif",
+      "okExitCodes": [0]
+    },
+    {
+      "name": "osv-scanner",
+      "enabled": true,
+      "version": "2.7.0",
+      "image": "ghcr.io/google/osv-scanner",
+      "tag": "v2.7.0",
+      "digest": "sha256:4f3b7e2c64b9d38a5febc5a7e4a3dfef1d1362f726dea7a2ef4762b46469fcd0",
+      "reference": "ghcr.io/google/osv-scanner@sha256:4f3b7e2c64b9d38a5febc5a7e4a3dfef1d1362f726dea7a2ef4762b46469fcd0",
+      "resolvedVia": "digest already pinned in .github/workflows/ci.yml; docker buildx imagetools inspect ghcr.io/google/osv-scanner:v2.7.0 returns the same digest; version confirmed with osv-scanner --version",
+      "resolvedOn": "2026-11-15",
+      "outputFormat": "sarif",
+      "okExitCodes": [0, 1]
+    },
+    {
+      "name": "gitleaks",
+      "enabled": true,
+      "version": "8.30.1",
+      "image": "ghcr.io/gitleaks/gitleaks",
+      "tag": "v8.30.1",
+      "digest": "sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f",
+      "reference": "ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f",
+      "resolvedVia": "docker buildx imagetools inspect ghcr.io/gitleaks/gitleaks:v8.30.1; version confirmed with gitleaks version",
+      "resolvedOn": "2026-11-15",
+      "outputFormat": "sarif",
+      "okExitCodes": [0]
+    },
+    {
+      "name": "codeql",
+      "enabled": false,
+      "version": null,
+      "image": null,
+      "tag": null,
+      "digest": null,
+      "reference": null,
+      "resolvedVia": "not resolved: CodeQL is not pulled or built until the licensing decision lands",
+      "resolvedOn": null,
+      "outputFormat": "sarif",
+      "okExitCodes": [0],
+      "enableFlag": "AFFIDAVIT_ENABLE_CODEQL",
+      "blockedBy": "P0-10",
+      "dockerfile": "codeql/Dockerfile"
+    }
+  ]
+}
