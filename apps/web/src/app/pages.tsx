@@ -59,11 +59,25 @@ export function CasePage() {
     ? `${q.data.headline} - Affidavit`
     : q.error instanceof CaseNotFoundError
       ? 'Case file not found - Affidavit'
-      : 'Case file - Affidavit';
+      : q.isError
+        ? 'Case file could not be loaded - Affidavit'
+        : 'Loading case file - Affidavit';
   useDocumentTitle(title);
-  if (q.isPending) return <p role="status">Loading case file.</p>;
+  if (q.isPending)
+    return (
+      <>
+        <h1 id="page-heading">Loading case file</h1>
+        <p role="status">Loading case file.</p>
+      </>
+    );
   if (q.error instanceof CaseNotFoundError) return <NotFoundPage />;
-  if (q.isError) return <p role="alert">This case file could not be loaded.</p>;
+  if (q.isError)
+    return (
+      <>
+        <h1 id="page-heading">Case file could not be loaded</h1>
+        <p role="alert">This case file could not be loaded.</p>
+      </>
+    );
   return <CaseFile view={q.data} slug={caseId} />;
 }
 

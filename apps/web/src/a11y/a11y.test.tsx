@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { CaseFile } from '../app/CaseFile.js';
-import { renderApp } from '../app/testUtils.js';
+import { renderApp, settled } from '../app/testUtils.js';
 import { APP_CSS } from '../app/styles.js';
 import { buildCaseView } from '../model/caseView.js';
 import { checkAccessibility, tabOrder } from './check.js';
@@ -20,7 +20,7 @@ describe('accessibility check on the real views', () => {
   for (const path of ['/', '/cases/nodegoat-sqli-001', '/cases/escalated-001', '/cases/nope']) {
     it(`passes on ${path}, with every disclosure open`, async () => {
       const { container } = renderApp(path);
-      await screen.findByRole('heading', { level: 1 });
+      await settled();
       openEverything();
       expect(checkAccessibility(container, APP_CSS)).toEqual([]);
     });
@@ -62,7 +62,7 @@ describe('accessibility check on the real views', () => {
 describe('keyboard navigation', () => {
   it('puts the skip link first and keeps tab order equal to reading order, with no positive tabindex', async () => {
     const { container } = renderApp('/cases/nodegoat-sqli-001');
-    await screen.findByRole('heading', { level: 1 });
+    await settled();
     const order = tabOrder(container);
     expect(order[0]?.textContent).toBe('Skip to content');
     expect(order.some((el) => Number(el.getAttribute('tabindex')) > 0)).toBe(false);
@@ -70,12 +70,17 @@ describe('keyboard navigation', () => {
     expect(buttons.length).toBeGreaterThanOrEqual(3);
   });
 
-  it('toggles a disclosure from a focused button and keeps focus on it', async () => {
+  it('uses a native button for disclosures, so Enter and Space work, and toggles on click', async () => {
     renderApp('/cases/escalated-001');
     const b = await screen.findByRole('button', { name: /exhibit-witness-001/ });
+    // jsdom does not turn Enter or Space into a click, so assert the guarantee we rely on:
+    // a real <button type="button"> with no custom key handling (source hygiene bans onKeyDown).
+    expect(b.tagName).toBe('BUTTON');
+    expect(b.getAttribute('type')).toBe('button');
+    expect(b.hasAttribute('tabindex')).toBe(false);
     b.focus();
-    fireEvent.keyDown(b, { key: 'Enter' });
-    fireEvent.click(b); // browsers turn Enter and Space on a button into this click
+    expect(document.activeElement).toBe(b);
+    fireEvent.click(b);
     expect(b.getAttribute('aria-expanded')).toBe('true');
     expect(document.activeElement).toBe(b);
     fireEvent.click(b);
@@ -106,6 +111,80 @@ describe('checker catches real problems', () => {
     expect(run(good('<img src="/a.png">')).join()).toMatch(/img without alt/);
     expect(run('<h1>T</h1>').join()).toMatch(/main landmark/);
     expect(run(good('<h1>Two</h1>')).join()).toMatch(/exactly one h1/);
+  });
+
+  it('flags named colors, modern color functions, and colors on any property', () => {
+    const decls = [
+      'color: red',
+      'background: White',
+      'color: oklch(0.7 0.1 150)',
+      'color: lab(50% 40 59)',
+      'color: lch(50% 40 59)',
+      'background: hwb(194 0% 0%)',
+      'color: color(srgb 1 0 0)',
+      'background: color-mix(in srgb, var(--color-bg), var(--color-text))',
+      'box-shadow: 0 0 4px #000',
+      'box-shadow: 0 0 4px black',
+      'fill: #fff',
+      'stroke: lime',
+      'text-decoration-color: gold',
+      'caret-color: hsl(1, 2%, 3%)',
+      'accent-color: green',
+      'border-block: 1px solid red',
+      'border-inline-start-color: #123',
+      'column-rule: 1px solid #abc',
+      '--custom: #fff',
+    ];
+    for (const d of decls) expect(run(good(''), `.x { ${d}; }`).join(), d).toMatch(/literal color/);
+  });
+
+  it('accepts tokens, transparent, currentColor, inherit and none', () => {
+    const decls = [
+      'color: var(--color-text)',
+      'background: transparent',
+      'border-color: currentColor',
+      'color: inherit',
+      'box-shadow: none',
+      'fill: currentColor',
+      'font-family: Menlo, monospace',
+    ];
+    for (const d of decls) expect(run(good(''), `.x { ${d}; }`).join(), d).not.toMatch(/literal/);
+  });
+
+  it('flags unknown color tokens', () => {
+    expect(run(good(''), '.x { color: var(--color-nope); }').join()).toMatch(/unknown color token/);
+    expect(run(good(''), ':root { --color-extra: #fff; }').join()).toMatch(/unknown color token/);
+  });
+
+  it('computes names from visible content only', () => {
+    expect(
+      run(good('<button type="button"><span aria-hidden="true">x</span></button>')).join(),
+    ).toMatch(/no accessible name/);
+    expect(run(good('<button type="button"><span hidden>x</span></button>')).join()).toMatch(
+      /no accessible name/,
+    );
+    expect(run(good('<button type="button" aria-hidden="true">x</button>')).join()).toEqual('');
+  });
+
+  it('resolves label for and wrapping labels on form controls', () => {
+    expect(run(good('<label for="a">Name</label><input id="a" type="text" />'))).toEqual([]);
+    expect(run(good('<label>Name <input type="text" /></label>'))).toEqual([]);
+    expect(run(good('<select id="s"><option>1</option></select>')).join()).toMatch(
+      /no accessible name/,
+    );
+    expect(run(good('<input type="text" />')).join()).toMatch(/no accessible name/);
+  });
+
+  it('flags empty headings, style attributes and onclick on non-interactive elements', () => {
+    expect(run(good('<h2></h2>')).join()).toMatch(/<h2> has no accessible name/);
+    expect(run(good('<h2><span aria-hidden="true">x</span></h2>')).join()).toMatch(
+      /<h2> has no accessible name/,
+    );
+    expect(run(good('<p style="color:red">x</p>')).join()).toMatch(/style attribute/);
+    expect(run(good('<div onclick="go()">x</div>')).join()).toMatch(/onclick on non-interactive/);
+    expect(run(good('<button type="button" onclick="go()">x</button>')).join()).not.toMatch(
+      /onclick/,
+    );
   });
 
   it('flags literal colors in any color-bearing declaration', () => {

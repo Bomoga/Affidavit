@@ -45,10 +45,14 @@ function poisonValue(v: unknown, key?: string): unknown {
   return v;
 }
 
-/** Prefixes every string in every event (payload and actor included) with a hostile payload. */
+/**
+ * Prefixes every free string in every event (caseId, actor and payload) with a hostile payload.
+ * `at` is left alone: the contract validates it as an ISO date, so it cannot carry markup.
+ */
 function poison(events: TrialEvent[]): TrialEvent[] {
   return events.map((e) => ({
     ...e,
+    caseId: PAYLOAD + e.caseId,
     actor: PAYLOAD + e.actor,
     payload: poisonValue(e.payload),
   })) as unknown as TrialEvent[];
@@ -83,6 +87,8 @@ describe('untrusted case content renders as inert text', () => {
     expect(container.textContent).toContain(IMG);
     expect(container.textContent).toContain(SCRIPT);
     expect(container.textContent).toContain(JS_URL);
+    // The case id is rendered in the label above the headline, as text.
+    expect(container.textContent).toContain(`Case file ${PAYLOAD}case-`);
   });
 
   it('neutralizes payloads in every event string, escalated case', () => {
@@ -106,7 +112,7 @@ describe('untrusted case content renders as inert text', () => {
       const { container } = render(<CaseFile view={buildCaseView(events)} />);
       const stamps = container.querySelectorAll('.stamp');
       expect(stamps).toHaveLength(1);
-      expect(stamps[0]?.textContent).toBe('UNVERIFIED');
+      expect(stamps[0]?.textContent).toBe('Status: UNVERIFIED');
       expect(container.querySelectorAll('.stamp--verified')).toHaveLength(0);
       expect(container.textContent).toContain(summary);
     });
@@ -116,7 +122,7 @@ describe('untrusted case content renders as inert text', () => {
 describe('source hygiene', () => {
   const SRC = join(import.meta.dirname, '..');
   const files = (readdirSync(SRC, { recursive: true }) as string[])
-    .filter((f) => /.(ts|tsx)$/.test(f) && !/.test./.test(f))
+    .filter((f) => /\.(ts|tsx)$/.test(f) && !/\.test\.tsx?$/.test(f))
     .map((f) => ({ f, text: readFileSync(join(SRC, f), 'utf8') }));
 
   const banned = [
@@ -130,6 +136,13 @@ describe('source hygiene', () => {
     'eval(',
     'new Function(',
     'document.write',
+    'style={',
+    '.setAttribute(',
+    'javascript:',
+    // Disclosures must stay native buttons: Enter and Space come from the browser, not from us.
+    'onKeyDown',
+    'onKeyUp',
+    'onKeyPress',
   ];
 
   it('scans the non-test src tree', () => {

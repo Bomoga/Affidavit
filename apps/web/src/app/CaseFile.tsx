@@ -1,6 +1,6 @@
 import { useId, useState, type ReactNode } from 'react';
 import type { CaseView, ExhibitView } from '../model/caseView.js';
-import { REVIEW_REASON, STATUS_STAMP } from './status.js';
+import { REVIEW_REASON, RULE_TEXT, STATUS_STAMP } from './status.js';
 
 // Everything below renders case content (summaries, ids, details) as React text children only.
 // Case content is untrusted: no raw HTML, no URLs or styles built from it.
@@ -13,7 +13,12 @@ export function Stamp({ view }: { view: CaseView }) {
       : view.status === 'verified'
         ? STATUS_STAMP.unverified
         : STATUS_STAMP[view.status];
-  return <p className={`stamp stamp--${tone}`}>{text}</p>;
+  return (
+    <p className={`stamp stamp--${tone}`}>
+      <span className="sr-only">Status: </span>
+      {text}
+    </p>
+  );
 }
 
 function Collapsible({
@@ -58,7 +63,7 @@ function ExhibitDetail({ exhibit }: { exhibit: ExhibitView }) {
       <p className="meta">
         {exhibit.admitted
           ? 'Admitted by the Judge.'
-          : `Not admitted by the Judge. Rule: ${exhibit.rejectedBy ?? 'not recorded'}.`}
+          : `Not admitted by the Judge. ${exhibit.rejectedBy ? RULE_TEXT[exhibit.rejectedBy] : 'The rule that applied is not recorded.'}`}
       </p>
       {exhibit.runs.length === 0 ? (
         <p className="muted">No Judge runs are recorded for this exhibit.</p>

@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { buildCaseView } from '../model/caseView.js';
 import { CaseFile } from './CaseFile.js';
 import { getCaseEvents, listCaseSlugs } from './data.js';
-import { renderApp } from './testUtils.js';
+import { renderApp, settled } from './testUtils.js';
 
 afterEach(cleanup);
 
@@ -53,7 +53,7 @@ describe('case list route', () => {
 describe('gate case view (nodegoat-sqli-001)', () => {
   it('renders end to end, summary first, and honestly unverified until CR-1 lands', async () => {
     renderApp('/cases/nodegoat-sqli-001');
-    const h1 = await screen.findByRole('heading', { level: 1 });
+    const h1 = await settled();
     expect(h1.textContent).toContain('not yet confirmed');
     expect(screen.getByText('UNVERIFIED')).toBeTruthy();
     expect(screen.queryByText('VERIFIED')).toBeNull();
@@ -126,14 +126,15 @@ describe('escalated case view (escalated-001)', () => {
     expect(within(panel).getAllByRole('listitem').length).toBeGreaterThan(0);
     expect(screen.queryByText('VERIFIED')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: /exhibit-witness-002/ }));
-    expect(screen.getByText(/Rule: differential/)).toBeTruthy();
+    expect(screen.getByText(/did not behave differently on the vulnerable code/)).toBeTruthy();
+    expect(screen.queryByText(/Rule:/)).toBeNull();
   });
 });
 
 describe('document title', () => {
   it('names each page', async () => {
     renderApp('/cases/escalated-001');
-    await screen.findByRole('heading', { level: 1 });
+    await settled();
     expect(document.title).toBe('Needs human review - Affidavit');
     cleanup();
     renderApp('/cases/nope');
@@ -162,7 +163,7 @@ describe('copy', () => {
   it('has no em or en dashes in any rendered page', async () => {
     for (const path of ['/', '/cases/nodegoat-sqli-001', '/cases/escalated-001', '/cases/nope']) {
       const { container, unmount } = renderApp(path);
-      await screen.findByRole('heading', { level: 1 });
+      await settled();
       for (const b of screen.queryAllByRole('button')) fireEvent.click(b);
       expect(container.textContent).not.toContain(EM_DASH);
       expect(container.textContent).not.toContain(EN_DASH);

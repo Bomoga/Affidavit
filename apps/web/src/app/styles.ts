@@ -89,8 +89,19 @@ h3 { font-size: 1rem; margin: 0; }
   font-size: 0.9375rem;
 }
 .disclosure button:focus-visible { outline: 2px solid var(--color-focus); outline-offset: -2px; }
-.disclosure button:hover { color: var(--color-accent); }
+.disclosure button:hover { text-decoration: underline; }
 .disclosure .panel-body { padding: 0 1rem 1rem; }
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
 .hash { overflow-wrap: anywhere; }
 table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
 caption { text-align: left; padding: 0.5rem 0; color: var(--color-muted); }
