@@ -4,7 +4,7 @@ import type { Exhibit, ParamSpace, PatchExhibit, Witness } from '@affidavit/cont
 import { canonicalJson } from './canonical.js';
 import type { ExecutionRequest, RawAttempt } from './executor.js';
 import { Judge, counterexampleExhibitId, patchExhibitId } from './judge.js';
-import { renderDiff } from './patch/diff.js';
+import { parseUnifiedDiff, renderDiff } from './patch/diff.js';
 import { DEFAULT_POLICY } from './rules.js';
 import {
   GATE_PATCH_DIFF,
@@ -414,14 +414,106 @@ describe('Judge.verifyPatch', () => {
       expect(workbench.prepared).toHaveLength(0);
     });
 
-    it('treats a *.test.js file next to the code as code', async () => {
+    it('refuses a *.test.js file next to the code: it is not exempt, and a runner could pick it up', async () => {
       const guard = newFile('app/data/guard.test.js', [
         `module.exports = (t) => t === "0' || '1'=='1";`,
       ]);
-      const { verify } = setup();
-      expect((await verify(patchExhibit(GATE_PATCH_DIFF + guard))).rejectedBy).toBe(
-        'literal-only-patch',
-      );
+      const { workbench, verify } = setup();
+      expect((await verify(patchExhibit(GATE_PATCH_DIFF + guard))).rejectedBy).toBe('suite-fails');
+      expect(workbench.prepared).toHaveLength(0);
+    });
+
+    // Re-review B-1: a section's names must be exactly what git writes, or the Judge and
+    // `git apply -p1` read different files.
+    it.each([
+      [
+        'deletes test/a.js under a z/ name',
+        'diff --git a/z/test/a.js b/z/test/a.js\n--- z/test/a.js\n+++ /dev/null\n@@ -1 +0,0 @@\n-it("x", f);\n',
+      ],
+      [
+        'edits src/app.js under a test/ name',
+        'diff --git a/test/src/app.js b/test/src/app.js\n--- test/src/app.js\n+++ test/src/app.js\n@@ -1 +1,2 @@\n x\n+globalThis.__ok = true;\n',
+      ],
+      ['has a section with no diff --git header', '--- a/x.js\n+++ b/x.js\n@@ -1 +1 @@\n-a\n+b\n'],
+    ])('rejects a patch that %s with schema, before building', async (_, extra) => {
+      const { workbench, verify } = setup();
+      const r = await verify(patchExhibit(GATE_PATCH_DIFF + extra, {}, { raw: true }));
+      expect(r.rejectedBy).toBe('schema');
+      expect(workbench.prepared).toHaveLength(0);
+    });
+
+    it('rejects the deny-everything chain: a guard in code, its key set from a fake test path', async () => {
+      // Section 1 (code, in the witness build) refuses everything unless a flag is set; section 2
+      // claims to be a test file but git -p1 writes it to src/app.js, which only the suite saw.
+      const chain =
+        'diff --git a/src/app.js b/src/app.js\n--- a/src/app.js\n+++ b/src/app.js\n@@ -1 +1,2 @@\n x\n+if (!globalThis.__ok) deny();\n' +
+        'diff --git a/test/src/app.js b/test/src/app.js\n--- test/src/app.js\n+++ test/src/app.js\n@@ -2 +2,2 @@\n y\n+globalThis.__ok = true;\n';
+      const { workbench, verify } = setup();
+      expect((await verify(patchExhibit(chain, {}, { raw: true }))).rejectedBy).toBe('schema');
+      expect(workbench.prepared).toHaveLength(0);
+    });
+
+    it('fails apply (schema) when git apply --numstat disagrees with the Judge', async () => {
+      const { workbench, verify } = setup(undefined, {
+        // What git would print if it read a path the Judge did not.
+        numstat: () => '2\t1\tsrc/other.js\n',
+      });
+      const r = await verify();
+      expect(r.rejectedBy).toBe('schema');
+      expect(workbench.prepared).toHaveLength(1);
+      expect(workbench.suiteRuns).toBe(0);
+    });
+
+    it('passes the numstat check when git and the Judge agree', async () => {
+      const gate = parseUnifiedDiff(GATE_PATCH_DIFF);
+      if (!gate.ok) throw new Error(gate.reason);
+      const numstat = gate.diff.files
+        .map((f) => `${f.added.length}\t${f.removed.length}\t${f.path}\n`)
+        .join('');
+      const { verify } = setup(undefined, { numstat: () => numstat });
+      expect((await verify()).rejectedBy).toBeUndefined();
+    });
+
+    it('runs the suite on the code build and the patch tests only as an extra check', async () => {
+      const test = newFile('test/sqli.test.js', [`it('blocks', () => get("0' || '1'=='1"));`]);
+      const passing = setup(undefined, { addedTestsPassed: true });
+      expect(
+        (await passing.verify(patchExhibit(GATE_PATCH_DIFF + test))).rejectedBy,
+      ).toBeUndefined();
+      expect(passing.workbench.addedTestRuns).toBe(1);
+      expect(passing.workbench.plans[0]?.tests.files.map((f) => f.path)).toEqual([
+        'test/sqli.test.js',
+      ]);
+
+      const failing = setup(undefined, { addedTestsPassed: false });
+      expect(await failing.verify(patchExhibit(GATE_PATCH_DIFF + test))).toMatchObject({
+        rejectedBy: 'suite-fails',
+        suitePassed: false,
+      });
+
+      // A pass is never required: a workbench that does not run them (null) is fine.
+      const skipped = setup(undefined, { addedTestsPassed: null });
+      expect(
+        (await skipped.verify(patchExhibit(GATE_PATCH_DIFF + test))).rejectedBy,
+      ).toBeUndefined();
+
+      // No patch tests: the extra check is not asked for.
+      const none = setup();
+      await none.verify();
+      expect(none.workbench.addedTestRuns).toBe(0);
+    });
+
+    it('rejects suite-fails when the own suite fails even if the added tests pass', async () => {
+      const test = newFile('test/sqli.test.js', [`it('ok', () => {});`]);
+      const { verify } = setup(undefined, { suitePassed: false, addedTestsPassed: true });
+      expect((await verify(patchExhibit(GATE_PATCH_DIFF + test))).rejectedBy).toBe('suite-fails');
+    });
+
+    it('maps a workbench suite-config refusal to suite-fails', async () => {
+      const { verify } = setup(undefined, {
+        prepare: { ok: false, stage: 'suite', detail: 'changes "scripts" in package.json' },
+      });
+      expect((await verify()).rejectedBy).toBe('suite-fails');
     });
 
     it.each([

@@ -1,13 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import type { ParamSpace } from '@affidavit/contracts';
+import { gitDiff } from '../test-helpers.js';
 import { parseUnifiedDiff } from './diff.js';
 import {
+  RUNNER_CONFIG,
   findLiteralSpecialCases,
   findSuiteTampering,
   isTestFile,
   paramLiterals,
   stringLiterals,
   stripComments,
+  suiteManifestChange,
 } from './literal.js';
 
 const PAYLOADS: ParamSpace = [{ name: 'payload', values: ["'", "1' OR '1'='1", "1'--"] }];
@@ -150,7 +153,7 @@ describe('literal-only-patch detection', () => {
 
   describe('suite tampering', () => {
     const parse = (diff: string) => {
-      const r = parseUnifiedDiff(diff);
+      const r = parseUnifiedDiff(gitDiff(diff));
       if (!r.ok) throw new Error(r.reason);
       return r.diff;
     };
@@ -178,6 +181,64 @@ describe('literal-only-patch detection', () => {
       ['removing a pretest script', edit('package.json', ['"pretest": "lint",'], [])],
       ['editing a mocha config', edit('.mocharc.json', ['"spec": "test/**"'], ['"spec": "x"'])],
       ['editing the Gruntfile', edit('Gruntfile.js', ['mochaTest: { src: t },'], ['x: 1,'])],
+      // Re-review bypasses (PR #17).
+      [
+        'a runtime skip added to an existing test',
+        edit('test/a.js', [], ['before(function () { this.skip(); });']),
+      ],
+      ['a test that ends the process', edit('test/a.js', [], ['process.exit(0);'])],
+      [
+        'a new test file that ends the process',
+        '--- /dev/null\n+++ b/test/000.js\n@@ -0,0 +1 @@\n+process.exit(0);\n',
+      ],
+      [
+        'a new .mocharc.json',
+        '--- /dev/null\n+++ b/.mocharc.json\n@@ -0,0 +1 @@\n+{"spec":"nothing/**"}\n',
+      ],
+      ['a new .mocharc.yml', '--- /dev/null\n+++ b/.mocharc.yml\n@@ -0,0 +1 @@\n+spec: nothing\n'],
+      ['editing jest.config.json', edit('jest.config.json', [], ['"testMatch": ["nothing"],'])],
+      ['editing ava.config.cjs', edit('ava.config.cjs', [], ['files: [],'])],
+      ['adding .c8rc.json', '--- /dev/null\n+++ b/.c8rc.json\n@@ -0,0 +1 @@\n+{}\n'],
+      ['editing playwright.config.ts', edit('playwright.config.ts', [], ['testDir: "x",'])],
+      ['editing cypress.config.js', edit('cypress.config.js', [], ['specPattern: "x",'])],
+      ['editing spec/support/jasmine.json', edit('spec/support/jasmine.json', [], ['"x": 1,'])],
+      ['editing .nycrc', edit('.nycrc', [], ['"all": false,'])],
+      ['adding a pretest script', edit('package.json', [], ['"pretest": "rm -rf test",'])],
+      ['adding a jest block', edit('package.json', [], ['"jest": { "testMatch": ["x"] },'])],
+      ['adding a mocha block', edit('package.json', [], ['"mocha": {', '"spec": "x"', '},'])],
+      [
+        'editing inside a visible nyc block',
+        [
+          '--- a/package.json',
+          '+++ b/package.json',
+          '@@ -1,4 +1,4 @@',
+          ' {',
+          '   "nyc": {',
+          '-    "all": true',
+          '+    "all": false',
+          '   }',
+          '',
+        ].join('\n'),
+      ],
+      [
+        'editing any script inside a visible scripts block',
+        [
+          '--- a/package.json',
+          '+++ b/package.json',
+          '@@ -1,3 +1,3 @@',
+          '   "scripts": {',
+          '     "start": "node server.js",',
+          '-    "build": "tsc"',
+          '+    "build": "tsc && rm -rf test"',
+          '',
+        ].join('\n'),
+      ],
+      ['a new package.json', '--- /dev/null\n+++ b/sub/package.json\n@@ -0,0 +1 @@\n+{}\n'],
+      [
+        'a new *.test.js beside the code',
+        '--- /dev/null\n+++ b/src/a.test.js\n@@ -0,0 +1 @@\n+x\n',
+      ],
+      ['editing a __tests__ file in the code', edit('src/__tests__/a.js', [], ['x();'])],
     ])('refuses %s', (_, diff) => {
       expect(findSuiteTampering(parse(diff))).not.toHaveLength(0);
     });
@@ -189,9 +250,75 @@ describe('literal-only-patch detection', () => {
         edit('package.json', ['"mongodb": "2.1.0",'], ['"mongodb": "3.6.0",']),
       ],
       ['a code edit', edit('app/x.js', ['a();'], ['b();'])],
+      [
+        'bumping a dependency named like a script inside dependencies',
+        edit('package.json', ['"ci-info": "^3.0.0",'], ['"ci-info": "^3.9.0",']),
+      ],
     ])('allows %s', (_, diff) => {
       expect(findSuiteTampering(parse(diff))).toEqual([]);
     });
+
+    it('matches runner config names, not ordinary files', () => {
+      for (const p of [
+        'jest.config.js',
+        '.mocharc',
+        'karma.conf.js',
+        'vitest.config.mts',
+        'a/.taprc',
+      ]) {
+        expect(RUNNER_CONFIG.test(p), p).toBe(true);
+      }
+      for (const p of ['src/config.js', 'jest-helpers/x.js', 'README.md', 'tsconfig.json']) {
+        expect(RUNNER_CONFIG.test(p), p).toBe(false);
+      }
+    });
+  });
+
+  describe('suiteManifestChange (the workbench check on applied files)', () => {
+    const before = JSON.stringify({
+      name: 'a',
+      scripts: { test: 'mocha', start: 'node s.js' },
+      dependencies: { x: '1' },
+    });
+    it('accepts a dependency bump and key reordering', () => {
+      expect(
+        suiteManifestChange(
+          before,
+          JSON.stringify({
+            dependencies: { x: '2' },
+            scripts: { start: 'node s.js', test: 'mocha' },
+            name: 'a',
+          }),
+        ),
+      ).toBeNull();
+    });
+    it.each([
+      ['a changed script', { scripts: { test: 'true', start: 'node s.js' } }],
+      [
+        'an added pretest',
+        { scripts: { test: 'mocha', start: 'node s.js', pretest: 'rm -rf test' } },
+      ],
+      ['a new jest block', { jest: { testMatch: [] } }],
+      ['a new nyc block', { nyc: { all: false } }],
+    ])('refuses %s', (_, over) => {
+      expect(
+        suiteManifestChange(before, JSON.stringify({ ...JSON.parse(before), ...over })),
+      ).not.toBeNull();
+    });
+    it('fails closed on unparseable text', () =>
+      expect(suiteManifestChange(before, '{')).not.toBeNull());
+  });
+
+  it('stays fast on long lines (no quadratic regex)', () => {
+    const line = `${'a'.repeat(1999)}`;
+    const many = Array.from({ length: 128 }, () => ({ path: 'app/x.js', text: line }));
+    const p: ParamSpace = [{ name: 'n', values: [1337] }];
+    const t0 = Date.now();
+    expect(findLiteralSpecialCases(many, p)).toEqual([]);
+    expect(findLiteralSpecialCases([{ path: 'app/x.js', text: `${'a.'.repeat(999)}` }], p)).toEqual(
+      [],
+    );
+    expect(Date.now() - t0).toBeLessThan(2000);
   });
 
   it('collects strings, object keys and numbers from nested values', () => {

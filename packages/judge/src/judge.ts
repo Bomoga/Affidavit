@@ -256,7 +256,11 @@ export class Judge implements JudgePort {
       return reject('literal-only-patch');
     }
 
-    const plan: PatchPlan = { full: diff, code: selectFiles(diff, (f) => !isTestFile(f.path)) };
+    const plan: PatchPlan = {
+      full: diff,
+      code: selectFiles(diff, (f) => !isTestFile(f.path)),
+      tests: selectFiles(diff, (f) => isTestFile(f.path)),
+    };
     const outcome = await deps.workbench.prepare(cf, p.data, plan);
     if (!outcome.ok) return reject(outcome.stage === 'apply' ? 'schema' : 'suite-fails');
     const prepared = outcome.prepared;
@@ -280,7 +284,12 @@ export class Judge implements JudgePort {
         },
         this.#policy,
       );
-      const suite = await deps.workbench.runSuite(cf, prepared);
+      // The vulnerable commit's own suite, on the same build the witness ran against. The
+      // patch's own tests are an extra check: a failure counts, a pass is never required.
+      const ownSuite = await deps.workbench.runSuite(cf, prepared);
+      const addedTests =
+        plan.tests.files.length === 0 ? null : await deps.workbench.runAddedTests(cf, prepared);
+      const suite = { passed: ownSuite.passed === true && addedTests?.passed !== false };
       const results: VerifyResult['counterexamples'] = [];
       for (const { exhibitId, code } of counters) {
         if (code === undefined) {
