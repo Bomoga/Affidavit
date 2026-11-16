@@ -11,6 +11,7 @@ import {
 } from '@tanstack/react-router';
 import { useEffect, useRef } from 'react';
 import { CaseListPage, CasePage, NotFoundPage } from './pages.js';
+import { SourceProvider, type SourceConfig } from './source.js';
 import { APP_CSS } from './styles.js';
 
 function Layout() {
@@ -79,13 +80,17 @@ declare module '@tanstack/react-router' {
 export function App({
   router,
   client,
+  source = { mode: 'fake' },
 }: {
   router: ReturnType<typeof createAppRouter>;
   client: QueryClient;
+  source?: SourceConfig;
 }) {
   return (
     <QueryClientProvider client={client}>
-      <RouterProvider router={router} />
+      <SourceProvider value={source}>
+        <RouterProvider router={router} />
+      </SourceProvider>
     </QueryClientProvider>
   );
 }

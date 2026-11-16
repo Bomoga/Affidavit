@@ -1,5 +1,5 @@
 import { useId, useState, type ReactNode } from 'react';
-import type { CaseView, ExhibitView } from '../model/caseView.js';
+import type { CaseView, DocketEntry, ExhibitView } from '../model/caseView.js';
 import { REVIEW_REASON, RULE_TEXT, STATUS_STAMP } from './status.js';
 
 // Everything below renders case content (summaries, ids, details) as React text children only.
@@ -102,12 +102,122 @@ function ExhibitDetail({ exhibit }: { exhibit: ExhibitView }) {
   );
 }
 
-export function CaseFile({ view, slug }: { view: CaseView; slug?: string }) {
+const CONNECTION_TEXT = {
+  connecting: 'Connecting',
+  live: 'Live',
+  reconnecting: 'Reconnecting',
+  disconnected: 'Disconnected',
+  complete: 'Complete, no more updates expected',
+} as const;
+
+/**
+ * Connection state of the live stream. The status element is always present, so a change is
+ * announced politely by screen readers; the text carries the state, color only reinforces it.
+ */
+export function ConnectionStatus({
+  status,
+  dropped,
+  onRetry,
+}: {
+  status: keyof typeof CONNECTION_TEXT;
+  dropped: number;
+  onRetry: () => void;
+}) {
+  return (
+    <p className={`connection connection--${status}`} role="status" aria-live="polite">
+      <span className="sr-only">Connection: </span>
+      {CONNECTION_TEXT[status]}
+      {dropped > 0
+        ? `. ${dropped} malformed ${dropped === 1 ? 'update was' : 'updates were'} dropped and not shown`
+        : ''}
+      {status === 'disconnected' ? (
+        <button type="button" onClick={onRetry}>
+          Try again
+        </button>
+      ) : null}
+    </p>
+  );
+}
+
+/**
+ * Seam for L3-09. Appeal events appear on the docket as their recorded line only; the appeal
+ * round's own exhibits and outcome are rendered here once appeals exist. Renders nothing now.
+ */
+export function AppealDocketDetail(props: {
+  entry: DocketEntry;
+  exhibits: readonly ExhibitView[];
+}) {
+  void props;
+  return null;
+}
+
+function ExhibitDeeper({
+  entry,
+  exhibits,
+}: {
+  entry: DocketEntry;
+  exhibits: readonly ExhibitView[];
+}) {
+  const [open, setOpen] = useState(false);
+  const uid = useId();
+  const id = entry.exhibitId ?? '';
+  const exhibit = exhibits.find((x) => x.id === id);
+  return (
+    <div className="inline-disclosure docket-detail">
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-controls={`${uid}-exhibit`}
+        onClick={() => setOpen(!open)}
+      >
+        {`${open ? 'Hide' : 'Show'} exhibit ${id}`}
+      </button>
+      <div id={`${uid}-exhibit`} hidden={!open}>
+        {entry.detail ? (
+          <p>
+            <span className="label">Claim as recorded</span>
+            <br />
+            {entry.detail}
+          </p>
+        ) : null}
+        {exhibit ? (
+          <ExhibitDetail exhibit={exhibit} />
+        ) : (
+          <p className="muted">This exhibit is not in the record yet.</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DocketDetail({
+  entry,
+  exhibits,
+}: {
+  entry: DocketEntry;
+  exhibits: readonly ExhibitView[];
+}) {
+  if (entry.entry === 'appeal') return <AppealDocketDetail entry={entry} exhibits={exhibits} />;
+  if (entry.entry === 'counterexample' || entry.entry === 'objection')
+    return <ExhibitDeeper entry={entry} exhibits={exhibits} />;
+  return null;
+}
+
+export function CaseFile({
+  view,
+  slug,
+  connection,
+}: {
+  view: CaseView;
+  slug?: string;
+  connection?: ReactNode;
+}) {
   return (
     <article aria-labelledby="page-heading">
       <p className="label">{`Case file ${slug ?? view.caseId}`}</p>
       <h1 id="page-heading">{view.headline}</h1>
       <Stamp view={view} />
+      {connection}
 
       <section aria-labelledby="summary-heading">
         <h2 id="summary-heading">Summary</h2>
@@ -172,6 +282,7 @@ export function CaseFile({ view, slug }: { view: CaseView; slug?: string }) {
                 <span className="mono muted">{`#${d.seq} ${d.stage} `}</span>
                 {d.label}
                 <span className="mono muted">{`  ${d.at}`}</span>
+                <DocketDetail entry={d} exhibits={view.exhibits} />
               </li>
             ))}
           </ol>

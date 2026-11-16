@@ -17,6 +17,15 @@ export interface DocketEntry {
   at: string;
   stage: CaseStage;
   label: string;
+  /**
+   * Set on entries that are about one exhibit (a counterexample or an objection) so the UI can
+   * open that exhibit one click deeper. Never set on entries that carry no exhibit.
+   */
+  exhibitId?: string;
+  /** Which docket detail to render. Absent for plain entries. */
+  entry?: 'counterexample' | 'objection' | 'appeal';
+  /** Recorded text for the entry, shown as untrusted plain text one click deeper. */
+  detail?: string;
 }
 
 export interface RunView {
@@ -76,6 +85,8 @@ function label(e: TrialEvent): string {
     case 'stage-exited':
       return `Stage finished: ${e.stage}, next ${e.payload.to}`;
     case 'exhibit-submitted':
+      if (e.payload.kind === 'counterexample')
+        return `Counterexample ${e.payload.exhibitId} filed by ${e.actor}`;
       return `${e.payload.kind} exhibit ${e.payload.exhibitId} submitted by ${e.actor}`;
     case 'exhibit-result': {
       const r = e.payload.result;
@@ -86,7 +97,9 @@ function label(e: TrialEvent): string {
     case 'exhibit-inadmissible':
       return `The Judge did not admit ${e.payload.exhibitId} (rule ${e.payload.rejectedBy})`;
     case 'objection':
-      return `Objection to ${e.payload.exhibitId}`;
+      return e.actor === 'prosecution'
+        ? `The Prosecution objected, citing ${e.payload.exhibitId}`
+        : `An objection was raised, citing ${e.payload.exhibitId}`;
     case 'appeal':
       return `Appeal round ${e.payload.round}`;
     case 'ballot-cast':
@@ -104,15 +117,58 @@ function label(e: TrialEvent): string {
   }
 }
 
-/** A patch counts as accepted only when the Judge recorded every check passing. */
-function isAccepted(v: VerifyResult): boolean {
+/**
+ * A patch counts as accepted only when the Judge recorded every check passing, reported exactly
+ * one result for each counterexample the Judge admitted, and none of them survived. A result that
+ * misses, repeats or invents a counterexample is not evidence the patch was tested against them.
+ * This is the same rule `packages/trial` applies before Remedy accepts a patch.
+ */
+function isAccepted(v: VerifyResult, expectedCounterexamples: readonly string[]): boolean {
+  const got = v.counterexamples.map((c) => c.exhibitId as string);
+  const want = new Set(expectedCounterexamples);
+  const complete =
+    got.length === want.size && new Set(got).size === got.length && got.every((id) => want.has(id));
   return (
     v.rejectedBy === undefined &&
     v.familyFlipped &&
     v.suitePassed &&
     v.rescanClean &&
+    complete &&
     v.counterexamples.every((c) => !c.survived)
   );
+}
+
+/**
+ * One docket line. Objections and counterexamples carry the exhibit they cite so the UI can open
+ * it one click deeper. Appeals get a distinct entry kind with only the recorded round and
+ * counterexample id; rendering them fully is L3-09 (see `AppealDocketDetail` in CaseFile).
+ */
+function docketEntry(e: TrialEvent, exhibits: ReadonlyMap<string, ExhibitView>): DocketEntry {
+  const base = { seq: e.seq, at: e.at, stage: e.stage, label: label(e) };
+  switch (e.type) {
+    case 'exhibit-submitted':
+      return e.payload.kind === 'counterexample'
+        ? { ...base, entry: 'counterexample', exhibitId: e.payload.exhibitId }
+        : base;
+    case 'exhibit-result':
+    case 'exhibit-inadmissible': {
+      const id = e.type === 'exhibit-result' ? e.payload.result.exhibitId : e.payload.exhibitId;
+      return exhibits.get(id)?.kind === 'counterexample'
+        ? { ...base, entry: 'counterexample', exhibitId: id }
+        : base;
+    }
+    case 'objection':
+      return {
+        ...base,
+        entry: 'objection',
+        exhibitId: e.payload.exhibitId,
+        detail: e.payload.claim,
+      };
+    case 'appeal':
+      return { ...base, entry: 'appeal', exhibitId: e.payload.counterexampleId };
+    default:
+      return base;
+  }
 }
 
 function stampBlockers(
@@ -208,9 +264,18 @@ export function buildCaseView(input: readonly TrialEvent[], extra: CaseViewInput
     }
   }
 
+  // The counterexamples a patch must be tested against: those the Judge admitted.
+  const admittedCounterexamples = [...exhibits.values()]
+    .filter((x) => x.kind === 'counterexample' && x.admitted)
+    .map((x) => x.id);
+
   const acceptedPatches = new Set<string>(
     (extra.verifyResults ?? [])
-      .filter((v) => isAccepted(v) && exhibits.get(v.patchExhibitId)?.kind === 'patch')
+      .filter(
+        (v) =>
+          isAccepted(v, admittedCounterexamples) &&
+          exhibits.get(v.patchExhibitId)?.kind === 'patch',
+      )
       .map((v) => v.patchExhibitId as string),
   );
 
@@ -258,7 +323,7 @@ export function buildCaseView(input: readonly TrialEvent[], extra: CaseViewInput
   }
 
   const exhibitList = [...exhibits.values()];
-  const docket = events.map((e) => ({ seq: e.seq, at: e.at, stage: e.stage, label: label(e) }));
+  const docket = events.map((e) => docketEntry(e, exhibits));
 
   return {
     caseId: events[0]?.caseId ?? '',
