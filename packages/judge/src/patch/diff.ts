@@ -36,6 +36,12 @@ export interface ParsedDiff {
 
 export type DiffParse = { ok: true; diff: ParsedDiff } | { ok: false; reason: string };
 
+/**
+ * Longest diff line accepted. Source lines longer than this are minified or generated code, which
+ * a patch has no reason to touch, and a cap keeps every pattern the Judge runs on a line cheap.
+ */
+export const MAX_LINE_CHARS = 2000;
+
 const HUNK = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
 const DIFF_GIT = /^diff --git a\/(\S+) b\/(\S+)$/;
 /** Extended header lines git writes that are harmless for a plain text edit. */
@@ -66,21 +72,27 @@ export function parseUnifiedDiff(diff: string): DiffParse {
   const seen = new Set<string>();
   let i = 0;
 
+  // Checked before any pattern runs on a line, so no regex here or in literal.ts sees a long one.
+  const long = lines.findIndex((l) => l.length > MAX_LINE_CHARS);
+  if (long !== -1) return fail(`line ${long + 1} is over ${MAX_LINE_CHARS} characters`);
+
   while (i < lines.length) {
     const start = i;
+    // Every section must start with `diff --git a/P b/P`, and its `---`/`+++` names must be
+    // exactly `a/P` (or /dev/null) and `b/P` (or /dev/null). `git apply` strips the first path
+    // component of whatever name it is given, so a section headed `--- z/test/a.js` would mean
+    // `test/a.js` to git and `z/test/a.js` to a reader that only strips `a/`. With these exact
+    // names the path the Judge checks is the path git writes.
     const header = lines[i] ?? '';
-    let gitPath: string | null = null;
-    if (header.startsWith('diff --git ')) {
-      const m = DIFF_GIT.exec(header);
-      if (!m || m[1] !== m[2]) return fail(`unsupported file header: ${header}`);
-      gitPath = m[1] ?? null;
+    const m = DIFF_GIT.exec(header);
+    if (!m || m[1] !== m[2]) return fail(`expected "diff --git a/P b/P" at line ${i + 1}`);
+    const path = m[1] as string;
+    i++;
+    while (i < lines.length && !(lines[i] ?? '').startsWith('--- ')) {
+      const ext = lines[i] ?? '';
+      if (ext.startsWith('diff --git ')) return fail(`no text change for ${path}`);
+      if (!HARMLESS.test(ext)) return fail(`unsupported extended header: ${ext}`);
       i++;
-      while (i < lines.length && !(lines[i] ?? '').startsWith('--- ')) {
-        const ext = lines[i] ?? '';
-        if (ext.startsWith('diff --git ')) return fail(`no text change for ${gitPath}`);
-        if (!HARMLESS.test(ext)) return fail(`unsupported extended header: ${ext}`);
-        i++;
-      }
     }
 
     const minus = lines[i] ?? '';
@@ -92,21 +104,16 @@ export function parseUnifiedDiff(diff: string): DiffParse {
     const newName = stripTimestamp(plus.slice(4));
     i += 2;
 
-    let status: DiffFile['status'] = 'modified';
-    let path: string;
+    if (oldName !== '/dev/null' && oldName !== `a/${path}`) {
+      return fail(`"--- ${oldName}" does not name a/${path}`);
+    }
+    if (newName !== '/dev/null' && newName !== `b/${path}`) {
+      return fail(`"+++ ${newName}" does not name b/${path}`);
+    }
     if (oldName === '/dev/null' && newName === '/dev/null')
       return fail('file header names no file');
-    if (oldName === '/dev/null') {
-      status = 'added';
-      path = stripPrefix(newName, 'b/');
-    } else if (newName === '/dev/null') {
-      status = 'deleted';
-      path = stripPrefix(oldName, 'a/');
-    } else {
-      path = stripPrefix(newName, 'b/');
-      if (stripPrefix(oldName, 'a/') !== path) return fail(`rename or copy of ${path}`);
-    }
-    if (gitPath !== null && gitPath !== path) return fail(`header mismatch for ${path}`);
+    const status: DiffFile['status'] =
+      oldName === '/dev/null' ? 'added' : newName === '/dev/null' ? 'deleted' : 'modified';
     const why = unsafePathReason(path);
     if (why !== null) return fail(`${why}: ${JSON.stringify(path)}`);
     if (seen.has(path)) return fail(`file appears twice: ${path}`);
@@ -159,10 +166,6 @@ export function parseUnifiedDiff(diff: string): DiffParse {
 function stripTimestamp(name: string): string {
   const tab = name.indexOf('\t');
   return tab === -1 ? name : name.slice(0, tab);
-}
-
-function stripPrefix(name: string, prefix: string): string {
-  return name.startsWith(prefix) ? name.slice(prefix.length) : name;
 }
 
 /** The diff restricted to some of its files, with `linesChanged` recounted. */

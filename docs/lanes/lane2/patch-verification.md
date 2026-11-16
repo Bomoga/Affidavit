@@ -9,13 +9,13 @@ Static checks run first, so a bad patch never costs a build.
 | Step | Check                                                                                                                                                                                                         | Fails with                                                                               |
 | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
 | 1    | Patch exhibit parses, belongs to this case, is authored by `remedy`, `sha256` is the SHA-256 of `diff`, `code` equals `diff`, diff within `maxSourceBytes`; witness parses and fits the case                  | `schema`                                                                                 |
-| 2    | Diff is a plain unified diff of text files with safe paths (see below), and the declared `filesTouched` and `linesChanged` equal what the diff contains                                                       | `schema`                                                                                 |
+| 2    | Diff is a plain git diff of text files with safe paths and exact file names, no line over 2000 characters (see below), and the declared `filesTouched` and `linesChanged` equal what the diff contains        | `schema`                                                                                 |
 | 3    | Added plus removed lines at most `maxPatchLinesChanged` (100), files at most `maxPatchFiles` (5)                                                                                                              | `diff-too-large`                                                                         |
 | 4    | The patch does not weaken the target's test suite (see "Suite guard")                                                                                                                                         | `suite-fails`                                                                            |
 | 5    | No added code line special-cases a witness value or loads one of the patch's test files (see below)                                                                                                           | `literal-only-patch`                                                                     |
-| 6    | `PatchWorkbench.prepare` applies the patch to the vulnerable commit and builds it                                                                                                                             | `schema` if it does not apply, `suite-fails` if it does not build                        |
+| 6    | `PatchWorkbench.prepare` checks git reads the same files and line counts, applies the patch to the vulnerable commit, checks every `package.json` keeps its suite keys, and builds it                         | `schema` if it does not apply or git disagrees, `suite-fails` otherwise                  |
 | 7    | The witness family reruns 3 times on `vulnerable` (must pass on every parameter) and 3 times on `patched` (must fail on every parameter)                                                                      | the first of `completes`, `stable-3of3`, `no-egress`, `time-budget`, else `differential` |
-| 8    | The target's own test suite passes on the patch                                                                                                                                                               | `suite-fails`                                                                            |
+| 8    | The vulnerable commit's own test suite passes on the patched build the witness ran against; the patch's own tests, if run, do not fail                                                                        | `suite-fails`                                                                            |
 | 9    | Every counterexample is first judged for admissibility (3 runs on `vulnerable`, 3 on `safe` when it exists, every rule of evidence); each admissible one reruns 3 times on `patched` and must fail everywhere | `counterexample-survives`                                                                |
 | 10   | Discovery re-scan of the patched tree (`RescanPort`, Lane 1) is clean                                                                                                                                         | `rescanClean: false` (no rule of its own in contracts v1.0)                              |
 
@@ -45,7 +45,20 @@ The reasoning: a counterexample that also passes on the safe variant, or that ne
 
 ## Diff rules
 
-The Judge counts from the diff itself and never trusts what the author declared. Refused: binary patches, renames and copies, mode changes, symlinks and submodules, a file appearing twice, absolute paths, `.` or `..` segments, anything under `.git`, quoted or unusual path characters, hunks whose line counts disagree with their header, and any trailing text that is not part of a hunk.
+The Judge counts from the diff itself and never trusts what the author declared. Refused: binary patches, renames and copies, mode changes, symlinks and submodules, a file appearing twice, absolute paths, `.` or `..` segments, anything under `.git`, quoted or unusual path characters, hunks whose line counts disagree with their header, any trailing text that is not part of a hunk, and any line over 2000 characters (`MAX_LINE_CHARS`; minified or generated code has no place in a fix, and the cap keeps every pattern the Judge runs on a line cheap).
+
+### File names must be exactly what git writes
+
+Every file section must start with `diff --git a/P b/P`, its `---` name must be exactly `a/P` or `/dev/null`, and its `+++` name exactly `b/P` or `/dev/null`. Anything else is `schema`.
+
+The reason: `git apply` (default `-p1`) strips the first path component of whatever name it is given. An earlier reader stripped `a/` and `b/` only when present, so the Judge and git could read different files. Found in the PR #17 re-review:
+
+| Section names                                | Earlier Judge reading        | What `git apply` does |
+| -------------------------------------------- | ---------------------------- | --------------------- |
+| `--- z/test/a.js`, `+++ /dev/null`           | deletes `z/test/a.js` (code) | deletes `test/a.js`   |
+| `--- test/src/app.js`, `+++ test/src/app.js` | edits a test file (exempt)   | edits `src/app.js`    |
+
+Chained, they made a fake fix pass: a code section added `if (!globalThis.__ok) deny();` (in the witness build, so every payload was refused), and a "test" section that git writes to `src/app.js` set `globalThis.__ok = true` (only in the suite's build, so the suite passed). Both builds are now one (`PatchPlan.code`), and as a second line of defence the workbench compares `git apply --numstat` with the Judge's reading (see "Workbench contract").
 
 ## Test files
 
@@ -54,20 +67,28 @@ A test file is a file under a test root (`test/`, `tests/`, `__tests__/`, `spec/
 Test files get two exemptions, and both are fenced:
 
 - The literal check skips their added lines, so a regression test may replay the payload.
-- The workbench builds the target the witness and the counterexamples run against from the patch without its test files (`PatchPlan.code`). The suite runs on the whole patch (`PatchPlan.full`). So code that loads a file from the patch's test files sees nothing at run time, and the family rerun does not flip.
+- The workbench makes one patched build, from the patch without its test files (`PatchPlan.code`). The witness, the counterexamples and the vulnerable commit's own suite all run against it. So code that loads a file from the patch's test files sees nothing at run time, and app code cannot tell a suite run from a witness run by the files in its tree. The patch's test files (`PatchPlan.tests`) only feed the extra added-tests check (see "Suite guard").
+
+A file that looks like a test to a runner's default discovery (`*.test.js`, `*.spec.ts`, a `__tests__`, `test`, `tests` or `spec` directory) but is not under a recognised test root is not a test file: it would be in the code build, where the vulnerable commit's runner could pick it up. A patch may not touch one at all (step 4).
 
 On top of that, step 5 rejects any non-test added line that names one of the patch's test files: its path, its file name, or its name without the last extension as the last segment of a string (`require('./guard.test.js')`, `require('../test/guard.test')`), or any relative path into a test root (`require('../test')`).
 
 ## Suite guard
 
-A patch may add tests, never take them away. Step 4 refuses, with `suite-fails` and before any build:
+The suite that decides `suite-fails` is the vulnerable commit's own: its test files, its `package.json` test script and its runner config, run on the same patched build as the witness. A patch may therefore not change anything that decides what that suite runs. Step 4 refuses, with `suite-fails` and before any build:
 
-- deleting a test file, or removing any line from an existing test file (an edit counts as a removal);
-- adding a line to a test file that skips or narrows the suite (`.only`, `.skip`, `.todo`, `xit`, `fdescribe` and the like);
-- removing a test or CI script (`test`, `pretest`, `posttest`, `test:*`, `ci`, `check`, `coverage`, `spec`) or the `scripts` key from a `package.json`;
-- deleting, or removing lines from, a test runner config (`.mocharc*`, `.nycrc*`, `jest.config.*`, `vitest.config.*`, `karma.conf.*`, `mocha.config.*`, `Gruntfile.*`, `gulpfile.*`).
+- deleting a test file, removing any line from one (an edit counts as a removal), or adding a line to one that skips, narrows or cuts short the suite (`.only`, `.skip`, `.todo`, `xit`, `fdescribe`, a runtime `this.skip()`, `process.exit`, `process.kill`);
+- adding, deleting or changing any test runner or coverage config file, in any name and format the runners read (`RUNNER_CONFIG`): `.mocharc*`, `mocha.opts`, `.nycrc*`, `.c8rc*`, `.taprc`, `jest.config.*`, `vitest.config.*`, `vite.config.*`, `karma.conf.*`, `ava.config.*`, `cypress.config.*`, `playwright.config.*`, `jasmine.json`, `Gruntfile.*`, `gulpfile.*`, with `.js`, `.cjs`, `.mjs`, `.ts`, `.json`, `.yml`, `.yaml` and other variants. A config inside a test root (`spec/support/jasmine.json`) is still a config;
+- any change to `scripts`, `config`, or a runner block (`jest`, `mocha`, `nyc`, `c8`, `ava`, `jasmine`, `tap`, `vitest`, `karma`, `cypress`, `playwright`) in a `package.json`, and adding or deleting a `package.json`. The diff shows only a window of the file, so this pass catches changed lines that name one of those keys or a suite script (`test`, `pretest`, `test:*`, `ci`, `coverage`, `spec`), and changed lines inside one of those blocks when its opening line is in the hunk. The workbench makes the exact check on the applied files (`suiteManifestChange`, see "Workbench contract");
+- touching a test-like file outside a test root (see "Test files").
 
 Dependency bumps in `package.json` stay allowed.
+
+The patch's own test files are an extra check, never a requirement. If the workbench runs them (`runAddedTests`, on top of the patched build), a failure counts as `suite-fails`; a pass, or not running them, changes nothing.
+
+Bypasses from the PR #17 re-review, each now refused with its own test: a new `test/000.js` with `process.exit(0)`; `before(function () { this.skip(); })` added to an existing test; a new `.mocharc.json` with `{"spec":"nothing/**"}`; edits to `jest.config.json`; added or edited `jest`, `mocha` or `nyc` blocks in `package.json`; an added `"pretest": "rm -rf test"`.
+
+Known gaps: app code can still tell a suite run from a witness run by its environment (`NODE_ENV`, process arguments, the runner's globals) and behave differently; the suite verdict is only as good as the runner's exit code. The family rerun in step 7 is unaffected, because the witness runs against the booted target.
 
 ## `literal-only-patch`
 
@@ -88,16 +109,29 @@ Known gaps (the family rerun in step 7 is the dynamic half of the same rule, and
 - range equality such as `t >= 3 && t <= 3`, or `Math.abs(t - 3) < 1`;
 - a number or payload built at run time from pieces (`'1' + "'--"`, `30 + 7`), or held in a variable or array declared on another line;
 - membership through a structure other than an inline array literal (an object map, a `switch` on a computed key);
+- a constant on another line (`const BAD = 1337;` then `if (id === BAD)`);
+- a string split across literals or lines (`'0\' || ' + "'1'=='1"`);
+- a case change before the compare (`t.toLowerCase() === 'select'` against an upper-case payload);
+- a BigInt literal (`1337n`), and comparisons through a function (`Object.is(+id, 1337)`);
+- membership through something other than `.includes`, `.indexOf`, `.lastIndexOf` or `new Set` on an inline array (`[1337].some((x) => x === id)`, an object-key lookup `({ 1337: 1 })[id]`);
+- a JSON or other data file of payload values added by the patch and used through `.includes`;
 - a `/` the regex-literal heuristic misreads can keep a real comment as code (a false positive, never a miss).
+
+Considered and not done: flagging every added numeric literal equal to a parameter number above 2, wherever it appears. It would catch the constant-on-another-line case, but parameter numbers often coincide with values a real fix uses (HTTP statuses such as `403`, limits, ports), so it would refuse correct fixes. The family rerun covers the dynamic side.
+
+Each line is at most 2000 characters (step 2), and every pattern in `literal.ts` and `diff.ts` is linear or bounded by that cap. The left-operand pattern in the number check used to restart at every position of a long run of identifier characters (quadratic: 128K characters took about 18 s in review); it now starts only where a run starts.
 
 ## Workbench contract
 
 `PatchWorkbench` (`src/patch/workbench.ts`) is scripted in tests until boot recipes (L2-04) land. The real workbench must:
 
-- apply the diff with `git apply` inside the jail, never with `--unsafe-paths`, and keep git's default refusal to write through a symlink already in the tree: a path beyond a symlink in the vulnerable commit is an `apply` failure (`schema`);
+- before applying `renderDiff(plan.code)` (the build) and `renderDiff(plan.full)` (the re-scan workspace), run `git apply --numstat` on each inside the jail and return `apply` (`schema`) when `numstatMismatch` reports any path or line count that differs from the Judge's reading;
+- apply with `git apply` (default `-p1`) inside the jail, never with `--unsafe-paths`, and keep git's default refusal to write through a symlink already in the tree: a path beyond a symlink in the vulnerable commit is an `apply` failure (`schema`);
+- after applying, compare every `package.json` with the vulnerable commit's (`suiteManifestChange`) and return `suite` (`suite-fails`) on any difference in `scripts`, `config` or a runner block;
 - write `workspacePath` only from that jailed apply step: the host never writes into it, and nothing later (build, suite, witness, target) gets a writable handle to it;
-- take the suite command from the case's boot recipe, never from the patched manifest, and always run the vulnerable commit's own test files (the patch may only add to them; step 4 has refused deletions and removed lines);
-- build the witness and counterexample target from `PatchPlan.code` and run the suite on `PatchPlan.full`. `PatchPlan.code` may have no files, when the patch only adds tests; the target is then the vulnerable commit rebuilt as is. `renderDiff` turns either plan back into text for `git apply`.
+- make one patched build, from `PatchPlan.code`, and run the witness, the counterexamples and the suite against it. `PatchPlan.code` may have no files, when the patch only adds tests; the build is then the vulnerable commit rebuilt as is;
+- in `runSuite`, run the vulnerable commit's own suite (its test files, test script and runner config, all unchanged in that build), with the command from the case's boot recipe, never from the patched manifest;
+- in `runAddedTests`, run only `PatchPlan.tests` on top of that build, in a separate run, and return null when there are none or they are not run.
 
 ## What is real and what is scripted
 

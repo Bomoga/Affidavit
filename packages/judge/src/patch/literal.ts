@@ -190,9 +190,11 @@ const EQ_OP = '(?:===|!==|==|!=)';
 function comparesNumber(code: string, numbers: readonly number[]): number | undefined {
   if (numbers.length === 0) return undefined;
   const has = (n: number): number | undefined => numbers.find((x) => x === n);
-  // `<left> OP <num>`; the number ends there (not `1.5`, not `1 + x`'s first term).
+  // `<left> OP <num>`; the number ends there (not `1.5`, not `1 + x`'s first term). The
+  // lookbehind makes `left` start only where a run of operand characters starts, so a long run
+  // with no operator after it is scanned once, not once per position (which was quadratic).
   const after = new RegExp(
-    String.raw`(?<left>[\w$.\])]+)\s*${EQ_OP}\s*${NUM_OPERAND}(?![\w.$])`,
+    String.raw`(?<![\w$.\])])(?<left>[\w$.\])]+)\s*${EQ_OP}\s*${NUM_OPERAND}(?![\w.$])`,
     'g',
   );
   for (const m of code.matchAll(after)) {
@@ -309,31 +311,179 @@ export function findLiteralSpecialCases(
   return hits;
 }
 
-/** Test runner modifiers that skip or narrow a suite: `.only`, `.skip`, `xit`, `fdescribe`. */
+/**
+ * Lines that skip, narrow or cut short a suite: `.only`, `.skip`, `xit`, `fdescribe`, a runtime
+ * `this.skip()` or `ctx.skip()`, and ending the process (`process.exit`, `process.kill`).
+ */
 const NARROWS_SUITE =
-  /\b(?:describe|context|suite|it|test|specify)\s*\.\s*(?:only|skip|todo)\b|\b[xf](?:it|describe|context|test)\s*\(/;
+  /\b(?:describe|context|suite|it|test|specify)\s*\.\s*(?:only|skip|todo)\b|\b[xf](?:it|describe|context|test)\s*\(|\.\s*skip\s*\(|\bprocess\s*\.\s*(?:exit|kill|abort)\b/;
 
-/** Manifest and runner config files whose removed lines could weaken the test suite. */
-const SUITE_CONFIG =
-  /(^|\/)(package\.json|\.mocharc(\.[a-z]+)?|\.nycrc(\.[a-z]+)?|(jest|vitest|karma|mocha)\.conf(ig)?\.[cm]?[jt]s|Gruntfile\.[cm]?[jt]s|[Gg]ulpfile\.[cm]?[jt]s)$/;
-/** A `package.json` line that is a test or CI script, or the `scripts` block itself. */
-const SUITE_SCRIPT_KEY =
-  /^\s*"(scripts|(pre|post)?(test|tests|spec|ci|check|coverage)([:._-][^"]*)?)"\s*:/;
+/** Config file extensions test runners read. */
+const CONFIG_EXT = String.raw`(?:js|cjs|mjs|ts|cts|mts|json|jsonc|json5|yml|yaml|toml)`;
+/** Test runner and coverage tools whose config files decide what the suite runs. */
+const RUNNERS = 'jest|vitest|vite|karma|mocha|ava|c8|nyc|cypress|playwright|jasmine|wdio|tap|uvu';
+/**
+ * Test runner and coverage config files, in any of the names and formats the runners read
+ * (`jest.config.json`, `.mocharc.yml`, `.nycrc`, `ava.config.cjs`, `playwright.config.ts`,
+ * `spec/support/jasmine.json`, `Gruntfile.js`, ...). A patch may not add, delete or change one.
+ */
+export const RUNNER_CONFIG = new RegExp(
+  String.raw`(?:^|/)(?:` +
+    String.raw`\.(?:${RUNNERS})rc(?:\.${CONFIG_EXT})?|` +
+    String.raw`(?:${RUNNERS})(?:\.conf(?:ig)?)?(?:\.[\w-]+)?\.${CONFIG_EXT}|` +
+    String.raw`mocha\.opts|[Gg]runtfile\.[cm]?[jt]s|[Gg]ulpfile\.[cm]?[jt]s` +
+    String.raw`)$`,
+);
+
+/**
+ * `package.json` keys that decide what the suite runs or how: `scripts` (every script, since
+ * `npm test` runs `pretest` and scripts can call each other) and the runners' own config blocks.
+ */
+export const SUITE_MANIFEST_KEYS = [
+  'scripts',
+  'config',
+  'jest',
+  'mocha',
+  'nyc',
+  'c8',
+  'ava',
+  'jasmine',
+  'tap',
+  'vitest',
+  'karma',
+  'cypress',
+  'playwright',
+] as const;
+
+/**
+ * Names that look like tests to a runner's default discovery (`*.test.js`, `*.spec.ts`, any
+ * `__tests__`, `test` or `tests` directory). Outside a recognised test root (`isTestFile`) such
+ * a file would be built into the target and could be picked up by the vulnerable commit's
+ * runner, so a patch may not touch one there.
+ */
+const TEST_LIKE = /(?:^|\/)(?:__tests__|tests?|spec)\/|\.(?:test|spec)\.[cm]?[jt]sx?$/;
 
 export interface SuiteTamper {
   path: string;
   reason: string;
 }
 
+const VERB: Record<DiffFile['status'], string> = {
+  added: 'adds',
+  modified: 'changes',
+  deleted: 'deletes',
+};
+
+const MANIFEST_KEY = new RegExp(String.raw`"(?:${SUITE_MANIFEST_KEYS.join('|')})"\s*:`);
+/** A script name npm or CI runs around the suite (`test`, `pretest`, `test:unit`, `ci`, ...). */
+const SUITE_SCRIPT_KEY = /^\s*"(?:pre|post)?(?:test|tests|spec|ci|coverage)(?::[^"]*)?"\s*:/;
+const KEY_OPEN = /^\s*"([^"\\]*)"\s*:\s*[{[]/;
+const indentOf = (l: string): number => /^\s*/.exec(l)?.[0].length ?? 0;
+
 /**
- * Diff-level guard for the target's own test suite: a patch may add tests, never take them away.
- * Refused: deleting a test file, removing any line from an existing test file, adding a line that
- * skips or narrows tests (`.only`, `.skip`, `xit`), removing a test or CI script (or the
- * `scripts` key) from a `package.json`, and removing lines from a test runner config.
+ * First pass over a `package.json` section: does a changed line name `scripts`, a runner block or
+ * a suite script, or sit (by indentation) inside a `scripts` or runner block that is in view in
+ * its hunk? The diff shows only a window of the file, so this cannot see every case; the
+ * workbench makes the exact check on the applied files (`suiteManifestChange`).
+ */
+export function manifestSuiteChange(raw: readonly string[]): string | null {
+  let hunk: string[] | null = null;
+  const check = (lines: readonly string[]): string | null => {
+    for (let j = 0; j < lines.length; j++) {
+      const l = lines[j] ?? '';
+      if (l[0] !== '+' && l[0] !== '-') continue;
+      const text = l.slice(1);
+      if (MANIFEST_KEY.test(text) || SUITE_SCRIPT_KEY.test(text)) {
+        return `changes ${text.trim().slice(0, 60)}`;
+      }
+      let want = indentOf(text);
+      for (let k = j - 1; k >= 0 && want > 0; k--) {
+        const prev = lines[k] ?? '';
+        if (prev[0] === '-') continue; // removed lines are not the new structure
+        const body = prev.slice(1);
+        if (body.trim() === '' || indentOf(body) >= want) continue;
+        want = indentOf(body);
+        const open = KEY_OPEN.exec(body);
+        const key = open?.[1];
+        if (key !== undefined && (SUITE_MANIFEST_KEYS as readonly string[]).includes(key)) {
+          return `changes the "${key}" block`;
+        }
+      }
+    }
+    return null;
+  };
+  for (const l of raw) {
+    if (l.startsWith('@@')) {
+      const p = hunk === null ? null : check(hunk);
+      if (p !== null) return p;
+      hunk = [];
+    } else if (hunk !== null) hunk.push(l);
+  }
+  return hunk === null ? null : check(hunk);
+}
+
+/**
+ * The exact check, for the workbench: do two `package.json` texts (the vulnerable commit's and the
+ * patched one) differ in `scripts` or any runner block? Null when they agree. Unparseable text is
+ * a difference (fail closed).
+ */
+export function suiteManifestChange(before: string, after: string): string | null {
+  const read = (t: string): Record<string, unknown> | null => {
+    try {
+      const v: unknown = JSON.parse(t);
+      return typeof v === 'object' && v !== null && !Array.isArray(v)
+        ? (v as Record<string, unknown>)
+        : null;
+    } catch {
+      return null;
+    }
+  };
+  const a = read(before);
+  const b = read(after);
+  if (a === null || b === null) return 'package.json does not parse';
+  for (const key of SUITE_MANIFEST_KEYS) {
+    if (JSON.stringify(canonical(a[key])) !== JSON.stringify(canonical(b[key]))) {
+      return `changes "${key}" in package.json`;
+    }
+  }
+  return null;
+}
+
+/** Key order does not matter to npm or the runners; sort keys so only content is compared. */
+function canonical(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(canonical);
+  if (typeof v === 'object' && v !== null) {
+    return Object.fromEntries(
+      Object.keys(v)
+        .sort()
+        .map((k) => [k, canonical((v as Record<string, unknown>)[k])]),
+    );
+  }
+  return v;
+}
+
+/**
+ * Diff-level guard for the target's own test suite. The suite that decides `suite-fails` is the
+ * vulnerable commit's own: its test files, its `package.json` scripts and its runner config, run
+ * on the same build the witness and counterexamples run on (`PatchPlan.code`). So a patch may not
+ * change any of the inputs that decide what that suite runs. Refused:
+ * - deleting a test file, removing lines from one, or adding a line that skips or narrows tests
+ *   (`.only`, `.skip`, `xit`); the patch's own test edits only feed the extra added-tests check,
+ *   but a patch that tries to weaken tests is refused outright;
+ * - adding, deleting or changing any test runner or coverage config file (`RUNNER_CONFIG`);
+ * - changing `scripts` or a runner block in any `package.json` (`manifestSuiteChange`);
+ * - touching a test-like file outside a recognised test root (`TEST_LIKE`), which the runner's
+ *   default discovery could pick up from the code build.
  */
 export function findSuiteTampering(diff: ParsedDiff): SuiteTamper[] {
   const out: SuiteTamper[] = [];
   for (const f of diff.files) {
+    // First: a runner config inside a test root (`spec/support/jasmine.json`, `test/mocha.opts`)
+    // is still a runner config.
+    if (RUNNER_CONFIG.test(f.path)) {
+      out.push({ path: f.path, reason: `${VERB[f.status]} a test runner config` });
+      continue;
+    }
     if (isTestFile(f.path)) {
       if (f.status === 'deleted') out.push({ path: f.path, reason: 'deletes a test file' });
       else if (f.removed.length > 0) {
@@ -344,15 +494,12 @@ export function findSuiteTampering(diff: ParsedDiff): SuiteTamper[] {
       }
       continue;
     }
-    if (!SUITE_CONFIG.test(f.path)) continue;
-    if (f.status === 'deleted') {
-      out.push({ path: f.path, reason: 'deletes a test runner config' });
+    if (TEST_LIKE.test(f.path)) {
+      out.push({ path: f.path, reason: 'touches a test file outside a test root' });
     } else if (basename(f.path) === 'package.json') {
-      if (f.removed.some((l) => SUITE_SCRIPT_KEY.test(l))) {
-        out.push({ path: f.path, reason: 'removes a test script' });
-      }
-    } else if (f.removed.length > 0) {
-      out.push({ path: f.path, reason: 'removes lines from a test runner config' });
+      const why =
+        f.status === 'modified' ? manifestSuiteChange(f.raw) : `${VERB[f.status]} a package.json`;
+      if (why !== null) out.push({ path: f.path, reason: why });
     }
   }
   return out;
