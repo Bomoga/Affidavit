@@ -47,13 +47,14 @@ The witness runs in the same process as the harness and could write the artifact
 
 - `--internal`, so it has no route out;
 - `com.docker.network.bridge.inhibit_ipv4=true`, so the host bridge gets no IPv4 address;
-- labelled with the run id, so `removeCaseNetwork` can remove the network and anything left on it, then check that nothing is left.
+- `--ipv6=false`, so the bridge gets no IPv6 gateway either; after creation `createCaseNetwork` reads the network back and fails unless it is internal, `EnableIPv6` is false, and it has exactly one subnet, which is IPv4;
+- labelled with the run id, so `removeCaseNetwork` can remove the network and anything left on it (`docker rm --force --volumes`), then check that nothing is left.
 
-The second option matters. On a plain `--internal` network a witness under gVisor fetched from a host listener through the bridge gateway (containment finding 9). With the option set, the witness reached none of the host's addresses and still reached the target. `createCaseNetwork` also refuses a network whose subnet contains an address of any host interface.
+The `inhibit_ipv4` option matters. On a plain `--internal` network a witness under gVisor fetched from a host listener through the bridge gateway (containment finding 9). With the option set, the witness reached none of the host's addresses and still reached the target. IPv6 is turned off so the same gateway cannot come back as an IPv6 address on hosts where Docker enables IPv6 by default. `createCaseNetwork` also refuses a network whose subnet contains an address of any host interface, IPv4 or IPv6 (an IPv4-mapped IPv6 address counts as the IPv4 address it carries).
 
 Names did not resolve through Docker's embedded DNS under gVisor (observed 2026-11-14; the lookup timed out), so the target is named through `/etc/hosts` (`--add-host target:<ip>`). The jail also gets `--dns-search .`, so the host's search domains, which can name a private network, are not copied in.
 
-Connections inside the case subnet are the witness doing its job and are not egress. Everything else that is not loopback is counted by the trace parser as an egress attempt and fails `no-egress`.
+Connections inside the case subnet are the witness doing its job and are not egress. Everything else that is not loopback is counted by the trace parser as an egress attempt and fails `no-egress`. Docker's embedded DNS resolver on `127.0.0.11` is the exception to the loopback rule: it forwards queries to the host's resolvers, so a DNS query is a channel out, and any connect or send to it counts as egress even if the lookup times out. A witness has no reason to use DNS, since the target is in `/etc/hosts`.
 
 ## The harness and the witness format (until L2-05)
 

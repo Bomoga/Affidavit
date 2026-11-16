@@ -19,6 +19,19 @@ export interface TargetProvider {
   endpoint(req: ExecutionRequest): Promise<TargetEndpoint | null>;
 }
 
+/**
+ * Cuts `s` to at most `maxBytes` UTF-8 bytes without splitting a character, so output handed to
+ * the Judge never exceeds its `maxOutputBytes` (the sandbox runner's own capture cap is larger).
+ */
+export function capUtf8(s: string, maxBytes: number): string {
+  const buf = Buffer.from(s, 'utf8');
+  if (buf.length <= maxBytes) return s;
+  let end = Math.max(0, maxBytes);
+  // Step back over continuation bytes (10xxxxxx) so the cut lands on a character boundary.
+  while (end > 0 && ((buf[end] ?? 0) & 0xc0) === 0x80) end--;
+  return buf.subarray(0, end).toString('utf8');
+}
+
 export const NO_TARGET: TargetProvider = { endpoint: () => Promise.resolve(null) };
 
 export interface JailExecutorOptions extends WitnessJailOptions {
@@ -54,8 +67,8 @@ export class JailExecutor implements WitnessExecutor {
       timedOut: jailed.timedOut,
       oomKilled: jailed.oomKilled,
       durationMs: jailed.durationMs,
-      stdout: jailed.stdout,
-      stderr: jailed.stderr,
+      stdout: capUtf8(jailed.stdout, req.maxOutputBytes),
+      stderr: capUtf8(jailed.stderr, req.maxOutputBytes),
       egressAttempts: jailed.trace.egressAttempts,
       traceTampered: jailed.trace.tampered,
       artifact,

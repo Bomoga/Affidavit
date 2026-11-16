@@ -3,7 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { networkInterfaces } from 'node:os';
 import { promisify } from 'node:util';
 import { CASE_NETWORK, PLAIN_RUNTIME, RUN_LABEL, buildGvisorRunArgs, type Limits } from './args.js';
-import { inCidr, ipv4ToInt, isIpv4Cidr } from './cidr.js';
+import { inCidr, inCidr6, ipv4ToInt, isIpv4Cidr, isIpv6Cidr, mappedIpv4 } from './cidr.js';
 import type { Mount } from './mounts.js';
 
 const exec = promisify(execFile);
@@ -12,6 +12,8 @@ const exec = promisify(execFile);
  * A per-case network: the target and the witness share it, and nothing else is on it.
  *
  * - `--internal`: no route out of the network.
+ * - `--ipv6=false`, checked after creation: IPv6 is off and every subnet is IPv4, so the
+ *   `inhibit_ipv4` guarantee below cannot be sidestepped through an IPv6 gateway on the bridge.
  * - `inhibit_ipv4`: the host bridge gets no IPv4 address. Without this, an internal network still
  *   reaches the host through the bridge gateway address (verified 2026-11-14: a witness on a
  *   plain `--internal` network reached a host listener on 172.18.0.1), and with it every host
@@ -24,18 +26,51 @@ export interface CaseNetwork {
   subnet: string;
 }
 
-/** Fails unless no host interface has an address inside `subnet`. */
+/**
+ * Fails unless no host interface has an address inside `subnet`, IPv4 or IPv6. An IPv4-mapped
+ * IPv6 host address (`::ffff:a.b.c.d`) is checked as the IPv4 address it carries. A subnet that
+ * is neither an IPv4 nor an IPv6 CIDR is refused, so a malformed answer never passes.
+ */
 export function assertHostNotOnSubnet(
   subnet: string,
   interfaces: ReturnType<typeof networkInterfaces> = networkInterfaces(),
 ): void {
+  const v4 = isIpv4Cidr(subnet);
+  if (!v4 && !isIpv6Cidr(subnet)) throw new Error(`not a CIDR subnet: ${subnet}`);
   for (const [name, addrs] of Object.entries(interfaces)) {
     for (const a of addrs ?? []) {
-      if (a.family === 'IPv4' && inCidr(a.address, subnet)) {
+      // Older Node versions report the family as a number.
+      const family = String(a.family);
+      let inside: boolean;
+      if (family === 'IPv4' || family === '4') {
+        inside = v4 && inCidr(a.address, subnet);
+      } else if (family === 'IPv6' || family === '6') {
+        const mapped = mappedIpv4(a.address);
+        inside = v4 ? mapped !== null && inCidr(mapped, subnet) : inCidr6(a.address, subnet);
+      } else {
+        throw new Error(`host interface ${name} has an address of unknown family ${family}`);
+      }
+      if (inside) {
         throw new Error(`host interface ${name} has ${a.address} inside case network ${subnet}`);
       }
     }
   }
+}
+
+/**
+ * Checks `docker network inspect` output for a case network: internal, IPv6 disabled, and every
+ * subnet IPv4. Returns the IPv4 subnets. Format: `<Internal> <EnableIPv6> <subnet>...`.
+ */
+export function parseCaseNetworkInspect(name: string, stdout: string): string[] {
+  const [internal, ipv6, ...subnets] = stdout.trim().split(/\s+/);
+  if (internal !== 'true') throw new Error(`network ${name} is not internal: ${stdout.trim()}`);
+  if (ipv6 !== 'false') throw new Error(`network ${name} has IPv6 enabled: ${stdout.trim()}`);
+  if (subnets.length === 0) throw new Error(`network ${name} has no subnet: ${stdout.trim()}`);
+  const bad = subnets.filter((s) => !isIpv4Cidr(s));
+  if (bad.length > 0) {
+    throw new Error(`network ${name} has a subnet that is not IPv4: ${bad.join(', ')}`);
+  }
+  return subnets;
 }
 
 export async function createCaseNetwork(): Promise<CaseNetwork> {
@@ -47,6 +82,7 @@ export async function createCaseNetwork(): Promise<CaseNetwork> {
     '--driver',
     'bridge',
     '--internal',
+    '--ipv6=false',
     '--opt',
     'com.docker.network.bridge.inhibit_ipv4=true',
     '--label',
@@ -58,14 +94,14 @@ export async function createCaseNetwork(): Promise<CaseNetwork> {
       'network',
       'inspect',
       '--format',
-      '{{.Internal}} {{range .IPAM.Config}}{{.Subnet}} {{end}}',
+      '{{.Internal}} {{.EnableIPv6}} {{range .IPAM.Config}}{{.Subnet}} {{end}}',
       name,
     ]);
-    const [internal, ...subnets] = stdout.trim().split(/\s+/);
-    const subnet = subnets.find(isIpv4Cidr);
-    if (internal !== 'true' || subnet === undefined) {
-      throw new Error(`network ${name} is not internal or has no IPv4 subnet: ${stdout.trim()}`);
+    const subnets = parseCaseNetworkInspect(name, stdout);
+    if (subnets.length !== 1) {
+      throw new Error(`network ${name} has more than one subnet: ${subnets.join(', ')}`);
     }
+    const subnet = subnets[0] ?? '';
     assertHostNotOnSubnet(subnet);
     return { name, runId, subnet };
   } catch (err) {
@@ -79,7 +115,7 @@ export async function removeCaseNetwork(net: CaseNetwork): Promise<void> {
   const filter = `label=${RUN_LABEL}=${net.runId}`;
   const { stdout } = await exec('docker', ['ps', '--all', '--quiet', '--filter', filter]);
   const ids = stdout.split('\n').filter((l) => l !== '');
-  if (ids.length > 0) await exec('docker', ['rm', '--force', ...ids]);
+  if (ids.length > 0) await exec('docker', ['rm', '--force', '--volumes', ...ids]);
   await exec('docker', ['network', 'rm', net.name]).catch(() => undefined);
   const left = await exec('docker', ['network', 'ls', '--quiet', '--filter', filter]);
   if (left.stdout.trim() !== '') throw new Error(`network ${net.name} was left behind`);

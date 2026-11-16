@@ -49,6 +49,23 @@ describe('parseTrace: egress', () => {
     expect(t.egressAttempts).toBe(0);
   });
 
+  it("counts a DNS query to Docker's embedded resolver as egress, though it is on loopback", () => {
+    const local = { sensitivePaths: [], localNetworks: ['172.18.0.0/16'] };
+    const t = parseTrace(
+      [
+        exit(
+          'sendto(0x15 socket:[4], 0x7f00 "q", 0x1, 0x0, 0x7f10 {Family: AF_INET, Addr: 127.0.0.11, Port: 53}, 0x10)',
+          '1 (0x1)',
+        ),
+        exit(connect('AF_INET', '127.0.0.11', 53), OK),
+        exit(connect('AF_INET6', '::ffff:127.0.0.11', 53), OK),
+        exit(connect('AF_INET', '127.0.0.1', 53), OK),
+      ].join('\n'),
+      local,
+    );
+    expect(t.egressAttempts).toBe(3);
+  });
+
   it('does not count connects inside the case network, but counts everything else', () => {
     const local = { sensitivePaths: [], localNetworks: ['172.18.0.0/16'] };
     const t = parseTrace(
