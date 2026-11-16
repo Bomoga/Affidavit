@@ -41,7 +41,7 @@ pnpm --filter @affidavit/sandbox containment         # must show 8 of 8
 | `--pids-limit 256`, `--cpus 1`, `--ulimit nofile=1024:1024`                        | Bounded resources                                                                                              |
 | `--log-driver none`                                                                | Output is captured by the runner (capped at 2 MiB per stream), not stored by Docker                            |
 | `--label affidavit.sandbox.run=<id>`                                               | Teardown check: after every run, `docker ps -a` filtered by that label must be empty                           |
-| Image pinned by `@sha256`                                                          | Unpinned images are refused                                                                                    |
+| Image pinned by `@sha256` digest or local image ID (`sha256:...`)                  | Unpinned images are refused; both are content hashes                                                           |
 
 Mounts go through `validateMounts` (`mounts.ts`) and are passed with `--mount`, never `-v`:
 

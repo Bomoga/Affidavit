@@ -55,6 +55,7 @@ export class JailExecutor implements WitnessExecutor {
           schemaVersion: 1,
           params: req.params,
           target: endpoint === null ? null : { url: endpoint.url },
+          testTimeoutMs: req.timeoutMs,
         },
         timeoutMs: req.timeoutMs,
         network: endpoint === null ? undefined : { net: endpoint.net, hosts: endpoint.hosts },
