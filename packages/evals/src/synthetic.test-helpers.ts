@@ -66,7 +66,7 @@ export function makeRun(opts: {
     manifest: {
       runId,
       startedAt: 'synthetic',
-      labelsSource: { kind: opts.kind ?? 'corpus', ref: 'in-test' },
+      labelsSource: { kind: opts.kind ?? 'synthetic', ref: 'in-test' },
       modelIds: {},
       promptVersions: {},
     },

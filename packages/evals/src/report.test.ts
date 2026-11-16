@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { computeReport } from './calibration.js';
+import { asRunId, computeReport } from './calibration.js';
 import { renderReport } from './report.js';
-import { makeRun, replay } from './test-helpers.js';
+import { makeRun, replay } from './synthetic.test-helpers.js';
 
 const EM_DASH = '—';
 
@@ -30,6 +30,7 @@ describe('renderReport', () => {
 
   it('prints numbers with run ids for corpus labels, and says when the jury does not beat the baseline', () => {
     const run = makeRun({
+      kind: 'corpus',
       runId: 'run-abc',
       labels: [
         ['a', 'proven-fixed'],
@@ -54,6 +55,7 @@ describe('renderReport', () => {
 
   it('claims a win only when supported', () => {
     const run = makeRun({
+      kind: 'corpus',
       runId: 'run-win',
       labels: [
         ['a', 'proven-fixed'],
@@ -74,8 +76,53 @@ describe('renderReport', () => {
         ['d', 'not-proven'],
       ],
     });
-    const report = computeReport(run);
+    expect(computeReport(run).juryVsBaseline).toBe('undetermined');
+    const report = computeReport(run, { minCases: 1 });
     expect(report.juryVsBaseline).toBe('supported');
-    expect(renderReport(report)).toContain('Both conditions held');
+    const md = renderReport(report);
+    expect(md).toContain('Both conditions held');
+    expect(md).toContain('Minimum cases before a win may be claimed: 1');
+  });
+
+  it('says undetermined, not "does not beat", when wrong-case votes cannot be assessed', () => {
+    const run = makeRun({
+      kind: 'corpus',
+      runId: 'run-none',
+      labels: [['a', 'proven-fixed']],
+      replays: [replay('a', 'proven-fixed', ['low', 'high'])],
+      baseline: [['a', 'not-proven']],
+    });
+    const md = renderReport(computeReport(run, { minCases: 1 }));
+    expect(md).toContain('The comparison is undetermined');
+    expect(md).not.toContain('does not beat');
+  });
+
+  it('renders the placeholder for a metric tagged with another run id', () => {
+    const run = makeRun({
+      kind: 'corpus',
+      runId: 'run-mine',
+      labels: [['a', 'proven-fixed']],
+      replays: [replay('a', 'proven-fixed', ['low', 'high'], 1)],
+    });
+    const report = computeReport(run);
+    const foreign = { ...report.juryAccuracy };
+    if (foreign.status !== 'measured') throw new Error('expected measured');
+    const tampered = { ...report, juryAccuracy: { ...foreign, runId: asRunId('run-other') } };
+    const md = renderReport(tampered);
+    expect(md).toContain('- Jury: [metric]');
+    expect(md).not.toContain('run-other');
+  });
+
+  it('notes that cost per verdict excludes escalated and dismissed spend', () => {
+    const run = makeRun({
+      kind: 'corpus',
+      runId: 'run-cost',
+      labels: [],
+      replays: [replay('a', 'proven-fixed', [], 2), replay('b', 'escalated', [], 6, false)],
+    });
+    const md = renderReport(computeReport(run));
+    expect(md).toContain('Cost per verdict: $2.0000');
+    expect(md).toContain('Cost per case: $4.0000');
+    expect(md).toContain('excluded');
   });
 });

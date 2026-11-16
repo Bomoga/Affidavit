@@ -19,6 +19,7 @@ export type ReplayErrorCode =
   | 'illegal-transition'
   | 'stage-mismatch'
   | 'event-after-terminal'
+  | 'verdict-outcome-mismatch'
   | 'no-terminal-event';
 
 export class ReplayError extends Error {
@@ -53,15 +54,58 @@ export interface ReplayResult {
   costRows: StageCost[];
   /** Sum of `costRows`. */
   cost: CostTotals;
+  /** From an `escalated` event only. */
   escalation?: Escalation;
+  /** From a mid-stream `budget-exhausted` event; not by itself an escalation. */
+  budgetExhausted?: Escalation;
   dismissal?: Dismissal;
   eventCount: number;
 }
 
 type Parsed = ReturnType<typeof TrialEvent.parse>;
 
+/**
+ * Terminal status comes from the event type, not from the event's stage field: escalated and
+ * dismissed events may carry the stage the case was in when it ended. A verdict-written event
+ * may follow an escalated or dismissed event as the final event, and must then agree with it.
+ */
 function isTerminal(e: Parsed): boolean {
   return e.type === 'verdict-written' || e.type === 'escalated' || e.type === 'dismissed';
+}
+
+/** Payload case ids must match the stream's case. Dismissal carries no case id to check. */
+function checkEventCase(e: Parsed, caseId: CaseId, index: number): void {
+  const payloadCase =
+    e.type === 'verdict-written'
+      ? e.payload.verdict.caseId
+      : e.type === 'escalated' || e.type === 'budget-exhausted'
+        ? e.payload.escalation.caseId
+        : undefined;
+  if (payloadCase !== undefined && payloadCase !== caseId) {
+    throw new ReplayError('case-mismatch', index, `event ${index} payload belongs to another case`);
+  }
+}
+
+/** A verdict that says escalated or dismissed needs the matching terminal event before it. */
+function checkClosingVerdict(
+  prev: Parsed | undefined,
+  cur: Extract<Parsed, { type: 'verdict-written' }>,
+  index: number,
+): void {
+  const outcome = cur.payload.verdict.outcome;
+  const expectedPrev =
+    prev?.type === 'escalated' ? 'escalated' : prev?.type === 'dismissed' ? 'dismissed' : undefined;
+  const ok =
+    expectedPrev !== undefined
+      ? outcome === expectedPrev
+      : outcome !== 'escalated' && outcome !== 'dismissed';
+  if (!ok) {
+    throw new ReplayError(
+      'verdict-outcome-mismatch',
+      index,
+      `event ${index} writes outcome ${outcome} but the preceding event is ${prev?.type ?? 'absent'}`,
+    );
+  }
 }
 
 function checkStages(prev: Parsed, cur: Parsed, index: number): void {
@@ -140,15 +184,20 @@ export function replayEvents(raw: readonly unknown[]): ReplayResult {
         `event ${index} exits ${cur.stage} to ${cur.payload.to}, which is not a legal transition`,
       );
     }
+    checkEventCase(cur, first.caseId, index);
+    if (cur.type === 'verdict-written') checkClosingVerdict(prev, cur, index);
     if (prev !== undefined) {
-      if (isTerminal(prev)) {
+      const closing =
+        cur.type === 'verdict-written' && (prev.type === 'escalated' || prev.type === 'dismissed');
+      if (isTerminal(prev) && !closing) {
         throw new ReplayError(
           'event-after-terminal',
           index,
           `event ${index} follows a terminal event`,
         );
       }
-      checkStages(prev, cur, index);
+      // A closing verdict is written after the case ended, so its stage is not a transition.
+      if (!closing) checkStages(prev, cur, index);
     }
     prev = cur;
   }
@@ -166,13 +215,15 @@ export function replayEvents(raw: readonly unknown[]): ReplayResult {
   const ballotEvents: Ballot[] = [];
   const submitted: ExhibitId[] = [];
   let escalation: Escalation | undefined;
+  let budgetExhausted: Escalation | undefined;
+  let dismissal: Dismissal | undefined;
   for (const e of events) {
     if (e.type === 'cost-charged') costRows.push(e.payload.cost);
     else if (e.type === 'ballot-cast') ballotEvents.push(e.payload.ballot);
     else if (e.type === 'exhibit-submitted') submitted.push(e.payload.exhibitId);
-    else if (e.type === 'escalated' || e.type === 'budget-exhausted') {
-      escalation = e.payload.escalation;
-    }
+    else if (e.type === 'escalated') escalation = e.payload.escalation;
+    else if (e.type === 'budget-exhausted') budgetExhausted = e.payload.escalation;
+    else if (e.type === 'dismissed') dismissal = e.payload.dismissal;
   }
   const cost = costRows.reduce<CostTotals>(
     (t, c) => ({
@@ -184,7 +235,12 @@ export function replayEvents(raw: readonly unknown[]): ReplayResult {
     { inputTokens: 0, outputTokens: 0, usd: 0, wallMs: 0 },
   );
 
-  const base = { caseId: last.caseId, costRows, cost, eventCount: events.length };
+  const extras = {
+    ...(escalation !== undefined ? { escalation } : {}),
+    ...(budgetExhausted !== undefined ? { budgetExhausted } : {}),
+    ...(dismissal !== undefined ? { dismissal } : {}),
+  };
+  const base = { caseId: last.caseId, costRows, cost, eventCount: events.length, ...extras };
   if (last.type === 'verdict-written') {
     const verdict = last.payload.verdict;
     return {
@@ -193,23 +249,12 @@ export function replayEvents(raw: readonly unknown[]): ReplayResult {
       verdict,
       exhibits: [...verdict.exhibits],
       ballots: [...verdict.ballots],
-      ...(escalation !== undefined ? { escalation } : {}),
-    };
-  }
-  if (last.type === 'dismissed') {
-    return {
-      ...base,
-      outcome: 'dismissed',
-      exhibits: submitted,
-      ballots: ballotEvents,
-      dismissal: last.payload.dismissal,
     };
   }
   return {
     ...base,
-    outcome: 'escalated',
+    outcome: last.type === 'dismissed' ? 'dismissed' : 'escalated',
     exhibits: submitted,
     ballots: ballotEvents,
-    ...(escalation !== undefined ? { escalation } : {}),
   };
 }

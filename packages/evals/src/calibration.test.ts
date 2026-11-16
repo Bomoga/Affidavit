@@ -12,7 +12,7 @@ import {
   tagReplay,
   type Metric,
 } from './calibration.js';
-import { makeRun, replay } from './test-helpers.js';
+import { makeRun, replay } from './synthetic.test-helpers.js';
 
 const value = (m: Metric): number => {
   if (m.status !== 'measured') throw new Error(`unmeasured: ${m.reason}`);
@@ -138,6 +138,69 @@ describe('juror agreement and correlation', () => {
   });
 });
 
+describe('correlation robustness', () => {
+  type V = 'low' | 'medium' | 'high' | 'critical';
+  const runOf = (cases: V[][]) =>
+    makeRun({
+      labels: [],
+      replays: cases.map((v, i) => replay(`c${i}`, 'proven-fixed', v)),
+    });
+
+  it('is unmeasured for constant votes (identical pairs, float residue)', () => {
+    const run = runOf(Array.from({ length: 7 }, () => ['medium', 'medium', 'medium'] as V[]));
+    expect(jurorCorrelation(run).status).toBe('unmeasured');
+    const three = runOf([
+      ['medium', 'medium'],
+      ['medium', 'medium'],
+      ['medium', 'medium'],
+    ]);
+    expect(jurorCorrelation(three).status).toBe('unmeasured');
+  });
+
+  it('does not depend on juror order', () => {
+    const cases: V[][] = [
+      ['low', 'low', 'high'],
+      ['high', 'critical', 'medium'],
+      ['medium', 'low', 'low'],
+      ['critical', 'high', 'high'],
+    ];
+    const base = jurorCorrelation(runOf(cases));
+    const swapped = jurorCorrelation(runOf(cases.map((c) => [...c].reverse())));
+    const rotated = jurorCorrelation(runOf(cases.map((c) => [c[1], c[2], c[0]] as V[])));
+    expect(base.status).toBe('measured');
+    expect(value(swapped)).toBeCloseTo(value(base));
+    expect(value(rotated)).toBeCloseTo(value(base));
+  });
+
+  it('reports n as unordered pairs', () => {
+    const m = jurorCorrelation(
+      runOf([
+        ['low', 'high', 'critical'],
+        ['low', 'low', 'high'],
+      ]),
+    );
+    expect(m.status === 'measured' && m.n).toBe(6);
+  });
+
+  it('rejects duplicate case ids', () => {
+    expect(() =>
+      makeRun({
+        labels: [
+          ['a', 'proven-fixed'],
+          ['a', 'not-proven'],
+        ],
+        replays: [],
+      }),
+    ).toThrow(/duplicate caseId/);
+    expect(() =>
+      makeRun({
+        labels: [],
+        replays: [replay('a', 'proven-fixed', []), replay('a', 'proven-fixed', [])],
+      }),
+    ).toThrow(/duplicate caseId/);
+  });
+});
+
 describe('cost per verdict', () => {
   it('averages usd over replays with a verdict only', () => {
     const run = makeRun({
@@ -165,20 +228,35 @@ describe('compareToBaseline', () => {
     synthetic,
   });
 
+  const policy = { maxWrongCaseCorrelation: 0.5, minCases: 10 };
+  const none: Metric = { status: 'unmeasured', reason: 'x' };
+
   it('supports only when accuracy is higher and wrong-case correlation is low', () => {
-    expect(compareToBaseline(m(0.9), m(0.8), m(0.2), 0.5)).toBe('supported');
-    expect(compareToBaseline(m(0.9), m(0.8), m(0.9), 0.5)).toBe('not-supported');
-    expect(compareToBaseline(m(0.9), m(0.8), { status: 'unmeasured', reason: 'x' }, 0.5)).toBe(
-      'not-supported',
+    expect(compareToBaseline(m(0.9), m(0.8), m(0.2), policy)).toBe('supported');
+    expect(compareToBaseline(m(0.9), m(0.8), m(0.9), policy)).toBe('not-supported');
+    expect(compareToBaseline(m(0.7), m(0.8), m(0.1), policy)).toBe('not-supported');
+  });
+
+  it('is undetermined when wrong-case correlation cannot be measured or n is small', () => {
+    expect(compareToBaseline(m(0.9), m(0.8), none, policy)).toBe('undetermined');
+    expect(compareToBaseline(m(0.9), m(0.8), m(0.1), { ...policy, minCases: 11 })).toBe(
+      'undetermined',
     );
-    expect(compareToBaseline(m(0.7), m(0.8), m(0.1), 0.5)).toBe('not-supported');
   });
 
   it('is unmeasured for synthetic or missing inputs', () => {
-    expect(compareToBaseline(m(0.9, true), m(0.8), m(0.1), 0.5)).toBe('unmeasured');
-    expect(compareToBaseline(m(0.9), { status: 'unmeasured', reason: 'x' }, m(0.1), 0.5)).toBe(
-      'unmeasured',
-    );
+    expect(compareToBaseline(m(0.9, true), m(0.8), m(0.1), policy)).toBe('unmeasured');
+    expect(compareToBaseline(m(0.9), none, m(0.1), policy)).toBe('unmeasured');
+  });
+
+  it('reports undetermined when the jury makes no errors', () => {
+    const run = makeRun({
+      kind: 'corpus',
+      labels: [['a', 'proven-fixed']],
+      replays: [replay('a', 'proven-fixed', ['low', 'high'])],
+      baseline: [['a', 'not-proven']],
+    });
+    expect(computeReport(run, { minCases: 1 }).juryVsBaseline).toBe('undetermined');
   });
 
   it('computeReport marks synthetic runs unmeasured end to end', () => {

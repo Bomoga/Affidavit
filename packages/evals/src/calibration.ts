@@ -53,7 +53,18 @@ export interface EvalRun {
   baseline: readonly BaselineDecision[];
 }
 
-/** Builds a run; refuses any replay or baseline row that carries a different run id. */
+function assertUnique(what: string, ids: readonly CaseId[]): void {
+  const seen = new Set<string>();
+  for (const id of ids) {
+    if (seen.has(id)) throw new Error(`duplicate caseId ${id} in ${what}`);
+    seen.add(id);
+  }
+}
+
+/**
+ * Builds a run; refuses any replay or baseline row that carries a different run id, and any
+ * duplicate caseId within replays, labels or baseline.
+ */
 export function createEvalRun(input: {
   manifest: RunManifest;
   labels: readonly CaseLabel[];
@@ -65,6 +76,18 @@ export function createEvalRun(input: {
     throw new Error('manifest.runId is required');
   }
   const baseline = input.baseline ?? [];
+  assertUnique(
+    'replays',
+    input.replays.map((r) => r.result.caseId),
+  );
+  assertUnique(
+    'labels',
+    input.labels.map((l) => l.caseId),
+  );
+  assertUnique(
+    'baseline',
+    baseline.map((b) => b.caseId),
+  );
   for (const r of input.replays) {
     if (r.runId !== runId)
       throw new Error(`replay for ${r.result.caseId} is tagged ${r.runId}, not ${runId}`);
@@ -133,14 +156,21 @@ const ORDINAL: Record<Ballot['question'], readonly string[]> = {
   'evidence-sufficiency': ['insufficient', 'sufficient'],
 };
 
-/** Votes mapped onto [0, 1] so questions with different scales can be pooled. */
-function numericVote(b: Ballot): number {
-  const scale = ORDINAL[b.question];
-  const i = scale.indexOf(b.vote);
-  return scale.length > 1 ? i / (scale.length - 1) : 0;
+function voteIndex(b: Ballot): number {
+  return ORDINAL[b.question].indexOf(b.vote);
 }
 
+/** Votes mapped onto [0, 1] so questions with different scales can be pooled. */
+function numericVote(b: Ballot): number {
+  const len = ORDINAL[b.question].length;
+  return len > 1 ? voteIndex(b) / (len - 1) : 0;
+}
+
+/** One unordered juror pair on one question. */
 interface PairObs {
+  question: Ballot['question'];
+  ia: number;
+  ib: number;
   a: number;
   b: number;
   agree: boolean;
@@ -158,7 +188,14 @@ function pairObservations(run: EvalRun, onlyWrong: boolean): PairObs[] {
         const y = ballots[j];
         if (x === undefined || y === undefined) continue;
         if (x.jurorId === y.jurorId || x.question !== y.question) continue;
-        obs.push({ a: numericVote(x), b: numericVote(y), agree: x.vote === y.vote });
+        obs.push({
+          question: x.question,
+          ia: voteIndex(x),
+          ib: voteIndex(y),
+          a: numericVote(x),
+          b: numericVote(y),
+          agree: x.vote === y.vote,
+        });
       }
     }
   }
@@ -172,23 +209,43 @@ export function jurorAgreement(run: EvalRun, opts: { onlyWrong?: boolean } = {})
   return measured(run, obs.filter((o) => o.agree).length / obs.length, obs.length);
 }
 
-/** Pearson correlation of paired votes; unmeasured when either side has no variance. */
+/**
+ * Symmetric (intraclass style) Pearson correlation of paired votes. Jurors are treated as
+ * exchangeable raters, so every unordered pair counts in both orders and the result does not
+ * depend on juror order. Each vote is centred on its question's mean before pooling, so
+ * differences between questions do not inflate r. `n` is the number of unordered pairs.
+ * Unmeasured when votes are constant (checked on the raw votes, not on float residue).
+ */
 export function jurorCorrelation(run: EvalRun, opts: { onlyWrong?: boolean } = {}): Metric {
   const obs = pairObservations(run, opts.onlyWrong ?? false);
   if (obs.length < 2) return unmeasured('fewer than two juror pairs');
-  const n = obs.length;
-  const ma = obs.reduce((s, o) => s + o.a, 0) / n;
-  const mb = obs.reduce((s, o) => s + o.b, 0) / n;
-  let cov = 0;
-  let va = 0;
-  let vb = 0;
+  const distinct = new Map<Ballot['question'], Set<number>>();
+  const sums = new Map<Ballot['question'], { total: number; count: number }>();
   for (const o of obs) {
-    cov += (o.a - ma) * (o.b - mb);
-    va += (o.a - ma) ** 2;
-    vb += (o.b - mb) ** 2;
+    const set = distinct.get(o.question) ?? new Set<number>();
+    set.add(o.ia).add(o.ib);
+    distinct.set(o.question, set);
+    const s = sums.get(o.question) ?? { total: 0, count: 0 };
+    s.total += o.a + o.b;
+    s.count += 2;
+    sums.set(o.question, s);
   }
-  if (va === 0 || vb === 0) return unmeasured('votes have no variance');
-  return measured(run, cov / Math.sqrt(va * vb), n);
+  if ([...distinct.values()].every((s) => s.size <= 1)) {
+    return unmeasured('votes have no variance');
+  }
+  let cov = 0;
+  let variance = 0;
+  for (const o of obs) {
+    const s = sums.get(o.question);
+    if (s === undefined) continue;
+    const mean = s.total / s.count;
+    const ca = o.a - mean;
+    const cb = o.b - mean;
+    cov += 2 * ca * cb;
+    variance += ca * ca + cb * cb;
+  }
+  if (variance < 1e-12) return unmeasured('votes have no variance');
+  return measured(run, Math.max(-1, Math.min(1, cov / variance)), obs.length);
 }
 
 /** Mean USD over replays that ended in a written verdict. */
@@ -199,7 +256,23 @@ export function costPerVerdict(run: EvalRun): Metric {
   return measured(run, total / withVerdict.length, withVerdict.length);
 }
 
-export type JuryVsBaseline = 'supported' | 'not-supported' | 'unmeasured';
+/** Mean USD over every replay, including escalated and dismissed cases. */
+export function costPerCase(run: EvalRun): Metric {
+  if (run.replays.length === 0) return unmeasured('no replays');
+  const total = run.replays.reduce((s, r) => s + r.result.cost.usd, 0);
+  return measured(run, total / run.replays.length, run.replays.length);
+}
+
+export type JuryVsBaseline = 'supported' | 'not-supported' | 'undetermined' | 'unmeasured';
+
+/** Policy parameters for the jury-versus-baseline call. These are choices, not measurements. */
+export interface ComparisonPolicy {
+  maxWrongCaseCorrelation: number;
+  /** Minimum cases (and juror pairs on wrong cases) before `supported` may be claimed. */
+  minCases: number;
+}
+
+export const DEFAULT_POLICY: ComparisonPolicy = { maxWrongCaseCorrelation: 0.5, minCases: 10 };
 
 export interface CalibrationReport {
   manifest: RunManifest;
@@ -209,32 +282,42 @@ export interface CalibrationReport {
   correlationAll: Metric;
   agreementWrong: Metric;
   correlationWrong: Metric;
+  /** Excludes spend on cases that ended without a written verdict. */
   costPerVerdict: Metric;
+  /** Includes every case. */
+  costPerCase: Metric;
   juryVsBaseline: JuryVsBaseline;
-  /** Policy parameter used for `juryVsBaseline`, not a measurement. */
-  maxWrongCaseCorrelation: number;
+  policy: ComparisonPolicy;
 }
 
 /**
  * The jury is only said to beat the baseline when accuracy is higher AND wrong-case juror
  * correlation is measured and at or below the cap. Anything not measured on real labels is
- * `unmeasured`; anything measured but short of both conditions is `not-supported`.
+ * `unmeasured`; lower accuracy, or high correlation, is `not-supported`; independence that
+ * cannot be assessed or too small a sample is `undetermined`.
  */
 export function compareToBaseline(
   jury: Metric,
   baseline: Metric,
   wrongCorrelation: Metric,
-  maxWrongCaseCorrelation: number,
+  policy: ComparisonPolicy,
 ): JuryVsBaseline {
   const real = (m: Metric): m is Extract<Metric, { status: 'measured' }> =>
     m.status === 'measured' && !m.synthetic;
   if (!real(jury) || !real(baseline)) return 'unmeasured';
   if (jury.value <= baseline.value) return 'not-supported';
-  if (!real(wrongCorrelation)) return 'not-supported';
-  return wrongCorrelation.value <= maxWrongCaseCorrelation ? 'supported' : 'not-supported';
+  // Accuracy is higher, so the verdict now rests on juror independence. If that cannot be
+  // assessed (for example the jury made no errors) or the sample is small, say undetermined.
+  if (!real(wrongCorrelation)) return 'undetermined';
+  if (jury.n < policy.minCases || wrongCorrelation.n < policy.minCases) return 'undetermined';
+  return wrongCorrelation.value <= policy.maxWrongCaseCorrelation ? 'supported' : 'not-supported';
 }
 
-export function computeReport(run: EvalRun, maxWrongCaseCorrelation = 0.5): CalibrationReport {
+export function computeReport(
+  run: EvalRun,
+  policyOverride: Partial<ComparisonPolicy> = {},
+): CalibrationReport {
+  const policy: ComparisonPolicy = { ...DEFAULT_POLICY, ...policyOverride };
   const jury = juryAccuracy(run);
   const baseline = baselineAccuracy(run);
   const correlationWrong = jurorCorrelation(run, { onlyWrong: true });
@@ -247,7 +330,8 @@ export function computeReport(run: EvalRun, maxWrongCaseCorrelation = 0.5): Cali
     agreementWrong: jurorAgreement(run, { onlyWrong: true }),
     correlationWrong,
     costPerVerdict: costPerVerdict(run),
-    juryVsBaseline: compareToBaseline(jury, baseline, correlationWrong, maxWrongCaseCorrelation),
-    maxWrongCaseCorrelation,
+    costPerCase: costPerCase(run),
+    juryVsBaseline: compareToBaseline(jury, baseline, correlationWrong, policy),
+    policy,
   };
 }
