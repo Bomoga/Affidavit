@@ -7,7 +7,7 @@ type Mount = Parameters<ToolRunnerPort['run']>[2][number];
 export interface ToolRunOptions {
   /**
    * Host path of the scan snapshot: a private copy of the repo, quarantined with
-   * quarantineToolControlPaths. Mounted read-only at /src.
+   * quarantineSnapshot. Mounted read-only at /src.
    */
   sourceDir: string;
   /** Host path for results. Mounted writable at /out. Use a new directory per run. */
@@ -91,7 +91,7 @@ function configMount(o: ToolRunOptions): Mount {
  * repo-controlled knob that has an off switch is switched off here (ignore files, inline
  * suppressions, per-repo configs), and our own config is always passed explicitly. What has no
  * flag (git metadata, .gitleaksignore and friends) is removed from the snapshot by
- * quarantineToolControlPaths, which runTool enforces.
+ * quarantineSnapshot, which runTool enforces.
  *
  * Network is never needed: the jail denies egress and every tool is invoked in its offline mode.
  */
@@ -169,6 +169,9 @@ export function buildInvocation(
           // Call analysis would run the Go toolchain (and Rust build scripts) on repo content, and
           // can mark findings "uncalled". Reachability is decided elsewhere, never by this flag.
           '--no-call-analysis=all',
+          // List every parsed package, so each lockfile that parsed shows up as a source in the
+          // report and runTool can tell which lockfiles did not.
+          '--all-packages',
           '--format',
           'json',
           '--output-file',

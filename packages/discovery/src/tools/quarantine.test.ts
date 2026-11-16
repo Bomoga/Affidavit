@@ -8,7 +8,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { ToolRunnerPort } from '@affidavit/contracts';
 import { afterAll, describe, expect, it } from 'vitest';
 import {
@@ -188,6 +188,21 @@ describe('tool-control path quarantine', () => {
     }
   });
 
+  it('moves only .git as a directory; other control-named directories stay and are scanned', async () => {
+    const root = snapDir();
+    put(root, 'src/.gitignore/evil.js', 'eval(x)');
+    put(root, 'lib/osv-scanner.toml/package-lock.json', '{}');
+    put(root, '.git/config');
+    put(root, 'real/.gitignore');
+    const snap = await quarantineSnapshot(root);
+    expect([...snap.removed]).toEqual(['.git', 'real/.gitignore']);
+    expect(existsSync(join(root, 'src', '.gitignore', 'evil.js'))).toBe(true);
+    expect(existsSync(join(root, 'lib', 'osv-scanner.toml', 'package-lock.json'))).toBe(true);
+    // and the lockfile inside such a directory is still found for OSV
+    expect(await findOsvLockfiles(root)).toEqual(['lib/osv-scanner.toml/package-lock.json']);
+    await expect(assertSnapshotClean(root)).resolves.toBeUndefined();
+  });
+
   it('changes nothing when collection fails (two-phase)', async () => {
     const root = snapDir({ '.gitignore': 'x', 'src/app.js': 'x' });
     const taken = `${root}.quarantine`;
@@ -359,7 +374,7 @@ describe('runTool', () => {
     expect(calls[1]?.sourceHost).toBe(snap.sidecarDir);
     expect(res.reports.map((r) => r.origin)).toEqual(['snapshot', 'quarantine']);
     const mapped = readFileSync(res.reports[1]!.file, 'utf8');
-    expect(mapped).toContain('"uri":".gitignore"');
+    expect(mapped).toContain('"uri":"/src/.gitignore"');
     expect(res.quarantined).toEqual(['.gitignore']);
   });
 
@@ -396,15 +411,104 @@ describe('runTool', () => {
     expect(err).toMatchObject({ exitCode: 2, quarantined: ['.gitignore'] });
   });
 
-  it('rejects a runner that reports a different output path than it was given', async () => {
+  it('works with runners that return a fixed, unrelated output directory and ignore /out', async () => {
+    // LocalDockerToolRunner and the gVisor runner behave like this: outputPath is fixed at
+    // construction, while the tool writes into the /out mount.
+    const snap = await snapshot({ 'src/app.js': 'x', '.gitignore': 'x' });
+    const fixed = tmp();
     const { runner } = fakeRunner(
       (out) => writeFileSync(join(out, 'gitleaks.sarif'), sarif()),
       0,
-      tmp(),
+      fixed,
     );
-    await expect(runTool(runner, manifest, 'gitleaks', await options())).rejects.toBeInstanceOf(
-      ToolOutputMissingError,
+    const opts = await options(snap);
+    const res = await runTool(runner, manifest, 'gitleaks', opts);
+    expect(res.reports).toHaveLength(2); // including the quarantine pass
+    expect(res.outputPath).toBe(resolve(opts.outputDir));
+  });
+
+  it('keeps the sidecar report beside the output dir even when the path has a trailing slash', async () => {
+    const snap = await snapshot({ 'src/app.js': 'x', '.gitignore': 'x' });
+    const out = join(tmp(), 'out');
+    const { runner } = fakeRunner((o) => writeFileSync(join(o, 'gitleaks.sarif'), sarif()));
+    const res = await runTool(runner, manifest, 'gitleaks', {
+      ...(await options(snap)),
+      outputDir: `${out}/`,
+    });
+    expect(res.reports[1]?.file).toBe(join(`${out}-quarantine`, 'gitleaks.sarif'));
+  });
+
+  it('rejects a report that is not valid JSON, as truncated', async () => {
+    const { runner } = fakeRunner((out) =>
+      writeFileSync(join(out, 'gitleaks.sarif'), '{"runs":[{'),
     );
+    const err = await runTool(runner, manifest, 'gitleaks', await options()).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ToolOutputMissingError);
+    expect((err as ToolOutputMissingError).tool).toBe('gitleaks');
+  });
+
+  it('says so when the quarantine pass is the one that failed', async () => {
+    const snap = await snapshot({ 'src/app.js': 'x', '.gitignore': 'x' });
+    let n = 0;
+    const { runner } = fakeRunner((out) => {
+      if (n++ === 0) writeFileSync(join(out, 'gitleaks.sarif'), sarif());
+    });
+    const err = await runTool(runner, manifest, 'gitleaks', await options(snap)).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ToolOutputMissingError);
+    expect((err as Error).message).toMatch(/quarantine pass/);
+    expect((err as ToolOutputMissingError).quarantined).toEqual(['.gitignore']);
+  });
+
+  it('marks gitleaks partial for files it silently skips as binary, including UTF-16', async () => {
+    const snap = await snapshot({
+      'src/app.js': 'x',
+      'docs/manual.pdf': '%PDF-1.4 AFFIDAVIT_FAKE_KEY_0123456789ABCDEF',
+    });
+    writeFileSync(
+      join(snap.dir, 'src', 'utf16.txt'),
+      Buffer.from('k\0=\0"\0s\0e\0c\0"\0', 'latin1'),
+    );
+    const { runner } = fakeRunner((out) => writeFileSync(join(out, 'gitleaks.sarif'), sarif()));
+    const res = await runTool(runner, manifest, 'gitleaks', await options(snap));
+    expect(res.partial).toBe(true);
+    const messages = res.notifications.map((n) => n.message).join('\n');
+    expect(messages).toContain('/src/docs/manual.pdf');
+    expect(messages).toContain('/src/src/utf16.txt');
+    expect(messages).not.toContain('/src/src/app.js');
+  });
+
+  it('marks OSV partial when a lockfile the snapshot has is missing from the report', async () => {
+    const snap = await snapshot({ 'a/package-lock.json': '{}', 'b/yarn.lock': 'x' });
+    const report = (paths: string[]) =>
+      JSON.stringify({ results: paths.map((path) => ({ source: { path, type: 'lockfile' } })) });
+    const partial = fakeRunner(
+      (out) => writeFileSync(join(out, 'osv-scanner.json'), report(['/src/a/package-lock.json'])),
+      1,
+    );
+    const res = await runTool(partial.runner, manifest, 'osv-scanner', {
+      ...(await options(snap)),
+      osvDatabaseDir: tmp(),
+    });
+    expect(res.partial).toBe(true);
+    expect(res.notifications.map((n) => n.message).join('\n')).toContain('/src/b/yarn.lock');
+
+    const full = fakeRunner(
+      (out) =>
+        writeFileSync(
+          join(out, 'osv-scanner.json'),
+          report(['/src/a/package-lock.json', '/src/b/yarn.lock']),
+        ),
+      1,
+    );
+    const ok = await runTool(full.runner, manifest, 'osv-scanner', {
+      ...(await options(snap)),
+      osvDatabaseDir: tmp(),
+    });
+    expect(ok.partial).toBe(false);
   });
 
   it('treats OSV exit 128 as an empty result only when the snapshot has no lockfile', async () => {

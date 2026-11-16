@@ -96,7 +96,9 @@ function makeRunner(): ToolRunnerPort {
           (error, _out, stderr) => {
             const exitCode = error ? (typeof error.code === 'number' ? error.code : 1) : 0;
             stderrByImage.set(image, stderr);
-            resolve({ exitCode, outputPath: out });
+            // Like the real runners, report a directory unrelated to the /out mount.
+            void out;
+            resolve({ exitCode, outputPath: tmpdir() });
           },
         );
       });
@@ -268,6 +270,12 @@ describe.skipIf(!enabled)('tool images, offline', () => {
       join(src, 'src', 'big.js'),
       'export const run = (x) => eval(x);\n' + '// padding\n'.repeat(120_000),
     );
+    // Files gitleaks silently skips as binary-looking, with a secret inside.
+    writeFileSync(join(src, 'src', 'doc.pdf'), '%PDF-1.4\nAFFIDAVIT_FAKE_KEY_1122334455667788\n');
+    writeFileSync(
+      join(src, 'src', 'utf16.txt'),
+      Buffer.from('AFFIDAVIT_FAKE_KEY_99AABBCCDDEEFF00', 'utf16le'),
+    );
     // A secret hidden inside a gzip archive.
     writeFileSync(
       join(src, 'src', 'secret.txt.gz'),
@@ -346,7 +354,11 @@ describe.skipIf(!enabled)('tool images, offline', () => {
           )
         : sarifFindings(leaksRaw);
     expect(
-      gitignoreSource.some((f) => f.uri === '.gitignore' || f.uri.endsWith('/.gitignore')),
+      gitignoreSource.some((f) =>
+        gitignoreReport === 'quarantine'
+          ? f.uri === '/src/.gitignore'
+          : f.uri.endsWith('/.gitignore'),
+      ),
       '.gitignore finding',
     ).toBe(true);
 
@@ -366,7 +378,10 @@ describe.skipIf(!enabled)('tool images, offline', () => {
 
   it('benign fixture: each tool runs offline and writes its report to the mounted output', async () => {
     const s = scenario('repo');
-    await runAll(s);
+    const { results } = await runAll(s);
+    // A fully parsed, text-only repo is not partial for OSV or gitleaks.
+    expect(results['osv-scanner']?.partial).toBe(false);
+    expect(results.gitleaks?.partial).toBe(false);
     expect(
       sarifFindings(read(s, 'semgrep', 'semgrep.sarif')).some((f) =>
         f.ruleId?.endsWith('affidavit.smoke.no-eval'),
@@ -385,6 +400,18 @@ describe.skipIf(!enabled)('tool images, offline', () => {
     const { snap, results } = await runAll(s);
     // The unparsable file is a signal, not silence: Semgrep exits 0 but reports a notification.
     expect(results.semgrep?.partial).toBe(true);
+    // gitleaks skips binary-looking files silently, so discovery lists them.
+    expect(results.gitleaks?.partial).toBe(true);
+    const skipped = results.gitleaks?.notifications.map((n) => n.message).join('\n') ?? '';
+    for (const f of ['src/doc.pdf', 'src/utf16.txt', 'src/secret.txt.gz'])
+      expect(skipped).toContain(`/src/${f}`);
+    // OSV drops the malformed second lockfile without failing; discovery notices.
+    expect(results['osv-scanner']?.partial).toBe(true);
+    expect(
+      results['osv-scanner']?.notifications.some((n) =>
+        n.message.includes('/src/extra/package-lock.json'),
+      ),
+    ).toBe(true);
     expect(results.semgrep?.notifications.some((n) => n.message.includes('broken.js'))).toBe(true);
     expect(snap.removed).toEqual(
       expect.arrayContaining([

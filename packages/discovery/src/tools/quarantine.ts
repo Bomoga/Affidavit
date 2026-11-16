@@ -57,7 +57,9 @@ export class OutputNotFreshError extends Error {
   }
 }
 
-// Module-private: the only way to build a QuarantinedSnapshot is quarantineSnapshot below.
+// Module-private: the only way to build a QuarantinedSnapshot is quarantineSnapshot below. This is
+// a type-level guard, not a security boundary: JavaScript callers can forge the token with a cast.
+// runTool therefore re-checks that the snapshot is clean before every run (assertSnapshotClean).
 const TOKEN: unique symbol = Symbol('quarantined-snapshot');
 
 /**
@@ -124,7 +126,11 @@ async function collect(dir: Buffer, rel: string[], found: Entry[]): Promise<void
   for (const entry of await readdir(dir, { withFileTypes: true, encoding: 'buffer' })) {
     const abs = child(dir, entry.name);
     const here = [...rel, display(entry.name)];
-    if (isToolControlName(entry.name.toString('latin1'))) {
+    const name = entry.name.toString('latin1');
+    // Only `.git` is moved as a directory. A directory that merely has a control name (for example
+    // `src/.gitignore/evil.js`) holds scannable content, so it stays and is walked; the scanners
+    // only act on control names that are files or symlinks.
+    if (isToolControlName(name) && (!entry.isDirectory() || name.toLowerCase() === '.git')) {
       found.push({ abs, rel: here.join('/') });
       continue;
     }
