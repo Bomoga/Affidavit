@@ -77,6 +77,22 @@ describe.runIf(onSandboxHost)('gVisor runner on a sandbox host', { timeout: 120_
     expect(readdirSync(DEFAULT_TRACE_ROOT).length).toBe(before);
   });
 
+  it('kills a run whose trace passes its cap, deletes the trace, and refuses to judge it', async () => {
+    const before = readdirSync(DEFAULT_TRACE_ROOT).length;
+    const started = Date.now();
+    await expect(
+      new GvisorRunner({ maxTraceBytes: 4 * 1024 * 1024 }).run({
+        script: `import fs from 'node:fs';
+          for (;;) { try { fs.openSync('/nope'); } catch {} }`,
+        args: {},
+        timeoutMs: 60_000,
+      }),
+    ).rejects.toThrow(/size cap/);
+    expect(Date.now() - started).toBeLessThan(20_000);
+    expect(leftovers()).toBe('');
+    expect(readdirSync(DEFAULT_TRACE_ROOT).length).toBe(before);
+  });
+
   it('kills a run at its timeout and leaves nothing behind', async () => {
     const started = Date.now();
     const r = await new GvisorRunner().run({
@@ -126,5 +142,24 @@ describe.runIf(onSandboxHost)('gVisor runner on a sandbox host', { timeout: 120_
     await expect(
       tools.run(PROBE_IMAGE, ['true'], [{ hostPath: '/run', containerPath: '/x', readOnly: true }]),
     ).rejects.toThrow(/outside the allowed roots/);
+  });
+
+  it('refuses an image that declares a VOLUME before starting anything', async () => {
+    const tag = 'affidavit-it-volume-image:latest';
+    const ctx = join(base, 'volume-image');
+    mkdirSync(ctx);
+    writeFileSync(join(ctx, 'Dockerfile'), `FROM ${PROBE_IMAGE}\nVOLUME /data\n`);
+    execFileSync('docker', ['build', '--quiet', '--tag', tag, ctx], { encoding: 'utf8' });
+    const volumesBefore = execFileSync('docker', ['volume', 'ls', '--quiet'], { encoding: 'utf8' });
+    try {
+      const tools = new GvisorToolRunner({ outputDir: base, allowedRoots: [workspace] });
+      await expect(tools.run(tag, ['true'], [])).rejects.toThrow(/declares volumes/);
+      expect(leftovers()).toBe('');
+      expect(execFileSync('docker', ['volume', 'ls', '--quiet'], { encoding: 'utf8' })).toBe(
+        volumesBefore,
+      );
+    } finally {
+      execFileSync('docker', ['image', 'rm', '--force', tag]);
+    }
   });
 });

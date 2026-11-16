@@ -20,6 +20,11 @@ export interface ExecutionRequest {
    * this size while the run goes; the Judge throws on output over it (JudgePolicy.maxOutputBytes).
    */
   maxOutputBytes: number;
+  /**
+   * The Judge's artifact limit. The executor reads at most one byte more, so an oversized
+   * artifact still reaches the Judge as oversized and one within the limit is never cut.
+   */
+  maxArtifactBytes: number;
 }
 
 /** What the executor observed for one run, before the Judge decides anything. */

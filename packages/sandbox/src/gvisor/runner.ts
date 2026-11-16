@@ -17,13 +17,21 @@ import {
 } from './args.js';
 import { validateMounts, type Mount } from './mounts.js';
 import { parseTrace, type TraceObservations } from './trace.js';
+import { assertNoImageVolumes, parseContainerVolumes } from './volumes.js';
 
 const exec = promisify(execFile);
 
 /** Output beyond this is dropped, so a chatty jail cannot exhaust the host's memory. */
 const MAX_CAPTURE = 2 * 1024 * 1024;
-/** A trace larger than this is refused rather than half-read. */
-const DEFAULT_MAX_TRACE_BYTES = 256 * 1024 * 1024;
+/**
+ * Largest trace a run may write. gVisor writes the trace to the host's disk while the run goes
+ * (measured: about 13 MiB/s from one thread opening files in a loop), so the size is watched
+ * live and the run is killed when it passes this. A run cut short this way cannot be observed
+ * in full and is reported as tampered.
+ */
+export const DEFAULT_MAX_TRACE_BYTES = 64 * 1024 * 1024;
+/** How often the live trace size and a pending kill are checked. */
+const WATCH_INTERVAL_MS = 250;
 
 export interface GvisorOptions {
   /**
@@ -84,36 +92,55 @@ async function inspect(
   }
 }
 
+async function traceFiles(root: string, id: string): Promise<string[]> {
+  try {
+    return (await readdir(root)).filter((f) => f.startsWith(`${id}.`)).sort();
+  } catch {
+    return [];
+  }
+}
+
+async function traceSize(root: string, files: readonly string[]): Promise<number> {
+  let total = 0;
+  for (const f of files)
+    total += await stat(join(root, f)).then(
+      (s) => s.size,
+      () => 0,
+    );
+  return total;
+}
+
 /**
  * Reads and removes the trace files gVisor wrote for one container (`<id>.<command>.txt`, written
  * straight into the trace root so the docker group can delete them; see sandbox-runner.md).
+ * Returns null, after deleting them, when they are over `maxBytes`.
  */
-async function collectTrace(root: string, id: string, maxBytes: number): Promise<string> {
-  let files: string[];
-  try {
-    files = (await readdir(root)).filter((f) => f.startsWith(`${id}.`)).sort();
-  } catch {
-    files = [];
-  }
+async function collectTrace(root: string, id: string, maxBytes: number): Promise<string | null> {
+  const files = await traceFiles(root, id);
   if (files.length === 0) {
     throw new Error(
       `no syscall trace for ${id} in ${root}; is the ${AUDIT_RUNTIME} runtime configured on this host?`,
     );
   }
   try {
-    let total = 0;
+    if ((await traceSize(root, files)) > maxBytes) return null;
     const parts: string[] = [];
-    for (const f of files) {
-      const path = join(root, f);
-      total += (await stat(path)).size;
-      if (total > maxBytes) throw new Error(`syscall trace for ${id} is over ${maxBytes} bytes`);
-      parts.push(await readFile(path, 'utf8'));
-    }
+    for (const f of files) parts.push(await readFile(join(root, f), 'utf8'));
     return parts.join('\n');
   } finally {
     await Promise.all(files.map((f) => rm(join(root, f), { force: true })));
   }
 }
+
+/** Observations for a run whose trace passed its cap: it cannot be shown to be clean. */
+const OVERFLOWED: TraceObservations = {
+  egressAttempts: 0,
+  deniedReads: 0,
+  deniedWrites: 0,
+  pidsLimitHit: false,
+  syscalls: 0,
+  tampered: true,
+};
 
 const UNTRACED: TraceObservations = {
   egressAttempts: 0,
@@ -124,8 +151,41 @@ const UNTRACED: TraceObservations = {
   tampered: false,
 };
 
-/** Fails unless every container labelled with this run id is gone. */
-export async function verifyTeardown(runId: string): Promise<void> {
+/**
+ * Refuses an image that declares `VOLUME`. Docker would give each container an anonymous volume
+ * that can outlive it; the jail never needs one (`/scratch` is a tmpfs). The image must be present
+ * locally: an image that cannot be inspected is refused too.
+ */
+export async function refuseImageVolumes(image: string): Promise<void> {
+  let stdout: string;
+  try {
+    ({ stdout } = await exec('docker', [
+      'image',
+      'inspect',
+      '--format',
+      '{{json .Config.Volumes}}',
+      image,
+    ]));
+  } catch (e) {
+    throw new Error(`cannot inspect image ${image}`, { cause: e });
+  }
+  assertNoImageVolumes(image, stdout);
+}
+
+/** Volumes mounted in a container, read before it is removed. */
+async function containerVolumes(name: string): Promise<string[]> {
+  const { stdout } = await exec('docker', ['inspect', '--format', '{{json .Mounts}}', name]);
+  return parseContainerVolumes(stdout);
+}
+
+/**
+ * Fails unless every container labelled with this run id is gone, and every volume those
+ * containers had (normally none, since images with volumes are refused) is gone as well.
+ */
+export async function verifyTeardown(
+  runId: string,
+  volumes: readonly string[] = [],
+): Promise<void> {
   const { stdout } = await exec('docker', [
     'ps',
     '--all',
@@ -134,6 +194,17 @@ export async function verifyTeardown(runId: string): Promise<void> {
     `label=${RUN_LABEL}=${runId}`,
   ]);
   if (stdout.trim() !== '') throw new Error(`containers left behind for run ${runId}: ${stdout}`);
+  const left: string[] = [];
+  for (const v of volumes) {
+    const exists = await exec('docker', ['volume', 'inspect', v]).then(
+      () => true,
+      () => false,
+    );
+    if (exists) left.push(v);
+  }
+  if (left.length > 0) {
+    throw new Error(`volumes left behind for run ${runId}: ${left.join(', ')}`);
+  }
 }
 
 /**
@@ -145,6 +216,7 @@ export async function runJailed(
   input: JailedRunInput,
   opts: GvisorOptions = {},
 ): Promise<JailedRun> {
+  await refuseImageVolumes(input.image);
   const runId = randomBytes(8).toString('hex');
   const name = `affidavit-${runId}`;
   const args = buildGvisorRunArgs({
@@ -165,11 +237,38 @@ export async function runJailed(
   child.stdin.on('error', () => undefined);
   child.stdin.end(input.stdin ?? '');
 
+  const traceRoot = opts.traceRoot ?? DEFAULT_TRACE_ROOT;
+  const maxTraceBytes = opts.maxTraceBytes ?? DEFAULT_MAX_TRACE_BYTES;
   let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    void exec('docker', ['kill', name]).catch(() => undefined);
-  }, input.timeoutMs);
+  let traceOverflow = false;
+  let killing = false;
+  let containerId: string | null = null;
+  let busy = false;
+  // One watcher for both limits. A kill is retried on every tick until the client exits: a kill
+  // sent before Docker has created the container fails, and must not leave the run unbounded.
+  const watcher = setInterval(() => {
+    if (busy) return;
+    busy = true;
+    void (async () => {
+      if (!timedOut && Date.now() - started >= input.timeoutMs) {
+        timedOut = true;
+        killing = true;
+      }
+      if (opts.trace !== false && !traceOverflow) {
+        containerId ??= (await inspect(name))?.id ?? null;
+        if (containerId !== null) {
+          const size = await traceSize(traceRoot, await traceFiles(traceRoot, containerId));
+          if (size > maxTraceBytes) {
+            traceOverflow = true;
+            killing = true;
+          }
+        }
+      }
+      if (killing) await exec('docker', ['kill', name]).catch(() => undefined);
+    })().finally(() => {
+      busy = false;
+    });
+  }, WATCH_INTERVAL_MS);
 
   try {
     await new Promise<void>((resolve, reject) => {
@@ -177,32 +276,43 @@ export async function runJailed(
       child.once('close', () => resolve());
     });
   } finally {
-    clearTimeout(timer);
+    clearInterval(watcher);
   }
   const durationMs = Date.now() - started;
 
   const state = await inspect(name);
-  await exec('docker', ['rm', '--force', name]).catch(() => undefined);
+  // Read the container's volumes before removing it, so teardown can prove they are gone too.
+  let volumeError: unknown = null;
+  const volumes =
+    state === null
+      ? []
+      : await containerVolumes(name).catch((e: unknown) => {
+          volumeError = e;
+          return [];
+        });
+  await exec('docker', ['rm', '--force', '--volumes', name]).catch(() => undefined);
   if (state === null) {
     throw new Error(`container ${name} was never created: ${stderr().slice(0, 2000)}`);
   }
-  const text =
-    opts.trace === false
-      ? null
-      : await collectTrace(
-          opts.traceRoot ?? DEFAULT_TRACE_ROOT,
-          state.id,
-          opts.maxTraceBytes ?? DEFAULT_MAX_TRACE_BYTES,
-        );
-  await verifyTeardown(runId);
+  if (volumeError !== null) {
+    throw new Error(`cannot list the volumes of ${name}, so teardown cannot be verified`, {
+      cause: volumeError,
+    });
+  }
+  const text = opts.trace === false ? null : await collectTrace(traceRoot, state.id, maxTraceBytes);
+  await verifyTeardown(runId, volumes);
 
-  const trace =
-    text === null ? UNTRACED : parseTrace(text, { sensitivePaths: opts.sensitivePaths ?? [] });
-  if (text !== null && trace.syscalls === 0) throw new Error(`syscall trace for ${name} is empty`);
+  let trace: TraceObservations;
+  if (opts.trace === false) trace = UNTRACED;
+  else if (text === null || traceOverflow) trace = OVERFLOWED;
+  else {
+    trace = parseTrace(text, { sensitivePaths: opts.sensitivePaths ?? [] });
+    if (trace.syscalls === 0) throw new Error(`syscall trace for ${name} is empty`);
+  }
 
   return {
     containerId: state.id,
-    exitCode: timedOut || state.oomKilled ? null : state.exitCode,
+    exitCode: timedOut || traceOverflow || state.oomKilled ? null : state.exitCode,
     durationMs,
     stdout: stdout(),
     stderr: stderr(),
@@ -230,7 +340,7 @@ export class GvisorRunner implements JailRunner {
     );
     if (r.trace.tampered) {
       throw new Error(
-        'syscall trace was tampered with by the jailed process (malformed or split syscall line); the run cannot be judged',
+        'syscall trace was tampered with by the jailed process (a malformed or split syscall line, or over its size cap); the run cannot be judged',
       );
     }
     return {

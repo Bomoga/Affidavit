@@ -76,7 +76,7 @@ export class PlainDockerRunner implements JailRunner {
     const durationMs = Date.now() - started;
 
     const state = await readState(name);
-    await exec('docker', ['rm', '--force', name]).catch(() => undefined);
+    await exec('docker', ['rm', '--force', '--volumes', name]).catch(() => undefined);
 
     return {
       exitCode: timedOut || state === null ? null : state.exitCode,

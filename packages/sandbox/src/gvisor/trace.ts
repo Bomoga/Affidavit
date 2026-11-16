@@ -27,7 +27,10 @@ export interface TraceObservations {
   pidsLimitHit: boolean;
   /** Exit lines that were recognised. Zero means the trace is empty or unreadable. */
   syscalls: number;
-  /** A syscall line was malformed or split, so the jailed process may have hidden an attempt. */
+  /**
+   * A syscall line was malformed or split, or the runner cut the trace off at its size cap, so
+   * the jailed process may have hidden an attempt.
+   */
   tampered: boolean;
 }
 

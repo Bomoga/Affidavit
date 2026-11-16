@@ -177,6 +177,7 @@ export class Judge implements JudgePort {
           template: r.template,
           params: r.params,
           timeoutMs: this.#policy.hardTimeoutMs,
+          maxArtifactBytes: this.#policy.maxArtifactBytes,
         });
         attempts.push({ ...raw, variant, attempt });
       }
