@@ -13,7 +13,7 @@ Contracts version in use: v1.0 is on `main` (Phase 0 merged, PR 11). Lane 3 code
 | L3-04 | done | lane3/L3-04-defense (stacked on PR 6) | Renderer injected; real L1-07 planted-instruction case file still to run |
 | L3-05 | done | lane3/L3-05-remedy (stacked on PR 7) | Interim VerifyResult and TrialWorkspace; counterexamples empty until L3-08 |
 | L3-06 | done | lane3/L3-06-verdict (stacked on PR 8) | Interim Verdict and exhibit id pattern; dismissed and escalated verdicts not wired yet |
-| L3-07 | doing | lane3/L3-07a-design-tokens, lane3/L3-07b-case-view-model (partial) | Tokens and contrast done (PR 3). View model and fake SSE source done (PR 10). React, Vite, TanStack Router and Query, and Testing Library are installed in `apps/web` (P0-02); shell, router and case view are next |
+| L3-07 | doing | lane3/L3-07a-design-tokens, lane3/L3-07b-case-view-model (partial) | Tokens and contrast done (PR 3). View model and fake SSE source done (PR 10) on contracts `TrialEvent` and `fixtures/trials/` via `@affidavit/testing`. VERIFIED stamp needs CR-1 (`contract-requests.md`); until then the gate fixture renders as unverified. React, Vite, TanStack Router and Query, and Testing Library are installed in `apps/web` (P0-02); shell, router and case view are next |
 | L3-08 | todo | | Phase 2 |
 | L3-09 | todo | | Phase 2 |
 | L3-10 | todo | | Phase 2 |
@@ -24,7 +24,8 @@ Contracts version in use: v1.0 is on `main` (Phase 0 merged, PR 11). Lane 3 code
 
 ## Blocked
 
-- None on Phase 0 any more. Open work: migrate the interim types in `packages/trial/src/interim` and `apps/web/src/model` to `@affidavit/contracts`, swap local fakes for `@affidavit/testing`, and move the placeholder fixtures to `fixtures/trials/`.
+- None on Phase 0 any more. Open work: migrate the interim types in `packages/trial/src/interim` to `@affidavit/contracts` and swap local fakes for `@affidavit/testing` (`apps/web` is migrated).
+- Contract request CR-1 (`verify-result` trial event) is open with the lead; see `docs/lanes/lane3/contract-requests.md`.
 
 ## Decisions made in this lane
 
