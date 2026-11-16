@@ -117,25 +117,30 @@ const CONNECTION_TEXT = {
 export function ConnectionStatus({
   status,
   dropped,
+  tooLong,
   onRetry,
 }: {
   status: keyof typeof CONNECTION_TEXT;
   dropped: number;
+  tooLong: boolean;
   onRetry: () => void;
 }) {
   return (
-    <p className={`connection connection--${status}`} role="status" aria-live="polite">
-      <span className="sr-only">Connection: </span>
-      {CONNECTION_TEXT[status]}
-      {dropped > 0
-        ? `. ${dropped} malformed ${dropped === 1 ? 'update was' : 'updates were'} dropped and not shown`
-        : ''}
-      {status === 'disconnected' ? (
+    <div className="connection-row">
+      <p className={`connection connection--${status}`} role="status" aria-live="polite">
+        <span className="sr-only">Connection: </span>
+        {CONNECTION_TEXT[status]}
+        {tooLong ? '. This record is too long to show here' : ''}
+        {dropped > 0
+          ? `. ${dropped} malformed ${dropped === 1 ? 'update was' : 'updates were'} dropped and not shown`
+          : ''}
+      </p>
+      {status === 'disconnected' && !tooLong ? (
         <button type="button" onClick={onRetry}>
           Try again
         </button>
       ) : null}
-    </p>
+    </div>
   );
 }
 

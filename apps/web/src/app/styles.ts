@@ -128,8 +128,9 @@ th { color: var(--color-muted); font-weight: 600; }
 .connection { margin: 0 0 1rem; font-family: var(--font-mono); font-size: 0.875rem; color: var(--color-text); }
 .connection--live { color: var(--color-accent); }
 .connection--reconnecting, .connection--disconnected { color: var(--color-warn); }
-.connection button {
-  margin-left: 0.75rem;
+.connection-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; margin: 0 0 1rem; }
+.connection-row .connection { margin: 0; }
+.connection-row button {
   background: var(--color-surface);
   color: var(--color-text);
   border: 1px solid var(--color-muted);

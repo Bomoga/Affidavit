@@ -91,7 +91,9 @@ describe('live case page', () => {
     await waitFor(() => expect(status().textContent).toContain('Disconnected'), {
       timeout: 8000,
     });
-    expect(within(status()).getByRole('button', { name: 'Try again' })).toBeTruthy();
+    // The button sits beside the status region, so it is not announced as part of it.
+    expect(screen.getByRole('button', { name: 'Try again' })).toBeTruthy();
+    expect(within(status()).queryByRole('button')).toBeNull();
     expect(checkAccessibility(container, APP_CSS)).toEqual([]);
   }, 12000);
 
@@ -172,15 +174,48 @@ describe('source selection from env', () => {
       VITE_AFFIDAVIT_API_URL: 'http://localhost:3000',
     });
     expect(ok.mode).toBe('live');
+    for (const good of ['http://[::1]:3000', 'https://api.example.com/v1', 'http://127.0.0.1:8080'])
+      expect(
+        sourceFromEnv({ VITE_AFFIDAVIT_SOURCE: 'live', VITE_AFFIDAVIT_API_URL: good }).mode,
+      ).toBe('live');
+  });
+
+  it('reports a config error, never fixtures, for a missing or unsafe live URL', () => {
     for (const url of [
       undefined,
+      '',
       'http://evil.example.com',
       'https://user:pw@api.example.com',
       'https://api.example.com/?x=1',
       'not a url',
+      'http://localhost//evil.example.com',
+      'https://api.example.com//evil.example.com',
     ])
       expect(
         sourceFromEnv({ VITE_AFFIDAVIT_SOURCE: 'live', VITE_AFFIDAVIT_API_URL: url }).mode,
-      ).toBe('fake');
+      ).toBe('config-error');
+  });
+
+  it('shows a plain config error page instead of case files', async () => {
+    const { container } = renderApp('/', { mode: 'config-error' });
+    expect(
+      await screen.findByRole('heading', {
+        level: 1,
+        name: 'Live API URL is missing or not allowed',
+      }),
+    ).toBeTruthy();
+    expect(screen.queryByRole('list', { name: 'Case files' })).toBeNull();
+    expect(checkAccessibility(container, APP_CSS)).toEqual([]);
+    expect(container.textContent).not.toContain('—');
+  });
+
+  it('shows the config error on a case address too', async () => {
+    renderApp('/cases/nodegoat-sqli-001', { mode: 'config-error' });
+    expect(
+      await screen.findByRole('heading', {
+        level: 1,
+        name: 'Live API URL is missing or not allowed',
+      }),
+    ).toBeTruthy();
   });
 });

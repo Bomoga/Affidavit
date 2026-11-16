@@ -39,6 +39,8 @@ export interface StreamSnapshot {
   invalidCount: number;
   /** Times a seq jump forced a reconnect. */
   gapCount: number;
+  /** True when the record passed the event cap and the stream stopped. Retry does not help. */
+  tooLong: boolean;
 }
 
 export interface BackoffPolicy {
@@ -61,14 +63,18 @@ export interface TrialStreamOptions {
   /** Resolves after `ms`, or immediately when aborted. Injected so tests need no real timers. */
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
   onInvalid?: (report: InvalidEventReport) => void;
+  /** Most events the stream will apply. Defaults to DEFAULT_MAX_EVENTS. */
+  maxEvents?: number;
 }
 
-const TERMINAL = new Set<TrialEvent['type']>([
-  'verdict-written',
-  'dismissed',
-  'escalated',
-  'budget-exhausted',
-]);
+/**
+ * Trial always writes a verdict after a dismissal, escalation or budget exhaustion, so the verdict
+ * is the only event that ends the stream. A clean close before it is a drop, not completion.
+ */
+const FINAL_EVENT: TrialEvent['type'] = 'verdict-written';
+
+/** No case in the corpus comes near this; a longer record is refused rather than rendered. */
+export const DEFAULT_MAX_EVENTS = 5000;
 
 function realSleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
@@ -85,6 +91,7 @@ function realSleep(ms: number, signal: AbortSignal): Promise<void> {
 
 /** Thrown inside the read loop to drop the connection and reconnect from the last good seq. */
 class GapDetected extends Error {}
+class RecordTooLong extends Error {}
 
 export interface TrialStream {
   getSnapshot: () => StreamSnapshot;
@@ -104,7 +111,13 @@ export function createTrialStream(options: TrialStreamOptions): TrialStream {
   const policy = options.backoff ?? DEFAULT_BACKOFF;
   const sleep = options.sleep ?? realSleep;
   const listeners = new Set<() => void>();
-  let snapshot: StreamSnapshot = { events: [], status: 'connecting', invalidCount: 0, gapCount: 0 };
+  let snapshot: StreamSnapshot = {
+    events: [],
+    status: 'connecting',
+    invalidCount: 0,
+    gapCount: 0,
+    tooLong: false,
+  };
   let lastSeq: number | undefined;
   let controller: AbortController | undefined;
   let runId = 0;
@@ -131,6 +144,8 @@ export function createTrialStream(options: TrialStreamOptions): TrialStream {
       if (!signal.aborted) set({ gapCount: snapshot.gapCount + 1 });
       throw new GapDetected();
     }
+    if (snapshot.events.length >= (options.maxEvents ?? DEFAULT_MAX_EVENTS))
+      throw new RecordTooLong();
     lastSeq = event.seq;
     set({ events: [...snapshot.events, event] });
     return 'applied';
@@ -148,7 +163,6 @@ export function createTrialStream(options: TrialStreamOptions): TrialStream {
     while (!signal.aborted && id === runId) {
       set({ status: first ? 'connecting' : 'reconnecting' });
       first = false;
-      let sawTerminal = snapshot.events.some((e) => TERMINAL.has(e.type));
       try {
         const messages = await options.transport.open(options.caseId, lastSeq, signal);
         if (signal.aborted) return;
@@ -158,16 +172,18 @@ export function createTrialStream(options: TrialStreamOptions): TrialStream {
           const before = snapshot.events.length;
           if (accept(raw, signal) === 'applied') {
             failures = 0;
-            const last = snapshot.events[before];
-            if (last && TERMINAL.has(last.type)) sawTerminal = true;
+            // Leaving the loop closes the connection, so a server that keeps it open is fine.
+            if (snapshot.events[before]?.type === FINAL_EVENT)
+              return void set({ status: 'complete' });
           }
         }
         if (signal.aborted) return;
-        if (sawTerminal) return void set({ status: 'complete' });
         failures += 1;
-      } catch {
-        // A dropped connection and a gap are recovered the same way: reconnect from lastSeq.
+      } catch (error) {
         if (signal.aborted) return;
+        if (error instanceof RecordTooLong)
+          return void set({ status: 'disconnected', tooLong: true });
+        // A dropped connection and a gap are recovered the same way: reconnect from lastSeq.
         failures += 1;
       }
       if (failures >= policy.maxAttempts) return void set({ status: 'disconnected' });
@@ -197,7 +213,7 @@ export function createTrialStream(options: TrialStreamOptions): TrialStream {
       runId += 1;
     },
     retry() {
-      if (snapshot.status === 'disconnected') begin();
+      if (snapshot.status === 'disconnected' && !snapshot.tooLong) begin();
     },
   };
 }

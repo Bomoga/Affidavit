@@ -105,6 +105,7 @@ function LiveCasePage({
         <ConnectionStatus
           status={snapshot.status}
           dropped={snapshot.invalidCount}
+          tooLong={snapshot.tooLong}
           onRetry={retry}
         />
       }
