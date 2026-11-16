@@ -219,6 +219,59 @@ describe.runIf(onSandboxHost)('boot recipes on a sandbox host', { timeout: 900_0
     expect(existsSync(marker)).toBe(false);
   });
 
+  /** A tiny app whose `npm run build` is `script`. */
+  const withBuildScript = (name: string, script: string): string => {
+    const src = tinyApp(root, name, LISTEN);
+    writeFileSync(
+      join(src, 'package.json'),
+      JSON.stringify({ name: 'tiny', version: '1.0.0', scripts: { build: script } }),
+    );
+    return src;
+  };
+
+  it('stops a build script from writing a huge sparse file (RLIMIT_FSIZE)', async () => {
+    const src = withBuildScript(
+      'sparse-huge',
+      `node -e "require('fs').truncateSync('big', 2 ** 40)"`,
+    );
+    const { build } = await buildAndBoot(src, tinyHints());
+    expect(build).toMatchObject({ ok: false, step: 'scripts' });
+    expect(build.leftovers).toBeUndefined();
+  });
+
+  it('refuses a built tree over the byte cap before it becomes a build context', async () => {
+    // Nine sparse files just under the per-file limit: each is allowed, the total is not.
+    const src = withBuildScript(
+      'sparse-total',
+      `node -e "for (let i = 0; i < 9; i++) require('fs').writeFileSync('s' + i, ''), require('fs').truncateSync('s' + i, 255 * 1024 * 1024)"`,
+    );
+    const { build } = await buildAndBoot(src, tinyHints());
+    expect(build).toMatchObject({ ok: false, step: 'scripts' });
+    expect(build.ok === false && build.reason).toMatch(/over \d+ bytes/);
+    expect(build.leftovers).toBeUndefined();
+  });
+
+  it('cleans up a chmod 000 directory a build script leaves, and reports the real outcome', async () => {
+    const src = withBuildScript('locked-dir', 'mkdir -p d/e && touch d/e/f && chmod 000 d');
+    const { build } = await buildAndBoot(src, tinyHints());
+    // The walker cannot read `d`, so the build stops before assemble; cleanup still empties it.
+    expect(build).toMatchObject({ ok: false, step: 'scripts' });
+    expect(build.ok === false && build.reason).toMatch(/unreadable directory: d/);
+    expect(build.leftovers).toBeUndefined();
+    expect(readdirSync(workRoot)).toEqual([]);
+  });
+
+  it('never puts host paths in a failed build reason', async () => {
+    const src = withBuildScript(
+      'fails-loudly',
+      `node -e "console.error(process.cwd()); process.exit(3)"`,
+    );
+    const { build } = await buildAndBoot(src, tinyHints());
+    expect(build.ok).toBe(false);
+    const reason = build.ok ? '' : build.reason;
+    for (const p of [workRoot, root, src, tmpdir()]) expect(reason).not.toContain(p);
+  });
+
   it('refuses a base image outside the allowlist before pulling it', async () => {
     const src = tinyApp(root, 'not-node', LISTEN);
     writeFileSync(join(src, 'Dockerfile'), 'FROM bitnami/node:22\nCMD ["node", "server.js"]\n');

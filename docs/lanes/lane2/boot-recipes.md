@@ -17,7 +17,19 @@ A target's Dockerfile usually runs `npm install`, which needs the network and ru
 
 The fetch step is the only one with a route out, and it runs no repository or package code (install scripts are off). The lockfile check refuses git, file, link, workspace and non-registry tarball sources. Dev-only entries are skipped when the install omits dev dependencies, because they are never downloaded. Integrity hashes are checked by npm when the lockfile has them; old lockfiles often do not, which is accepted.
 
-Build steps write into the staged tree as uid 65534, which the host user cannot delete. A jailed janitor container, as the same user, empties the tree before the host removes the build directory.
+### Host disk and cleanup
+
+The fetch and scripts steps mount the staged tree read-write from the host's work root, and the scripts step runs repository and package code. So their writes are bounded on three levels:
+
+- Each jailed step runs with `RLIMIT_FSIZE` at `BUILD_MAX_FILE_BYTES` (256 MiB, configuration): no single file, sparse or not, can pass it (`truncate` to 1 TiB fails with `EFBIG`).
+- After the fetch step and again after the scripts step, before the tree becomes a build context, `checkBuiltTree` walks it with `lstat` (links counted, never followed) and an explicit stack. More than `BUILT_TREE_CAPS.maxEntries` (200 000) entries, more than `maxBytes` (2 GiB, the sum of `st_size`, which is what `COPY .` writes for a sparse file), any FIFO, socket or device, or any directory the host cannot read stops the build at that step (`failed`, reason with tree-relative paths).
+- **Host setup:** the work root should sit on its own filesystem or quota, so that what a step writes before the walk sees it (up to the tree caps, plus `/scratch` and `/tmp` in RAM) cannot fill the host disk. Not enforced by this code.
+
+Build steps write into the staged tree as uid 65534, which the host user cannot delete. A jailed janitor container, as the same user, runs `chmod -R u+rwX /w` (a build script can leave `chmod 000` directories that even uid 65534 cannot descend into) and then `find /w -mindepth 1 -delete`; its exit status is checked. The host then removes the build directory. Cleanup never throws, so it cannot replace the build's real outcome. If the directory is still there afterwards, the outcome carries `leftovers` (a separate operational signal, not an error), or a process warning is emitted when the build itself threw.
+
+### Reasons never carry host paths
+
+Outcome reasons end up in evidence and the courtroom UI. Errors from `execFile` begin with `Command failed: <bin> <args>`, which repeats every host path in the arguments, so only their stderr is used (`execErrorText`). Every build reason then goes through `scrubPaths`, which replaces the tree, build directory, source checkout, work root, host temp directory and the Compose binary with `<tree>`, `<build>`, `<src>`, `<workRoot>`, `<tmp>` and `<compose>`.
 
 ## The fetch network
 
@@ -39,6 +51,8 @@ Every failure in this step (pulling `FETCH_IMAGE`, resolving the registry, creat
 
 1. **The proxy's own network reach is not firewalled.** The egress bridge is an ordinary Docker bridge, so at the network layer the proxy container could reach the host's bridge gateway, RFC 1918 addresses and `169.254.169.254`. What stops that today is the proxy's code: it dials only the checked public addresses, on 443, and takes no address from the client. A bug in Node's HTTP parser that gave the client code execution inside the proxy would remove that check. The fix is host firewall rules in the `DOCKER-USER` chain that let traffic from each egress bridge reach only the resolved registry addresses on 443. The orchestrator runs as an unprivileged member of the docker group and cannot write iptables rules, so this needs a privileged host-setup helper (sandbox host setup, P0-10). Not done in this PR.
 2. **Domain fronting.** The proxy checks the CONNECT target, not what travels inside the TLS tunnel. The registry sits behind a shared CDN, so a client that controls TLS could ask the CDN for another hostname (a different SNI or `Host`) through a tunnel opened to `registry.npmjs.org:443`. In the fetch step the only client is Lane 2's npm, with install scripts off and a lockfile that names only registry URLs, so no repository or package code is running that could do this. The risk is that npm itself is steered (a bug, or a crafted registry response), which would give a channel to other sites on the same CDN, but no route into the host or the case network.
+
+3. **Docker's data root fills with images (follow-up).** Sidecar images can be any Docker Hub reference, with no limit on how many a compose file names or how large they are, and pulled images (sidecars, bases, `FETCH_IMAGE`) and assembled target images are never removed. That is the same disk risk as unbounded build writes, on Docker's data root instead of the work root. Needs a sidecar count and size cap and an image garbage collector (assembled images carry `affidavit.sandbox.image`). Not done in this PR.
 
 ### Why a Lane 2 npm image
 
@@ -118,7 +132,7 @@ The only other host-side CLI call that touches the tree is the assemble step's `
 
 ## Verified on the sandbox host (2026-11-15, owner's workstation)
 
-This evidence predates the hardening above (the fetch proxy, the Lane 2 npm image, the base allowlist, ONBUILD refusal, the YAML precheck, the timeout clamp, and `main`'s volume refusal). It must be re-run on the hardened code before it counts, together with the new sandbox-host tests: the fetch step cannot reach an IP literal, cloud metadata or the bridge gateway; the proxy refuses other hosts; ONBUILD is detected; a non-node base is refused; and a `.docker/cli-plugins/docker-compose` shipped in the tree never runs.
+This evidence predates the hardening above (the fetch proxy, the Lane 2 npm image, the base allowlist, ONBUILD refusal, the YAML precheck, the timeout clamp, `main`'s volume refusal, the host-side Compose isolation, the build write caps and the cleanup changes). `test:sandbox-host` must be re-run on the hardened tip before it counts, together with the new sandbox-host tests: the fetch step cannot reach an IP literal, cloud metadata or the bridge gateway; the proxy refuses other hosts; ONBUILD is detected; a non-node base is refused; a `.docker/cli-plugins/docker-compose` shipped in the tree never runs; a build script cannot write a 1 TiB sparse file or a tree over the byte cap; a `chmod 000` directory left by a build script is cleaned up; and failed build reasons carry no host paths.
 
 `pnpm --filter @affidavit/sandbox test:sandbox-host` with `AFFIDAVIT_NODEGOAT_DIR` pointing at OWASP NodeGoat `c5cb68a7`:
 

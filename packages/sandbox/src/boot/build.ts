@@ -27,6 +27,7 @@ import {
 import { baseImageProblem, imageOnBuild, pinImage, pullPinned } from './images.js';
 import { NPM_REGISTRY } from './lockfile.js';
 import { deriveRecipe, type BootRecipe } from './recipe.js';
+import { composePathPairs, execErrorText, scrubPaths } from './scrub.js';
 
 const exec = promisify(execFile);
 
@@ -94,15 +95,23 @@ export async function stageTree(src: string, dest: string): Promise<StageReport>
   return report;
 }
 
-export type BuildOutcome =
+export type BuildOutcome = (
   | { ok: true; imageId: string; baseImage: string; recipe: BootRecipe; stage: StageReport }
   | {
       ok: false;
       /** `unsupported`: outside what the MVP can boot without weakening a control. */
       unsupported: boolean;
       step: 'stage' | 'recipe' | 'base' | 'fetch' | 'scripts' | 'assemble';
+      /** Host paths are replaced by placeholders (`<tree>`, `<build>`, `<src>`, `<tmp>`). */
       reason: string;
-    };
+    }
+) & {
+  /**
+   * Operational signal, separate from the build's result: set when the build directory could not
+   * be fully removed, so untrusted files may be left under the work root. Not an exception.
+   */
+  leftovers?: string;
+};
 
 export interface BuildOptions {
   /** Host directory for build workspaces. Each build gets its own directory, removed after. */
@@ -140,11 +149,39 @@ export async function buildTarget(
   if (!parsedHints.success) {
     return { ok: false, unsupported: false, step: 'recipe', reason: 'boot hints do not parse' };
   }
-  const hints = parsedHints.data;
   const dir = await mkdtemp(join(opts.workRoot, 'build-'));
-  const tree = join(dir, 'tree');
-  const limits = opts.limits ?? BUILD_LIMITS;
+  const scrub = (text: string): string =>
+    scrubPaths(text, [
+      ['<tree>', join(dir, 'tree')],
+      ['<build>', dir],
+      ['<src>', srcDir],
+      ['<workRoot>', opts.workRoot],
+      ...composePathPairs(),
+    ]);
+  let outcome: BuildOutcome | undefined;
   try {
+    outcome = await buildIn(srcDir, parsedHints.data, dir, opts.limits ?? BUILD_LIMITS);
+    if (!outcome.ok) outcome = { ...outcome, reason: scrub(outcome.reason) };
+    return outcome;
+  } finally {
+    // Never throws: an exception here would replace the build's real outcome. What could not be
+    // removed is reported on the outcome (or, if the build itself threw, as a process warning).
+    const leftovers = await removeBuildDir(dir);
+    if (leftovers !== null) {
+      if (outcome !== undefined) outcome.leftovers = scrub(leftovers);
+      else process.emitWarning(`build directory not fully removed: ${scrub(leftovers)}`);
+    }
+  }
+}
+
+async function buildIn(
+  srcDir: string,
+  hints: BootHints,
+  dir: string,
+  limits: Readonly<Limits>,
+): Promise<BuildOutcome> {
+  const tree = join(dir, 'tree');
+  {
     let stage: StageReport;
     try {
       stage = await stageTree(srcDir, tree);
@@ -169,7 +206,7 @@ export async function buildTarget(
         ok: false,
         unsupported: true,
         step: 'base',
-        reason: (err as Error).message.slice(0, 500),
+        reason: execErrorText(err).slice(0, 500),
       };
     }
     if (onBuild.length > 0) {
@@ -194,6 +231,8 @@ export async function buildTarget(
       mounts,
       workdir: recipe.workdir,
       writableTmpMb: 256,
+      // RLIMIT_FSIZE in the jail: no single file the steps write (sparse or not) may pass this.
+      maxFileBytes: BUILD_MAX_FILE_BYTES,
       env: {
         npm_config_cache: '/scratch/npm-cache',
         npm_config_registry: `https://${NPM_REGISTRY}/`,
@@ -232,11 +271,15 @@ export async function buildTarget(
         ok: false,
         unsupported: false,
         step: 'fetch',
-        reason: (err as Error).message.slice(0, 1500),
+        reason: execErrorText(err).slice(0, 1500),
       };
     }
     if (failed(fetched))
       return { ok: false, unsupported: false, step: 'fetch', reason: tail(fetched) };
+    const afterFetch = await checkBuiltTree(tree);
+    if (afterFetch !== null) {
+      return { ok: false, unsupported: false, step: 'fetch', reason: afterFetch };
+    }
 
     const scripts = [['npm', 'rebuild'], ...(recipe.buildScript ? [['npm', 'run', 'build']] : [])];
     for (const command of scripts) {
@@ -251,7 +294,7 @@ export async function buildTarget(
           ok: false,
           unsupported: false,
           step: 'scripts',
-          reason: `${command.join(' ')}: ${(err as Error).message.slice(0, 1500)}`,
+          reason: `${command.join(' ')}: ${execErrorText(err).slice(0, 1500)}`,
         };
       }
       if (failed(run)) {
@@ -262,6 +305,13 @@ export async function buildTarget(
           reason: `${command.join(' ')}: ${tail(run)}`,
         };
       }
+    }
+    // The scripts ran repository and package code with write access to the tree. Before the
+    // tree becomes a build context (which `COPY .` writes out in full, sparse files unsparse),
+    // walk it again without following links and hold it to the caps.
+    const afterScripts = await checkBuiltTree(tree);
+    if (afterScripts !== null) {
+      return { ok: false, unsupported: false, step: 'scripts', reason: afterScripts };
     }
 
     const ctxDir = join(dir, 'dockerfile');
@@ -298,11 +348,12 @@ export async function buildTarget(
         },
       );
     } catch (err) {
+      // stderr only: the error message repeats the command line, with every host path in it.
       return {
         ok: false,
         unsupported: false,
         step: 'assemble',
-        reason: (err as Error).message.slice(-1500),
+        reason: execErrorText(err).slice(-1500),
       };
     }
     const imageId = (await readFile(iid, 'utf8')).trim();
@@ -310,34 +361,128 @@ export async function buildTarget(
       return { ok: false, unsupported: false, step: 'assemble', reason: `bad image id ${imageId}` };
     }
     return { ok: true, imageId, baseImage, recipe, stage };
-  } finally {
-    await removeBuildDir(dir);
   }
+}
+
+/** What a built tree may hold after the fetch and scripts steps. Configuration only. */
+export interface TreeCaps {
+  /** Entries of any kind (files, directories, symlinks). */
+  maxEntries: number;
+  /** Sum of `st_size` over regular files: the bytes `COPY .` would write. */
+  maxBytes: number;
+}
+export const BUILT_TREE_CAPS: Readonly<TreeCaps> = {
+  maxEntries: 200_000,
+  maxBytes: 2 * 1024 * 1024 * 1024,
+};
+/** RLIMIT_FSIZE for the fetch and scripts steps. Configuration only. */
+export const BUILD_MAX_FILE_BYTES = 256 * 1024 * 1024;
+
+/**
+ * Walks a tree the jailed steps wrote, with `lstat` (links are counted, never followed) and an
+ * explicit stack (no recursion depth to exhaust). Null when the tree is within `caps`, else the
+ * reason, with paths relative to the tree. Refused: more entries or bytes than the caps, any
+ * entry that is not a regular file, directory or symlink (FIFOs, sockets, devices), and any
+ * directory the host cannot read.
+ */
+export async function checkBuiltTree(
+  root: string,
+  caps: Readonly<TreeCaps> = BUILT_TREE_CAPS,
+): Promise<string | null> {
+  let entries = 0;
+  let bytes = 0;
+  const stack: string[] = [''];
+  while (stack.length > 0) {
+    const rel = stack.pop() as string;
+    let names: string[];
+    try {
+      names = await readdir(join(root, rel));
+    } catch {
+      return `built tree has an unreadable directory: ${rel === '' ? '.' : rel}`;
+    }
+    for (const name of names) {
+      const childRel = rel === '' ? name : `${rel}/${name}`;
+      entries++;
+      if (entries > caps.maxEntries) {
+        return `built tree has more than ${caps.maxEntries} entries`;
+      }
+      let s: Awaited<ReturnType<typeof lstat>>;
+      try {
+        s = await lstat(join(root, childRel));
+      } catch {
+        return `built tree has an unreadable entry: ${childRel}`;
+      }
+      if (s.isDirectory()) stack.push(childRel);
+      else if (s.isFile()) {
+        bytes += s.size;
+        if (bytes > caps.maxBytes) return `built tree is over ${caps.maxBytes} bytes`;
+      } else if (!s.isSymbolicLink()) {
+        return `built tree has a special file: ${childRel}`;
+      }
+    }
+  }
+  return null;
 }
 
 /**
  * Build steps write as nobody, so the host user cannot delete what they wrote. A jailed janitor,
- * as the same nobody, empties the tree first; the host then removes what is left.
+ * as the same nobody, first makes everything it owns readable and writable (a build script can
+ * leave `chmod 000` directories that even nobody could not descend into), then empties the tree;
+ * the host removes what is left. Never throws: returns null when the directory is gone, else what
+ * was left and why, for the caller to report.
  */
-async function removeBuildDir(dir: string): Promise<void> {
+async function removeBuildDir(dir: string): Promise<string | null> {
   const tree = join(dir, 'tree');
+  const problems: string[] = [];
+  let hasTree = true;
   try {
     await lstat(tree);
-    const mounts = validateMounts(
-      [{ hostPath: tree, containerPath: '/w', readOnly: false }],
-      [dir],
-    );
-    await runJailed(
-      {
-        image: PROBE_IMAGE,
-        command: ['find', '/w', '-mindepth', '1', '-delete'],
-        mounts,
-        timeoutMs: 120_000,
-      },
-      { trace: false },
-    );
   } catch {
-    // No tree, or the janitor failed: the host removal below reports what is left.
+    hasTree = false;
   }
-  await rm(dir, { recursive: true, force: true });
+  if (hasTree) {
+    try {
+      const mounts = validateMounts(
+        [{ hostPath: tree, containerPath: '/w', readOnly: false }],
+        [dir],
+      );
+      const janitor = await runJailed(
+        {
+          image: PROBE_IMAGE,
+          command: JANITOR_COMMAND,
+          mounts,
+          timeoutMs: 120_000,
+        },
+        { trace: false },
+      );
+      if (janitor.exitCode !== 0) {
+        problems.push(`janitor exited ${janitor.exitCode}: ${janitor.stderr.slice(-300)}`);
+      }
+    } catch (err) {
+      problems.push(`janitor did not run: ${(err as Error).message.slice(0, 300)}`);
+    }
+  }
+  try {
+    await rm(dir, { recursive: true, force: true });
+  } catch (err) {
+    problems.push(`host removal failed: ${(err as NodeJS.ErrnoException).code ?? 'error'}`);
+  }
+  try {
+    await lstat(dir);
+  } catch {
+    return null; // gone
+  }
+  return `<build> still exists${problems.length > 0 ? ` (${problems.join('; ')})` : ''}`;
 }
+
+/**
+ * The janitor's command. `chmod -R u+rwX` changes a directory before descending into it, so a
+ * `chmod 000` directory the build left becomes readable again; errors on files the host staged
+ * (owned by the host user, already world-writable) are ignored. `find -delete` then empties the
+ * tree, and its exit status is the janitor's.
+ */
+export const JANITOR_COMMAND = [
+  'sh',
+  '-c',
+  'chmod -R u+rwX /w 2>/dev/null; find /w -mindepth 1 -delete',
+];

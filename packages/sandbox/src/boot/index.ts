@@ -6,3 +6,4 @@ export * from './images.js';
 export * from './lockfile.js';
 export * from './recipe.js';
 export * from './fetch.js';
+export * from './scrub.js';

@@ -11,6 +11,7 @@ import {
 } from './compose.js';
 import { envProblem, hostAliasProblem, workdirProblem } from '../gvisor/args.js';
 import { readDockerfile } from './dockerfile.js';
+import { composePathPairs, execErrorText, scrubPaths } from './scrub.js';
 import { checkLockfile } from './lockfile.js';
 
 /**
@@ -97,7 +98,10 @@ export async function deriveRecipe(treeDir: string, hints: BootHints): Promise<R
       // directory outside the tree, never the tree (which could ship `.docker/cli-plugins`).
       normalized = await withEmptyDockerConfig((cfg) => normalizeCompose(treeDir, hints.path, cfg));
     } catch (err) {
-      return fail(`compose file did not parse: ${(err as Error).message.slice(0, 500)}`);
+      // stderr only (never `Command failed: <bin> --project-directory <tree> ...`), with any host
+      // path that is left replaced by a placeholder.
+      const text = scrubPaths(execErrorText(err), [['<tree>', treeDir], ...composePathPairs()]);
+      return fail(`compose file did not parse: ${text.slice(0, 500)}`);
     }
     // Second layer: Compose's own reading of the file must not contain them either (a parser
     // difference between js-yaml and Compose). Nothing it read reaches a container.
