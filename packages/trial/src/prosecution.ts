@@ -82,6 +82,9 @@ export function createProsecutionHandler(deps: ProsecutionDeps): StageHandler {
         }
 
         const rendered = render(config.promptId, blocks);
+        if (rendered.promptId !== 'prosecution') {
+          throw new Error(`prosecution rendered prompt ${rendered.promptId}, not prosecution`);
+        }
         const res = await ctx.runAgentValidated(
           {
             promptId: rendered.promptId,
@@ -107,7 +110,7 @@ export function createProsecutionHandler(deps: ProsecutionDeps): StageHandler {
         const resolved = resolveCounterexample(family.params, res.value, limits);
         if (!resolved.ok) {
           const exhibitId =
-            `exhibit-counterexample-rejected-${digestOf({ caseId: ctx.caseId, stage: ctx.stage, attempt: ctx.attempt, submission: res.result.submission }).slice(0, 24)}` as ExhibitId;
+            `exhibit-counterexample-rejected-${digestOf({ caseId: ctx.caseId, stage: ctx.stage, attempt: ctx.attempt, turn: i, submission: res.result.submission }).slice(0, 24)}` as ExhibitId;
           await ctx.record('exhibit-inadmissible', { exhibitId, rejectedBy: 'schema' }, 'judge');
           notes.push(`inadmissible (schema): ${resolved.errors.join('; ')}`);
           continue;
@@ -127,6 +130,12 @@ export function createProsecutionHandler(deps: ProsecutionDeps): StageHandler {
         );
         // Pass or fail comes only from the Judge.
         const result = await judge.runCounterexample(caseFile, built.witness, built.exhibit);
+        // The Judge mints ids by the same recipe; a different id means the two disagree on what ran.
+        if (result.exhibitId !== built.exhibit.id) {
+          throw new Error(
+            `Judge exhibit id ${result.exhibitId} does not match the counterexample id ${built.exhibit.id}`,
+          );
+        }
         await ctx.record('exhibit-result', { result }, 'judge');
         if (!result.admissible) {
           if (result.rejectedBy) {

@@ -25,6 +25,8 @@ import {
   makeCaseFile,
   openAt,
   turnCost,
+  withId,
+  withRecipeIds,
 } from './test-support.js';
 import { witnessExhibitId, witnessSha256 } from './witness.js';
 import { InMemoryWorkspace } from './workspace.js';
@@ -84,7 +86,7 @@ async function run(
     handlers: {
       defense: createDefenseHandler({
         caseFiles: new FakeCaseFileSource([cf]),
-        judge,
+        judge: withRecipeIds(judge),
         render: renderPrompt,
         config: cfg,
         workspace,
@@ -123,7 +125,9 @@ describe('Defense', () => {
       sha256: key(W1),
     });
     expect(admitted?.witness.id).toMatch(/^witness-[0-9a-f]{24}$/);
-    expect(await t.workspace.getExhibits(cf.id)).toEqual([ADMITTED.exhibitId]);
+    expect(await t.workspace.getExhibits(cf.id)).toEqual([
+      witnessExhibitId(cf.id, W1.template, W1.params),
+    ]);
   });
 
   it('emits exhibit-submitted with the Judge recipe id and exhibit-result with the result', async () => {
@@ -138,7 +142,7 @@ describe('Defense', () => {
     });
     expect(submitted?.actor).toBe('defense');
     const result = evs.find((e) => e.type === 'exhibit-result');
-    expect(result?.payload).toEqual({ result: ADMITTED });
+    expect(result?.payload).toEqual({ result: withId(cf, W1, ADMITTED) });
     expect(result?.actor).toBe('judge');
   });
 
@@ -187,7 +191,7 @@ describe('Defense', () => {
     expect(t.model.requests[1]?.system).toBe(getPrompt('defense').system);
     const inadmissible = t.events().find((e) => e.type === 'exhibit-inadmissible');
     expect(inadmissible?.payload).toEqual({
-      exhibitId: rejected('no-egress').exhibitId,
+      exhibitId: witnessExhibitId(cf.id, W1.template, W1.params),
       rejectedBy: 'no-egress',
     });
   });

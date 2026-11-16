@@ -32,10 +32,31 @@ export interface ParamLimits {
   maxFamilySize: number;
   /** Largest canonical JSON size of one new value, in characters. */
   maxValueChars: number;
+  /** Largest canonical JSON size of the whole resolved space. The Judge default maxParamsBytes is 65536. */
+  maxParamsChars: number;
 }
-export const DEFAULT_PARAM_LIMITS: ParamLimits = { maxFamilySize: 64, maxValueChars: 1024 };
+export const DEFAULT_PARAM_LIMITS: ParamLimits = {
+  maxFamilySize: 64,
+  maxValueChars: 1024,
+  maxParamsChars: 65_536,
+};
 
 const MAX_CHOICES = 32;
+const MAX_NAME_CHARS = 128;
+const SHOWN_NAME_CHARS = 64;
+
+/** An agent-chosen name, quoted and shortened for error text. */
+const shown = (name: string): string =>
+  JSON.stringify(name.length > SHOWN_NAME_CHARS ? `${name.slice(0, SHOWN_NAME_CHARS)}...` : name);
+
+/** True when any object at any depth has an own key named __proto__ (which JSON.parse creates). */
+function hasProtoKey(v: unknown): boolean {
+  if (Array.isArray(v)) return v.some(hasProtoKey);
+  if (typeof v !== 'object' || v === null) return false;
+  return Object.keys(v).some(
+    (k) => k === '__proto__' || hasProtoKey((v as Record<string, unknown>)[k]),
+  );
+}
 const MAX_ENTRIES = 256;
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> =>
@@ -60,8 +81,13 @@ export function checkCounterexampleSubmission(
   }
   const choices: CounterexampleChoice[] = [];
   value.choices.slice(0, MAX_CHOICES).forEach((raw: unknown, i) => {
-    if (!isPlainObject(raw) || typeof raw.name !== 'string' || raw.name.length === 0) {
-      errors.push(`choices.${i}.name: expected a non-empty string`);
+    if (
+      !isPlainObject(raw) ||
+      typeof raw.name !== 'string' ||
+      raw.name.length === 0 ||
+      raw.name.length > MAX_NAME_CHARS
+    ) {
+      errors.push(`choices.${i}.name: expected a string of 1 to ${MAX_NAME_CHARS} characters`);
       return;
     }
     const choice: CounterexampleChoice = { name: raw.name };
@@ -128,10 +154,10 @@ export function resolveCounterexample(
   for (const c of submission.choices) {
     if (!declared.has(c.name)) {
       errors.push(
-        `parameter ${JSON.stringify(c.name)} is not declared by the witness family (declared: ${family.map((p) => p.name).join(', ')})`,
+        `parameter ${shown(c.name)} is not declared by the witness family (declared: ${family.map((p) => p.name).join(', ')})`,
       );
     } else if (chosen.has(c.name)) {
-      errors.push(`parameter ${JSON.stringify(c.name)} is chosen more than once`);
+      errors.push(`parameter ${shown(c.name)} is chosen more than once`);
     } else chosen.set(c.name, c);
   }
 
@@ -162,6 +188,10 @@ export function resolveCounterexample(
         errors.push(`${p.name}: a value could not be read as JSON`);
         continue;
       }
+      if (hasProtoKey(v)) {
+        errors.push(`${p.name}: a value contains a __proto__ key`);
+        continue;
+      }
       if (!declaredKeys.has(key)) {
         if (key.length > limits.maxValueChars) {
           errors.push(`${p.name}: a new value is over ${limits.maxValueChars} characters`);
@@ -187,6 +217,9 @@ export function resolveCounterexample(
         `the counterexample space has ${size} combinations; the cap is ${limits.maxFamilySize}`,
       );
     }
+  }
+  if (errors.length === 0 && canonicalJson(params).length > limits.maxParamsChars) {
+    errors.push(`the counterexample space is over ${limits.maxParamsChars} characters`);
   }
   if (errors.length > 0) return { ok: false, errors };
   const parsed = ParamSpace.safeParse(params);
@@ -214,6 +247,12 @@ export function counterexampleCode(template: string, params: ParamSpace): string
   return `${paramsHeader(params)}\n${template}`;
 }
 
+/**
+ * TODO(CR-T8, L2-07): the Judge mints counterexample ids from the params of the witness passed with
+ * the exhibit. VerifyResult.counterexamples[].exhibitId from the real verifyPatch may therefore not
+ * equal these ids until CR-T8 lands, which is a prerequisite for L2-07. Remedy accepts a patch only
+ * when the result names exactly the ids submitted, so a mismatch fails closed.
+ */
 /** Judge id recipe (docs/lanes/lane2/rules-of-evidence.md, "Exhibit ids") for a counterexample. */
 export function counterexampleExhibitId(
   caseId: CaseFile['id'],

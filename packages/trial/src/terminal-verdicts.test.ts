@@ -29,15 +29,17 @@ import {
 } from './test-support.js';
 import { checkSummary } from './verdict.js';
 import { createVerifyHandler } from './verify.js';
-import { witnessSha256 } from './witness.js';
+import { witnessExhibitId, witnessSha256 } from './witness.js';
 import { InMemoryWorkspace } from './workspace.js';
 
 const PARAMS: ParamSpace = [{ name: 'threshold', values: [1, 2, 3] }];
 const W1 = { template: 'witness template one', params: PARAMS };
 const key = witnessSha256(W1.template, W1.params);
-const rejectedResult = ExhibitResult.parse(
-  readFixtureJson('exhibit-results/rejected-no-egress.json'),
-);
+const rejectedResult = ExhibitResult.parse({
+  ...(readFixtureJson('exhibit-results/rejected-no-egress.json') as object),
+  // The handlers refuse a result whose id is not the Judge recipe id for the witness.
+  exhibitId: witnessExhibitId(makeCaseFile().id, W1.template, W1.params),
+});
 
 const submit = (submission: unknown): ModelTurnResult => ({
   outcome: 'submitted',

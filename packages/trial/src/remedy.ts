@@ -53,6 +53,7 @@ export function createRemedyHandler(deps: RemedyDeps): StageHandler {
         (await deps.counterexamples?.(ctx.caseId)) ??
         (await workspace.getCounterexamples(ctx.caseId)).map((c) => c.exhibit);
 
+      const expectedIds = counterexamples.map((c) => c.id);
       const feedback: string[] = [];
       let last: PatchOutcome = { accepted: false, reason: 'no patch was submitted' };
 
@@ -119,7 +120,7 @@ export function createRemedyHandler(deps: RemedyDeps): StageHandler {
         await ctx.record('exhibit-submitted', { exhibitId: patch.id, kind: 'patch' }, 'remedy');
         const result = await judge.verifyPatch(caseFile, patch, admitted.witness, counterexamples);
 
-        if (isAccepted(result)) {
+        if (isAccepted(result, expectedIds)) {
           await workspace.addExhibit(ctx.caseId, patch.id);
           await workspace.savePatchOutcome(ctx.caseId, {
             accepted: true,
@@ -138,8 +139,8 @@ export function createRemedyHandler(deps: RemedyDeps): StageHandler {
             'judge',
           );
         }
-        feedback.push(describeVerify(result));
-        last = { accepted: false, patch, result, reason: describeVerify(result) };
+        feedback.push(describeVerify(result, expectedIds));
+        last = { accepted: false, patch, result, reason: describeVerify(result, expectedIds) };
       }
 
       await workspace.savePatchOutcome(ctx.caseId, last);

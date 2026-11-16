@@ -3,6 +3,8 @@ import {
   ExhibitResult,
   Exhibit,
   Verdict,
+  type CaseId,
+  type ExhibitId,
   VerifyResult,
   type CaseFile,
   type JudgePort,
@@ -40,7 +42,8 @@ import {
   turnCost,
 } from './test-support.js';
 import { createVerifyHandler, survivingCounterexamples } from './verify.js';
-import { buildWitness } from './witness.js';
+import { isAccepted } from './patch.js';
+import { buildWitness, witnessExhibitId } from './witness.js';
 import { InMemoryWorkspace } from './workspace.js';
 
 const FAMILY: ParamSpace = [
@@ -48,7 +51,10 @@ const FAMILY: ParamSpace = [
   { name: 'mode', values: ['get'] },
 ];
 const ADMITTED = ExhibitResult.parse(readFixtureJson('exhibit-results/admissible.json'));
-const PASS = VerifyResult.parse(readFixtureJson('exhibit-results/verify-pass.json'));
+const PASS = VerifyResult.parse({
+  ...(readFixtureJson('exhibit-results/verify-pass.json') as object),
+  counterexamples: [],
+});
 const DIFF = `--- a/app/x.js\n+++ b/app/x.js\n@@ -1,2 +1,2 @@\n context\n-const q = "select " + id;\n+const q = db.prepare("select ?", [id]);\n`;
 
 const submit = (stage: 'prosecution' | 'remedy', submission: unknown): ModelTurnResult => ({
@@ -204,7 +210,13 @@ async function trial(modelScript: ModelTurnResult[], judge: JudgePort, cf = make
  * verifyPatch from the counterexamples it is given: those named in `defeat` survive the patch.
  */
 class ScriptedJudge implements JudgePort {
-  readonly cxCalls: { witnessParams: ParamSpace; code: string }[] = [];
+  readonly cxCalls: { witnessParams: ParamSpace; code: string; exhibit: Exhibit }[] = [];
+  /** What the Judge reports for the counterexample ids it was given. */
+  report: (
+    ids: string[],
+    defeat: ReadonlySet<string>,
+  ) => { exhibitId: ExhibitId; survived: boolean }[] = (ids, defeat) =>
+    ids.map((id) => ({ exhibitId: id as ExhibitId, survived: defeat.has(id) }));
   readonly verifyCx: string[][] = [];
   private readonly fake: FakeJudge;
   constructor(
@@ -217,15 +229,15 @@ class ScriptedJudge implements JudgePort {
   }
   runWitness: JudgePort['runWitness'] = (...a) => this.fake.runWitness(...a);
   runCounterexample: JudgePort['runCounterexample'] = (cf, w, ex) => {
-    this.cxCalls.push({ witnessParams: w.params, code: ex.code });
+    this.cxCalls.push({ witnessParams: w.params, code: ex.code, exhibit: ex });
     return this.fake.runCounterexample(cf, w, ex);
   };
   verifyPatch: JudgePort['verifyPatch'] = (_cf, _p, _w, cxs) => {
     this.verifyCx.push(cxs.map((c) => c.id));
-    const counterexamples = cxs.map((c) => ({
-      exhibitId: c.id,
-      survived: this.defeat.has(c.id),
-    }));
+    const counterexamples = this.report(
+      cxs.map((c) => c.id),
+      this.defeat,
+    );
     const survived = counterexamples.some((c) => c.survived);
     return Promise.resolve({
       ...PASS,
@@ -469,5 +481,235 @@ describe('Prosecution', () => {
     expect(req?.system).not.toContain(planted);
     expect(req?.user).toContain(planted);
     expect(req?.user.indexOf('BEGIN UNTRUSTED DATA')).toBeLessThan(req?.user.indexOf(planted) ?? 0);
+  });
+});
+
+describe('review fixes', () => {
+  it('matches the rules-of-evidence test vector for the counterexample id', () => {
+    const params: ParamSpace = [{ name: 'p', values: [1] }];
+    expect(counterexampleExhibitId('case-x' as CaseId, 't', params)).toBe(
+      'exhibit-counterexample-acffdfb8b1fadd693641b6d2',
+    );
+    expect(witnessExhibitId('case-x' as CaseId, 't', params)).toBe(
+      'exhibit-witness-065ed82f887fd688aef7d3a3',
+    );
+  });
+
+  describe('a patch needs exactly one rerun result per counterexample', () => {
+    const v = (ids: string[]): VerifyResult =>
+      VerifyResult.parse({
+        ...PASS,
+        counterexamples: ids.map((exhibitId) => ({ exhibitId, survived: false })),
+      });
+    it('accepts the exact set', () => {
+      expect(isAccepted(v(['a', 'b']), ['a', 'b'])).toBe(true);
+      expect(isAccepted(v([]), [])).toBe(true);
+    });
+    it.each([
+      ['a missing result', ['a'], ['a', 'b']],
+      ['no results at all', [], ['a']],
+      ['an extra id', ['a', 'b'], ['a']],
+      ['a duplicate', ['a', 'a'], ['a', 'b']],
+      ['a duplicate of the only id', ['a', 'a'], ['a']],
+      ['a different id', ['z'], ['a']],
+    ])('refuses %s', (_n, got, expected) => {
+      expect(isAccepted(v(got), expected)).toBe(false);
+    });
+
+    it('does not end proven-fixed when the Judge reports no counterexample results', async () => {
+      const cf = makeCaseFile();
+      const built = cxBuilt(cf, CX_NEW);
+      const judge = new ScriptedJudge(
+        cf,
+        { [built.exhibit.sha256]: admitted(built.exhibit.id) },
+        new Set(),
+      );
+      judge.report = () => [];
+      const t = await trial(
+        [submit('prosecution', { choices: CX_NEW }), none, submit('remedy', { diff: DIFF })],
+        judge,
+        cf,
+      );
+      expect((await t.workspace.getPatchOutcome(cf.id))?.accepted).toBe(false);
+      expect(t.verdict.outcome).toBe('proven-unfixed');
+    });
+
+    it('does not accept an extra or duplicated id in the Judge result', async () => {
+      for (const extra of ['exhibit-counterexample-extra', 'dup']) {
+        const cf = makeCaseFile();
+        const built = cxBuilt(cf, CX_NEW);
+        const judge = new ScriptedJudge(
+          cf,
+          { [built.exhibit.sha256]: admitted(built.exhibit.id) },
+          new Set(),
+        );
+        judge.report = (ids) =>
+          [...ids, extra === 'dup' ? ids[0]! : extra].map((id) => ({
+            exhibitId: id as ExhibitId,
+            survived: false,
+          }));
+        const t = await trial(
+          [submit('prosecution', { choices: CX_NEW }), none, submit('remedy', { diff: DIFF })],
+          judge,
+          cf,
+        );
+        expect(t.verdict.outcome).toBe('proven-unfixed');
+      }
+    });
+  });
+
+  it('refuses a Judge result whose id is not the recipe id', async () => {
+    const cf = makeCaseFile();
+    const built = cxBuilt(cf, CX_NEW);
+    const judge = new ScriptedJudge(
+      cf,
+      { [built.exhibit.sha256]: admitted('exhibit-counterexample-other') },
+      new Set(),
+    );
+    await expect(trial([submit('prosecution', { choices: CX_NEW })], judge, cf)).rejects.toThrow(
+      /does not match/,
+    );
+  });
+
+  it('gives the Judge only system-built fields, whatever the agent adds', async () => {
+    const cf = makeCaseFile();
+    const built = cxBuilt(cf, CX_NEW);
+    const judge = new ScriptedJudge(
+      cf,
+      { [built.exhibit.sha256]: admitted(built.exhibit.id) },
+      new Set(),
+    );
+    await trial(
+      [
+        submit('prosecution', {
+          choices: CX_NEW,
+          code: 'evil()',
+          sha256: 'f'.repeat(64),
+          id: 'forged',
+          author: 'defense',
+          kind: 'witness',
+        }),
+        none,
+        submit('remedy', { diff: DIFF }),
+      ],
+      judge,
+      cf,
+    );
+    expect(judge.cxCalls).toHaveLength(1);
+    const ex = judge.cxCalls[0]?.exhibit;
+    expect(ex).toEqual(built.exhibit);
+    expect(ex?.code).not.toContain('evil()');
+    expect(ex).toMatchObject({ author: 'prosecution', kind: 'counterexample' });
+  });
+
+  describe('caps', () => {
+    const one: ParamSpace = [{ name: 'a', values: ['x'] }];
+    const pick = (values: string[]) =>
+      resolveCounterexample(one, { choices: [{ name: 'a', values }] });
+    const strings = (n: number) => Array.from({ length: n }, (_, i) => `v${i}`);
+
+    it('accepts 64 combinations and rejects 65', () => {
+      expect(pick(['x', ...strings(63)]).ok).toBe(true);
+      expect(pick(['x', ...strings(64)]).ok).toBe(false);
+    });
+
+    it('accepts a value of 1024 canonical characters and rejects 1025', () => {
+      expect(pick(['y'.repeat(1022)]).ok).toBe(true);
+      expect(pick(['y'.repeat(1023)]).ok).toBe(false);
+    });
+
+    it('caps the whole space by canonical size', () => {
+      const r = resolveCounterexample(
+        one,
+        { choices: [{ name: 'a', values: ['y'.repeat(100)] }] },
+        { ...DEFAULT_PARAM_LIMITS, maxParamsChars: 50 },
+      );
+      expect(r.ok).toBe(false);
+    });
+
+    it('caps and truncates a parameter name', () => {
+      expect(
+        checkCounterexampleSubmission({ choices: [{ name: 'n'.repeat(129), indices: [0] }] }).ok,
+      ).toBe(false);
+      const r = resolveCounterexample(one, { choices: [{ name: 'n'.repeat(128), indices: [0] }] });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.errors.join(' ').length).toBeLessThan(250);
+    });
+
+    it('rejects a value with a __proto__ key at any depth', () => {
+      const fam: ParamSpace = [{ name: 'o', values: [{ a: 1 }] }];
+      for (const raw of ['{"__proto__":{"x":1}}', '{"a":[{"b":{"__proto__":1}}]}']) {
+        const r = resolveCounterexample(fam, {
+          choices: [{ name: 'o', values: [JSON.parse(raw) as never] }],
+        });
+        expect(r.ok).toBe(false);
+        if (!r.ok) expect(r.errors.join(' ')).toContain('__proto__');
+      }
+    });
+  });
+
+  it('puts every untrusted input only inside its own labeled block', async () => {
+    const base = makeCaseFile();
+    const MARK = {
+      slice: 'SLICEMARKaa11',
+      candidate: 'CANDMARKbb22',
+      judge: 'exhibit-witness-JUDGEMARKcc33',
+      prior: 'PRIORMARKdd44',
+      witness: 'WITNESSMARKee55',
+    };
+    const cf = makeCaseFile({
+      candidate: { ...base.candidate, ruleId: MARK.candidate },
+      slices: base.slices.map((s, i) => (i === 0 ? { ...s, code: `${s.code} ${MARK.slice}` } : s)),
+    });
+    const store = new LoggingCaseStore([], { juryEnabled: false });
+    await openAt(store, cf, BIG_BUDGET, PATH_TO.prosecution);
+    const workspace = new InMemoryWorkspace();
+    await workspace.saveWitness(cf.id, {
+      witness: buildWitness(cf, { template: MARK.witness, params: FAMILY }),
+      result: { ...ADMITTED, exhibitId: MARK.judge as ExhibitId },
+    });
+    const model = new ReplayModel(
+      inOrder([submit('prosecution', { choices: [{ name: MARK.prior, indices: [0] }] }), none]),
+    );
+    const orch = new Orchestrator({
+      store,
+      sink: new FakeEventSink(),
+      model,
+      handlers: {
+        prosecution: createProsecutionHandler({
+          caseFiles: new FakeCaseFileSource([cf]),
+          judge: new ScriptedJudge(cf, {}, new Set()),
+          render: renderPrompt,
+          workspace,
+          config: pcfg,
+        }),
+        remedy: { run: () => Promise.resolve({ kind: 'advance', next: 'verify' }) },
+        verify: { run: () => Promise.resolve({ kind: 'advance', next: 'verdict' }) },
+      },
+      config: { killSwitch: () => false, maxStageAttempts: 1, now: () => NOW },
+    });
+    await orch.run(cf.id);
+    const user = model.requests[1]?.user ?? '';
+    const spans = new Map<string, string>();
+    for (const m of user.matchAll(
+      /<<<BEGIN UNTRUSTED DATA source=([a-z0-9:_-]+) fence=(\w+)>>>([\s\S]*?)<<<END \2>>>/g,
+    )) {
+      spans.set(m[1]!, (spans.get(m[1]!) ?? '') + m[3]!);
+    }
+    const label: Record<keyof typeof MARK, string> = {
+      slice: 'case-file-slice',
+      candidate: 'candidate',
+      judge: 'judge-results',
+      prior: 'prior-counterexamples',
+      witness: 'witness',
+    };
+    for (const k of Object.keys(MARK) as (keyof typeof MARK)[]) {
+      const mark = MARK[k];
+      const inside = spans.get(label[k]) ?? '';
+      const count = (t: string) => t.split(mark).length - 1;
+      expect(count(inside), `${k} inside ${label[k]}`).toBeGreaterThan(0);
+      expect(count(user), `${k} everywhere`).toBe(count(inside));
+      expect(model.requests[1]?.system).not.toContain(mark);
+    }
   });
 });

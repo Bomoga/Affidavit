@@ -59,7 +59,7 @@ export class InMemoryWorkspace implements TrialWorkspace {
 
   addCounterexample(caseId: CaseId, admitted: AdmittedCounterexample): Promise<void> {
     const list = this.counterexamples.get(caseId) ?? [];
-    list.push(admitted);
+    if (!list.some((c) => c.exhibit.id === admitted.exhibit.id)) list.push(admitted);
     this.counterexamples.set(caseId, list);
     return Promise.resolve();
   }
