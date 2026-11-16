@@ -27,7 +27,12 @@ CREATE TABLE "cases" (
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL,
 	CONSTRAINT "cases_tenant_id_id_pk" PRIMARY KEY("tenant_id","id"),
-	CONSTRAINT "cases_stage_valid" CHECK ("cases"."stage" in ('intake', 'map', 'arraign', 'defense', 'prosecution', 'remedy', 'verify', 'jury', 'verdict', 'dismissed', 'escalated'))
+	CONSTRAINT "cases_stage_valid" CHECK ("cases"."stage" in ('intake', 'map', 'arraign', 'defense', 'prosecution', 'remedy', 'verify', 'jury', 'verdict', 'dismissed', 'escalated')),
+	CONSTRAINT "cases_file_matches" CHECK ("cases"."case_file"->>'id' = "cases"."id"
+        and "cases"."case_file"->>'tenantId' = "cases"."tenant_id"
+        and ("cases"."case_file"->'candidate'->>'score')::double precision = "cases"."candidate_score"
+        and ("cases"."case_file"->>'escalationFloor')::double precision = "cases"."escalation_floor"),
+	CONSTRAINT "cases_budget_finite" CHECK ("cases"."remaining_usd" <> 'NaN'::numeric)
 );
 --> statement-breakpoint
 ALTER TABLE "cases" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
@@ -112,7 +117,9 @@ CREATE TABLE "stage_runs" (
 	"case_id" text NOT NULL,
 	"stage" text NOT NULL,
 	"attempt" integer NOT NULL,
+	"visit" integer NOT NULL,
 	"worker_id" text NOT NULL,
+	"lease_token" text DEFAULT gen_random_uuid()::text NOT NULL,
 	"claimed_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"heartbeat_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"lease_expires_at" timestamp with time zone NOT NULL,

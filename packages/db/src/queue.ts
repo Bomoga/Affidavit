@@ -99,10 +99,11 @@ export interface FailedStageJob {
 
 /**
  * Queue jobs that will never run again: those that exhausted their single attempt with an error
- * (including failures before claiming, such as a forged payload or a database outage), and those
- * still locked by a worker that died (locked longer than `staleLockSeconds` with the attempt used
- * up and no error ever recorded). Read as the worker role. Surface these; such a job keeps its
- * key, so the same attempt cannot be enqueued again and the orchestrator must use the next one.
+ * (including failures before claiming, such as a forged payload, a refused claim or a database
+ * outage), and those still locked by a worker that died (locked longer than `staleLockSeconds`
+ * with the attempt used up, no error ever recorded, and no live stage-run lease). Read as the
+ * worker role. Surface these; such a job keeps its key, so the same attempt cannot be enqueued
+ * again and the orchestrator must use the next one.
  */
 export async function listFailedStageJobs(
   workerPool: pg.Pool,
@@ -114,10 +115,14 @@ export async function listFailedStageJobs(
     last_error: string | null;
     stale: boolean;
   }>(
-    `select key, attempts, last_error, (locked_at is not null) as stale from graphile_worker.jobs
+    `select key, attempts, last_error, (locked_at is not null) as stale
+     from graphile_worker._private_jobs j
      where attempts >= max_attempts
        and ((last_error is not null and locked_at is null)
-         or (locked_at is not null and locked_at < now() - make_interval(secs => $1)))
+         or (locked_at is not null and locked_at < now() - make_interval(secs => $1)
+             and not coalesce(public.stage_run_has_live_lease(
+               j.payload->>'tenantId', j.payload->>'caseId', j.payload->>'stage',
+               (j.payload->>'attempt')::int), false)))
      order by id`,
     [staleLockSeconds],
   );
@@ -134,8 +139,9 @@ export type StageJobState = 'none' | 'queued' | 'running' | 'failed' | 'stale';
 /**
  * The queue job for a stage attempt's key, as the worker role sees it. `none`: no job (never
  * enqueued, or finished and deleted). `failed`: errored with its attempt used up. `stale`: locked
- * with the attempt used up for longer than `staleLockSeconds` (the worker died, possibly before
- * claiming). `running`: locked recently. `queued`: waiting.
+ * with the attempt used up for longer than `staleLockSeconds`, and no live stage-run lease (the
+ * worker died, possibly before claiming). `running`: locked recently, or its attempt still holds
+ * a live lease. `queued`: waiting.
  */
 export async function stageJobState(
   workerPool: pg.Pool,
@@ -148,31 +154,40 @@ export async function stageJobState(
     last_error: string | null;
     locked: boolean;
     stale: boolean;
+    live: boolean;
   }>(
     `select attempts, max_attempts, last_error, (locked_at is not null) as locked,
-            coalesce(locked_at < now() - make_interval(secs => $2), false) as stale
-     from graphile_worker.jobs where key = $1`,
-    [stageJobKey(p), staleLockSeconds],
+            coalesce(locked_at < now() - make_interval(secs => $2), false) as stale,
+            coalesce(public.stage_run_has_live_lease($3, $4, $5, $6), false) as live
+     from graphile_worker._private_jobs where key = $1`,
+    [stageJobKey(p), staleLockSeconds, p.tenantId, p.caseId, p.stage, p.attempt],
   );
   const r = rows[0];
   if (!r) return 'none';
-  if (r.locked) return r.stale && r.attempts >= r.max_attempts ? 'stale' : 'running';
+  if (r.locked) return r.stale && r.attempts >= r.max_attempts && !r.live ? 'stale' : 'running';
   if (r.attempts >= r.max_attempts && r.last_error !== null) return 'failed';
   return 'queued';
 }
 
 export interface StageContext {
   workerId: string;
+  /**
+   * Aborted when the lease could not be extended (it expired, was abandoned, or the database was
+   * unreachable). A well-behaved handler stops its work then; completing would fail anyway.
+   */
+  signal: AbortSignal;
   /** Run work in a transaction scoped to the job's tenant (row-level security applies). */
   inTenantTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T>;
   /**
    * Complete this attempt inside `tx`. Call it in the handler's own final transaction, after its
    * last writes, so "the work happened" and "the attempt is complete" commit together: a kill
-   * can no longer fall between them. If the attempt is not open any more it throws, rolling the
-   * transaction back.
+   * can no longer fall between them. If the lease is not live any more it throws, rolling the
+   * transaction back. Writes made through other ports (PgCaseStore opens its own transactions)
+   * are not part of `tx`: a kill after them but before this commit leaves the attempt open, and
+   * the orchestrator adopts it once the case has left the stage (resumeDecision, adopt-complete).
    */
   complete(tx: Tx): Promise<void>;
-  /** Extend the lease while a long handler runs. */
+  /** Extend the lease now (the task wrapper also does this on a timer). */
   heartbeat(): Promise<boolean>;
 }
 
@@ -183,8 +198,9 @@ export interface StageTaskOptions {
   appPool: pg.Pool;
   /** Worker-role pool: the claim function. */
   workerPool: pg.Pool;
-  /** Identifies this process in leases. Default: a random id per call. */
+  /** Identifies this process in leases (informational). Default: a random id per call. */
   workerId?: string;
+  /** Lease length, 1 to 3600 seconds. The wrapper heartbeats about every third of it. */
   leaseSeconds?: number;
   /** Where ignored outcomes are reported. Default: console.error. */
   log?: (message: string, err?: unknown) => void;
@@ -195,11 +211,14 @@ export interface StageTaskOptions {
  * handler.
  *
  * Semantics: the claim goes through claim_stage_run(), which refuses a payload that does not
- * match a stage_jobs record (the job fails and shows in listFailedStageJobs). A claimed attempt
- * starts at most once per (tenant, case, stage, attempt); a later delivery is skipped. A handler
- * error marks the attempt failed (failed_at, error) and rethrows. A handler that returns without
- * completing in its own transaction is completed afterwards. If the process dies mid-handler the
- * attempt stays open until its lease expires; the orchestrator then uses resumeDecision.
+ * match a stage_jobs record, a job whose case left the stage or visit, a superseded attempt, and
+ * a second open attempt (the job fails and shows in listFailedStageJobs). A claimed attempt
+ * starts at most once per (tenant, case, stage, attempt); a later delivery is skipped. While the
+ * handler runs the wrapper extends the lease every lease/3 seconds and aborts `ctx.signal` if it
+ * cannot. A handler error marks the attempt failed (failed_at, error) and rethrows. A handler
+ * that returns without completing in its own transaction is completed afterwards. If the process
+ * dies mid-handler the attempt stays open until its lease expires; the orchestrator then uses
+ * resumeDecision.
  */
 export function stageTaskList(
   handlers: Partial<Record<CaseStage, StageHandler>>,
@@ -219,33 +238,57 @@ export function stageTaskList(
     list[stageTaskIdentifier(stage)] = async (raw) => {
       const job = parseStagePayload(raw);
       if (job.stage !== stage) throw new Error(`payload stage ${job.stage} on task for ${stage}`);
-      if (!(await claimStageRun(options.workerPool, job, workerId, leaseSeconds))) return;
+      const token = await claimStageRun(options.workerPool, job, workerId, leaseSeconds);
+      if (token === null) return;
+      const abort = new AbortController();
+      const beat = async (): Promise<boolean> => {
+        try {
+          const ok = await heartbeatStageRun(options.appPool, job, token, leaseSeconds);
+          if (!ok) abort.abort(new Error('lease lost'));
+          return ok;
+        } catch (err) {
+          log(`heartbeat failed for ${stageJobKey(job)}`, err);
+          return false;
+        }
+      };
+      const timer = setInterval(
+        () => {
+          void beat();
+        },
+        Math.max(250, (leaseSeconds * 1000) / 3),
+      );
       const ctx: StageContext = {
         workerId,
+        signal: abort.signal,
         inTenantTx: (fn) => withTenant(options.appPool, job.tenantId, fn),
-        complete: (tx) => completeStageRunIn(tx, job, workerId),
-        heartbeat: () => heartbeatStageRun(options.appPool, job, workerId, leaseSeconds),
+        complete: (tx) => completeStageRunIn(tx, job, token),
+        heartbeat: beat,
       };
       try {
-        await handler(job, ctx);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
         try {
-          if (!(await failStageRun(options.appPool, job, message, workerId))) {
-            log(`could not record the failure of ${stageJobKey(job)}: attempt no longer open`);
+          await handler(job, ctx);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          try {
+            if (!(await failStageRun(options.appPool, job, message, token))) {
+              log(`could not record the failure of ${stageJobKey(job)}: attempt no longer open`);
+            }
+          } catch (recordErr) {
+            log(`could not record the failure of ${stageJobKey(job)}`, recordErr);
           }
-        } catch (recordErr) {
-          log(`could not record the failure of ${stageJobKey(job)}`, recordErr);
+          throw err;
         }
-        throw err;
-      }
-      // A handler that completed in its own transaction leaves nothing open, so false is expected
-      // then. False for an attempt that is still not completed (an expired lease) is logged.
-      if (!(await completeStageRun(options.appPool, job, workerId))) {
-        const info = await stageRunInfo(options.appPool, job).catch(() => null);
-        if (info?.state !== 'completed') {
-          log(`stage run ${stageJobKey(job)} was not completed after its handler returned`);
+        // A handler that completed in its own transaction leaves nothing open, so false is
+        // expected then. False for an attempt that is still not completed (an expired lease) is
+        // logged, and the attempt stays open for the orchestrator to adopt or abandon.
+        if (!(await completeStageRun(options.appPool, job, token))) {
+          const info = await stageRunInfo(options.appPool, job).catch(() => null);
+          if (info?.state !== 'completed') {
+            log(`stage run ${stageJobKey(job)} was not completed after its handler returned`);
+          }
         }
+      } finally {
+        clearInterval(timer);
       }
     };
   }

@@ -327,59 +327,265 @@ describePg('stage queue (Graphile Worker)', () => {
   }, 60_000);
 
   describe('leases are enforced in SQL', () => {
+    /** One statement as the database owner or superuser, rolled back: for the trigger guards. */
+    async function adminSql(text: string): Promise<string> {
+      const c = await db().admin.connect();
+      try {
+        await c.query('begin');
+        try {
+          await c.query(text);
+          return 'no error';
+        } catch (err) {
+          return (err as Error).message;
+        }
+      } finally {
+        await c.query('rollback');
+        c.release();
+      }
+    }
+
     it('a live lease cannot be abandoned or adopted; an expired one cannot be heartbeaten or completed', async () => {
       const file = await newCaseA();
       const p = pay(A, file.id, 'intake');
       await enqueueStage(db().app, p);
-      expect(await claimStageRun(db().worker, p, 'w1', 60)).toBe(true);
+      const token = await claimStageRun(db().worker, p, 'w1', 60);
+      expect(token).toEqual(expect.any(String));
       // Live: neither the orchestrator's abandon nor its adopt works.
       expect(await failStageRun(db().app, p, 'abandon')).toBe(false);
       expect(await completeStageRun(db().app, p)).toBe(false);
-      // Only the holder can heartbeat.
-      expect(await heartbeatStageRun(db().app, p, 'w2', 60)).toBe(false);
-      expect(await heartbeatStageRun(db().app, p, 'w1', 60)).toBe(true);
+      // Only the holder of the secret token can heartbeat, complete or fail.
+      expect(await heartbeatStageRun(db().app, p, 'guess', 60)).toBe(false);
+      expect(await completeStageRun(db().app, p, 'guess')).toBe(false);
+      expect(await failStageRun(db().app, p, 'x', 'guess')).toBe(false);
+      expect(await heartbeatStageRun(db().app, p, token!, 60)).toBe(true);
       expect(await stageRunState(db().app, p)).toBe('running');
       // Expired: the zombie holder can no longer heartbeat or complete, in any of the three ways.
       await expireLease(p);
-      expect(await heartbeatStageRun(db().app, p, 'w1', 60)).toBe(false);
-      expect(await completeStageRun(db().app, p, 'w1')).toBe(false);
+      expect(await heartbeatStageRun(db().app, p, token!, 60)).toBe(false);
+      expect(await completeStageRun(db().app, p, token!)).toBe(false);
       await expect(
-        withTenant(db().app, A, (tx) => completeStageRunIn(tx, p, 'w1')),
+        withTenant(db().app, A, (tx) => completeStageRunIn(tx, p, token!)),
       ).rejects.toThrow(/not open under a live lease/);
-      expect(
-        await appSql(
-          `update stage_runs set lease_expires_at = now() + interval '1 hour' where case_id = '${file.id}'`,
-        ),
-      ).toMatch(/expired lease cannot be extended/);
       // Now the orchestrator may abandon it, once.
       expect(await failStageRun(db().app, p, 'lease expired')).toBe(true);
       expect(await failStageRun(db().app, p, 'again')).toBe(false);
     });
 
-    it('the application role cannot push a lease or heartbeat out to infinity', async () => {
+    it('the application role has no UPDATE on stage runs and cannot read lease tokens', async () => {
       const file = await newCaseA();
       const p = pay(A, file.id, 'intake');
       await enqueueStage(db().app, p);
       await claimStageRun(db().worker, p, 'w1', 60);
-      for (const col of ['lease_expires_at', 'heartbeat_at']) {
+      for (const set of [
+        `completed_at = now()`,
+        `failed_at = now(), error = 'x'`,
+        `lease_expires_at = now() + interval '1 minute'`,
+        `heartbeat_at = now()`,
+        `lease_token = 'mine'`,
+      ]) {
         expect(
-          await appSql(`update stage_runs set ${col} = 'infinity' where case_id = '${file.id}'`),
-          col,
-        ).toMatch(/beyond the allowed bound/);
+          await appSql(`update stage_runs set ${set} where case_id = '${file.id}'`),
+          set,
+        ).toMatch(/permission denied/);
       }
-      expect(
-        await appSql(
-          `update stage_runs set lease_expires_at = now() + interval '3 days' where case_id = '${file.id}'`,
-        ),
-      ).toMatch(/beyond the allowed bound/);
+      expect(await appSql(`select lease_token from stage_runs`)).toMatch(/permission denied/);
+      expect(await appSql(`select * from stage_runs`)).toMatch(/permission denied/);
     });
 
-    it('claim refuses a lease outside 1 second to 1 day', async () => {
+    it('the database caps a lease, refuses infinity, and will not extend an expired lease', async () => {
+      const file = await newCaseA();
+      const p = pay(A, file.id, 'intake');
+      await enqueueStage(db().app, p);
+      await claimStageRun(db().worker, p, 'w1', 60);
+      const where = `where case_id = '${file.id}'`;
+      for (const col of ['lease_expires_at', 'heartbeat_at']) {
+        expect(await adminSql(`update stage_runs set ${col} = 'infinity' ${where}`), col).toMatch(
+          /beyond the allowed bound/,
+        );
+      }
+      expect(
+        await adminSql(
+          `update stage_runs set lease_expires_at = now() + interval '3 hours' ${where}`,
+        ),
+      ).toMatch(/beyond the allowed bound/);
+      await expireLease(p);
+      expect(
+        await adminSql(
+          `update stage_runs set lease_expires_at = now() + interval '1 minute' ${where}`,
+        ),
+      ).toMatch(/expired lease cannot be extended/);
+    });
+
+    it('claim refuses a lease outside 1 second to 1 hour', async () => {
       const file = await newCaseA();
       const p = pay(A, file.id, 'intake');
       await enqueueStage(db().app, p);
       await expect(claimStageRun(db().worker, p, 'w1', 0)).rejects.toThrow(/invalid claim/);
-      await expect(claimStageRun(db().worker, p, 'w1', 86401)).rejects.toThrow(/invalid claim/);
+      await expect(claimStageRun(db().worker, p, 'w1', 3601)).rejects.toThrow(/invalid claim/);
+    });
+
+    it('the wrapper heartbeats on a timer so a long handler keeps its lease, and aborts the signal when the lease is lost', async () => {
+      const file = await newCaseA();
+      const p = pay(A, file.id, 'intake');
+      let finished = false;
+      let abortedByLoss = false;
+      await enqueueStage(db().app, p);
+      const r = await startKillableRunner(
+        {
+          intake: async (_job, ctx) => {
+            // Longer than the 3 second lease: only the timer heartbeats keep it alive.
+            await wait(4500);
+            ctx.signal.addEventListener('abort', () => (abortedByLoss = true));
+            await ctx.inTenantTx((tx) => ctx.complete(tx));
+            finished = true;
+          },
+        },
+        { leaseSeconds: 3 },
+      );
+      await until(() => finished, 20_000);
+      expect(finished).toBe(true);
+      expect(await stageRunState(db().app, p)).toBe('completed');
+      expect(abortedByLoss).toBe(false);
+      await r.kill();
+    }, 40_000);
+
+    it('aborts ctx.signal when the lease is lost mid-handler', async () => {
+      const file = await newCaseA();
+      const p = pay(A, file.id, 'intake');
+      let aborted = false;
+      let started = false;
+      await enqueueStage(db().app, p);
+      const r = await startKillableRunner(
+        {
+          intake: async (_job, ctx) => {
+            started = true;
+            await new Promise<void>((resolve) => {
+              ctx.signal.addEventListener('abort', () => {
+                aborted = true;
+                resolve();
+              });
+            });
+          },
+        },
+        { leaseSeconds: 3 },
+      );
+      await until(() => started);
+      await expireLease(p);
+      await until(() => aborted, 10_000);
+      expect(aborted).toBe(true);
+      await r.kill();
+    }, 40_000);
+  });
+
+  describe('attempt numbers and stale jobs', () => {
+    it('a reused attempt number cannot silently skip a new stage visit', async () => {
+      const file = await newCaseA();
+      for (const s of ['map', 'arraign', 'defense', 'prosecution', 'remedy', 'verify'] as const) {
+        await storeA.transition(file.id, s);
+      }
+      const first = pay(A, file.id, 'verify', 1);
+      await enqueueStage(db().app, first);
+      const token = await claimStageRun(db().worker, first, 'w1', 60);
+      expect(await completeStageRun(db().app, first, token!)).toBe(true);
+      // verify -> remedy -> verify: a new visit. Reusing attempt 1 is refused loudly.
+      await storeA.transition(file.id, 'remedy');
+      await storeA.transition(file.id, 'verify');
+      await expect(enqueueStage(db().app, first)).rejects.toThrow(/earlier visit/);
+      expect(await resumeDecision(pools(), first)).toBe('done');
+      // A fresh attempt number for the new visit works.
+      const second = pay(A, file.id, 'verify', 2);
+      expect(await enqueueStage(db().app, second)).toBe(true);
+      expect(await claimStageRun(db().worker, second, 'w1', 60)).toEqual(expect.any(String));
+    }, 60_000);
+
+    it('claim refuses a job that can no longer run, and the refusal fails the job', async () => {
+      // Case moved to another stage after enqueue.
+      const moved = await newCaseA();
+      const a = pay(A, moved.id, 'intake');
+      await enqueueStage(db().app, a);
+      await storeA.transition(moved.id, 'map');
+      await expect(claimStageRun(db().worker, a, 'w', 60)).rejects.toThrow(
+        /is at stage map, not intake/,
+      );
+      // Case left the visit (verify, remedy, verify) after an unclaimed enqueue.
+      const looped = await newCaseA();
+      for (const s of ['map', 'arraign', 'defense', 'prosecution', 'remedy', 'verify'] as const) {
+        await storeA.transition(looped.id, s);
+      }
+      const v1 = pay(A, looped.id, 'verify', 1);
+      await enqueueStage(db().app, v1);
+      await storeA.transition(looped.id, 'remedy');
+      await storeA.transition(looped.id, 'verify');
+      await expect(claimStageRun(db().worker, v1, 'w', 60)).rejects.toThrow(/earlier visit/);
+      // A later attempt exists for the visit.
+      const sup = await newCaseA();
+      const s1 = pay(A, sup.id, 'intake', 1);
+      await enqueueStage(db().app, s1);
+      await enqueueStage(db().app, { ...s1, attempt: 2 });
+      await expect(claimStageRun(db().worker, s1, 'w', 60)).rejects.toThrow(/superseded/);
+      // Another attempt of the visit is still open.
+      const s2 = { ...s1, attempt: 2 };
+      expect(await claimStageRun(db().worker, s2, 'w', 60)).toEqual(expect.any(String));
+      await enqueueStage(db().app, { ...s1, attempt: 3 });
+      await expect(claimStageRun(db().worker, { ...s1, attempt: 3 }, 'w', 60)).rejects.toThrow(
+        /another attempt of stage intake is still open/,
+      );
+      // And through the real worker the refused job fails and is listed.
+      const viaWorker = await newCaseA();
+      const w = pay(A, viaWorker.id, 'intake', 1);
+      await enqueueStage(db().app, w);
+      await storeA.transition(viaWorker.id, 'map');
+      const ran: number[] = [];
+      await runWorker(
+        {
+          intake: (job) => {
+            ran.push(job.attempt);
+            return Promise.resolve();
+          },
+        },
+        () => false,
+      );
+      expect(ran).toEqual([]);
+      const failed = await listFailedStageJobs(db().worker);
+      expect(failed.find((j) => j.key === stageJobKey(w))?.lastError).toMatch(/is at stage map/);
+      // An unclaimed queued job is never adopted while it can still run; once it has failed the
+      // case having left the stage means adopt-complete (nothing left to do).
+      expect(await resumeDecision(pools(), w)).toBe('adopt-complete');
+    }, 90_000);
+
+    it('a stale-looking job whose attempt still holds a live lease is running, not stale', async () => {
+      const file = await newCaseA();
+      const p = pay(A, file.id, 'intake');
+      await enqueueStage(db().app, p);
+      const hang: StageHandler = () => new Promise<void>(() => undefined);
+      const r1 = await startKillableRunner({ intake: hang }, { leaseSeconds: 60 });
+      await until(async () => (await stageRunState(db().app, p)) === 'running');
+      await ageJobLock(p);
+      expect(await stageJobState(db().worker, p)).toBe('running');
+      expect((await listFailedStageJobs(db().worker)).some((j) => j.key === stageJobKey(p))).toBe(
+        false,
+      );
+      await expireLease(p);
+      expect(await stageJobState(db().worker, p)).toBe('stale');
+      await r1.kill();
+    }, 60_000);
+
+    it('stage history is written by the database; the application role cannot insert it', async () => {
+      const file = await newCaseA();
+      await storeA.transition(file.id, 'map');
+      const { rows } = await db().admin.query<{ stage: string; ordinal: number }>(
+        `select stage, ordinal from stages where case_id = $1 order by ordinal`,
+        [file.id],
+      );
+      expect(rows).toEqual([
+        { stage: 'intake', ordinal: 1 },
+        { stage: 'map', ordinal: 2 },
+      ]);
+      expect(
+        await appSql(
+          `insert into stages (tenant_id, case_id, ordinal, stage) values ('${A}', '${file.id}', 3, 'map')`,
+        ),
+      ).toMatch(/permission denied/);
     });
   });
 

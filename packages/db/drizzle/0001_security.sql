@@ -17,8 +17,8 @@ DECLARE
   r text;
   v pg_roles%ROWTYPE;
 BEGIN
-  IF current_user IN ('affidavit_app', 'affidavit_worker') THEN
-    RAISE EXCEPTION 'migrations must run as the owner, not as an application role';
+  IF current_user <> 'affidavit_owner' OR (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) THEN
+    RAISE EXCEPTION 'migrations must run as the non-superuser owner affidavit_owner (see bootstrapRoles)';
   END IF;
   FOREACH r IN ARRAY ARRAY['affidavit_app', 'affidavit_worker'] LOOP
     SELECT * INTO v FROM pg_roles WHERE rolname = r;
@@ -136,7 +136,7 @@ BEGIN
   EXECUTE format('CREATE POLICY owner_access ON public.stage_runs FOR ALL TO %I USING (true) WITH CHECK (true)', current_user);
   -- enqueue_stage() reads the case and its stage history.
   EXECUTE format('CREATE POLICY owner_read ON public.cases FOR SELECT TO %I USING (true)', current_user);
-  EXECUTE format('CREATE POLICY owner_read ON public.stages FOR SELECT TO %I USING (true)', current_user);
+  EXECUTE format('CREATE POLICY owner_access ON public.stages FOR ALL TO %I USING (true) WITH CHECK (true)', current_user);
 END
 $$;
 --> statement-breakpoint
@@ -145,7 +145,7 @@ $$;
 -- role cannot create tenants, stage jobs or stage runs. Mutable tables get column-level UPDATE.
 GRANT SELECT ON public.tenants, public.stage_jobs TO affidavit_app;
 --> statement-breakpoint
-GRANT SELECT, INSERT ON public.repos, public.stages, public.ballots, public.verdicts,
+GRANT SELECT, INSERT ON public.repos, public.ballots, public.verdicts,
   public.cost_rows, public.escalations, public.events TO affidavit_app;
 --> statement-breakpoint
 GRANT SELECT, INSERT ON public.cases TO affidavit_app;
@@ -157,9 +157,12 @@ GRANT SELECT, INSERT ON public.exhibits TO affidavit_app;
 --> statement-breakpoint
 GRANT UPDATE (result) ON public.exhibits TO affidavit_app;
 --> statement-breakpoint
-GRANT SELECT ON public.stage_runs TO affidavit_app;
+-- Stage history is written by the cases trigger; stage runs by claim_stage_run(). The application
+-- role reads them (never the lease token) and changes them only through the stage_run_* functions.
+GRANT SELECT ON public.stages TO affidavit_app;
 --> statement-breakpoint
-GRANT UPDATE (heartbeat_at, lease_expires_at, completed_at, failed_at, error) ON public.stage_runs TO affidavit_app;
+GRANT SELECT (tenant_id, case_id, stage, attempt, visit, worker_id, claimed_at, heartbeat_at,
+  lease_expires_at, completed_at, failed_at, error) ON public.stage_runs TO affidavit_app;
 --> statement-breakpoint
 
 -- Append-only tables: triggers stop the application roles (and a careless owner). They are not a
@@ -299,9 +302,9 @@ CREATE FUNCTION stage_runs_guard() RETURNS trigger
   SET search_path = pg_catalog, public
   AS $$
 BEGIN
-  IF (NEW.tenant_id, NEW.case_id, NEW.stage, NEW.attempt, NEW.worker_id, NEW.claimed_at)
+  IF (NEW.tenant_id, NEW.case_id, NEW.stage, NEW.attempt, NEW.visit, NEW.lease_token, NEW.worker_id, NEW.claimed_at)
      IS DISTINCT FROM
-     (OLD.tenant_id, OLD.case_id, OLD.stage, OLD.attempt, OLD.worker_id, OLD.claimed_at) THEN
+     (OLD.tenant_id, OLD.case_id, OLD.stage, OLD.attempt, OLD.visit, OLD.lease_token, OLD.worker_id, OLD.claimed_at) THEN
     RAISE EXCEPTION 'stage run identity is immutable' USING ERRCODE = 'insufficient_privilege';
   END IF;
   IF OLD.completed_at IS NOT NULL OR OLD.failed_at IS NOT NULL THEN
@@ -318,7 +321,7 @@ BEGIN
   END IF;
   -- Bounds: a lease is at most a day and a minute ahead (claim allows 86400 seconds), a heartbeat
   -- at most a minute ahead, and an expired lease cannot be revived. Infinity is out of range.
-  IF NEW.lease_expires_at > now() + interval '1 day 1 minute' OR NEW.heartbeat_at > now() + interval '1 minute' THEN
+  IF NEW.lease_expires_at > now() + interval '1 hour 1 minute' OR NEW.heartbeat_at > now() + interval '1 minute' THEN
     RAISE EXCEPTION 'lease or heartbeat is beyond the allowed bound' USING ERRCODE = 'check_violation';
   END IF;
   IF NEW.lease_expires_at > OLD.lease_expires_at AND OLD.lease_expires_at <= now() THEN
@@ -341,7 +344,8 @@ BEGIN
   IF NEW.stage <> 'intake' OR NEW.appeals <> 0 OR NEW.seq <> 0 OR NEW.exhausted THEN
     RAISE EXCEPTION 'a case is inserted at intake with no appeals, seq 0 and not exhausted' USING ERRCODE = 'check_violation';
   END IF;
-  IF NEW.remaining_input_tokens < 0 OR NEW.remaining_output_tokens < 0 OR NEW.remaining_usd < 0 THEN
+  IF NEW.remaining_input_tokens < 0 OR NEW.remaining_output_tokens < 0 OR NEW.remaining_usd < 0
+     OR NEW.remaining_usd = 'NaN'::numeric THEN
     RAISE EXCEPTION 'a case is inserted with a non-negative budget' USING ERRCODE = 'check_violation';
   END IF;
   IF NEW.candidate_score < 0 OR NEW.candidate_score > 1 OR NEW.escalation_floor < 0 OR NEW.escalation_floor > 1 THEN
@@ -371,6 +375,12 @@ BEGIN
   END IF;
   IF NEW.appeals < OLD.appeals OR NEW.seq < OLD.seq THEN
     RAISE EXCEPTION 'case counters only increase' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  IF NEW.seq <> OLD.seq AND NEW.seq <> OLD.seq + 1 THEN
+    RAISE EXCEPTION 'seq advances by one per update' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  IF NEW.remaining_usd = 'NaN'::numeric THEN
+    RAISE EXCEPTION 'budget must be a number' USING ERRCODE = 'check_violation';
   END IF;
   IF NEW.remaining_input_tokens > OLD.remaining_input_tokens
      OR NEW.remaining_output_tokens > OLD.remaining_output_tokens
@@ -493,14 +503,38 @@ CREATE TRIGGER escalations_event_guard BEFORE INSERT ON public.escalations
   FOR EACH ROW EXECUTE FUNCTION event_projection_guard('escalated', 'budget-exhausted');
 --> statement-breakpoint
 
+-- Stage history is written by the database, not by callers: a row for every stage a case enters
+-- (the first at insert, one per stage change). The application role has no INSERT on stages, so a
+-- stage change without a history row is impossible and visit numbers can be trusted.
+CREATE FUNCTION record_stage_entry() RETURNS trigger
+  LANGUAGE plpgsql SECURITY DEFINER
+  SET search_path = pg_catalog, public, pg_temp
+  AS $$
+BEGIN
+  INSERT INTO public.stages (tenant_id, case_id, ordinal, stage)
+    SELECT NEW.tenant_id, NEW.id, coalesce(max(s.ordinal), 0) + 1, NEW.stage
+    FROM public.stages s WHERE s.tenant_id = NEW.tenant_id AND s.case_id = NEW.id;
+  RETURN NULL;
+END
+$$;
+--> statement-breakpoint
+CREATE TRIGGER cases_record_stage_insert AFTER INSERT ON public.cases
+  FOR EACH ROW EXECUTE FUNCTION record_stage_entry();
+--> statement-breakpoint
+CREATE TRIGGER cases_record_stage_update AFTER UPDATE OF stage ON public.cases
+  FOR EACH ROW WHEN (OLD.stage IS DISTINCT FROM NEW.stage) EXECUTE FUNCTION record_stage_entry();
+--> statement-breakpoint
+
 -- The only way the application role can enqueue work. SECURITY DEFINER, search_path pinned, and
--- the tenant is taken from the transaction setting, never an argument. It writes a durable
--- stage_jobs record (the case must exist for the tenant) and then the queue job, idempotent on
--- tenant, case, stage and attempt. Returns true when a new job was queued, false when the same
--- key is already queued, running or failed. The job key matches stageJobKey() in queue.ts.
+-- the tenant is taken from the transaction setting, never an argument. The case must be at that
+-- stage now. It writes a durable stage_jobs record carrying the stage VISIT (the stage-history
+-- ordinal), and refuses to reuse an attempt number that was used for an earlier visit. Then it
+-- queues the job, idempotent on tenant, case, stage and attempt. Returns true when a job row was
+-- added, false when the same key is already in the queue (queued, running or failed). The job
+-- key matches stageJobKey() in queue.ts. Attempts are bounded at 100 per case and stage.
 CREATE FUNCTION enqueue_stage(p_case_id text, p_stage text, p_attempt integer) RETURNS boolean
   LANGUAGE plpgsql SECURITY DEFINER
-  SET search_path = pg_catalog, public
+  SET search_path = pg_catalog, public, pg_temp
   AS $$
 DECLARE
   v_tenant text := public.app_tenant_id();
@@ -508,20 +542,18 @@ DECLARE
   v_existed boolean;
   v_current text;
   v_visit integer;
+  v_old_visit integer;
 BEGIN
   IF v_tenant IS NULL THEN
     RAISE EXCEPTION 'no tenant set' USING ERRCODE = 'insufficient_privilege';
   END IF;
   IF p_case_id IS NULL OR p_case_id = '' OR p_attempt IS NULL OR p_attempt < 1 OR p_attempt > 100 THEN
-    -- Attempts are bounded at 100 per case and stage so attempt numbers cannot be used to flood the queue.
     RAISE EXCEPTION 'invalid stage job' USING ERRCODE = 'invalid_parameter_value';
   END IF;
   IF p_stage IS NULL OR p_stage NOT IN ('intake', 'map', 'arraign', 'defense', 'prosecution', 'remedy',
                                        'verify', 'jury', 'verdict', 'dismissed', 'escalated') THEN
     RAISE EXCEPTION 'invalid stage' USING ERRCODE = 'invalid_parameter_value';
   END IF;
-  -- The job must be for the stage the case is at now; the visit is that stage entry's ordinal in
-  -- the stage history, so a later return to the same stage is a different visit.
   SELECT stage INTO v_current FROM public.cases WHERE tenant_id = v_tenant AND id = p_case_id;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'unknown case %', p_case_id USING ERRCODE = 'no_data_found';
@@ -530,6 +562,12 @@ BEGIN
     RAISE EXCEPTION 'case % is at stage %, not %', p_case_id, v_current, p_stage USING ERRCODE = 'check_violation';
   END IF;
   SELECT coalesce(max(ordinal), 0) INTO v_visit FROM public.stages WHERE tenant_id = v_tenant AND case_id = p_case_id;
+  SELECT visit INTO v_old_visit FROM public.stage_jobs
+    WHERE tenant_id = v_tenant AND case_id = p_case_id AND stage = p_stage AND attempt = p_attempt;
+  IF FOUND AND v_old_visit <> v_visit THEN
+    RAISE EXCEPTION 'attempt % of stage % was used for an earlier visit; use a new attempt number', p_attempt, p_stage
+      USING ERRCODE = 'check_violation';
+  END IF;
   INSERT INTO public.stage_jobs (tenant_id, case_id, stage, attempt, visit)
     VALUES (v_tenant, p_case_id, p_stage, p_attempt, v_visit)
     ON CONFLICT DO NOTHING;
@@ -554,34 +592,167 @@ GRANT EXECUTE ON FUNCTION enqueue_stage(text, text, integer) TO affidavit_app;
 
 -- The only way a stage run is created, and only the worker role may call it. The job payload is
 -- checked against the stage_jobs record written by enqueue_stage(), so a forged or rewritten
--- queue job (the worker role can write queue tables) is refused here. Returns true for the one
--- caller that created the run, false for a repeat claim.
+-- queue job (the worker role can write queue tables) is refused. It also refuses a job that can
+-- no longer run: the case is not at that stage now, the stage visit moved on, a later attempt
+-- exists for this visit, or another attempt for this visit is still open. A refusal raises, so the
+-- queue job FAILS and shows in listFailedStageJobs. Returns the secret lease token for the one
+-- caller that created the run, or NULL for a repeat claim (the job is then skipped).
 CREATE FUNCTION claim_stage_run(p_tenant text, p_case_id text, p_stage text, p_attempt integer,
-                                p_worker_id text, p_lease_seconds integer) RETURNS boolean
+                                p_worker_id text, p_lease_seconds integer) RETURNS text
   LANGUAGE plpgsql SECURITY DEFINER
-  SET search_path = pg_catalog, public
+  SET search_path = pg_catalog, public, pg_temp
   AS $$
 DECLARE
-  v_rows integer;
+  v_job_visit integer;
+  v_current text;
+  v_visit integer;
+  v_token text;
 BEGIN
   IF p_worker_id IS NULL OR p_worker_id = '' OR p_lease_seconds IS NULL
-     OR p_lease_seconds < 1 OR p_lease_seconds > 86400 THEN
+     OR p_lease_seconds < 1 OR p_lease_seconds > 3600 THEN
     RAISE EXCEPTION 'invalid claim' USING ERRCODE = 'invalid_parameter_value';
   END IF;
-  IF NOT EXISTS (
-    SELECT 1 FROM public.stage_jobs
-    WHERE tenant_id = p_tenant AND case_id = p_case_id AND stage = p_stage AND attempt = p_attempt
-  ) THEN
+  SELECT visit INTO v_job_visit FROM public.stage_jobs
+    WHERE tenant_id = p_tenant AND case_id = p_case_id AND stage = p_stage AND attempt = p_attempt;
+  IF NOT FOUND THEN
     RAISE EXCEPTION 'no enqueued stage job matches this payload' USING ERRCODE = 'insufficient_privilege';
   END IF;
-  INSERT INTO public.stage_runs (tenant_id, case_id, stage, attempt, worker_id, lease_expires_at)
-    VALUES (p_tenant, p_case_id, p_stage, p_attempt, p_worker_id, now() + make_interval(secs => p_lease_seconds))
-    ON CONFLICT DO NOTHING;
-  GET DIAGNOSTICS v_rows = ROW_COUNT;
-  RETURN v_rows = 1;
+  IF EXISTS (SELECT 1 FROM public.stage_runs
+             WHERE tenant_id = p_tenant AND case_id = p_case_id AND stage = p_stage AND attempt = p_attempt) THEN
+    RETURN NULL;
+  END IF;
+  SELECT stage INTO v_current FROM public.cases WHERE tenant_id = p_tenant AND id = p_case_id;
+  IF v_current IS DISTINCT FROM p_stage THEN
+    RAISE EXCEPTION 'case % is at stage %, not %', p_case_id, v_current, p_stage USING ERRCODE = 'check_violation';
+  END IF;
+  SELECT coalesce(max(ordinal), 0) INTO v_visit FROM public.stages WHERE tenant_id = p_tenant AND case_id = p_case_id;
+  IF v_visit <> v_job_visit THEN
+    RAISE EXCEPTION 'attempt % of stage % is for an earlier visit of the case', p_attempt, p_stage USING ERRCODE = 'check_violation';
+  END IF;
+  IF EXISTS (SELECT 1 FROM public.stage_jobs
+             WHERE tenant_id = p_tenant AND case_id = p_case_id AND stage = p_stage
+               AND visit = v_job_visit AND attempt > p_attempt) THEN
+    RAISE EXCEPTION 'attempt % of stage % was superseded by a later attempt', p_attempt, p_stage USING ERRCODE = 'check_violation';
+  END IF;
+  IF EXISTS (SELECT 1 FROM public.stage_runs
+             WHERE tenant_id = p_tenant AND case_id = p_case_id AND stage = p_stage
+               AND visit = v_job_visit AND attempt <> p_attempt
+               AND completed_at IS NULL AND failed_at IS NULL) THEN
+    RAISE EXCEPTION 'another attempt of stage % is still open', p_stage USING ERRCODE = 'check_violation';
+  END IF;
+  INSERT INTO public.stage_runs (tenant_id, case_id, stage, attempt, visit, worker_id, lease_expires_at)
+    VALUES (p_tenant, p_case_id, p_stage, p_attempt, v_job_visit, p_worker_id,
+            now() + make_interval(secs => p_lease_seconds))
+    RETURNING lease_token INTO v_token;
+  RETURN v_token;
 END
 $$;
 --> statement-breakpoint
 REVOKE ALL ON FUNCTION claim_stage_run(text, text, text, integer, text, integer) FROM PUBLIC;
 --> statement-breakpoint
 GRANT EXECUTE ON FUNCTION claim_stage_run(text, text, text, integer, text, integer) TO affidavit_worker;
+--> statement-breakpoint
+
+-- Lease operations for the application role, which has no UPDATE on stage_runs. The tenant comes
+-- from the transaction setting. The holder proves itself with the secret lease token; the
+-- orchestrator (no token) may abandon or adopt only an EXPIRED lease. Timestamps are set here.
+-- They run in the caller's transaction, so a handler can complete atomically with its own work.
+CREATE FUNCTION stage_run_heartbeat(p_case_id text, p_stage text, p_attempt integer, p_token text,
+                                    p_lease_seconds integer) RETURNS boolean
+  LANGUAGE plpgsql SECURITY DEFINER
+  SET search_path = pg_catalog, public, pg_temp
+  AS $$
+DECLARE
+  v_tenant text := public.app_tenant_id();
+  v_rows integer;
+BEGIN
+  IF v_tenant IS NULL THEN
+    RAISE EXCEPTION 'no tenant set' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  IF p_token IS NULL OR p_lease_seconds IS NULL OR p_lease_seconds < 1 OR p_lease_seconds > 3600 THEN
+    RAISE EXCEPTION 'invalid heartbeat' USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+  UPDATE public.stage_runs
+    SET heartbeat_at = now(),
+        lease_expires_at = greatest(lease_expires_at, now() + make_interval(secs => p_lease_seconds))
+    WHERE tenant_id = v_tenant AND case_id = p_case_id AND stage = p_stage AND attempt = p_attempt
+      AND lease_token = p_token AND completed_at IS NULL AND failed_at IS NULL AND lease_expires_at > now();
+  GET DIAGNOSTICS v_rows = ROW_COUNT;
+  RETURN v_rows = 1;
+END
+$$;
+--> statement-breakpoint
+CREATE FUNCTION stage_run_complete(p_case_id text, p_stage text, p_attempt integer, p_token text DEFAULT NULL)
+  RETURNS boolean
+  LANGUAGE plpgsql SECURITY DEFINER
+  SET search_path = pg_catalog, public, pg_temp
+  AS $$
+DECLARE
+  v_tenant text := public.app_tenant_id();
+  v_rows integer;
+BEGIN
+  IF v_tenant IS NULL THEN
+    RAISE EXCEPTION 'no tenant set' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  UPDATE public.stage_runs SET completed_at = now()
+    WHERE tenant_id = v_tenant AND case_id = p_case_id AND stage = p_stage AND attempt = p_attempt
+      AND completed_at IS NULL AND failed_at IS NULL
+      AND CASE WHEN p_token IS NULL THEN lease_expires_at <= now()
+               ELSE lease_token = p_token AND lease_expires_at > now() END;
+  GET DIAGNOSTICS v_rows = ROW_COUNT;
+  RETURN v_rows = 1;
+END
+$$;
+--> statement-breakpoint
+CREATE FUNCTION stage_run_fail(p_case_id text, p_stage text, p_attempt integer, p_error text, p_token text DEFAULT NULL)
+  RETURNS boolean
+  LANGUAGE plpgsql SECURITY DEFINER
+  SET search_path = pg_catalog, public, pg_temp
+  AS $$
+DECLARE
+  v_tenant text := public.app_tenant_id();
+  v_rows integer;
+BEGIN
+  IF v_tenant IS NULL THEN
+    RAISE EXCEPTION 'no tenant set' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  UPDATE public.stage_runs SET failed_at = now(), error = left(coalesce(p_error, 'unknown error'), 2000)
+    WHERE tenant_id = v_tenant AND case_id = p_case_id AND stage = p_stage AND attempt = p_attempt
+      AND completed_at IS NULL AND failed_at IS NULL
+      AND CASE WHEN p_token IS NULL THEN lease_expires_at <= now() ELSE lease_token = p_token END;
+  GET DIAGNOSTICS v_rows = ROW_COUNT;
+  RETURN v_rows = 1;
+END
+$$;
+--> statement-breakpoint
+REVOKE ALL ON FUNCTION stage_run_heartbeat(text, text, integer, text, integer) FROM PUBLIC;
+--> statement-breakpoint
+REVOKE ALL ON FUNCTION stage_run_complete(text, text, integer, text) FROM PUBLIC;
+--> statement-breakpoint
+REVOKE ALL ON FUNCTION stage_run_fail(text, text, integer, text, text) FROM PUBLIC;
+--> statement-breakpoint
+GRANT EXECUTE ON FUNCTION stage_run_heartbeat(text, text, integer, text, integer) TO affidavit_app;
+--> statement-breakpoint
+GRANT EXECUTE ON FUNCTION stage_run_complete(text, text, integer, text) TO affidavit_app;
+--> statement-breakpoint
+GRANT EXECUTE ON FUNCTION stage_run_fail(text, text, integer, text, text) TO affidavit_app;
+--> statement-breakpoint
+
+-- For the worker role's dead-job detection: is there an open attempt with a live lease for this
+-- queue job? (The worker role cannot read stage_runs.) A job whose attempt still holds a live
+-- lease is running, however old its Graphile lock is.
+CREATE FUNCTION stage_run_has_live_lease(p_tenant text, p_case_id text, p_stage text, p_attempt integer)
+  RETURNS boolean
+  LANGUAGE sql STABLE SECURITY DEFINER
+  SET search_path = pg_catalog, public, pg_temp
+  AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.stage_runs
+    WHERE tenant_id = p_tenant AND case_id = p_case_id AND stage = p_stage AND attempt = p_attempt
+      AND completed_at IS NULL AND failed_at IS NULL AND lease_expires_at > now()
+  )
+$$;
+--> statement-breakpoint
+REVOKE ALL ON FUNCTION stage_run_has_live_lease(text, text, text, integer) FROM PUBLIC;
+--> statement-breakpoint
+GRANT EXECUTE ON FUNCTION stage_run_has_live_lease(text, text, text, integer) TO affidavit_worker;

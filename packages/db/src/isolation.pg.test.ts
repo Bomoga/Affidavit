@@ -188,7 +188,7 @@ describePg('cross-tenant isolation (tenant A against tenant B data)', () => {
     });
 
     it(`select on ${table} with no tenant set returns no rows`, async () => {
-      const { rows } = await db().app.query(`select * from ${table}`);
+      const { rows } = await db().app.query(`select tenant_id from ${table}`);
       expect(rows).toHaveLength(0);
     });
 
@@ -197,7 +197,7 @@ describePg('cross-tenant isolation (tenant A against tenant B data)', () => {
       try {
         await client.query('begin');
         await client.query(`select set_config('app.tenant_id', '', true)`);
-        const { rows } = await client.query(`select * from ${table}`);
+        const { rows } = await client.query(`select tenant_id from ${table}`);
         await client.query('rollback');
         expect(rows).toHaveLength(0);
       } finally {
@@ -219,7 +219,7 @@ describePg('cross-tenant isolation (tenant A against tenant B data)', () => {
         `select id from cases where id in (select case_id from escalations)`,
         `select * from cases where tenant_id <> current_setting('app.tenant_id')`,
         `select * from cases where tenant_id = '${B}'`,
-        `select * from stage_runs where tenant_id = '${B}'`,
+        `select case_id from stage_runs where tenant_id = '${B}'`,
       ];
       for (const q of queries) {
         const { rows } = await client.query<Record<string, unknown>>(q);
@@ -253,8 +253,8 @@ describePg('cross-tenant isolation (tenant A against tenant B data)', () => {
       params: () => [B, caseB.id],
     },
     stage_runs: {
-      text: `insert into stage_runs (tenant_id, case_id, stage, attempt, worker_id, lease_expires_at)
-        values ($1, $2, 'map', 9, 'w', now())`,
+      text: `insert into stage_runs (tenant_id, case_id, stage, attempt, visit, worker_id, lease_expires_at)
+        values ($1, $2, 'map', 9, 1, 'w', now())`,
       params: () => [B, caseB.id],
     },
     exhibits: {

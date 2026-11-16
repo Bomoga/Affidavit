@@ -1,5 +1,5 @@
 {
-  "id": "bba305c9-94e1-47da-8433-fee9ca401a3a",
+  "id": "cc439323-1250-426d-b81c-1cca3f75422b",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "version": "7",
   "dialect": "postgresql",
@@ -200,6 +200,14 @@
         "cases_stage_valid": {
           "name": "cases_stage_valid",
           "value": "\"cases\".\"stage\" in ('intake', 'map', 'arraign', 'defense', 'prosecution', 'remedy', 'verify', 'jury', 'verdict', 'dismissed', 'escalated')"
+        },
+        "cases_file_matches": {
+          "name": "cases_file_matches",
+          "value": "\"cases\".\"case_file\"->>'id' = \"cases\".\"id\"\n        and \"cases\".\"case_file\"->>'tenantId' = \"cases\".\"tenant_id\"\n        and (\"cases\".\"case_file\"->'candidate'->>'score')::double precision = \"cases\".\"candidate_score\"\n        and (\"cases\".\"case_file\"->>'escalationFloor')::double precision = \"cases\".\"escalation_floor\""
+        },
+        "cases_budget_finite": {
+          "name": "cases_budget_finite",
+          "value": "\"cases\".\"remaining_usd\" <> 'NaN'::numeric"
         }
       },
       "isRLSEnabled": true
@@ -708,11 +716,24 @@
           "primaryKey": false,
           "notNull": true
         },
+        "visit": {
+          "name": "visit",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
         "worker_id": {
           "name": "worker_id",
           "type": "text",
           "primaryKey": false,
           "notNull": true
+        },
+        "lease_token": {
+          "name": "lease_token",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "gen_random_uuid()::text"
         },
         "claimed_at": {
           "name": "claimed_at",

@@ -88,9 +88,7 @@ export class PgCaseStore implements CaseStore {
         .onConflictDoNothing()
         .returning({ id: t.cases.id });
       if (inserted.length === 0) throw new Error(`case ${caseFile.id} already open`);
-      await tx
-        .insert(t.stages)
-        .values({ tenantId: this.tenantId, caseId: caseFile.id, ordinal: 1, stage: 'intake' });
+      // The stage-history row for intake is written by a trigger on cases.
     });
   }
 
@@ -138,10 +136,7 @@ export class PgCaseStore implements CaseStore {
           updatedAt: sql`now()`,
         })
         .where(this.caseWhere(caseId));
-      await tx.execute(sql`
-        insert into public.stages (tenant_id, case_id, ordinal, stage)
-        select ${this.tenantId}, ${caseId}, coalesce(max(ordinal), 0) + 1, ${to}
-        from public.stages where tenant_id = ${this.tenantId} and case_id = ${caseId}`);
+      // The stage-history row for the new stage is written by a trigger on cases.
     });
   }
 

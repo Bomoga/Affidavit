@@ -127,6 +127,8 @@ describe('schema and migrations', () => {
   it('inserts into the lifecycle tables are not granted to the application role', () => {
     expect(security).not.toMatch(/GRANT[^;]*INSERT[^;]*stage_runs/);
     expect(security).not.toMatch(/GRANT[^;]*INSERT[^;]*stage_jobs/);
+    expect(security).not.toMatch(/GRANT[^;]*INSERT[^;]*public\.stages\b/);
+    expect(security).not.toMatch(/GRANT[^;]*UPDATE[^;]*stage_runs/);
     expect(security).not.toMatch(/GRANT[^;]*INSERT[^;]*tenants/);
   });
 });
@@ -146,6 +148,14 @@ describe('SQL guards', () => {
       .flatMap(([from, tos]) => tos.map((to) => `${from}>${to}`))
       .sort();
     expect(sqlPairs).toEqual(tablePairs);
+  });
+
+  it('SECURITY DEFINER functions put pg_temp last in their search_path', () => {
+    const fns = (security.match(/CREATE FUNCTION[\s\S]*?\$\$;/g) ?? []).filter((f) =>
+      f.includes('SECURITY DEFINER'),
+    );
+    expect(fns.length).toBeGreaterThanOrEqual(7);
+    for (const f of fns) expect(f).toContain('SET search_path = pg_catalog, public, pg_temp');
   });
 
   it('every function pins search_path, and temp objects are revoked', () => {
@@ -209,6 +219,9 @@ describe('decideResume', () => {
     expect(d(null, 'defense', { job: 'queued' })).toBe('wait');
     expect(d(null, 'defense', { job: 'running' })).toBe('wait');
     expect(d(null, 'prosecution')).toBe('adopt-complete');
+    // A queue job that can still run is never adopted from under it: claim refuses it and it fails.
+    expect(d(null, 'prosecution', { job: 'queued' })).toBe('wait');
+    expect(d(null, 'prosecution', { job: 'running' })).toBe('wait');
   });
   it('an unclaimed attempt whose job failed or went stale before claiming means the next attempt', () => {
     expect(d(null, 'defense', { job: 'failed' })).toBe('next-attempt');
@@ -226,7 +239,7 @@ describe('decideResume', () => {
   });
   it('an attempt whose case left the stage counts as complete once the lease is gone', () => {
     expect(d(run('running', past), 'prosecution')).toBe('adopt-complete');
-    expect(d(run('failed', past), 'prosecution')).toBe('adopt-complete');
+    expect(d(run('failed', past), 'prosecution')).toBe('done');
   });
   it('a return to the same stage is a new visit, so the old attempt is adopted, not re-run', () => {
     // verify (visit 4), remedy (5), verify again (6): the old verify attempt is for visit 4.
@@ -241,9 +254,9 @@ describe('decideResume', () => {
 
 describe('scramVerifier', () => {
   it('has the SCRAM-SHA-256 verifier shape and a fresh salt each time', () => {
-    const v = scramVerifier('pw');
+    const v = scramVerifier('correct-horse-battery-staple');
     expect(v).toMatch(/^SCRAM-SHA-256\$4096:[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+$/);
-    expect(v).not.toContain('pw');
-    expect(scramVerifier('pw')).not.toBe(v);
+    expect(v).not.toContain('correct-horse');
+    expect(scramVerifier('correct-horse-battery-staple')).not.toBe(v);
   });
 });

@@ -167,8 +167,19 @@ describePg('database guards behind the store', () => {
       return {
         text: `insert into cases (tenant_id, id, repo_id, case_file, candidate_score, escalation_floor,
           remaining_input_tokens, remaining_output_tokens, remaining_usd, stage, appeals, seq, exhausted)
-          values ($1, $2, $3, '{}', ${v.score}, 0.1, ${v.input}, 1, ${v.usd}, ${v.stage}, ${v.appeals}, ${v.seq}, ${v.exhausted})`,
-        params: [T, id, repo],
+          values ($1, $2, $3, $4::jsonb, ${v.score}, 0.1, ${v.input}, 1, ${v.usd}, ${v.stage}, ${v.appeals}, ${v.seq}, ${v.exhausted})`,
+        // A case file that agrees with the columns, so only the guard under test can object.
+        params: [
+          T,
+          id,
+          repo,
+          JSON.stringify({
+            id,
+            tenantId: T,
+            candidate: { score: Number(v.score) },
+            escalationFloor: 0.1,
+          }),
+        ],
       };
     };
 
@@ -207,14 +218,14 @@ describePg('database guards behind the store', () => {
 
     it('a stage run cannot be inserted finished, and its lease and outcome rules hold', async () => {
       const { file } = await openCase();
-      const base = `insert into stage_runs (tenant_id, case_id, stage, attempt, worker_id, lease_expires_at`;
+      const base = `insert into stage_runs (tenant_id, case_id, stage, attempt, visit, worker_id, lease_expires_at`;
       for (const [cols, vals] of [
         [', completed_at', `, now()`],
         [', failed_at', `, now()`],
         [', error', `, 'x'`],
       ] as const) {
         await expect(
-          db().admin.query(`${base}${cols}) values ($1, $2, 'map', 1, 'w', now()${vals})`, [
+          db().admin.query(`${base}${cols}) values ($1, $2, 'map', 1, 1, 'w', now()${vals})`, [
             T,
             file.id,
           ]),
@@ -263,6 +274,55 @@ describePg('database guards behind the store', () => {
       }
     });
 
+    it('the case file must agree with the tenant, id, score and floor columns (F3 cannot be dodged)', async () => {
+      const { file } = await openCase();
+      const text = `insert into cases (tenant_id, id, repo_id, case_file, candidate_score, escalation_floor,
+        remaining_input_tokens, remaining_output_tokens, remaining_usd)
+        values ($1, $2, $3, $4::jsonb, $5, $6, 1, 1, 1)`;
+      const good = { id: 'cf-ok', tenantId: T, candidate: { score: 0.9 }, escalationFloor: 0.7 };
+      const attempt = (id: string, over: object, score = 0.9, floor = 0.7) =>
+        asApp(text, [
+          T,
+          id,
+          file.target.repo,
+          JSON.stringify({ ...good, id, ...over }),
+          score,
+          floor,
+        ]);
+      expect(await attempt('cf-ok', {})).toBe('no error');
+      expect(await attempt('cf-1', { tenantId: 'other' })).toMatch(/cases_file_matches/);
+      expect(await attempt('cf-2', {}, 0.1)).toMatch(/cases_file_matches/); // score column lowered
+      expect(await attempt('cf-3', {}, 0.9, 0.99)).toMatch(/cases_file_matches/); // floor raised
+      expect(await attempt('cf-4', { id: 'different' })).toMatch(/cases_file_matches/);
+    });
+
+    it('the budget must be a number and seq advances by one', async () => {
+      const { store, file } = await openCase();
+      await expect(
+        db().admin.query(`update cases set remaining_usd = 'NaN' where id = $1`, [file.id]),
+      ).rejects.toThrow(/budget|cases_budget_finite/);
+      await store.nextSeq(file.id);
+      await expect(
+        db().admin.query(`update cases set seq = seq + 5 where id = $1`, [file.id]),
+      ).rejects.toThrow(/advances by one/);
+    });
+
+    it('stage history cannot be forged even by the owner, and changes always leave a row', async () => {
+      const { store, file } = await openCase();
+      await store.transition(file.id, 'map');
+      await expect(
+        db().admin.query(
+          `insert into stages (tenant_id, case_id, ordinal, stage) values ($1, $2, 3, 'arraign')`,
+          [T, file.id],
+        ),
+      ).rejects.toThrow(/stage history must record/);
+      const { rows } = await db().admin.query<{ n: string }>(
+        `select count(*)::text as n from stages where case_id = $1`,
+        [file.id],
+      );
+      expect(Number(rows[0]!.n)).toBe(2);
+    });
+
     it('case exhaustion never clears', async () => {
       const { store, file } = await openCase();
       await store.chargeBudget(file.id, {
@@ -294,7 +354,7 @@ describePg('database guards behind the store', () => {
             [T, file.id, ordinal, stage],
           ),
           `${stage} ${ordinal}`,
-        ).toMatch(/stage history must record|duplicate key/);
+        ).toMatch(/permission denied/);
       }
     });
   });

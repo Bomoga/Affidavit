@@ -71,6 +71,16 @@ export const cases = pgTable(
     primaryKey({ columns: [t.tenantId, t.id] }),
     foreignKey({ columns: [t.tenantId, t.repoId], foreignColumns: [repos.tenantId, repos.id] }),
     check('cases_stage_valid', sql`${t.stage} in (${stageList})`),
+    // The columns the store and the SQL guards act on must agree with the validated case file, so
+    // F3 cannot be dodged by a row whose score or floor column differs from its case file.
+    check(
+      'cases_file_matches',
+      sql`${t.caseFile}->>'id' = ${t.id}
+        and ${t.caseFile}->>'tenantId' = ${t.tenantId}
+        and (${t.caseFile}->'candidate'->>'score')::double precision = ${t.candidateScore}
+        and (${t.caseFile}->>'escalationFloor')::double precision = ${t.escalationFloor}`,
+    ),
+    check('cases_budget_finite', sql`${t.remainingUsd} <> 'NaN'::numeric`),
   ],
 ).enableRLS();
 
@@ -240,7 +250,17 @@ export const stageRuns = pgTable(
     caseId: text('case_id').notNull(),
     stage: text('stage').notNull(),
     attempt: integer('attempt').notNull(),
+    /** The stage visit (stage-history ordinal) this attempt belongs to, copied from stage_jobs. */
+    visit: integer('visit').notNull(),
     workerId: text('worker_id').notNull(),
+    /**
+     * Secret handed only to the claimer. Heartbeat, completion and a holder's failure need it, so
+     * another caller with the application role cannot act on someone else's lease. Not readable
+     * by the application role (column-level grants omit it).
+     */
+    leaseToken: text('lease_token')
+      .notNull()
+      .default(sql`gen_random_uuid()::text`),
     claimedAt: timestamp('claimed_at', { withTimezone: true }).notNull().defaultNow(),
     heartbeatAt: timestamp('heartbeat_at', { withTimezone: true }).notNull().defaultNow(),
     leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true }).notNull(),
