@@ -210,8 +210,9 @@ export function buildInvocation(
           '--gitleaks-ignore-path',
           '/tool-config',
           '--ignore-gitleaks-allow',
-          // Look inside archives (.gz, .zip, .tar) up to 3 levels. Works offline. UTF-16 files are
-          // still not scanned (accepted gap, see README).
+          // Look inside archives (.gz, .zip, .tar) up to 3 levels. Works offline. Files gitleaks
+          // skips or reads incompletely (UTF-16, binary-looking headers, chunk cuts) are listed by
+          // runTool as coverage notifications instead.
           '--max-archive-depth',
           '3',
           '--report-format',

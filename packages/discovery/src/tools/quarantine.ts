@@ -1,5 +1,6 @@
 import { lstat, mkdir, readdir, rename } from 'node:fs/promises';
-import { basename, dirname, join, sep } from 'node:path';
+import { basename, dirname, join } from 'node:path';
+import { listDir } from './walk.js';
 
 /**
  * Repo-controlled files that change what a scanner does: ignore lists, allowlists, per-repo
@@ -96,52 +97,37 @@ export class QuarantinedSnapshot {
   }
 }
 
-/** Display form of a raw file name: UTF-8 when it round-trips, else percent-escaped bytes. */
-function display(name: Buffer): string {
-  const text = name.toString('utf8');
-  if (Buffer.from(text, 'utf8').equals(name)) return text;
-  return [...name]
-    .map((b) =>
-      b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : `%${b.toString(16).padStart(2, '0')}`,
-    )
-    .join('');
-}
-
-const SEP = Buffer.from(sep);
-
-function child(dir: Buffer, name: Buffer): Buffer {
-  return Buffer.concat([dir, SEP, name]);
-}
-
 interface Entry {
-  abs: Buffer;
+  abs: string;
   rel: string;
 }
 
 /**
- * Finds tool-control entries without changing anything. Never follows symlinks. Names are read as
- * raw bytes so non-UTF-8 names cannot be misread or skipped.
+ * Finds tool-control entries without changing anything. Never follows symlinks. A name that is not
+ * valid UTF-8 throws NonUtf8NameError (one policy for every walk in this module).
  */
-async function collect(dir: Buffer, rel: string[], found: Entry[]): Promise<void> {
-  for (const entry of await readdir(dir, { withFileTypes: true, encoding: 'buffer' })) {
-    const abs = child(dir, entry.name);
-    const here = [...rel, display(entry.name)];
-    const name = entry.name.toString('latin1');
+async function collect(dir: string, rel: string[], found: Entry[]): Promise<void> {
+  for (const entry of await listDir(dir)) {
+    const abs = join(dir, entry.name);
+    const here = [...rel, entry.name];
     // Only `.git` is moved as a directory. A directory that merely has a control name (for example
     // `src/.gitignore/evil.js`) holds scannable content, so it stays and is walked; the scanners
     // only act on control names that are files or symlinks.
-    if (isToolControlName(name) && (!entry.isDirectory() || name.toLowerCase() === '.git')) {
+    if (
+      isToolControlName(entry.name) &&
+      (!entry.isDirectory || entry.name.toLowerCase() === '.git')
+    ) {
       found.push({ abs, rel: here.join('/') });
       continue;
     }
-    if (entry.isDirectory()) await collect(abs, here, found);
+    if (entry.isDirectory) await collect(abs, here, found);
   }
 }
 
 /** Lists tool-control paths without changing anything. */
 export async function findToolControlPaths(snapshotDir: string): Promise<string[]> {
   const found: Entry[] = [];
-  await collect(Buffer.from(snapshotDir), [], found);
+  await collect(snapshotDir, [], found);
   return found.map((e) => e.rel).sort();
 }
 
@@ -157,7 +143,7 @@ export async function quarantineSnapshot(snapshotDir: string): Promise<Quarantin
   const stat = await lstat(snapshotDir);
   if (!stat.isDirectory()) throw new Error(`snapshot is not a directory: ${snapshotDir}`);
   const found: Entry[] = [];
-  await collect(Buffer.from(snapshotDir), [], found);
+  await collect(snapshotDir, [], found);
   if (found.length === 0) return new QuarantinedSnapshot(TOKEN, snapshotDir, null, new Map());
 
   const sidecar = join(dirname(snapshotDir), `${basename(snapshotDir)}.quarantine`);
@@ -223,7 +209,7 @@ export function resolveQuarantinedUri(
   return undefined;
 }
 
-const GIT_METADATA = new Set([
+export const GIT_METADATA = new Set([
   'head',
   'config',
   'config.worktree',
@@ -259,11 +245,45 @@ const GIT_METADATA = new Set([
   'rebase-apply',
 ]);
 
+/** True for a top-level entry of a `.git` directory that is git's own bookkeeping. */
+export function isGitMetadataEntry(name: string): boolean {
+  const lower = name.toLowerCase();
+  return GIT_METADATA.has(lower) || lower.endsWith('.lock');
+}
+
+const GIT_HOOKS = new Set([
+  'applypatch-msg',
+  'commit-msg',
+  'fsmonitor-watchman',
+  'post-applypatch',
+  'post-checkout',
+  'post-commit',
+  'post-merge',
+  'post-receive',
+  'post-rewrite',
+  'post-update',
+  'pre-applypatch',
+  'pre-auto-gc',
+  'pre-commit',
+  'pre-merge-commit',
+  'pre-push',
+  'pre-rebase',
+  'pre-receive',
+  'prepare-commit-msg',
+  'push-to-checkout',
+  'reference-transaction',
+  'sendemail-validate',
+  'update',
+]);
+const GIT_INFO = new Set(['exclude', 'attributes', 'refs', 'sparse-checkout', 'grafts']);
+
 /**
  * `.git` directories are moved aside and never scanned by Semgrep or OSV-Scanner. If one holds
  * anything other than git metadata, that content (application code, lockfiles) was hidden from
  * them, so the caller marks their results partial. Returns original-relative paths of such
- * entries (top level of the `.git` directory only).
+ * entries: unknown top-level names, plus unexpected names inside `info/` and `hooks/`, and ref
+ * files that do not look like refs. `objects/`, `logs/`, `modules/` and similar are treated as
+ * metadata (history is an accepted gap).
  */
 export async function gitDirExtraContent(snapshot: QuarantinedSnapshot): Promise<string[]> {
   if (snapshot.sidecarDir === null) return [];
@@ -273,10 +293,34 @@ export async function gitDirExtraContent(snapshot: QuarantinedSnapshot): Promise
     const dir = join(snapshot.sidecarDir, neutral);
     const st = await lstat(dir);
     if (!st.isDirectory()) continue;
-    for (const name of await readdir(dir)) {
-      const lower = name.toLowerCase();
-      if (!GIT_METADATA.has(lower) && !lower.endsWith('.lock')) extras.push(`${original}/${name}`);
+    for (const e of await listDir(dir)) {
+      const lower = e.name.toLowerCase();
+      const at = `${original}/${e.name}`;
+      if (!isGitMetadataEntry(e.name)) {
+        extras.push(at);
+      } else if (lower === 'hooks' && e.isDirectory) {
+        for (const h of await listDir(join(dir, e.name))) {
+          if (!h.name.endsWith('.sample') && !GIT_HOOKS.has(h.name)) extras.push(`${at}/${h.name}`);
+        }
+      } else if (lower === 'info' && e.isDirectory) {
+        for (const h of await listDir(join(dir, e.name))) {
+          if (!GIT_INFO.has(h.name)) extras.push(`${at}/${h.name}`);
+        }
+      } else if (lower === 'refs' && e.isDirectory) {
+        extras.push(...(await oddRefs(join(dir, e.name), at)));
+      }
     }
   }
   return extras.sort();
+}
+
+/** Files under refs/ that are not a short hash or symbolic ref (anything bigger is not a ref). */
+async function oddRefs(dir: string, label: string): Promise<string[]> {
+  const odd: string[] = [];
+  for (const e of await listDir(dir)) {
+    const full = join(dir, e.name);
+    if (e.isDirectory) odd.push(...(await oddRefs(full, `${label}/${e.name}`)));
+    else if (!e.isFile || (await lstat(full)).size > 512) odd.push(`${label}/${e.name}`);
+  }
+  return odd;
 }

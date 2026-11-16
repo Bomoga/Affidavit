@@ -35,7 +35,10 @@ const NAMES = new Set([
   'podfile.lock',
   'cabal.project.freeze',
   'stack.yaml.lock',
-  // Names present in OSV-Scanner 2.7.0's extractors, found by inspecting the pinned binary.
+  // Names found in the pinned 2.7.0 binary. Some (deno.lock, Podfile.lock, project.assets.json,
+  // plain deps.json) did not react to garbage content in the probe and may need valid content;
+  // others only apply in a specific directory (node_modules/.package-lock.json, gradle/). Kept on
+  // purpose: over-inclusion only turns an empty result into a failure.
   'pylock.toml',
   '.package-lock.json',
   'verification-metadata.xml',
@@ -46,6 +49,8 @@ const NAMES = new Set([
   'project.assets.json',
   'packages.lock',
   'bom.json',
+  'bom.xml',
+  'directory.packages.props',
 ]);
 
 export function isOsvLockfileName(name: string): boolean {
@@ -55,7 +60,9 @@ export function isOsvLockfileName(name: string): boolean {
     /^requirements[\w.-]*\.txt$/.test(n) ||
     /^pylock\.[\w.-]+\.toml$/.test(n) ||
     /\.(?:cdx|spdx)\.(?:json|xml)$/.test(n) ||
-    /\.(?:csproj|vbproj|fsproj)$/.test(n)
+    /\.(?:csproj|vbproj|fsproj)$/.test(n) ||
+    /\.spdx(?:\.(?:json|xml|ya?ml|rdf))?$/.test(n) ||
+    /\.deps\.json$/.test(n)
   );
 }
 

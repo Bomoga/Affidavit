@@ -7,6 +7,7 @@ import { isEmptyExit, isOkExit, type ToolManifest, type ToolName } from './manif
 import {
   assertSnapshotClean,
   gitDirExtraContent,
+  isGitMetadataEntry,
   prepareOutput,
   prepareScratch,
   type QuarantinedSnapshot,
@@ -43,11 +44,17 @@ export interface ToolRunResult {
   empty: boolean;
   /**
    * True when the run may have missed something: Semgrep reported a timeout or unparsed file,
-   * gitleaks was given files it silently skips as binary, or OSV-Scanner's report lacks a lockfile
+   * gitleaks was given files it may skip or cut through (see UnscannableKind), a quarantined .git
+   * hid content from Semgrep and OSV, or OSV-Scanner's report lacks a lockfile
    * the snapshot has. Findings are then incomplete. Treat it as a signal, not as "clean".
    */
   partial: boolean;
   notifications: ToolNotification[];
+  /**
+   * Well-formed binary files (images, fonts, archives) that gitleaks does not scan. Informational:
+   * unlike everything in `notifications`, they do not make the run `partial`.
+   */
+  skippedAssets: string[];
   /** The output directory the run wrote into (the one passed in options). */
   outputPath: string;
   /** Name of the main report file. When `empty`, no file was written under this name. */
@@ -64,10 +71,10 @@ const where = (pass: Pass) => (pass === 'quarantine' ? ' (quarantine pass)' : ''
 
 /** The tool exited normally but did not leave a regular, non-empty, valid report where expected. */
 export class ToolOutputMissingError extends Error {
-  readonly tool: string;
+  readonly tool: ToolName;
   readonly quarantined: readonly string[];
   constructor(
-    tool: string,
+    tool: ToolName,
     file: string,
     why: string,
     quarantined: readonly string[] = [],
@@ -102,7 +109,7 @@ export class ToolFailedError extends Error {
 
 /** Requires a regular, non-empty file (lstat, so a symlink is refused) holding valid JSON. */
 async function readJsonReport(
-  tool: string,
+  tool: ToolName,
   file: string,
   q: readonly string[],
   pass: Pass,
@@ -122,11 +129,26 @@ async function readJsonReport(
   }
   if (!st.isFile()) throw new ToolOutputMissingError(tool, file, 'not a regular file', q, pass);
   if (st.size === 0) throw new ToolOutputMissingError(tool, file, 'file is empty', q, pass);
+  let doc: unknown;
   try {
-    return JSON.parse(await readFile(file, 'utf8')) as unknown;
+    doc = JSON.parse(await readFile(file, 'utf8')) as unknown;
   } catch {
     throw new ToolOutputMissingError(tool, file, 'not valid JSON (truncated?)', q, pass);
   }
+  // Shape check, so a well-formed but wrong document (or one an attacker shaped) is a typed
+  // failure and not a silent "no findings".
+  const isObject = typeof doc === 'object' && doc !== null && !Array.isArray(doc);
+  const runs = isObject ? (doc as { runs?: unknown }).runs : undefined;
+  if (tool === 'osv-scanner' ? !isObject : !Array.isArray(runs)) {
+    throw new ToolOutputMissingError(
+      tool,
+      file,
+      tool === 'osv-scanner' ? 'not an OSV report object' : 'not a SARIF document (no runs array)',
+      q,
+      pass,
+    );
+  }
+  return doc;
 }
 
 /** Semgrep reports skipped, timed-out and unparsed files as SARIF notifications, with exit 0. */
@@ -172,31 +194,47 @@ function osvMissingLockfiles(doc: unknown, lockfiles: readonly string[]): string
   );
 }
 
-const MAX_FILE_NOTES = 200;
-
 const KIND_TEXT: Record<Unscannable['kind'], string> = {
   'binary-asset': 'is a binary file, which gitleaks does not scan',
   'binary-header-mismatch':
     'starts with a binary file signature that does not match its extension, so gitleaks may skip it; a secret could be hidden behind that header',
   'non-text-header':
-    'does not start like plain text (NUL bytes, invalid UTF-8 or control characters, or UTF-16), so gitleaks may skip it',
+    'is not plain text (control characters at the start, or NUL bytes or invalid UTF-8 anywhere, as in UTF-16 text), so gitleaks may skip it',
+  'chunk-split-risk':
+    'is over 100 KB with a 25 KB stretch that has no blank line, so gitleaks may cut a chunk through a secret and miss it',
   unreadable: 'could not be read (mode or ownership), so the jailed gitleaks cannot read it either',
 };
 
-function binaryNotes(files: readonly Unscannable[]): ToolNotification[] {
-  const notes = files.slice(0, MAX_FILE_NOTES).map((f) => ({
-    level: 'warning',
-    id: f.kind,
-    message: `/src/${f.path} ${KIND_TEXT[f.kind]}`,
-  }));
-  if (files.length > MAX_FILE_NOTES) {
-    notes.push({
-      level: 'warning',
-      id: 'binary-asset',
-      message: `${files.length - MAX_FILE_NOTES} more files not listed`,
-    });
+const KIND_ORDER: Unscannable['kind'][] = [
+  'binary-header-mismatch',
+  'non-text-header',
+  'unreadable',
+  'chunk-split-risk',
+];
+
+/**
+ * Splits gitleaks coverage findings. Everything except well-formed binary assets is a coverage
+ * loss: it becomes a notification, never truncated, listed by severity. Well-formed assets (a real
+ * PNG, font, archive) lose nothing a text scanner could find and are returned apart.
+ */
+function coverageSplit(files: readonly Unscannable[]): {
+  notifications: ToolNotification[];
+  skippedAssets: string[];
+} {
+  const notifications: ToolNotification[] = [];
+  for (const kind of KIND_ORDER) {
+    for (const f of files) {
+      if (f.kind === kind) {
+        notifications.push({
+          level: 'warning',
+          id: kind,
+          message: `/src/${f.path} ${KIND_TEXT[kind]}`,
+        });
+      }
+    }
   }
-  return notes;
+  const skippedAssets = files.filter((f) => f.kind === 'binary-asset').map((f) => `/src/${f.path}`);
+  return { notifications, skippedAssets };
 }
 
 /** Maps a sidecar entry (`q0001/...`) back to its original path under /src. */
@@ -321,13 +359,21 @@ export async function runTool(
         q,
       );
     }
-    return { ...base, empty: true, partial: false, notifications: [], reports: [] };
+    return {
+      ...base,
+      empty: true,
+      partial: false,
+      notifications: [],
+      skippedAssets: [],
+      reports: [],
+    };
   }
 
   const file = join(outputDir, run.inv.outputFile);
   const doc = await readJsonReport(name, file, q, 'snapshot');
   const reports: ToolReport[] = [{ file, origin: 'snapshot' }];
   const notifications: ToolNotification[] = [];
+  let skippedAssets: string[] = [];
 
   if (name === 'semgrep') notifications.push(...semgrepNotifications(doc));
 
@@ -360,11 +406,12 @@ export async function runTool(
       const side = await findGitleaksUnscannable(snapshot.sidecarDir);
       for (const f of side) {
         const original = mapSidecarPath(f.path, snapshot.mapping);
-        // Git history (objects and packs) is an accepted gap, not a per-file signal. Other files
-        // inside a quarantined .git directory are still checked.
-        if (original !== undefined && !/(?:^|\/)\.git\/objects(?:\/|$)/i.test(original)) {
-          unscanned.push({ path: original, kind: f.kind });
-        }
+        if (original === undefined) continue;
+        // git's own bookkeeping (index, objects, packs, refs, HEAD, config, ...) is expected to
+        // be binary and is skipped. Anything else inside a quarantined .git is still checked.
+        const inGit = /(?:^|\/)\.git\/([^/]+)/i.exec(original);
+        if (inGit?.[1] !== undefined && isGitMetadataEntry(inGit[1])) continue;
+        unscanned.push({ path: original, kind: f.kind });
       }
     }
 
@@ -388,8 +435,17 @@ export async function runTool(
       await rewriteSidecarReport(sideFile, sideDoc, snapshot.mapping);
       reports.push({ file: sideFile, origin: 'quarantine' });
     }
-    notifications.push(...binaryNotes(unscanned.sort((a, b) => a.path.localeCompare(b.path))));
+    const split = coverageSplit(unscanned.sort((a, b) => a.path.localeCompare(b.path)));
+    notifications.push(...split.notifications);
+    skippedAssets = split.skippedAssets;
   }
 
-  return { ...base, empty: false, partial: notifications.length > 0, notifications, reports };
+  return {
+    ...base,
+    empty: false,
+    partial: notifications.length > 0,
+    notifications,
+    skippedAssets,
+    reports,
+  };
 }

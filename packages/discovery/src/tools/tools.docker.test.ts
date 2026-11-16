@@ -87,13 +87,11 @@ const stderrByImage = new Map<string, string>();
 function makeRunner(): ToolRunnerPort {
   return {
     run(image, args, mounts) {
-      const out = mounts.find((m) => m.containerPath === '/out')?.hostPath ?? '';
       return new Promise((resolve) => {
         execFile('docker', dockerRunArgs(image, args, mounts), (error, _out, stderr) => {
           const exitCode = error ? (typeof error.code === 'number' ? error.code : 1) : 0;
           stderrByImage.set(image, stderr);
           // Like the real runners, report a directory unrelated to the /out mount.
-          void out;
           resolve({ exitCode, outputPath: tmpdir() });
         });
       });
@@ -266,13 +264,13 @@ describe.skipIf(!enabled)('tool images, offline', () => {
       'export const run = (x) => eval(x);\n' + '// padding\n'.repeat(120_000),
     );
     // Files gitleaks silently skips as binary-looking, with a secret inside.
-    writeFileSync(join(src, 'src', 'doc.pdf'), '%PDF-1.4\nAFFIDAVIT_FAKE_KEY_1122334455667788\n');
+    writeFileSync(join(src, 'src', 'doc.dat'), '%PDF-1.4\nAFFIDAVIT_FAKE_KEY_1122334455667788\n');
     writeFileSync(
       join(src, 'src', 'utf16.txt'),
       Buffer.from('AFFIDAVIT_FAKE_KEY_99AABBCCDDEEFF00', 'utf16le'),
     );
     // Loose files inside the quarantined .git: a secret behind a PDF header, and non-metadata.
-    writeFileSync(join(src, '.git', 'doc.pdf'), '%PDF-1.4\nAFFIDAVIT_FAKE_KEY_0011223344556677\n');
+    writeFileSync(join(src, '.git', 'doc.dat'), '%PDF-1.4\nAFFIDAVIT_FAKE_KEY_0011223344556677\n');
     writeFileSync(join(src, '.git', 'payload.js'), 'export const run = (x) => eval(x);\n');
     // A secret hidden inside a gzip archive.
     writeFileSync(
@@ -375,7 +373,19 @@ describe.skipIf(!enabled)('tool images, offline', () => {
   }
 
   it('benign fixture: each tool runs offline and writes its report to the mounted output', async () => {
-    const s = scenario('repo');
+    const s = scenario('repo', (src) => {
+      // What every real clone has: a binary index and pack files inside .git.
+      mkdirSync(join(src, '.git', 'objects', 'pack'), { recursive: true });
+      writeFileSync(
+        join(src, '.git', 'index'),
+        Buffer.from('DIRC\0\0\0\u0002\0\0\0\u0001', 'latin1'),
+      );
+      writeFileSync(
+        join(src, '.git', 'objects', 'pack', 'p.pack'),
+        Buffer.from('PACK\0\0\0\u0002', 'latin1'),
+      );
+      writeFileSync(join(src, '.git', 'HEAD'), 'ref: refs/heads/main\n');
+    });
     const { results } = await runAll(s);
     // A fully parsed, text-only repo is not partial for OSV or gitleaks.
     expect(results['osv-scanner']?.partial).toBe(false);
@@ -402,15 +412,16 @@ describe.skipIf(!enabled)('tool images, offline', () => {
     // gitleaks skips binary-looking files silently, so discovery lists them.
     expect(results.gitleaks?.partial).toBe(true);
     const skipped = results.gitleaks?.notifications.map((n) => n.message).join('\n') ?? '';
-    for (const f of ['src/doc.pdf', 'src/utf16.txt', 'src/secret.txt.gz'])
-      expect(skipped).toContain(`/src/${f}`);
+    for (const f of ['src/doc.dat', 'src/utf16.txt']) expect(skipped).toContain(`/src/${f}`);
+    // A well-formed archive is informational, not a coverage loss (its contents were scanned).
+    expect(results.gitleaks?.skippedAssets).toContain('/src/src/secret.txt.gz');
     // OSV drops the malformed second lockfile without failing; discovery notices.
     expect(results['osv-scanner']?.partial).toBe(true);
     // Code hidden inside the quarantined .git was never seen by Semgrep or OSV.
     for (const tool of ['semgrep', 'osv-scanner'] as const) {
       expect(results[tool]?.notifications.some((n) => n.id === 'git-dir-extra-content')).toBe(true);
     }
-    expect(skipped).toContain('/src/.git/doc.pdf');
+    expect(skipped).toContain('/src/.git/doc.dat');
     expect(
       results['osv-scanner']?.notifications.some((n) =>
         n.message.includes('/src/extra/package-lock.json'),
@@ -525,6 +536,57 @@ describe.skipIf(!enabled)('tool images, offline', () => {
     expect(messages.some((m) => m.startsWith('/src/package-lock.json '))).toBe(true);
     expect(messages.some((m) => m.startsWith('/src/extra/package-lock.json '))).toBe(false);
   }, 240_000);
+
+  it('flags a secret that straddles gitleaks chunk boundary, in dense lines and in one long line', async () => {
+    const secret = 'AFFIDAVIT_FAKE_KEY_0123456789ABCDEF';
+    const s = scenario('repo', (src) => {
+      // 80-character lines with no blank line; the key crosses byte 125,000.
+      const dense = Buffer.alloc(130_000, 0x61);
+      for (let i = 79; i < dense.length; i += 80) dense[i] = 0x0a;
+      dense.write(secret, 124_990);
+      writeFileSync(join(src, 'src', 'dense.txt'), dense);
+      // the same in a single long line
+      const one = Buffer.alloc(130_000, 0x62);
+      one.write(secret, 124_990);
+      writeFileSync(join(src, 'src', 'oneline.txt'), one);
+    });
+    const snap = await quarantineSnapshot(s.src);
+    const { sourceDir: _ignored, ...rest } = s.options('gitleaks');
+    void _ignored;
+    const res = await runTool(s.runner, manifest, 'gitleaks', { ...rest, snapshot: snap });
+    expect(res.partial).toBe(true);
+    const risk = res.notifications.filter((n) => n.id === 'chunk-split-risk').map((n) => n.message);
+    expect(risk.some((m) => m.includes('/src/src/dense.txt'))).toBe(true);
+    expect(risk.some((m) => m.includes('/src/src/oneline.txt'))).toBe(true);
+  }, 240_000);
+
+  // Names OSV-Scanner 2.7.0 reacted to in a probe that were not on discovery's list before.
+  for (const name of [
+    'bom.xml',
+    'sbom.spdx',
+    'app.spdx.json',
+    'x.spdx.yml',
+    'x.spdx.rdf',
+    'app.deps.json',
+    'Directory.Packages.props',
+  ]) {
+    it(`a lone unparseable ${name} is a failure or a partial result, never silently clean`, async () => {
+      const s = scenario('repo', (src) => {
+        rmSync(join(src, 'package.json'));
+        rmSync(join(src, 'package-lock.json'));
+        writeFileSync(join(src, name), 'garbage {{{ not valid\n');
+      });
+      const snap = await quarantineSnapshot(s.src);
+      const { sourceDir: _ignored, ...rest } = s.options('osv-scanner');
+      void _ignored;
+      const outcome: ToolRunResult | Error = await runTool(s.runner, manifest, 'osv-scanner', {
+        ...rest,
+        snapshot: snap,
+      }).catch((e: unknown) => e as Error);
+      if (outcome instanceof Error) expect(outcome).toBeInstanceOf(ToolFailedError);
+      else expect(outcome.partial).toBe(true);
+    }, 240_000);
+  }
 
   it('OSV-Scanner exits 128 with no report when there is nothing to scan, which runTool reports as empty', async () => {
     const s = scenario('repo', (src) => {
