@@ -11,7 +11,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { PROBE_IMAGE } from '../containment/probes.js';
 import { DEFAULT_TRACE_ROOT, RUN_LABEL } from './args.js';
 import { GvisorRunner, GvisorToolRunner } from './runner.js';
@@ -27,9 +27,15 @@ const leftovers = (): string =>
   }).trim();
 
 describe.runIf(onSandboxHost)('gVisor runner on a sandbox host', { timeout: 120_000 }, () => {
-  const base = mkdtempSync(join(tmpdir(), 'affidavit-runner-it-'));
-  const workspace = join(base, 'workspace');
-  mkdirSync(workspace);
+  // Created in beforeAll, not in the describe body: Vitest runs the body even when the suite is
+  // skipped, and then never runs afterAll, which leaked one directory per plain `pnpm test`.
+  let base = '';
+  let workspace = '';
+  beforeAll(() => {
+    base = mkdtempSync(join(tmpdir(), 'affidavit-runner-it-'));
+    workspace = join(base, 'workspace');
+    mkdirSync(workspace);
+  });
   afterAll(() => rmSync(base, { recursive: true, force: true }));
 
   it('runs a script inside gVisor and tears everything down', async () => {

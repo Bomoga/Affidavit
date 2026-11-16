@@ -2,14 +2,15 @@ import {
   ExhibitId,
   type AdmissibilityRule,
   type Budget,
-  type CaseFile,
+  type PromptId,
+  type CaseFileSource,
   type CaseId,
   type JudgePort,
   type PatchExhibit,
   type VerifyResult,
 } from '@affidavit/contracts';
-import { renderPrompt, type PromptId } from '@affidavit/prompts';
 import { canonicalJson, sha256Hex } from './canonical.js';
+import { loadCaseFile, type PromptRenderer } from './defense.js';
 import { SUBMISSIONS } from './envelope.js';
 import type { StageHandler, StageResult } from './orchestrator.js';
 import type { TrialWorkspace } from './workspace.js';
@@ -24,8 +25,9 @@ export interface RemedyConfig {
 }
 
 export interface RemedyDeps {
-  loadCaseFile: (caseId: CaseId) => Promise<CaseFile>;
+  caseFiles: CaseFileSource;
   judge: JudgePort;
+  render: PromptRenderer;
   workspace: TrialWorkspace;
   config: RemedyConfig;
 }
@@ -91,13 +93,14 @@ function describeVerify(r: VerifyResult): string {
  * a fix that cannot be proven becomes a verdict, not a crash.
  */
 export function createRemedyHandler(deps: RemedyDeps): StageHandler {
-  const { config, judge, workspace } = deps;
+  const { config, judge, render, workspace } = deps;
 
   return {
     async run(ctx): Promise<StageResult> {
-      const caseFile = await deps.loadCaseFile(ctx.caseId);
-      const witness = await workspace.getWitness(ctx.caseId);
-      if (!witness) throw new Error(`no admitted witness for case ${ctx.caseId}`);
+      const caseFile = await loadCaseFile(deps.caseFiles, ctx.caseId);
+      const admitted = await workspace.getWitness(ctx.caseId);
+      if (!admitted) throw new Error(`no admitted witness for case ${ctx.caseId}`);
+      const witness = admitted.witness;
 
       const feedback: string[] = [];
       let last: { patch?: PatchExhibit; result?: VerifyResult; reason: string } = {
@@ -119,7 +122,7 @@ export function createRemedyHandler(deps: RemedyDeps): StageHandler {
         if (feedback.length > 0)
           blocks.push({ label: 'judge-feedback', content: feedback.join('\n') });
 
-        const rendered = renderPrompt(config.promptId, blocks);
+        const rendered = render(config.promptId, blocks);
         const res = await ctx.runAgentValidated(
           {
             actor: 'remedy',

@@ -56,6 +56,7 @@ export function raw(results: readonly boolean[], over: Partial<RawAttempt> = {})
     stdout: 'ok',
     stderr: '',
     egressAttempts: 0,
+    traceTampered: false,
     artifact: artifactJson(results),
     ...over,
   };

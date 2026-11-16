@@ -8,7 +8,8 @@ import {
   type VerifyResult,
   type Witness,
 } from '@affidavit/contracts';
-import { FakeEventSink, FakeJudge, ReplayModel } from '@affidavit/testing';
+import { renderPrompt } from '@affidavit/prompts';
+import { FakeCaseFileSource, FakeEventSink, FakeJudge, ReplayModel } from '@affidavit/testing';
 import { buildPatchExhibit, createRemedyHandler, type RemedyConfig } from './remedy.js';
 import { Orchestrator, type ModelTurnResult, type StageHandler } from './orchestrator.js';
 import {
@@ -81,7 +82,12 @@ async function run(
     verifyResults: verifyScript,
   });
   const workspace = new InMemoryWorkspace();
-  if (opts.withWitness !== false) await workspace.saveWitness(CASE, witness);
+  if (opts.withWitness !== false) {
+    await workspace.saveWitness(CASE, {
+      witness,
+      result: ExhibitResult.parse(samples.ExhibitResult),
+    });
+  }
   const next = (to: CaseStage): StageHandler => ({
     run: () => Promise.resolve({ kind: 'advance', next: to }),
   });
@@ -91,8 +97,9 @@ async function run(
     model,
     handlers: {
       remedy: createRemedyHandler({
-        loadCaseFile: () => Promise.resolve(CF),
+        caseFiles: new FakeCaseFileSource([CF]),
         judge,
+        render: renderPrompt,
         workspace,
         config,
       }),

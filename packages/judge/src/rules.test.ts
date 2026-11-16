@@ -267,6 +267,7 @@ describe('executor output is checked, never trusted', () => {
     ['a negative duration', { durationMs: -1 }, /durationMs/],
     ['a fractional exit code', { exitCode: 1.5 }, /exitCode/],
     ['a non-string artifact', { artifact: 42 as unknown as string }, /artifact/],
+    ['a missing tamper flag', { traceTampered: undefined as unknown as boolean }, /traceTampered/],
   ])('throws on %s instead of judging it', (_name, over, why) => {
     const attempts = gateWith(observed('vulnerable', 2, ALL, over));
     expect(() => judgeEvidence(evidence(attempts), DEFAULT_POLICY)).toThrow(why);
@@ -278,4 +279,19 @@ describe('executor output is checked, never trusted', () => {
     );
     expect(() => judgeEvidence(evidence(attempts), DEFAULT_POLICY)).toThrow(/egressAttempts/);
   });
+});
+
+describe('a tampered syscall trace', () => {
+  it.each(['vulnerable', 'safe'] as const)(
+    'fails no-egress even with zero recorded attempts (%s variant)',
+    (variant) => {
+      const attempts = gateWith(
+        observed(variant, 3, variant === 'safe' ? NONE : ALL, { traceTampered: true }),
+      );
+      const r = judgeEvidence(evidence(attempts), DEFAULT_POLICY);
+      expect(r.admissible).toBe(false);
+      expect(r.rejectedBy).toBe('no-egress');
+      expect(r.egressAttempts).toBe(0);
+    },
+  );
 });

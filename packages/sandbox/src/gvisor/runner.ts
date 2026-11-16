@@ -16,6 +16,7 @@ import {
   type Limits,
 } from './args.js';
 import { validateMounts, type Mount } from './mounts.js';
+import type { CaseNetwork } from './network.js';
 import { parseTrace, type TraceObservations } from './trace.js';
 import { assertNoImageVolumes, parseContainerVolumes } from './volumes.js';
 
@@ -63,6 +64,10 @@ export interface JailedRunInput {
   mounts: readonly Mount[];
   stdin?: string;
   timeoutMs: number;
+  /** Join this case network (with these /etc/hosts names) instead of `--network none`. */
+  network?: { net: CaseNetwork; hosts?: Readonly<Record<string, string>> };
+  /** Largest file the jail may write; see `GvisorRunSpec.maxFileBytes`. */
+  maxFileBytes?: number;
 }
 
 function capture(stream: NodeJS.ReadableStream): () => string {
@@ -228,6 +233,11 @@ export async function runJailed(
     limits: opts.limits ?? DEFAULT_LIMITS,
     stdin: input.stdin !== undefined,
     runtime: opts.trace === false ? PLAIN_RUNTIME : AUDIT_RUNTIME,
+    network:
+      input.network === undefined
+        ? undefined
+        : { name: input.network.net.name, hosts: input.network.hosts },
+    maxFileBytes: input.maxFileBytes,
   });
 
   const started = Date.now();
@@ -306,7 +316,10 @@ export async function runJailed(
   if (opts.trace === false) trace = UNTRACED;
   else if (text === null || traceOverflow) trace = OVERFLOWED;
   else {
-    trace = parseTrace(text, { sensitivePaths: opts.sensitivePaths ?? [] });
+    trace = parseTrace(text, {
+      sensitivePaths: opts.sensitivePaths ?? [],
+      localNetworks: input.network === undefined ? [] : [input.network.net.subnet],
+    });
     if (trace.syscalls === 0) throw new Error(`syscall trace for ${name} is empty`);
   }
 
