@@ -1,0 +1,20 @@
+{
+  "id": "AFFIDAVIT-SMOKE-0002",
+  "modified": "2026-01-01T00:00:00Z",
+  "published": "2026-01-01T00:00:00Z",
+  "summary": "Synthetic Go advisory for the offline OSV smoke test. Not a real vulnerability record.",
+  "affected": [
+    {
+      "package": { "ecosystem": "Go", "name": "example.com/vuln" },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [{ "introduced": "0" }, { "fixed": "1.2.0" }]
+        }
+      ],
+      "ecosystem_specific": {
+        "imports": [{ "path": "example.com/vuln", "symbols": ["Run"] }]
+      }
+    }
+  ]
+}

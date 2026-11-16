@@ -1,9 +1,12 @@
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BundleManifest } from '@affidavit/contracts';
 import { describe, expect, it } from 'vitest';
 import {
   enabledToolNames,
+  isEmptyExit,
+  isOkExit,
   loadToolManifest,
   parseToolManifest,
   repoRoot,
@@ -58,7 +61,10 @@ describe('tool manifest', () => {
     const codeql = manifest.tools.find((t) => t.name === 'codeql');
     expect(codeql?.enabled).toBe(false);
     expect(codeql?.reference).toBeNull();
-    expect(codeql?.enableFlag).toBe('AFFIDAVIT_ENABLE_CODEQL');
+    expect(codeql).not.toHaveProperty('enableFlag');
+    expect(readFileSync(join(repoRoot(), 'docker', 'tools', 'tools.json'), 'utf8')).not.toMatch(
+      /ENABLE_CODEQL/,
+    );
     expect(codeql?.blockedBy).toBe('P0-10');
     expect(enabledToolNames(manifest)).not.toContain('codeql');
   });
@@ -109,15 +115,59 @@ describe('tool manifest', () => {
     if (codeql) codeql.enabled = true;
     expect(() => parseToolManifest(copy)).toThrow();
   });
+
+  const rawManifest = () =>
+    structuredClone(
+      JSON.parse(readFileSync(join(repoRoot(), 'docker', 'tools', 'tools.json'), 'utf8')) as {
+        tools: { name: string; okExitCodes: number[]; emptyExitCodes?: number[] }[];
+      },
+    );
+
+  it('rejects a duplicate tool name', () => {
+    const copy = rawManifest();
+    copy.tools.push(structuredClone(copy.tools[0]!));
+    expect(() => parseToolManifest(copy)).toThrow(/duplicate/);
+  });
+
+  it('rejects empty okExitCodes and empty-result codes that are not ok codes', () => {
+    const none = rawManifest();
+    none.tools[0]!.okExitCodes = [];
+    expect(() => parseToolManifest(none)).toThrow(/okExitCodes/);
+    const stray = rawManifest();
+    stray.tools[0]!.emptyExitCodes = [99];
+    expect(() => parseToolManifest(stray)).toThrow(/emptyExitCodes/);
+  });
+
+  it('records OSV exit 128 (no packages found) as an empty result', () => {
+    expect(isEmptyExit(manifest, 'osv-scanner', 128)).toBe(true);
+    expect(isOkExit(manifest, 'osv-scanner', 128)).toBe(true);
+    expect(isEmptyExit(manifest, 'semgrep', 128)).toBe(false);
+  });
+
+  it('can be loaded from an explicit path, for deployments without the repo layout', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'affidavit-manifest-'));
+    const file = join(dir, 'tools.json');
+    copyFileSync(join(repoRoot(), 'docker', 'tools', 'tools.json'), file);
+    expect(loadToolManifest(file)).toEqual(manifest);
+  });
 });
 
 describe('BundleManifest.toolVersions', () => {
-  it('maps enabled tools to their recorded version and fits the contract', () => {
+  it('maps tools to version and image digest, and fits the contract', () => {
     const versions = toolVersions(manifest);
     expect(Object.keys(versions).sort()).toEqual(['gitleaks', 'osv-scanner', 'semgrep']);
     expect(versions['codeql']).toBeUndefined();
+    for (const t of manifest.tools.filter((x) => x.enabled)) {
+      expect(versions[t.name]).toBe(`${t.version}@${t.digest}`);
+    }
+    expect(versions['semgrep']).toMatch(/^\d+\.\d+\.\d+@sha256:[0-9a-f]{64}$/);
     const parsed = BundleManifest.shape.toolVersions.safeParse(versions);
     expect(parsed.success).toBe(true);
+  });
+
+  it('lists only the tools that actually ran, and refuses disabled ones', () => {
+    expect(Object.keys(toolVersions(manifest, ['semgrep']))).toEqual(['semgrep']);
+    expect(() => toolVersions(manifest, ['codeql'])).toThrow();
   });
 
   it('exposes the digest-pinned reference for each enabled tool', () => {

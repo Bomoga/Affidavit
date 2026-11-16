@@ -130,6 +130,11 @@ export function buildInvocation(
           '--no-git-ignore',
           '--disable-nosem',
           '--x-ignore-semgrepignore-files',
+          // No silent give-up: no size cap (default skips files over 1 MB), no per-rule timeout and
+          // no timeout-based file skipping. The runner's wall-clock limit bounds the run instead.
+          '--max-target-bytes=0',
+          '--timeout=0',
+          '--timeout-threshold=0',
           '--config',
           '/rules',
           '--sarif',
@@ -164,6 +169,9 @@ export function buildInvocation(
           '--config',
           '/tool-config/osv-scanner.toml',
           '--no-ignore',
+          // Call analysis would run the Go toolchain (and Rust build scripts) on repo content, and
+          // can mark findings "uncalled". Reachability is decided elsewhere, never by this flag.
+          '--no-call-analysis=all',
           '--format',
           'json',
           '--output-file',

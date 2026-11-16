@@ -18,7 +18,8 @@ export interface ToolEntry {
   resolvedOn: string | null;
   outputFormat: 'sarif' | 'json';
   okExitCodes: number[];
-  enableFlag?: string;
+  /** Exit codes that mean "nothing to scan, no report written" (OSV-Scanner 128). Subset of okExitCodes. */
+  emptyExitCodes?: number[];
   blockedBy?: string;
   dockerfile?: string;
 }
@@ -75,8 +76,16 @@ function parseTool(raw: unknown): ToolEntry {
     if (version === null || !/^\d+\.\d+\.\d+$/.test(version)) fail(`${name}: version required`);
   }
   const codes = raw['okExitCodes'];
-  if (!Array.isArray(codes) || !codes.every((c) => Number.isInteger(c))) {
-    fail(`${name}: okExitCodes must be integers`);
+  if (!Array.isArray(codes) || codes.length === 0 || !codes.every((c) => Number.isInteger(c))) {
+    fail(`${name}: okExitCodes must be a non-empty list of integers`);
+  }
+  const empty = raw['emptyExitCodes'];
+  if (
+    empty !== undefined &&
+    (!Array.isArray(empty) ||
+      !empty.every((c) => Number.isInteger(c) && (codes as number[]).includes(c as number)))
+  ) {
+    fail(`${name}: emptyExitCodes must be integers that are also in okExitCodes`);
   }
   const format = raw['outputFormat'];
   if (format !== 'sarif' && format !== 'json') fail(`${name}: outputFormat must be sarif or json`);
@@ -93,7 +102,7 @@ function parseTool(raw: unknown): ToolEntry {
     outputFormat: format,
     okExitCodes: codes as number[],
   };
-  if (typeof raw['enableFlag'] === 'string') entry.enableFlag = raw['enableFlag'];
+  if (empty !== undefined) entry.emptyExitCodes = empty as number[];
   if (typeof raw['blockedBy'] === 'string') entry.blockedBy = raw['blockedBy'];
   if (typeof raw['dockerfile'] === 'string') entry.dockerfile = raw['dockerfile'];
   return entry;
@@ -103,10 +112,20 @@ export function parseToolManifest(raw: unknown): ToolManifest {
   if (!isRecord(raw) || raw['schemaVersion'] !== 1) fail('schemaVersion must be 1');
   const tools = raw['tools'];
   if (!Array.isArray(tools)) fail('tools must be an array');
-  return { schemaVersion: 1, tools: tools.map(parseTool) };
+  const parsed = tools.map(parseTool);
+  const seen = new Set<string>();
+  for (const t of parsed) {
+    if (seen.has(t.name)) fail(`duplicate tool ${t.name}`);
+    seen.add(t.name);
+  }
+  return { schemaVersion: 1, tools: parsed };
 }
 
-/** Walks up from this file to the repo root (the directory holding docker/tools/tools.json). */
+/**
+ * Walks up from this file to the repo root (the directory holding docker/tools/tools.json). Only
+ * works where docker/tools ships with the code. A deployment without the repo layout must pass
+ * explicit paths: `loadToolManifest(path)` and `ToolRunOptions.configDir`.
+ */
 export function repoRoot(): string {
   let dir = dirname(fileURLToPath(import.meta.url));
   for (;;) {
@@ -126,10 +145,23 @@ export function enabledToolNames(manifest: ToolManifest): ToolName[] {
   return manifest.tools.filter((t) => t.enabled).map((t) => t.name);
 }
 
-/** For BundleManifest.toolVersions: enabled tool name to its recorded version. */
-export function toolVersions(manifest: ToolManifest): BundleManifest['toolVersions'] {
+/**
+ * For BundleManifest.toolVersions: tool name to `<version>@<image digest>`, so a run can be
+ * replayed against the exact image. Pass the names of the tools that actually ran so the bundle
+ * does not claim tools that did not; with no argument every enabled tool is listed, which is only
+ * right if all of them ran. Naming a disabled or unknown tool throws.
+ */
+export function toolVersions(
+  manifest: ToolManifest,
+  ran?: Iterable<ToolName>,
+): BundleManifest['toolVersions'] {
+  const wanted = ran === undefined ? undefined : new Set<ToolName>(ran);
   const out: Record<string, string> = {};
-  for (const t of manifest.tools) if (t.enabled && t.version) out[t.name] = t.version;
+  for (const name of wanted ?? enabledToolNames(manifest)) {
+    const t = manifest.tools.find((x) => x.name === name);
+    if (!t?.enabled || !t.version || !t.digest) fail(`${name} is not an enabled tool`);
+    out[name] = `${t.version}@${t.digest}`;
+  }
   return out;
 }
 
@@ -138,6 +170,11 @@ export function toolImageRefs(manifest: ToolManifest): Record<string, string> {
   const out: Record<string, string> = {};
   for (const t of manifest.tools) if (t.enabled && t.reference) out[t.name] = t.reference;
   return out;
+}
+
+/** True when this exit code means "nothing to scan" and the tool writes no report. */
+export function isEmptyExit(manifest: ToolManifest, name: ToolName, code: number): boolean {
+  return manifest.tools.find((t) => t.name === name)?.emptyExitCodes?.includes(code) ?? false;
 }
 
 export function isOkExit(manifest: ToolManifest, name: ToolName, code: number): boolean {

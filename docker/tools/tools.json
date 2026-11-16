@@ -25,7 +25,8 @@
       "resolvedVia": "digest already pinned in .github/workflows/ci.yml; docker buildx imagetools inspect ghcr.io/google/osv-scanner:v2.7.0 returns the same digest; version confirmed with osv-scanner --version",
       "resolvedOn": "2026-11-15",
       "outputFormat": "json",
-      "okExitCodes": [0, 1]
+      "okExitCodes": [0, 1, 128],
+      "emptyExitCodes": [128]
     },
     {
       "name": "gitleaks",
@@ -52,7 +53,6 @@
       "resolvedOn": null,
       "outputFormat": "sarif",
       "okExitCodes": [0],
-      "enableFlag": "AFFIDAVIT_ENABLE_CODEQL",
       "blockedBy": "P0-10",
       "dockerfile": "codeql/Dockerfile"
     }

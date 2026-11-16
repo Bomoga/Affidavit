@@ -109,6 +109,19 @@ describe('tool invocations', () => {
     expect(args).toContain('--x-ignore-semgrepignore-files');
   });
 
+  it('semgrep cannot silently skip a target for size or time', () => {
+    const { args } = buildInvocation(manifest, 'semgrep', opts);
+    expect(args).toContain('--max-target-bytes=0');
+    expect(args).toContain('--timeout=0');
+    expect(args).toContain('--timeout-threshold=0');
+  });
+
+  it('osv-scanner never runs call analysis, which executes repo toolchains and can mark findings uncalled', () => {
+    const { args } = buildInvocation(manifest, 'osv-scanner', opts);
+    expect(args).toContain('--no-call-analysis=all');
+    expect(args.some((a) => a.startsWith('--call-analysis'))).toBe(false);
+  });
+
   it('semgrep mounts our rules read-only and a writable home for its settings', () => {
     const { mounts } = buildInvocation(manifest, 'semgrep', opts);
     expect(mounts).toContainEqual({
@@ -168,11 +181,17 @@ describe('tool invocations', () => {
     }
   });
 
-  it('ships our own configs: gitleaks extends the defaults, osv ignores nothing', () => {
+  it('ships our own configs: vendored gitleaks rules without the global allowlist, osv ignores nothing', () => {
     const dir = join(repoRoot(), 'docker', 'tools', 'config');
     const gl = readFileSync(join(dir, 'gitleaks.toml'), 'utf8');
-    expect(gl).toMatch(/useDefault\s*=\s*true/);
-    expect(gl).not.toMatch(/allowlist/i);
+    expect(gl).toMatch(/^title = "gitleaks config"/m);
+    expect(gl.match(/^\[\[rules\]\]/gm)?.length).toBeGreaterThan(200);
+    expect(gl).toContain('id = "generic-api-key"');
+    // The upstream global allowlist skips node_modules, lockfiles, vendor dirs and more.
+    expect(gl).not.toMatch(/^\[allowlist\]/m);
+    expect(gl).not.toMatch(/^\[\[allowlists\]\]/m);
+    expect(gl).not.toMatch(/node_modules/);
+    expect(gl).not.toMatch(/useDefault/);
     expect(readdirSync(dir).sort()).toEqual(['gitleaks.toml', 'osv-scanner.toml']);
     expect(readFileSync(join(dir, 'osv-scanner.toml'), 'utf8')).not.toMatch(/^\s*\[/m);
   });
