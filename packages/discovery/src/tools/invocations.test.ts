@@ -1,11 +1,11 @@
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
+import { buildInvocation } from './invocations.js';
 import {
   ToolDisabledError,
   ToolOptionError,
-  buildInvocation,
   isOkExit,
   loadToolManifest,
   repoRoot,
@@ -15,6 +15,10 @@ import {
 const DIGEST_REF = /^[a-z0-9][a-z0-9./_-]*@sha256:[0-9a-f]{64}$/;
 
 const manifest = loadToolManifest();
+const tmpDirs: string[] = [];
+afterAll(() => {
+  for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
+});
 
 const opts: ToolRunOptions = {
   sourceDir: '/work/case 1/src',
@@ -65,6 +69,7 @@ describe('tool invocations', () => {
 
       it('takes nothing from repo contents: option-like file names change no argv', () => {
         const dir = mkdtempSync(join(tmpdir(), 'affidavit-argv-'));
+        tmpDirs.push(dir);
         const empty = buildInvocation(manifest, name, { ...opts, sourceDir: dir });
         for (const hostile of ['--config=evil', '-oops', '--output=evil', 'a b; rm -rf x']) {
           writeFileSync(join(dir, hostile.replace(/[/;]/g, '_')), 'x');
@@ -109,11 +114,10 @@ describe('tool invocations', () => {
     expect(args).toContain('--x-ignore-semgrepignore-files');
   });
 
-  it('semgrep cannot silently skip a target for size or time', () => {
+  it('semgrep has no size cap but keeps its own per-file timeouts', () => {
     const { args } = buildInvocation(manifest, 'semgrep', opts);
     expect(args).toContain('--max-target-bytes=0');
-    expect(args).toContain('--timeout=0');
-    expect(args).toContain('--timeout-threshold=0');
+    expect(args.some((a) => a.startsWith('--timeout'))).toBe(false);
   });
 
   it('osv-scanner never runs call analysis, which executes repo toolchains and can mark findings uncalled', () => {
@@ -168,6 +172,7 @@ describe('tool invocations', () => {
     expect(flagValue(args, '--gitleaks-ignore-path')).toBe('/tool-config');
     expect(args).toContain('--redact');
     expect(flagValue(args, '--exit-code')).toBe('0');
+    expect(flagValue(args, '--max-archive-depth')).toBe('3');
     expect(mounts.find((m) => m.containerPath === '/tool-config')?.readOnly).toBe(true);
   });
 

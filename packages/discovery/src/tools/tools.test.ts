@@ -1,8 +1,8 @@
-import { copyFileSync, mkdtempSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BundleManifest } from '@affidavit/contracts';
-import { describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
 import {
   enabledToolNames,
   isEmptyExit,
@@ -10,13 +10,16 @@ import {
   loadToolManifest,
   parseToolManifest,
   repoRoot,
-  toolImageRefs,
   toolVersions,
 } from './index.js';
 
 const DIGEST_REF = /^[a-z0-9][a-z0-9./_-]*@sha256:[0-9a-f]{64}$/;
 
 const manifest = loadToolManifest();
+const tmpDirs: string[] = [];
+afterAll(() => {
+  for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
+});
 
 function allDockerfiles(dir: string): string[] {
   const found: string[] = [];
@@ -146,6 +149,7 @@ describe('tool manifest', () => {
 
   it('can be loaded from an explicit path, for deployments without the repo layout', () => {
     const dir = mkdtempSync(join(tmpdir(), 'affidavit-manifest-'));
+    tmpDirs.push(dir);
     const file = join(dir, 'tools.json');
     copyFileSync(join(repoRoot(), 'docker', 'tools', 'tools.json'), file);
     expect(loadToolManifest(file)).toEqual(manifest);
@@ -154,7 +158,7 @@ describe('tool manifest', () => {
 
 describe('BundleManifest.toolVersions', () => {
   it('maps tools to version and image digest, and fits the contract', () => {
-    const versions = toolVersions(manifest);
+    const versions = toolVersions(manifest, enabledToolNames(manifest));
     expect(Object.keys(versions).sort()).toEqual(['gitleaks', 'osv-scanner', 'semgrep']);
     expect(versions['codeql']).toBeUndefined();
     for (const t of manifest.tools.filter((x) => x.enabled)) {
@@ -168,10 +172,5 @@ describe('BundleManifest.toolVersions', () => {
   it('lists only the tools that actually ran, and refuses disabled ones', () => {
     expect(Object.keys(toolVersions(manifest, ['semgrep']))).toEqual(['semgrep']);
     expect(() => toolVersions(manifest, ['codeql'])).toThrow();
-  });
-
-  it('exposes the digest-pinned reference for each enabled tool', () => {
-    const refs = toolImageRefs(manifest);
-    for (const ref of Object.values(refs)) expect(ref).toMatch(DIGEST_REF);
   });
 });

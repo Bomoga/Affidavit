@@ -7,7 +7,8 @@
 # hostile repo could use to hide a secret. Rule-level allowlists are kept as shipped.
 # This file is always passed with --config, so a config planted in the scanned repo is never loaded.
 #
-# This file has been auto-generated. Do not edit manually.
+# Upstream's header said this file is auto-generated and not to be edited by hand. That no longer
+# holds for this copy, which Affidavit edited (see above).
 # If you would like to contribute new rules, please use
 # cmd/generate/config/main.go and follow the contributing guidelines
 # at https://github.com/gitleaks/gitleaks/blob/master/CONTRIBUTING.md

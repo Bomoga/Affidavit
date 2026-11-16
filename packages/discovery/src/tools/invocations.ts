@@ -56,10 +56,7 @@ export class ToolOptionError extends Error {
   }
 }
 
-function joinHost(base: string, sub: string): string {
-  const sep = base.includes('\\') && !base.includes('/') ? '\\' : '/';
-  return `${base.replace(/[\\/]+$/, '')}${sep}${sub}`;
-}
+const joinHost = (base: string, sub: string): string => join(base, sub);
 
 function need(value: string | undefined, label: string): string {
   if (!value) throw new ToolOptionError(`${label} is required`);
@@ -130,11 +127,11 @@ export function buildInvocation(
           '--no-git-ignore',
           '--disable-nosem',
           '--x-ignore-semgrepignore-files',
-          // No silent give-up: no size cap (default skips files over 1 MB), no per-rule timeout and
-          // no timeout-based file skipping. The runner's wall-clock limit bounds the run instead.
+          // No size cap (the default silently skips files over 1 MB). Semgrep's own per-file
+          // timeouts stay at their defaults so a hostile file cannot hang the worker (the port has
+          // no wall-clock limit); files that time out or fail to parse are reported by Semgrep as
+          // notifications, which runTool surfaces as `partial`.
           '--max-target-bytes=0',
-          '--timeout=0',
-          '--timeout-threshold=0',
           '--config',
           '/rules',
           '--sarif',
@@ -210,6 +207,10 @@ export function buildInvocation(
           '--gitleaks-ignore-path',
           '/tool-config',
           '--ignore-gitleaks-allow',
+          // Look inside archives (.gz, .zip, .tar) up to 3 levels. Works offline. UTF-16 files are
+          // still not scanned (accepted gap, see README).
+          '--max-archive-depth',
+          '3',
           '--report-format',
           'sarif',
           '--report-path',

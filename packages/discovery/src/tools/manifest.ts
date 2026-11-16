@@ -71,6 +71,9 @@ function parseTool(raw: unknown): ToolEntry {
     }
     if (!DIGEST.test(digest)) fail(`${name}: digest malformed`);
   }
+  if (name === 'codeql' && enabled) {
+    fail('codeql cannot be enabled in the manifest until the licensing decision (P0-10) lands');
+  }
   if (enabled) {
     if (reference === null) fail(`${name}: an enabled tool needs a digest reference`);
     if (version === null || !/^\d+\.\d+\.\d+$/.test(version)) fail(`${name}: version required`);
@@ -148,27 +151,18 @@ export function enabledToolNames(manifest: ToolManifest): ToolName[] {
 /**
  * For BundleManifest.toolVersions: tool name to `<version>@<image digest>`, so a run can be
  * replayed against the exact image. Pass the names of the tools that actually ran so the bundle
- * does not claim tools that did not; with no argument every enabled tool is listed, which is only
- * right if all of them ran. Naming a disabled or unknown tool throws.
+ * does not claim tools that did not. Naming a disabled or unknown tool throws.
  */
 export function toolVersions(
   manifest: ToolManifest,
-  ran?: Iterable<ToolName>,
+  ran: Iterable<ToolName>,
 ): BundleManifest['toolVersions'] {
-  const wanted = ran === undefined ? undefined : new Set<ToolName>(ran);
   const out: Record<string, string> = {};
-  for (const name of wanted ?? enabledToolNames(manifest)) {
+  for (const name of new Set<ToolName>(ran)) {
     const t = manifest.tools.find((x) => x.name === name);
     if (!t?.enabled || !t.version || !t.digest) fail(`${name} is not an enabled tool`);
     out[name] = `${t.version}@${t.digest}`;
   }
-  return out;
-}
-
-/** Enabled tool name to its digest-pinned image reference. */
-export function toolImageRefs(manifest: ToolManifest): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const t of manifest.tools) if (t.enabled && t.reference) out[t.name] = t.reference;
   return out;
 }
 

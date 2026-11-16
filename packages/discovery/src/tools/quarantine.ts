@@ -1,15 +1,16 @@
-import { lstat, mkdir, readdir, rm } from 'node:fs/promises';
-import { join, sep } from 'node:path';
+import { lstat, mkdir, readdir, rename } from 'node:fs/promises';
+import { basename, dirname, join, sep } from 'node:path';
 
 /**
  * Repo-controlled files that change what a scanner does: ignore lists, allowlists, per-repo
  * configs, and the git metadata that tools shell out to. A hostile repo can use them to silence a
  * scanner or to run code through git. Flags on each invocation cover most of them; this list
- * covers the rest by removing them from the scan snapshot.
+ * covers the rest by moving them out of the scan snapshot.
  *
  * Matched on the exact base name, case-insensitively, at any depth. Never by prefix: a directory
  * such as `.semgrep-lib/` is application code and stays. `.github` stays too: workflows are scan
- * targets.
+ * targets. Semgrep's `.semgrep*` config names are not here because Semgrep always runs with
+ * `--config /rules` and never reads them from the target (a docker test checks this).
  */
 export const TOOL_CONTROL_NAMES: readonly string[] = [
   '.git',
@@ -23,9 +24,6 @@ export const TOOL_CONTROL_NAMES: readonly string[] = [
   'osv-scanner.toml',
   '.osv-scanner.toml',
   '.semgrepignore',
-  '.semgrep.yml',
-  '.semgrep.yaml',
-  '.semgrep',
 ];
 
 const NAMES = new Set(TOOL_CONTROL_NAMES);
@@ -45,18 +43,6 @@ export class SnapshotNotCleanError extends Error {
   }
 }
 
-/** A control directory (`.semgrep/`) holds something other than YAML config, so it may be app code. */
-export class ControlDirectoryHoldsCodeError extends Error {
-  readonly path: string;
-  constructor(path: string) {
-    super(
-      `refusing to delete ${path}: it holds files other than tool config; treat the repo as hostile or review it`,
-    );
-    this.name = 'ControlDirectoryHoldsCodeError';
-    this.path = path;
-  }
-}
-
 export class ScratchNotFreshError extends Error {
   constructor(dir: string) {
     super(`scratch directory must be new and empty for every tool run: ${dir}`);
@@ -71,20 +57,40 @@ export class OutputNotFreshError extends Error {
   }
 }
 
+// Module-private: the only way to build a QuarantinedSnapshot is quarantineSnapshot below.
+const TOKEN: unique symbol = Symbol('quarantined-snapshot');
+
 /**
- * A scan snapshot that went through quarantine. The only way to get one is quarantineSnapshot, and
- * runTool takes this type, so the list of removed paths travels with the snapshot and cannot be
- * dropped on the floor. Record `removed` as a signal on the case.
+ * A scan snapshot that went through quarantine. Only quarantineSnapshot can create one, and
+ * runTool takes this type, so a snapshot cannot reach a scanner without being quarantined and the
+ * removed-path list travels with it.
+ *
+ * Quarantined entries are not deleted. They are moved into `sidecarDir` (a sibling of the
+ * snapshot) under neutral names, so they are out of the scan tree but can still be scanned for
+ * secrets. `mapping` gives neutral name to original path. Keep the sidecar out of any workspace
+ * that leaves ingestion; it holds the repo's own ignore lists, git metadata and configs.
  */
 export class QuarantinedSnapshot {
-  // Private member makes the type nominal: a plain `{ dir, removed }` object does not satisfy it.
   private readonly brand = 'quarantined';
+  /** The scan copy, now free of tool-control paths. */
   readonly dir: string;
-  /** Paths removed from the snapshot, relative to it, posix separators, sorted. */
+  /** Original paths that were quarantined, relative to the snapshot, posix separators, sorted. */
   readonly removed: readonly string[];
-  constructor(dir: string, removed: readonly string[]) {
+  /** Directory holding the quarantined entries under neutral names, or null if none were found. */
+  readonly sidecarDir: string | null;
+  /** Neutral sidecar entry name to original relative path. */
+  readonly mapping: ReadonlyMap<string, string>;
+  constructor(
+    token: typeof TOKEN,
+    dir: string,
+    sidecarDir: string | null,
+    mapping: ReadonlyMap<string, string>,
+  ) {
+    if (token !== TOKEN) throw new Error('use quarantineSnapshot');
     this.dir = dir;
-    this.removed = removed;
+    this.sidecarDir = sidecarDir;
+    this.mapping = mapping;
+    this.removed = [...mapping.values()].sort();
   }
 }
 
@@ -105,63 +111,59 @@ function child(dir: Buffer, name: Buffer): Buffer {
   return Buffer.concat([dir, SEP, name]);
 }
 
-/** True if a directory holds only YAML config files (recursively), by name, without following links. */
-async function holdsOnlyYaml(dir: Buffer): Promise<boolean> {
-  for (const e of await readdir(dir, { withFileTypes: true, encoding: 'buffer' })) {
-    const full = child(dir, e.name);
-    if (e.isDirectory()) {
-      if (!(await holdsOnlyYaml(full))) return false;
-    } else if (!(e.isFile() && /\.ya?ml$/i.test(e.name.toString('latin1')))) {
-      return false;
-    }
-  }
-  return true;
+interface Entry {
+  abs: Buffer;
+  rel: string;
 }
 
 /**
- * Walks the snapshot without following symlinks. Names are read as raw bytes so non-UTF-8 names
- * cannot be misread or skipped.
+ * Finds tool-control entries without changing anything. Never follows symlinks. Names are read as
+ * raw bytes so non-UTF-8 names cannot be misread or skipped.
  */
-async function walk(dir: Buffer, rel: string[], remove: boolean, found: string[]): Promise<void> {
+async function collect(dir: Buffer, rel: string[], found: Entry[]): Promise<void> {
   for (const entry of await readdir(dir, { withFileTypes: true, encoding: 'buffer' })) {
-    const full = child(dir, entry.name);
+    const abs = child(dir, entry.name);
     const here = [...rel, display(entry.name)];
     if (isToolControlName(entry.name.toString('latin1'))) {
-      const lower = entry.name.toString('latin1').toLowerCase();
-      if (lower === '.semgrep' && entry.isDirectory() && !(await holdsOnlyYaml(full))) {
-        throw new ControlDirectoryHoldsCodeError(here.join('/'));
-      }
-      found.push(here.join('/'));
-      // No `force`: a removal that fails must fail the quarantine, not be reported as done.
-      if (remove) await rm(full, { recursive: true });
+      found.push({ abs, rel: here.join('/') });
       continue;
     }
-    if (entry.isDirectory()) await walk(full, here, remove, found);
+    if (entry.isDirectory()) await collect(abs, here, found);
   }
 }
 
 /** Lists tool-control paths without changing anything. */
 export async function findToolControlPaths(snapshotDir: string): Promise<string[]> {
-  const found: string[] = [];
-  await walk(Buffer.from(snapshotDir), [], false, found);
-  return found.sort();
+  const found: Entry[] = [];
+  await collect(Buffer.from(snapshotDir), [], found);
+  return found.map((e) => e.rel).sort();
 }
 
 /**
- * Removes tool-control paths from a scan snapshot and returns the snapshot together with what was
- * removed, so the caller can record it as a signal (a repo that plants these is suspicious).
+ * Moves tool-control paths out of a scan snapshot into a sibling sidecar directory
+ * (`<snapshot>.quarantine`, which must not exist) and returns the snapshot with the mapping.
  *
- * MUTATES THE DIRECTORY. Only ever pass a private copy of the repo made for scanning, never the
- * original checkout. Symlinks are removed as links, never followed. Throws
- * ControlDirectoryHoldsCodeError rather than delete a `.semgrep/` directory that holds anything
- * but YAML.
+ * Two phases: everything is found first, and nothing is touched if that fails. MUTATES THE
+ * DIRECTORY, so only ever pass a private copy of the repo made for scanning, never the original
+ * checkout. Symlinks are moved as links, never followed.
  */
 export async function quarantineSnapshot(snapshotDir: string): Promise<QuarantinedSnapshot> {
   const stat = await lstat(snapshotDir);
   if (!stat.isDirectory()) throw new Error(`snapshot is not a directory: ${snapshotDir}`);
-  const removed: string[] = [];
-  await walk(Buffer.from(snapshotDir), [], true, removed);
-  return new QuarantinedSnapshot(snapshotDir, removed.sort());
+  const found: Entry[] = [];
+  await collect(Buffer.from(snapshotDir), [], found);
+  if (found.length === 0) return new QuarantinedSnapshot(TOKEN, snapshotDir, null, new Map());
+
+  const sidecar = join(dirname(snapshotDir), `${basename(snapshotDir)}.quarantine`);
+  await mkdir(sidecar); // not recursive: fails if it already exists, so no mixing with old runs
+  const mapping = new Map<string, string>();
+  let i = 0;
+  for (const e of found) {
+    const neutral = `q${String(++i).padStart(4, '0')}`;
+    await rename(e.abs, join(sidecar, neutral));
+    mapping.set(neutral, e.rel);
+  }
+  return new QuarantinedSnapshot(TOKEN, snapshotDir, sidecar, mapping);
 }
 
 /** Fails closed: throws SnapshotNotCleanError if any tool-control path is still present. */

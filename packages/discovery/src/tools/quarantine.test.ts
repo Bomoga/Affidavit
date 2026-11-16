@@ -1,17 +1,27 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ToolRunnerPort } from '@affidavit/contracts';
-import { describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
 import {
-  ControlDirectoryHoldsCodeError,
   OutputNotFreshError,
   QuarantinedSnapshot,
   ScratchNotFreshError,
   SnapshotNotCleanError,
+  ToolFailedError,
   ToolOutputMissingError,
   assertSnapshotClean,
+  findOsvLockfiles,
   findToolControlPaths,
+  isOsvLockfileName,
   isToolControlName,
   loadToolManifest,
   prepareScratch,
@@ -19,8 +29,23 @@ import {
   runTool,
 } from './index.js';
 
+const tmpDirs: string[] = [];
+afterAll(() => {
+  for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
+});
+
 function tmp(): string {
-  return mkdtempSync(join(tmpdir(), 'affidavit-quarantine-'));
+  const d = mkdtempSync(join(tmpdir(), 'affidavit-quarantine-'));
+  tmpDirs.push(d);
+  return d;
+}
+
+/** A parent dir holding a `snap` directory, so the sidecar `snap.quarantine` has room beside it. */
+function snapDir(files: Record<string, string> = {}): string {
+  const dir = join(tmp(), 'snap');
+  mkdirSync(dir);
+  for (const [f, body] of Object.entries(files)) put(dir, f, body);
+  return dir;
 }
 
 function put(root: string, rel: string, body = 'x'): void {
@@ -41,6 +66,18 @@ function canSymlink(): boolean {
 }
 const symlinks = canSymlink();
 
+/** Raw non-UTF-8 names are rejected by some filesystems. Probe once so the test skips visibly. */
+function canMakeRawNames(): boolean {
+  const base = tmp();
+  try {
+    mkdirSync(Buffer.concat([Buffer.from(base + '/'), Buffer.from([0x66, 0xff, 0xfe, 0x6f])]));
+    return true;
+  } catch {
+    return false;
+  }
+}
+const rawNames = canMakeRawNames();
+
 const CONTROL = [
   '.git/config',
   '.gitignore',
@@ -54,8 +91,6 @@ const CONTROL = [
   'src/nested/.semgrepignore',
   'sub/pkg/osv-scanner.toml',
   'sub/.GITIGNORE',
-  '.semgrep/rules.yml',
-  '.semgrep.yml',
 ];
 
 describe('tool-control path quarantine', () => {
@@ -75,8 +110,9 @@ describe('tool-control path quarantine', () => {
       'package.json',
       'gitignore.md',
       'osv-scanner-notes.md',
+      '.semgrep',
+      '.semgrep.yml',
       '.semgrep-lib',
-      '.semgrep-x',
       '.gitleaks-fixtures',
       '.gitlab-ci.yml',
     ]) {
@@ -84,9 +120,9 @@ describe('tool-control path quarantine', () => {
     }
   });
 
-  it('removes every control path at any depth and returns what it removed with the snapshot', async () => {
-    const root = tmp();
-    for (const f of CONTROL) put(root, f);
+  it('moves every control path out of the snapshot into a sidecar, with a mapping back', async () => {
+    const root = snapDir();
+    for (const f of CONTROL) put(root, f, `content of ${f}`);
     put(root, 'src/app.js');
     put(root, '.github/workflows/ci.yml');
     const snap = await quarantineSnapshot(root);
@@ -101,8 +137,6 @@ describe('tool-control path quarantine', () => {
         '.gitleaksbaseline',
         '.gitleaksignore',
         '.osv-scanner.toml',
-        '.semgrep',
-        '.semgrep.yml',
         '.semgrepignore',
         'osv-scanner.toml',
         'src/nested/.semgrepignore',
@@ -113,47 +147,69 @@ describe('tool-control path quarantine', () => {
     expect(existsSync(join(root, 'src', 'app.js'))).toBe(true);
     expect(existsSync(join(root, '.github', 'workflows', 'ci.yml'))).toBe(true);
     expect(await findToolControlPaths(root)).toEqual([]);
+
+    // Nothing was destroyed: each entry is in the sidecar under a neutral name.
+    expect(snap.sidecarDir).toBe(`${root}.quarantine`);
+    expect(snap.mapping.size).toBe(snap.removed.length);
+    for (const [neutral, original] of snap.mapping) {
+      expect(neutral).toMatch(/^q\d{4}$/);
+      expect(existsSync(join(snap.sidecarDir!, neutral))).toBe(true);
+      if (original === '.gitignore') {
+        expect(readFileSync(join(snap.sidecarDir!, neutral), 'utf8')).toBe('content of .gitignore');
+      }
+    }
+  });
+
+  it('has no sidecar and an empty list when nothing needed quarantine', async () => {
+    const root = snapDir({ 'src/app.js': 'x' });
+    const snap = await quarantineSnapshot(root);
+    expect(snap.sidecarDir).toBeNull();
+    expect(snap.removed).toEqual([]);
   });
 
   it('keeps application code in look-alike directories, so it is still scanned', async () => {
-    const root = tmp();
+    const root = snapDir();
     put(root, '.semgrep-x/app.js', 'eval(x)');
     put(root, '.semgrep-lib/index.js');
+    put(root, '.semgrep.yml');
+    put(root, '.semgrep/code.js', 'eval(x)');
     put(root, '.gitleaks-fixtures/key.txt');
     put(root, '.semgrepignore');
     const snap = await quarantineSnapshot(root);
     expect([...snap.removed]).toEqual(['.semgrepignore']);
-    expect(existsSync(join(root, '.semgrep-x', 'app.js'))).toBe(true);
-    expect(existsSync(join(root, '.semgrep-lib', 'index.js'))).toBe(true);
-    expect(existsSync(join(root, '.gitleaks-fixtures', 'key.txt'))).toBe(true);
-  });
-
-  it('refuses to delete a .semgrep directory that holds code, instead of hiding it', async () => {
-    const root = tmp();
-    put(root, '.semgrep/rules.yml');
-    put(root, '.semgrep/payload.js', 'eval(x)');
-    await expect(quarantineSnapshot(root)).rejects.toBeInstanceOf(ControlDirectoryHoldsCodeError);
-    expect(existsSync(join(root, '.semgrep', 'payload.js'))).toBe(true);
-  });
-
-  it('walks directories with non-UTF-8 names without error', async () => {
-    const root = tmp();
-    const odd = Buffer.concat([Buffer.from(root + '/'), Buffer.from([0x66, 0xff, 0xfe, 0x6f])]);
-    try {
-      mkdirSync(odd);
-      writeFileSync(Buffer.concat([odd, Buffer.from('/.semgrepignore')]), 'x');
-    } catch {
-      return; // this filesystem rejects raw non-UTF-8 names; nothing to check here
+    for (const kept of [
+      '.semgrep-x/app.js',
+      '.semgrep-lib/index.js',
+      '.semgrep.yml',
+      '.semgrep/code.js',
+      '.gitleaks-fixtures/key.txt',
+    ]) {
+      expect(existsSync(join(root, kept))).toBe(true);
     }
+  });
+
+  it('changes nothing when collection fails (two-phase)', async () => {
+    const root = snapDir({ '.gitignore': 'x', 'src/app.js': 'x' });
+    const taken = `${root}.quarantine`;
+    mkdirSync(taken); // sidecar already exists, so quarantine must refuse before moving anything
+    await expect(quarantineSnapshot(root)).rejects.toThrow();
+    expect(existsSync(join(root, '.gitignore'))).toBe(true);
+  });
+
+  it.skipIf(!rawNames)('walks directories with non-UTF-8 names without error', async () => {
+    const root = snapDir();
+    const odd = Buffer.concat([Buffer.from(root + '/'), Buffer.from([0x66, 0xff, 0xfe, 0x6f])]);
+    mkdirSync(odd);
+    writeFileSync(Buffer.concat([odd, Buffer.from('/.semgrepignore')]), 'x');
     const snap = await quarantineSnapshot(root);
     expect(snap.removed).toHaveLength(1);
     expect(snap.removed[0]).toMatch(/\.semgrepignore$/);
   });
 
   it.skipIf(!symlinks)(
-    'removes a symlink named like a control file without following it',
+    'moves a symlink named like a control file without following it',
     async () => {
-      const root = tmp();
+      const root = snapDir();
       const outside = tmp();
       put(outside, 'keep.txt');
       symlinkSync(outside, join(root, '.git'), 'dir');
@@ -163,19 +219,40 @@ describe('tool-control path quarantine', () => {
   );
 
   it('assertSnapshotClean fails closed until the snapshot is quarantined', async () => {
-    const root = tmp();
-    put(root, 'src/.semgrepignore');
+    const root = snapDir({ 'src/.semgrepignore': 'x' });
     await expect(assertSnapshotClean(root)).rejects.toBeInstanceOf(SnapshotNotCleanError);
     await quarantineSnapshot(root);
     await expect(assertSnapshotClean(root)).resolves.toBeUndefined();
   });
 
+  it('cannot be built by hand', () => {
+    expect(
+      () => new QuarantinedSnapshot(Symbol('forged') as never, '/x', null, new Map()),
+    ).toThrow();
+  });
+
   it('prepareScratch demands a new or empty directory per run', async () => {
-    const base = tmp();
-    const scratch = join(base, 'run1');
+    const scratch = join(tmp(), 'run1');
     await prepareScratch(scratch, ['tmp']);
     expect(existsSync(join(scratch, 'tmp'))).toBe(true);
     await expect(prepareScratch(scratch, ['tmp'])).rejects.toBeInstanceOf(ScratchNotFreshError);
+  });
+});
+
+describe('OSV lockfile detection', () => {
+  it('recognises lockfile names and finds them at any depth', async () => {
+    for (const n of [
+      'package-lock.json',
+      'go.mod',
+      'Cargo.lock',
+      'requirements-dev.txt',
+      'x.cdx.json',
+    ]) {
+      expect(isOsvLockfileName(n)).toBe(true);
+    }
+    expect(isOsvLockfileName('app.js')).toBe(false);
+    const root = snapDir({ 'a/b/yarn.lock': 'x', 'src/app.js': 'x' });
+    expect(await findOsvLockfiles(root)).toEqual(['a/b/yarn.lock']);
   });
 });
 
@@ -185,25 +262,27 @@ describe('runTool', () => {
   function fakeRunner(
     onRun?: (outputDir: string) => void,
     exitCode = 0,
-  ): { runner: ToolRunnerPort; calls: number[] } {
-    const calls: number[] = [];
+    outputPath?: string,
+  ): { runner: ToolRunnerPort; calls: { image: string; sourceHost: string }[] } {
+    const calls: { image: string; sourceHost: string }[] = [];
     return {
       calls,
       runner: {
-        run(_image, _args, mounts) {
-          calls.push(1);
+        run(image, _args, mounts) {
           const out = mounts.find((m) => m.containerPath === '/out')?.hostPath ?? '';
+          calls.push({
+            image,
+            sourceHost: mounts.find((m) => m.containerPath === '/src')?.hostPath ?? '',
+          });
           onRun?.(out);
-          return Promise.resolve({ exitCode, outputPath: out });
+          return Promise.resolve({ exitCode, outputPath: outputPath ?? out });
         },
       },
     };
   }
 
   async function snapshot(files: Record<string, string> = { 'src/app.js': 'x' }) {
-    const dir = tmp();
-    for (const [f, body] of Object.entries(files)) put(dir, f, body);
-    return quarantineSnapshot(dir);
+    return quarantineSnapshot(snapDir(files));
   }
 
   const options = async (snap?: QuarantinedSnapshot) => ({
@@ -212,13 +291,15 @@ describe('runTool', () => {
     scratchDir: join(tmp(), 's'),
   });
 
-  it('refuses a dirty snapshot and never reaches the runner', async () => {
-    const dirty = new QuarantinedSnapshot(tmp(), []);
-    put(dirty.dir, '.gitleaksignore');
+  const sarif = (extra: object = {}) => JSON.stringify({ runs: [{ results: [], ...extra }] });
+
+  it('refuses a snapshot that went dirty after quarantine and never reaches the runner', async () => {
+    const snap = await snapshot();
+    put(snap.dir, '.gitleaksignore');
     const { runner, calls } = fakeRunner();
-    await expect(
-      runTool(runner, manifest, 'gitleaks', await options(dirty)),
-    ).rejects.toBeInstanceOf(SnapshotNotCleanError);
+    await expect(runTool(runner, manifest, 'gitleaks', await options(snap))).rejects.toBeInstanceOf(
+      SnapshotNotCleanError,
+    );
     expect(calls).toHaveLength(0);
   });
 
@@ -243,17 +324,43 @@ describe('runTool', () => {
   });
 
   it('runs a clean snapshot through the port and passes the quarantine list through', async () => {
-    const snap = await snapshot({ 'src/app.js': 'x', '.semgrepignore': '*' });
-    const { runner, calls } = fakeRunner((out) => writeFileSync(join(out, 'gitleaks.sarif'), '{}'));
+    const snap = await snapshot({ 'src/app.js': 'x' });
+    const { runner, calls } = fakeRunner((out) =>
+      writeFileSync(join(out, 'gitleaks.sarif'), sarif()),
+    );
     const res = await runTool(runner, manifest, 'gitleaks', await options(snap));
     expect(res).toMatchObject({
-      ok: true,
       empty: false,
+      partial: false,
       outputFile: 'gitleaks.sarif',
       exitCode: 0,
-      quarantined: ['.semgrepignore'],
+      quarantined: [],
     });
+    expect(res.reports).toHaveLength(1);
     expect(calls).toHaveLength(1);
+  });
+
+  it('also scans the quarantined files with gitleaks and maps their paths back', async () => {
+    const snap = await snapshot({ 'src/app.js': 'x', '.gitignore': 'secret' });
+    const neutral = [...snap.mapping.keys()][0]!;
+    const seen: string[] = [];
+    const { runner, calls } = fakeRunner((out) => {
+      const uri = seen.length === 0 ? 'src/app.js' : `/src/${neutral}`;
+      seen.push(uri);
+      writeFileSync(
+        join(out, 'gitleaks.sarif'),
+        sarif({
+          results: [{ locations: [{ physicalLocation: { artifactLocation: { uri } } }] }],
+        }),
+      );
+    });
+    const res = await runTool(runner, manifest, 'gitleaks', await options(snap));
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.sourceHost).toBe(snap.sidecarDir);
+    expect(res.reports.map((r) => r.origin)).toEqual(['snapshot', 'quarantine']);
+    const mapped = readFileSync(res.reports[1]!.file, 'utf8');
+    expect(mapped).toContain('"uri":".gitignore"');
+    expect(res.quarantined).toEqual(['.gitignore']);
   });
 
   it('throws when a normal exit leaves no report', async () => {
@@ -279,19 +386,88 @@ describe('runTool', () => {
     );
   });
 
-  it('reports a failing exit code as not ok, without demanding a report', async () => {
+  it('throws ToolFailedError, with the exit code and quarantine list, for a failing exit', async () => {
+    const snap = await snapshot({ '.gitignore': 'x' });
     const { runner } = fakeRunner(undefined, 2);
-    const res = await runTool(runner, manifest, 'gitleaks', await options());
-    expect(res.ok).toBe(false);
+    const err = await runTool(runner, manifest, 'gitleaks', await options(snap)).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ToolFailedError);
+    expect(err).toMatchObject({ exitCode: 2, quarantined: ['.gitignore'] });
   });
 
-  it('treats OSV exit 128 (no packages found) as an empty result with no report', async () => {
+  it('rejects a runner that reports a different output path than it was given', async () => {
+    const { runner } = fakeRunner(
+      (out) => writeFileSync(join(out, 'gitleaks.sarif'), sarif()),
+      0,
+      tmp(),
+    );
+    await expect(runTool(runner, manifest, 'gitleaks', await options())).rejects.toBeInstanceOf(
+      ToolOutputMissingError,
+    );
+  });
+
+  it('treats OSV exit 128 as an empty result only when the snapshot has no lockfile', async () => {
     const { runner } = fakeRunner(undefined, 128);
     const res = await runTool(runner, manifest, 'osv-scanner', {
       ...(await options()),
       osvDatabaseDir: tmp(),
     });
-    expect(res).toMatchObject({ ok: true, empty: true, exitCode: 128 });
-    rmSync(res.outputPath, { recursive: true, force: true });
+    expect(res).toMatchObject({ empty: true, exitCode: 128, reports: [], partial: false });
+  });
+
+  it('fails OSV exit 128 when a lockfile is present, because it probably failed to parse', async () => {
+    const snap = await snapshot({ 'package-lock.json': '{ not json' });
+    const { runner } = fakeRunner(undefined, 128);
+    const err = await runTool(runner, manifest, 'osv-scanner', {
+      ...(await options(snap)),
+      osvDatabaseDir: tmp(),
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ToolFailedError);
+    expect((err as Error).message).toMatch(/lockfile/);
+  });
+
+  it('marks a Semgrep run partial and attaches its notifications', async () => {
+    const { runner } = fakeRunner((out) =>
+      writeFileSync(
+        join(out, 'semgrep.sarif'),
+        sarif({
+          invocations: [
+            {
+              executionSuccessful: true,
+              toolExecutionNotifications: [
+                {
+                  level: 'warning',
+                  descriptor: { id: 'Syntax error' },
+                  message: { text: 'Syntax error at line /src/broken.js:1' },
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+    );
+    const res = await runTool(runner, manifest, 'semgrep', {
+      ...(await options()),
+      rulesDir: tmp(),
+    });
+    expect(res.partial).toBe(true);
+    expect(res.notifications).toEqual([
+      { level: 'warning', id: 'Syntax error', message: 'Syntax error at line /src/broken.js:1' },
+    ]);
+  });
+
+  it('does not mark a clean Semgrep run partial', async () => {
+    const { runner } = fakeRunner((out) =>
+      writeFileSync(
+        join(out, 'semgrep.sarif'),
+        sarif({ invocations: [{ executionSuccessful: true, toolExecutionNotifications: [] }] }),
+      ),
+    );
+    const res = await runTool(runner, manifest, 'semgrep', {
+      ...(await options()),
+      rulesDir: tmp(),
+    });
+    expect(res).toMatchObject({ partial: false, notifications: [] });
   });
 });

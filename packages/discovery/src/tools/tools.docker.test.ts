@@ -22,20 +22,22 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { crc32 } from 'node:zlib';
+import { crc32, gzipSync } from 'node:zlib';
 import type { ToolRunnerPort } from '@affidavit/contracts';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { buildInvocation } from './invocations.js';
 import {
-  buildInvocation,
   isOkExit,
   loadToolManifest,
   prepareOutput,
   prepareScratch,
-  QuarantinedSnapshot,
+  SnapshotNotCleanError,
+  ToolFailedError,
   quarantineSnapshot,
   repoRoot,
   runTool,
   type ToolName,
+  type ToolRunResult,
   type ToolRunOptions,
 } from './index.js';
 
@@ -194,6 +196,17 @@ function sarifFindings(raw: string): Finding[] {
   );
 }
 
+function semgrepNotes(raw: string): string[] {
+  const sarif = JSON.parse(raw) as {
+    runs: { invocations?: { toolExecutionNotifications?: { message?: { text?: string } }[] }[] }[];
+  };
+  return sarif.runs.flatMap((r) =>
+    (r.invocations ?? []).flatMap((i) =>
+      (i.toolExecutionNotifications ?? []).map((n) => n.message?.text ?? ''),
+    ),
+  );
+}
+
 describe.skipIf(!enabled)('tool images, offline', () => {
   let work: string;
   let osvDb: string;
@@ -250,21 +263,27 @@ describe.skipIf(!enabled)('tool images, offline', () => {
     readFileSync(join(s.out(tool), file), 'utf8');
 
   /** Writes a source file larger than Semgrep's default 1 MB cap, with the unsafe call at the top. */
-  const addBigFile = (src: string) =>
+  const addGenerated = (src: string) => {
     writeFileSync(
       join(src, 'src', 'big.js'),
       'export const run = (x) => eval(x);\n' + '// padding\n'.repeat(120_000),
     );
+    // A secret hidden inside a gzip archive.
+    writeFileSync(
+      join(src, 'src', 'secret.txt.gz'),
+      gzipSync('const k = "AFFIDAVIT_FAKE_KEY_5566778899AABBCC";\n'),
+    );
+  };
 
   async function runAll(s: Scenario) {
     const snap = await quarantineSnapshot(s.src);
+    const results: Partial<Record<ToolName, ToolRunResult>> = {};
     for (const tool of TOOLS) {
       const { sourceDir: _ignored, ...rest } = s.options(tool);
       void _ignored;
-      const res = await runTool(s.runner, manifest, tool, { ...rest, snapshot: snap });
-      expect(res.ok, `${tool} exit ${res.exitCode}`).toBe(true);
+      results[tool] = await runTool(s.runner, manifest, tool, { ...rest, snapshot: snap });
     }
-    return snap;
+    return { snap, results };
   }
 
   async function runWithoutGate(s: Scenario, tool: ToolName) {
@@ -277,21 +296,31 @@ describe.skipIf(!enabled)('tool images, offline', () => {
     expect(isOkExit(manifest, tool, res.exitCode), `${tool} exit ${res.exitCode}`).toBe(true);
   }
 
-  function expectHostileFindingsSurvive(s: Scenario) {
-    const semgrep = sarifFindings(read(s, 'semgrep', 'semgrep.sarif')).map((f) => f.uri);
+  function expectHostileFindingsSurvive(s: Scenario, gitignoreReport: 'quarantine' | 'tree') {
+    const semgrepFindings = sarifFindings(read(s, 'semgrep', 'semgrep.sarif'));
+    // Rule files planted in the repo (.semgrep.yml, .semgrep/) must never be loaded.
+    expect(semgrepFindings.some((f) => f.ruleId?.includes('planted'))).toBe(false);
+    const semgrep = semgrepFindings.map((f) => f.uri);
     for (const file of [
       'src/app.js',
       'src/ignored/hidden.js',
       'src/nested/deep.js',
       'src/nosem.js',
       'src/hidden-by-gitignore.js',
-      'src/big.js',
     ]) {
       expect(
         semgrep.some((u) => u.endsWith(file)),
         `semgrep finding in ${file}`,
       ).toBe(true);
     }
+
+    // A file over 1 MB is either scanned or reported by Semgrep as a notification (it may time out
+    // on a slow machine), never silently absent.
+    const notes = semgrepNotes(read(s, 'semgrep', 'semgrep.sarif'));
+    expect(
+      semgrep.some((u) => u.endsWith('src/big.js')) || notes.some((n) => n.includes('big.js')),
+      'src/big.js scanned or reported',
+    ).toBe(true);
 
     const leaksRaw = read(s, 'gitleaks', 'gitleaks.sarif');
     const leaks = sarifFindings(leaksRaw).map((f) => f.uri);
@@ -300,6 +329,7 @@ describe.skipIf(!enabled)('tool images, offline', () => {
       'src/allowed.js',
       'node_modules/leaky/index.js',
       'vendor/github.com/acme/key.js',
+      'src/secret.txt.gz',
     ]) {
       expect(
         leaks.some((u) => u.endsWith(file)),
@@ -307,6 +337,18 @@ describe.skipIf(!enabled)('tool images, offline', () => {
       ).toBe(true);
     }
     expect(leaksRaw).not.toContain('AFFIDAVIT_FAKE_KEY_0123456789ABCDEF');
+
+    // A secret inside a file that quarantine moved aside is still found, under its original path.
+    const gitignoreSource =
+      gitignoreReport === 'quarantine'
+        ? sarifFindings(
+            readFileSync(join(`${s.out('gitleaks')}-quarantine`, 'gitleaks.sarif'), 'utf8'),
+          )
+        : sarifFindings(leaksRaw);
+    expect(
+      gitignoreSource.some((f) => f.uri === '.gitignore' || f.uri.endsWith('/.gitignore')),
+      '.gitignore finding',
+    ).toBe(true);
 
     const osv = read(s, 'osv-scanner', 'osv-scanner.json');
     expect(osv).toContain('AFFIDAVIT-SMOKE-0001');
@@ -339,8 +381,11 @@ describe.skipIf(!enabled)('tool images, offline', () => {
   }, 240_000);
 
   it('hostile repo, after quarantine: no finding is hidden, nothing is skipped, no canary', async () => {
-    const s = scenario('hostile', addBigFile);
-    const snap = await runAll(s);
+    const s = scenario('hostile', addGenerated);
+    const { snap, results } = await runAll(s);
+    // The unparsable file is a signal, not silence: Semgrep exits 0 but reports a notification.
+    expect(results.semgrep?.partial).toBe(true);
+    expect(results.semgrep?.notifications.some((n) => n.message.includes('broken.js'))).toBe(true);
     expect(snap.removed).toEqual(
       expect.arrayContaining([
         '.git',
@@ -352,17 +397,17 @@ describe.skipIf(!enabled)('tool images, offline', () => {
         'src/nested/.semgrepignore',
       ]),
     );
-    expectHostileFindingsSurvive(s);
+    expectHostileFindingsSurvive(s, 'quarantine');
     expectNoGoToolchain();
   }, 240_000);
 
   it('hostile repo, flags alone (no quarantine, minus .gitleaksignore): findings survive, no canary', async () => {
-    const s = scenario('hostile', addBigFile);
+    const s = scenario('hostile', addGenerated);
     // gitleaks has no flag that stops it reading a repo .gitleaksignore (next test), so that one
     // file is only ever handled by quarantine. Everything else must be covered by flags.
     rmSync(join(s.src, '.gitleaksignore'));
     for (const tool of TOOLS) await runWithoutGate(s, tool);
-    expectHostileFindingsSurvive(s);
+    expectHostileFindingsSurvive(s, 'tree');
     expectNoGoToolchain();
   }, 240_000);
 
@@ -371,15 +416,30 @@ describe.skipIf(!enabled)('tool images, offline', () => {
     await runWithoutGate(s, 'gitleaks');
     const leaks = sarifFindings(read(s, 'gitleaks', 'gitleaks.sarif')).map((f) => f.uri);
     expect(leaks.some((u) => u.endsWith('src/config.js'))).toBe(false);
+    // Quarantine, then plant the file again: runTool must refuse rather than run.
+    const snap = await quarantineSnapshot(s.src);
+    writeFileSync(join(s.src, '.gitleaksignore'), 'x');
     const { sourceDir: _ignored, ...rest } = s.options('gitleaks');
     void _ignored;
     await expect(
       runTool(s.runner, manifest, 'gitleaks', {
         ...rest,
         outputDir: join(work, 'fresh-out'),
-        snapshot: new QuarantinedSnapshot(s.src, []),
+        snapshot: snap,
       }),
-    ).rejects.toThrow(/quarantine/);
+    ).rejects.toBeInstanceOf(SnapshotNotCleanError);
+  }, 240_000);
+
+  it('a malformed lockfile makes OSV-Scanner exit 128, which runTool fails instead of calling empty', async () => {
+    const s = scenario('repo', (src) =>
+      writeFileSync(join(src, 'package-lock.json'), '{ not json'),
+    );
+    const snap = await quarantineSnapshot(s.src);
+    const { sourceDir: _ignored, ...rest } = s.options('osv-scanner');
+    void _ignored;
+    await expect(
+      runTool(s.runner, manifest, 'osv-scanner', { ...rest, snapshot: snap }),
+    ).rejects.toBeInstanceOf(ToolFailedError);
   }, 240_000);
 
   it('OSV-Scanner exits 128 with no report when there is nothing to scan, which runTool reports as empty', async () => {
@@ -391,6 +451,6 @@ describe.skipIf(!enabled)('tool images, offline', () => {
     const { sourceDir: _ignored, ...rest } = s.options('osv-scanner');
     void _ignored;
     const res = await runTool(s.runner, manifest, 'osv-scanner', { ...rest, snapshot: snap });
-    expect(res).toMatchObject({ ok: true, empty: true, exitCode: 128 });
+    expect(res).toMatchObject({ empty: true, exitCode: 128 });
   }, 240_000);
 });
