@@ -1,2 +1,2 @@
-// TODO: placeholder for @affidavit/mcp. No logic yet.
-export {};
+export * from './api-client.js';
+export { createAffidavitMcpServer, TOOL_NAME } from './server.js';
