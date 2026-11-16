@@ -2,7 +2,7 @@ Read docs/plan.md, then docs/implementation-plan.md section 6 (Lane 2) before wo
 
 # @affidavit/judge
 
-**Owner:** Lane 2 (Judge and Evidence)
+**Owner:** Lane 2 (Judge and Evidence), @Thearius123
 
 **Mission:** Rules of evidence and the witness runner; the only bridge between agents and the sandbox.
 

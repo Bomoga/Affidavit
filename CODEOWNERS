@@ -1,6 +1,6 @@
 # Owners by lane (docs/implementation-plan.md section 2.2).
-# Lanes 1 and 2 have no named owner yet (open decision 1); @Bomoga holds them until assigned.
-# Replace the handle on those lines when owners are named.
+# Lane 1 has no named owner yet (open decision 1); @Bomoga holds it until assigned.
+# Lane 2 is owned by @Thearius123 since 2026-11-14. @Bomoga stays listed so a PR by the lane owner can still get a code owner review.
 
 # Lead: contracts, testing fakes, root config, docs
 /packages/contracts/ @Bomoga
@@ -27,13 +27,13 @@
 /fixtures/corpus/ @Bomoga
 
 # Lane 2: Judge and Evidence
-/packages/sandbox/ @Bomoga
-/packages/judge/ @Bomoga
-/packages/evidence/ @Bomoga
-/apps/signer/ @Bomoga
-/docker/sandbox/ @Bomoga
-/fixtures/exhibit-results/ @Bomoga
-/fixtures/bundles/ @Bomoga
+/packages/sandbox/ @Thearius123 @Bomoga
+/packages/judge/ @Thearius123 @Bomoga
+/packages/evidence/ @Thearius123 @Bomoga
+/apps/signer/ @Thearius123 @Bomoga
+/docker/sandbox/ @Thearius123 @Bomoga
+/fixtures/exhibit-results/ @Thearius123 @Bomoga
+/fixtures/bundles/ @Thearius123 @Bomoga
 
 # Lane 3: Trial and Courtroom
 /packages/trial/ @Bomoga

@@ -1,17 +1,21 @@
-import {
-  isAccepted,
-  type Budget,
-  type CaseFile,
-  type JudgePort,
-  type PatchSubmission,
-  type PromptRenderer,
-  type TrialWorkspace,
-  type VerifyResult,
-} from './interim/types.js';
+import type {
+  Budget,
+  CaseFileSource,
+  Exhibit,
+  ExhibitId,
+  JudgePort,
+  PromptId,
+} from '@affidavit/contracts';
+import type { UntrustedBlock } from '@affidavit/prompts';
+import { digestOf } from './canonical.js';
+import { loadCaseFile, type PromptRenderer } from './defense.js';
+import { SUBMISSIONS } from './envelope.js';
 import type { StageHandler, StageResult } from './orchestrator.js';
+import { buildPatchExhibit, describeVerify, isAccepted, rejectionRule } from './patch.js';
+import type { PatchOutcome, TrialWorkspace } from './workspace.js';
 
 export interface RemedyConfig {
-  promptId: string;
+  promptId: PromptId;
   model: string;
   /** Agent turns. Schema failures and Judge rejections each use one. */
   maxIterations: number;
@@ -20,47 +24,46 @@ export interface RemedyConfig {
 }
 
 export interface RemedyDeps {
-  loadCaseFile: (caseId: string) => Promise<CaseFile>;
+  caseFiles: CaseFileSource;
   judge: JudgePort;
   render: PromptRenderer;
   workspace: TrialWorkspace;
   config: RemedyConfig;
-}
-
-function describe(result: VerifyResult): string {
-  const rule = result.rejectedBy ?? 'not-accepted';
-  const flags = [
-    result.familyFlipped ? null : 'family not flipped',
-    result.suitePassed ? null : 'suite failed',
-    result.rescanClean ? null : 'rescan not clean',
-    result.counterexamples.some((c) => c.survived) ? 'counterexample survived' : null,
-  ].filter((f): f is string => f !== null);
-  return `judge: ${rule}${flags.length ? ` [${flags.join(', ')}]` : ''}${result.detail ? ` (${result.detail})` : ''}`;
+  /**
+   * Admissible counterexamples the patch must defeat. Prosecution (L3-08) supplies them; until it
+   * exists the list is empty.
+   */
+  counterexamples?: (caseId: string) => Promise<readonly Exhibit[]>;
 }
 
 /**
- * Remedy writes a patch and submits it to the Judge's verifyPatch. Acceptance comes only
- * from the Judge result. The stage always moves on to verify, carrying the outcome in the
- * workspace, so a fix that cannot be proven becomes a not-proven verdict, not a crash.
+ * Remedy writes a patch and submits it to the Judge's verifyPatch. Acceptance comes only from the
+ * Judge result. The stage always moves on to verify, carrying the outcome in the workspace, so a
+ * fix that cannot be proven becomes a proven-unfixed or not-proven verdict, not a crash.
  */
 export function createRemedyHandler(deps: RemedyDeps): StageHandler {
   const { config, judge, render, workspace } = deps;
 
   return {
     async run(ctx): Promise<StageResult> {
-      const caseFile = await deps.loadCaseFile(ctx.caseId);
-      const witness = await workspace.getWitness(ctx.caseId);
-      if (!witness) throw new Error(`no admitted witness for case ${ctx.caseId}`);
+      const caseFile = await loadCaseFile(deps.caseFiles, ctx.caseId);
+      const admitted = await workspace.getWitness(ctx.caseId);
+      if (!admitted) throw new Error(`no admitted witness for case ${ctx.caseId}`);
+      const counterexamples = (await deps.counterexamples?.(ctx.caseId)) ?? [];
 
       const feedback: string[] = [];
-      let last: { patch?: PatchSubmission; result?: VerifyResult; reason: string } = {
-        reason: 'no patch was submitted',
-      };
+      let last: PatchOutcome = { accepted: false, reason: 'no patch was submitted' };
 
       for (let i = 0; i < config.maxIterations; i++) {
-        const blocks = [
+        const blocks: UntrustedBlock[] = [
           { label: 'candidate', content: JSON.stringify(caseFile.candidate) },
-          { label: 'witness', content: JSON.stringify(witness) },
+          {
+            label: 'witness',
+            content: JSON.stringify({
+              template: admitted.witness.template,
+              params: admitted.witness.params,
+            }),
+          },
           ...caseFile.slices.map((s) => ({
             label: 'case-file-slice',
             content: `file: ${s.file}\n${s.code}`,
@@ -70,52 +73,79 @@ export function createRemedyHandler(deps: RemedyDeps): StageHandler {
           blocks.push({ label: 'judge-feedback', content: feedback.join('\n') });
 
         const rendered = render(config.promptId, blocks);
-        const res = await ctx.runAgentValidated({
-          actor: 'remedy',
-          promptId: rendered.promptId,
-          promptVersion: rendered.version,
-          model: config.model,
-          system: rendered.system,
-          user: rendered.user,
-          tools: ['submit_patch'],
-          outputSchemaRef: rendered.outputSchemaRef,
-          maxTurns: config.maxTurns,
-          budget: config.turnBudget,
-        });
+        const res = await ctx.runAgentValidated(
+          {
+            promptId: rendered.promptId,
+            promptVersion: rendered.version,
+            model: config.model,
+            system: rendered.system,
+            user: rendered.user,
+            tools: ['submit_patch'],
+            outputSchemaRef: rendered.outputSchemaRef,
+            maxTurns: config.maxTurns,
+            budget: config.turnBudget,
+          },
+          SUBMISSIONS.remedy,
+        );
 
         if (res.outcome === 'no-submission') {
-          last = { reason: 'no patch was submitted' };
+          last = { accepted: false, reason: 'no patch was submitted' };
           break;
         }
         if (res.outcome === 'inadmissible') {
           feedback.push(`schema: ${res.errors.join('; ')}`);
-          last = { reason: `schema: ${res.errors.join('; ')}` };
+          last = { accepted: false, reason: 'patch failed schema' };
           continue;
         }
 
-        const patch = res.value as PatchSubmission;
-        await ctx.record(
-          'patch-submitted',
-          { filesTouched: patch.filesTouched, linesChanged: patch.linesChanged },
-          'remedy',
-        );
-        const result = await judge.verifyPatch(caseFile, patch, witness, []);
+        // Files touched and lines changed come from the diff, computed in code.
+        let patch;
+        try {
+          patch = buildPatchExhibit(caseFile, res.value.diff);
+        } catch (err) {
+          const why = err instanceof Error ? err.message : String(err);
+          await ctx.record(
+            'exhibit-inadmissible',
+            { exhibitId: rejectedPatchId(res.result.submission), rejectedBy: 'schema' },
+            'judge',
+          );
+          feedback.push(`schema: the diff could not be read as a patch (${why})`);
+          last = { accepted: false, reason: 'patch diff could not be read' };
+          continue;
+        }
+
+        await ctx.record('exhibit-submitted', { exhibitId: patch.id, kind: 'patch' }, 'remedy');
+        const result = await judge.verifyPatch(caseFile, patch, admitted.witness, counterexamples);
 
         if (isAccepted(result)) {
-          await ctx.record('patch-verified', { accepted: true }, 'judge');
-          await workspace.savePatchOutcome(ctx.caseId, { accepted: true, patch, result });
+          await workspace.addExhibit(ctx.caseId, patch.id);
+          await workspace.savePatchOutcome(ctx.caseId, {
+            accepted: true,
+            patch,
+            result,
+            reason: 'accepted by the Judge',
+          });
           return { kind: 'advance', next: 'verify' };
         }
 
-        const rule = result.rejectedBy ?? 'not-accepted';
-        await ctx.record('patch-rejected', { rule, detail: result.detail ?? null }, 'judge');
-        feedback.push(describe(result));
-        last = { patch, result, reason: describe(result) };
+        const rule = rejectionRule(result);
+        if (rule) {
+          await ctx.record(
+            'exhibit-inadmissible',
+            { exhibitId: patch.id, rejectedBy: rule },
+            'judge',
+          );
+        }
+        feedback.push(describeVerify(result));
+        last = { accepted: false, patch, result, reason: describeVerify(result) };
       }
 
-      await ctx.record('patch-verified', { accepted: false, reason: last.reason }, 'judge');
-      await workspace.savePatchOutcome(ctx.caseId, { accepted: false, ...last });
+      await workspace.savePatchOutcome(ctx.caseId, last);
       return { kind: 'advance', next: 'verify' };
     },
   };
+}
+
+function rejectedPatchId(submission: unknown): ExhibitId {
+  return `exhibit-patch-rejected-${digestOf(submission).slice(0, 24)}` as ExhibitId;
 }
