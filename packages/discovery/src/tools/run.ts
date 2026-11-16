@@ -54,7 +54,7 @@ export interface ToolRunResult {
   partial: boolean;
   notifications: ToolNotification[];
   /**
-   * Image, audio, video and font files. gitleaks reads these as text (probed on the pinned image),
+   * Image, audio and video files whose extension agrees with their signature. gitleaks reads these as text (probed on the pinned image),
    * so a plaintext secret inside is found; they are listed for information only and, unlike
    * everything in `notifications`, do not make the run `partial`. Archives, PDFs, SQLite files and
    * executables are NOT here: gitleaks skips them, so they are coverage losses.
@@ -218,6 +218,8 @@ const KIND_TEXT: Record<Exclude<Unscannable['kind'], 'binary-media'>, string> = 
     'is not plain text (control characters at the start, or NUL bytes or invalid UTF-8 anywhere, as in UTF-16 text), so gitleaks may skip it',
   'chunk-split-risk':
     'is over 100 KB with a 25 KB stretch that has no blank line, so gitleaks may cut a chunk through a secret and miss it',
+  'multiline-split-risk':
+    'holds a -----BEGIN/-----END block (a PEM key) that spans a simulated gitleaks chunk cut, so gitleaks may split it and miss it',
   unreadable:
     'could not be read by the host user (mode or ownership), so the jailed gitleaks may not read it either',
 };
@@ -228,10 +230,11 @@ const KIND_ORDER = [
   'unreadable',
   'skipped-file-type',
   'chunk-split-risk',
+  'multiline-split-risk',
 ] as const;
 
 /**
- * Splits gitleaks coverage findings. Everything except image, audio, video and font files is a
+ * Splits gitleaks coverage findings. Everything except media files (image, audio, video) is a
  * coverage loss: it becomes a notification, never truncated, listed by severity. gitleaks reads
  * media files as text (probed), so they lose nothing and are returned apart.
  */

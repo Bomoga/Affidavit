@@ -565,29 +565,96 @@ describe.skipIf(!enabled)('tool images, offline', () => {
     }
   }, 240_000);
 
-  it('images and fonts are read by gitleaks, so a secret inside is found and the run is not partial', async () => {
+  it('real images are read by gitleaks, and fonts are skipped even with complete headers', async () => {
     const secret = Buffer.from('\nAFFIDAVIT_FAKE_KEY_0123456789ABCDEF\n');
+    const zeros = (n: number) => Buffer.alloc(n);
+    const png = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d]),
+      Buffer.from('IHDR'),
+      zeros(17),
+    ]);
     const s = scenario('repo', (src) => {
       mkdirSync(join(src, 'm'));
+      writeFileSync(join(src, 'm', 'logo.png'), Buffer.concat([png, secret]));
+      // complete font headers: gitleaks logs "skipping binary file" for these
       writeFileSync(
-        join(src, 'm', 'logo.png'),
-        Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47]), secret]),
+        join(src, 'm', 'a.woff'),
+        Buffer.concat([Buffer.from('wOFF'), Buffer.from([0, 1, 0, 0]), zeros(24), secret]),
       );
-      writeFileSync(join(src, 'm', 'font.woff'), Buffer.concat([Buffer.from('wOFF'), secret]));
+      writeFileSync(
+        join(src, 'm', 'a.woff2'),
+        Buffer.concat([Buffer.from('wOF2'), Buffer.from([0, 1, 0, 0]), zeros(24), secret]),
+      );
+      writeFileSync(
+        join(src, 'm', 'a.ttf'),
+        Buffer.concat([Buffer.from([0, 1, 0, 0, 0]), zeros(24), secret]),
+      );
+      writeFileSync(
+        join(src, 'm', 'a.otf'),
+        Buffer.concat([Buffer.from('OTTO'), Buffer.from([0]), zeros(24), secret]),
+      );
     });
     const snap = await quarantineSnapshot(s.src);
     const { sourceDir: _ignored, ...rest } = s.options('gitleaks');
     void _ignored;
     const res = await runTool(s.runner, manifest, 'gitleaks', { ...rest, snapshot: snap });
-    expect(res.partial).toBe(false);
-    expect(res.binaryMediaFiles).toEqual(
-      expect.arrayContaining(['/src/m/logo.png', '/src/m/font.woff']),
-    );
+    expect(res.binaryMediaFiles).toEqual(['/src/m/logo.png']);
+    for (const f of ['a.woff', 'a.woff2', 'a.ttf', 'a.otf']) {
+      const note = res.notifications.find((n) => n.message.startsWith(`/src/m/${f} `));
+      expect(note?.id, f).toBe('skipped-file-type');
+    }
     const found = sarifFindings(
       readFileSync(join(s.out('gitleaks'), 'gitleaks.sarif'), 'utf8'),
     ).map((f) => f.uri);
     expect(found.some((u) => u.endsWith('m/logo.png'))).toBe(true);
-    expect(found.some((u) => u.endsWith('m/font.woff'))).toBe(true);
+    expect(found.some((u) => u.endsWith('m/a.woff'))).toBe(false); // really skipped
+  }, 240_000);
+
+  it('a media signature on a file with another extension cannot switch off the checks', async () => {
+    const key16 = Buffer.from('AFFIDAVIT_FAKE_KEY_0123456789ABCDEF', 'utf16le');
+    const s = scenario('repo', (src) => {
+      mkdirSync(join(src, 'h'));
+      writeFileSync(join(src, 'h', 'app.env'), 'GIF89a=1\nAFFIDAVIT_FAKE_KEY_0123456789ABCDEF\n');
+      writeFileSync(
+        join(src, 'h', 'c.js'),
+        'ID3\nconst k = "AFFIDAVIT_FAKE_KEY_0123456789ABCDEF";\n',
+      );
+      writeFileSync(
+        join(src, 'h', 'notes.txt'),
+        Buffer.concat([Buffer.from('ID3'), Buffer.from([3, 0]), key16]),
+      );
+    });
+    const snap = await quarantineSnapshot(s.src);
+    const { sourceDir: _ignored, ...rest } = s.options('gitleaks');
+    void _ignored;
+    const res = await runTool(s.runner, manifest, 'gitleaks', { ...rest, snapshot: snap });
+    expect(res.partial).toBe(true);
+    for (const f of ['app.env', 'c.js', 'notes.txt']) {
+      const note = res.notifications.find((n) => n.message.startsWith(`/src/h/${f} `));
+      expect(note?.id, f).toBe('binary-header-mismatch');
+    }
+  }, 240_000);
+
+  it('an encrypted PEM key that straddles a blank-line cut is flagged', async () => {
+    const pem =
+      '-----BEGIN ENCRYPTED PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0123456789ABCDEF\n\n' +
+      `${'A'.repeat(64)}\n`.repeat(5) +
+      '-----END ENCRYPTED PRIVATE KEY-----\n';
+    const line = `${'x'.repeat(79)}\n`;
+    const filler = (n: number) => line.repeat(Math.floor(n / 80)) + 'y'.repeat(n % 80);
+    const s = scenario('repo', (src) => {
+      writeFileSync(join(src, 'src', 'key.pem.txt'), filler(99_950) + pem + filler(40_000));
+    });
+    const snap = await quarantineSnapshot(s.src);
+    const { sourceDir: _ignored, ...rest } = s.options('gitleaks');
+    void _ignored;
+    const res = await runTool(s.runner, manifest, 'gitleaks', { ...rest, snapshot: snap });
+    expect(res.partial).toBe(true);
+    expect(
+      res.notifications.some(
+        (n) => n.id === 'multiline-split-risk' && n.message.includes('key.pem.txt'),
+      ),
+    ).toBe(true);
   }, 240_000);
 
   it('flags a secret that straddles gitleaks chunk boundary, in dense lines and in one long line', async () => {

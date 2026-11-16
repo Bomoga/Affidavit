@@ -35,10 +35,17 @@ describe('classifyHead', () => {
 
   it('treats media as read by gitleaks, and every other known type as skipped', () => {
     const png = bytes([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-    // gitleaks reads images, audio, video and fonts as text: informational whatever the extension
+    // gitleaks reads images, audio and video as text: informational, but only when the extension
+    // agrees with the signature. Otherwise the header is a way to hide a file.
     expect(classifyHead('logo.png', png)).toBe('binary-media');
-    expect(classifyHead('config.js', png)).toBe('binary-media');
-    expect(classifyHead('a.woff', bytes('wOFF', [0, 1]))).toBe('binary-media');
+    expect(classifyHead('config.js', png)).toBe('binary-header-mismatch');
+    expect(classifyHead('app.env', bytes('GIF89a=1\nKEY=value'))).toBe('binary-header-mismatch');
+    expect(classifyHead('c.js', bytes('ID3\nconst k = 1'))).toBe('binary-header-mismatch');
+    expect(classifyHead('notes.txt', bytes('ID3', [3, 0], 'x'))).toBe('binary-header-mismatch');
+    // fonts are skipped by gitleaks (application/font-sfnt, application/font-woff)
+    expect(classifyHead('a.woff', bytes('wOFF', [0, 1, 0, 0]))).toBe('skipped-file-type');
+    expect(classifyHead('a.ttf', bytes([0, 1, 0, 0, 0]))).toBe('skipped-file-type');
+    expect(classifyHead('a.otf', bytes('OTTO', [0]))).toBe('skipped-file-type');
     // application types are skipped, with a matching extension or not
     const zip = bytes('PK\x03\x04', [0, 0]);
     expect(classifyHead('lib.zip', zip)).toBe('skipped-file-type');
