@@ -4,9 +4,22 @@ import type { ReplayResult, TrialOutcome } from './replay.js';
 /** Branded so a bare string cannot stand in for a run id. */
 export type RunId = string & { readonly __brand: 'RunId' };
 
+/** Safe characters only, so a run id can never inject markdown or control characters. */
+const RUN_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+
 export function asRunId(value: string): RunId {
-  if (value.trim() === '') throw new Error('runId must be a non-empty string');
+  if (!RUN_ID_PATTERN.test(value)) {
+    throw new Error('runId must match ^[A-Za-z0-9._:-]{1,128}$');
+  }
   return value as RunId;
+}
+
+function deepFreeze<T>(value: T): T {
+  if (typeof value === 'object' && value !== null && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const v of Object.values(value)) deepFreeze(v);
+  }
+  return value;
 }
 
 export interface LabelsSource {
@@ -72,10 +85,21 @@ export function createEvalRun(input: {
   baseline?: readonly BaselineDecision[];
 }): EvalRun {
   const { runId } = input.manifest;
-  if (typeof runId !== 'string' || runId.trim() === '') {
-    throw new Error('manifest.runId is required');
+  if (typeof runId !== 'string' || !RUN_ID_PATTERN.test(runId)) {
+    throw new Error('manifest.runId is required and must match ^[A-Za-z0-9._:-]{1,128}$');
   }
   const baseline = input.baseline ?? [];
+  for (const r of input.replays) {
+    const seen = new Set<string>();
+    for (const b of r.result.ballots) {
+      voteIndex(b); // throws on a vote outside the contract scale
+      const key = `${b.jurorId}\u0000${b.question}`;
+      if (seen.has(key)) {
+        throw new Error(`juror ${b.jurorId} voted twice on ${b.question} in ${r.result.caseId}`);
+      }
+      seen.add(key);
+    }
+  }
   assertUnique(
     'replays',
     input.replays.map((r) => r.result.caseId),
@@ -96,11 +120,12 @@ export function createEvalRun(input: {
     if (b.runId !== runId)
       throw new Error(`baseline for ${b.caseId} is tagged ${b.runId}, not ${runId}`);
   }
-  const run: EvalRun = Object.freeze({
-    manifest: input.manifest,
-    labels: Object.freeze([...input.labels]),
-    replays: Object.freeze([...input.replays]),
-    baseline: Object.freeze([...baseline]),
+  // Deep copies, then deep freeze: later mutation of the caller's objects cannot change a run.
+  const run: EvalRun = deepFreeze({
+    manifest: structuredClone(input.manifest),
+    labels: structuredClone([...input.labels]),
+    replays: structuredClone([...input.replays]),
+    baseline: structuredClone([...baseline]),
   });
   created.add(run);
   return run;
@@ -175,7 +200,10 @@ export function wrongCases(run: EvalRun): Set<CaseId> {
   );
 }
 
-const ORDINAL: Record<Ballot['question'], readonly string[]> = {
+type VoteOf<Q extends Ballot['question']> = Extract<Ballot, { question: Q }>['vote'];
+
+/** Ordinal scale per question, typed from the contract's vote types. */
+export const VOTE_SCALES: { readonly [Q in Ballot['question']]: readonly VoteOf<Q>[] } = {
   severity: ['low', 'medium', 'high', 'critical'],
   'fix-minimality': ['minimal', 'acceptable', 'excessive'],
   'merge-risk': ['low', 'medium', 'high'],
@@ -183,12 +211,15 @@ const ORDINAL: Record<Ballot['question'], readonly string[]> = {
 };
 
 function voteIndex(b: Ballot): number {
-  return ORDINAL[b.question].indexOf(b.vote);
+  const scale: readonly string[] = VOTE_SCALES[b.question];
+  const i = scale.indexOf(b.vote);
+  if (i < 0) throw new Error(`unknown vote ${String(b.vote)} for question ${b.question}`);
+  return i;
 }
 
 /** Votes mapped onto [0, 1] so questions with different scales can be pooled. */
 function numericVote(b: Ballot): number {
-  const len = ORDINAL[b.question].length;
+  const len = VOTE_SCALES[b.question].length;
   return len > 1 ? voteIndex(b) / (len - 1) : 0;
 }
 
@@ -288,6 +319,7 @@ export function jurorCorrelation(run: EvalRun, opts: { onlyWrong?: boolean } = {
 
 /** Mean USD over replays that ended in a written verdict. */
 export function costPerVerdict(run: EvalRun): Metric {
+  if (run.replays.some((r) => !r.result.complete)) return unmeasured('partial replay');
   // Escalated and dismissed cases can carry a closing verdict; their spend is not verdict cost.
   const withVerdict = run.replays.filter(
     (r) =>
@@ -303,6 +335,7 @@ export function costPerVerdict(run: EvalRun): Metric {
 /** Mean USD over every replay, including escalated and dismissed cases. */
 export function costPerCase(run: EvalRun): Metric {
   if (run.replays.length === 0) return unmeasured('no replays');
+  if (run.replays.some((r) => !r.result.complete)) return unmeasured('partial replay');
   const total = run.replays.reduce((s, r) => s + r.result.cost.usd, 0);
   return measured(run, total / run.replays.length, run.replays.length);
 }
@@ -349,16 +382,36 @@ export function compareToBaseline(
   const real = (m: Metric): m is Extract<Metric, { status: 'measured' }> =>
     m.status === 'measured' && !m.synthetic;
   if (!real(jury)) return 'unmeasured';
+  // An invalid policy can never support a claim.
+  if (!validatePolicy(policy)) return 'undetermined';
+  // Sample size first, so a handful of cases never yields a recommendation either way.
+  if (jury.cases < policy.minCases) return 'undetermined';
   // A baseline that is absent or does not cover every labelled case cannot be compared against.
   if (!real(baseline)) return 'undetermined';
   if (jury.value <= baseline.value) return 'not-supported';
   // Accuracy is higher, so the verdict now rests on juror independence. If that cannot be
   // assessed (for example the jury made no errors) or the sample is small, say undetermined.
   if (!real(wrongCorrelation)) return 'undetermined';
-  if (jury.cases < policy.minCases || wrongCorrelation.cases < policy.minCases) {
-    return 'undetermined';
-  }
+  if (wrongCorrelation.cases < policy.minCases) return 'undetermined';
   return wrongCorrelation.value <= policy.maxWrongCaseCorrelation ? 'supported' : 'not-supported';
+}
+
+/** minCases must be a finite integer of at least 1; the correlation cap finite and in [-1, 1). */
+export function validatePolicy(p: ComparisonPolicy): boolean {
+  return (
+    Number.isInteger(p.minCases) &&
+    p.minCases >= 1 &&
+    Number.isFinite(p.maxWrongCaseCorrelation) &&
+    p.maxWrongCaseCorrelation >= -1 &&
+    p.maxWrongCaseCorrelation < 1
+  );
+}
+
+/** Reports built by `computeReport`; the renderer refuses anything else. */
+const computedReports = new WeakSet<object>();
+
+export function isComputedReport(r: CalibrationReport): boolean {
+  return computedReports.has(r);
 }
 
 export function computeReport(
@@ -369,7 +422,7 @@ export function computeReport(
   const jury = juryAccuracy(run);
   const baseline = baselineAccuracy(run);
   const correlationWrong = jurorCorrelation(run, { onlyWrong: true });
-  return {
+  const report: CalibrationReport = {
     manifest: run.manifest,
     juryAccuracy: jury,
     baselineAccuracy: baseline,
@@ -382,4 +435,7 @@ export function computeReport(
     juryVsBaseline: compareToBaseline(jury, baseline, correlationWrong, policy),
     policy,
   };
+  deepFreeze(report);
+  computedReports.add(report);
+  return report;
 }

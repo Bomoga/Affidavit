@@ -3,6 +3,7 @@ import {
   isLegalTransition,
   type Ballot,
   type CaseId,
+  type CaseStage,
   type Dismissal,
   type Escalation,
   type ExhibitId,
@@ -61,6 +62,10 @@ export interface ReplayResult {
   budgetExhausted?: Escalation;
   dismissal?: Dismissal;
   eventCount: number;
+  /** Stage of the first recorded event. */
+  opensAt: CaseStage;
+  /** True only when the stream opens at intake with no `from`; truncated streams are partial. */
+  complete: boolean;
 }
 
 type Parsed = ReturnType<typeof TrialEvent.parse>;
@@ -255,7 +260,19 @@ export function replayEvents(raw: readonly unknown[]): ReplayResult {
     ...(budgetExhausted !== undefined ? { budgetExhausted } : {}),
     ...(dismissal !== undefined ? { dismissal } : {}),
   };
-  const base = { caseId: last.caseId, costRows, cost, eventCount: events.length, ...extras };
+  const base = {
+    caseId: last.caseId,
+    costRows,
+    cost,
+    eventCount: events.length,
+    opensAt: first.stage,
+    // Spend before the first recorded event is invisible, so only intake-opening streams count.
+    complete:
+      first.stage === 'intake' &&
+      first.type === 'stage-entered' &&
+      first.payload.from === undefined,
+    ...extras,
+  };
   if (last.type === 'verdict-written') {
     const verdict = last.payload.verdict;
     return {

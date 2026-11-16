@@ -45,7 +45,7 @@ describe('renderReport', () => {
         ['b', 'not-proven'],
       ],
     });
-    const md = renderReport(computeReport(run));
+    const md = renderReport(computeReport(run, { minCases: 1 }));
     expect(md).toContain('run run-abc');
     expect(md).toContain('Run id: run-abc');
     expect(md).toContain('$2.0000');
@@ -124,6 +124,80 @@ describe('renderReport', () => {
     const md = renderReport(forged);
     expect(md).not.toContain('jury scored higher');
     expect(md).toContain('undetermined');
+  });
+
+  it('renders placeholders only for a hand-built report, even if every field looks real', () => {
+    const real = makeRun({
+      kind: 'corpus',
+      runId: 'run-real',
+      labels: [['a', 'proven-fixed']],
+      replays: [replay('a', 'proven-fixed', ['low', 'high'], 1)],
+    });
+    const good = computeReport(real, { minCases: 1 });
+    const metric = (v: number) =>
+      ({
+        status: 'measured',
+        value: v,
+        n: 20,
+        cases: 20,
+        runId: asRunId('run-real'),
+        synthetic: false,
+      }) as const;
+    const forged = {
+      manifest: {
+        ...good.manifest,
+        labelsSource: { kind: 'synthetic' as const, ref: 'fake' },
+      },
+      juryAccuracy: metric(0.9),
+      baselineAccuracy: metric(0.5),
+      agreementAll: metric(0.5),
+      correlationAll: metric(0.1),
+      agreementWrong: metric(0.5),
+      correlationWrong: metric(0.1),
+      costPerVerdict: metric(1),
+      costPerCase: metric(1),
+      juryVsBaseline: 'supported' as const,
+      policy: { minCases: 1, maxWrongCaseCorrelation: 0.5 },
+    };
+    for (const report of [forged, { ...forged, manifest: good.manifest }]) {
+      const md = renderReport(report);
+      expect(md).not.toMatch(/\d/);
+      expect(md).not.toContain('jury scored higher');
+      expect(md).toContain('undetermined');
+    }
+  });
+
+  it('never yields a win for invalid policies', () => {
+    const run = makeRun({
+      kind: 'corpus',
+      runId: 'run-pol',
+      labels: [['a', 'proven-fixed']],
+      replays: [replay('a', 'not-proven', ['low', 'high'])],
+      baseline: [['a', 'not-proven']],
+    });
+    for (const policy of [{ minCases: Number.NaN }, { minCases: 0 }]) {
+      expect(renderReport(computeReport(run, policy))).not.toContain('jury scored higher');
+    }
+  });
+
+  it('escapes newlines and markdown in free-text fields', () => {
+    const run = makeRun({
+      kind: 'corpus',
+      runId: 'run-esc',
+      labels: [['a', 'proven-fixed']],
+      replays: [replay('a', 'proven-fixed', ['low', 'high'], 1)],
+      ref: 'corpus\n# Injected heading\n- [x](http://evil)',
+      startedAt: 'now\n## Another',
+    });
+    const md = renderReport(computeReport(run));
+    expect(md.split('\n').filter((l) => l.startsWith('#'))).toEqual([
+      '# Calibration',
+      '## Accuracy against labels',
+      '## Inter-juror votes',
+      '## Cost',
+      '## Jury versus single reviewer',
+    ]);
+    expect(md).toContain('corpus \\# Injected heading');
   });
 
   it('notes that cost per verdict excludes escalated and dismissed spend', () => {

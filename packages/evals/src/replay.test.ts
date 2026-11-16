@@ -138,6 +138,16 @@ describe('replayEvents rejects bad streams', () => {
     expect(codeOf(() => replayEvents(events))).toBe('bad-first-event');
   });
 
+  it('marks truncated streams as partial', () => {
+    expect(replayEvents(load('nodegoat-sqli-001')).complete).toBe(true);
+    expect(replayEvents(load('nodegoat-sqli-001')).opensAt).toBe('intake');
+    const tail = reseq(load('nodegoat-sqli-001').filter((e) => (e['seq'] as number) >= 16));
+    const r = replayEvents(tail);
+    expect(r.opensAt).toBe('verify');
+    expect(r.complete).toBe(false);
+    expect(replayEvents(load('escalated-001')).complete).toBe(false);
+  });
+
   it('reports the failing index', () => {
     const gap = load('nodegoat-sqli-001').filter((e) => e['seq'] !== 5);
     expect(failOf(() => replayEvents(gap))).toEqual({ code: 'seq-gap', index: 5 });

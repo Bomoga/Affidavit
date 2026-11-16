@@ -1,5 +1,8 @@
+import { Ballot } from '@affidavit/contracts';
 import { describe, expect, it } from 'vitest';
 import {
+  VOTE_SCALES,
+  validatePolicy,
   asRunId,
   baselineAccuracy,
   compareToBaseline,
@@ -13,7 +16,7 @@ import {
   tagReplay,
   type Metric,
 } from './calibration.js';
-import { makeRun, replay } from './synthetic.test-helpers.js';
+import { ballot, cid, makeRun, replay } from './synthetic.test-helpers.js';
 
 const value = (m: Metric): number => {
   if (m.status !== 'measured') throw new Error(`unmeasured: ${m.reason}`);
@@ -304,6 +307,99 @@ describe('compareToBaseline', () => {
     const real = makeRun({ labels: [['a', 'proven-fixed']], replays: [] });
     const forged = { ...real };
     expect(() => juryAccuracy(forged)).toThrow(/createEvalRun/);
+  });
+
+  it('never supports a win under an invalid policy', () => {
+    const ids = Array.from({ length: 12 }, (_, i) => `c${i}`);
+    const run = makeRun({
+      kind: 'corpus',
+      labels: ids.map((id) => [id, 'proven-fixed']),
+      replays: ids.map((id, i) =>
+        i < 2
+          ? replay(id, 'not-proven', i === 0 ? ['low', 'critical'] : ['critical', 'low'])
+          : replay(id, 'proven-fixed', ['high', 'high']),
+      ),
+      baseline: ids.map((id) => [id, 'not-proven']),
+    });
+    for (const bad of [
+      { minCases: Number.NaN },
+      { minCases: 0 },
+      { minCases: 1.5 },
+      { maxWrongCaseCorrelation: Number.POSITIVE_INFINITY },
+      { maxWrongCaseCorrelation: 1 },
+      { maxWrongCaseCorrelation: Number.NaN },
+    ]) {
+      expect(computeReport(run, bad).juryVsBaseline).not.toBe('supported');
+    }
+    // A valid policy with the same data can support, so the guard is what blocks the others.
+    expect(computeReport(run, { minCases: 2 }).juryVsBaseline).toBe('supported');
+    expect(validatePolicy({ minCases: 10, maxWrongCaseCorrelation: 0.5 })).toBe(true);
+    expect(validatePolicy({ minCases: 10, maxWrongCaseCorrelation: -1 })).toBe(true);
+  });
+
+  it('applies the minimum-sample gate before the accuracy comparison', () => {
+    const lower = compareToBaseline(
+      { status: 'measured', value: 0.1, n: 1, cases: 1, runId: asRunId('r'), synthetic: false },
+      { status: 'measured', value: 0.9, n: 1, cases: 1, runId: asRunId('r'), synthetic: false },
+      { status: 'unmeasured', reason: 'x' },
+      { minCases: 10, maxWrongCaseCorrelation: 0.5 },
+    );
+    expect(lower).toBe('undetermined');
+  });
+
+  it('is not affected by mutating inputs after the run is built', () => {
+    const manifest = {
+      runId: asRunId('run-mut'),
+      startedAt: 'x',
+      labelsSource: { kind: 'synthetic' as 'synthetic' | 'corpus', ref: 'r' },
+      modelIds: {},
+      promptVersions: {},
+    };
+    const run = createEvalRun({
+      manifest,
+      labels: [{ caseId: cid('a'), expected: 'proven-fixed' }],
+      replays: [],
+    });
+    manifest.labelsSource.kind = 'corpus';
+    expect(run.manifest.labelsSource.kind).toBe('synthetic');
+    expect(() => {
+      (run.manifest.labelsSource as { kind: string }).kind = 'corpus';
+    }).toThrow(TypeError);
+    const m = juryAccuracy(run);
+    expect(m.status === 'measured' && m.synthetic).toBe(true);
+  });
+
+  it('rejects unsafe run ids', () => {
+    expect(() => asRunId('run\n# injected')).toThrow();
+    expect(() => asRunId('a'.repeat(129))).toThrow();
+    expect(asRunId('run-1.2:x_y')).toBe('run-1.2:x_y');
+  });
+
+  it('rejects two ballots from one juror on one question and unknown votes', () => {
+    const dup = replay('a', 'proven-fixed', ['low', 'high']);
+    dup.ballots = [ballot('same', 'low'), ballot('same', 'high')];
+    expect(() => makeRun({ labels: [], replays: [dup] })).toThrow(/voted twice/);
+    const bad = replay('b', 'proven-fixed', []);
+    bad.ballots = [{ ...ballot('j', 'low'), vote: 'bogus' } as unknown as Ballot];
+    expect(() => makeRun({ labels: [], replays: [bad] })).toThrow(/unknown vote/);
+  });
+
+  it('keeps vote scales a permutation of the contract enums', () => {
+    for (const opt of Ballot.options) {
+      const q = opt.shape.question.value;
+      expect([...VOTE_SCALES[q]].sort()).toEqual([...opt.shape.vote.options].sort());
+    }
+  });
+
+  it('treats partial replays as unmeasured for cost', () => {
+    const partial = replay('a', 'proven-fixed', [], 2);
+    partial.complete = false;
+    partial.opensAt = 'verify';
+    const run = makeRun({ labels: [], replays: [partial] });
+    const a = costPerVerdict(run);
+    const b = costPerCase(run);
+    expect(a.status === 'unmeasured' && a.reason).toBe('partial replay');
+    expect(b.status === 'unmeasured' && b.reason).toBe('partial replay');
   });
 
   it('labels non-finite values distinctly', () => {

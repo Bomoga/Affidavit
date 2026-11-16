@@ -46,6 +46,8 @@ export function replay(
     costRows: [],
     cost: { inputTokens: 0, outputTokens: 0, usd, wallMs: 0 },
     eventCount: 0,
+    opensAt: 'intake',
+    complete: true,
   };
   if (withVerdict) {
     base.verdict = { outcome } as ReplayResult['verdict'];
@@ -59,14 +61,16 @@ export function makeRun(opts: {
   labels: [string, TrialOutcome][];
   replays: ReplayResult[];
   baseline?: [string, TrialOutcome][];
+  ref?: string;
+  startedAt?: string;
 }): EvalRun {
   const runId = asRunId(opts.runId ?? 'test-run-synthetic');
   const labels: CaseLabel[] = opts.labels.map(([id, expected]) => ({ caseId: cid(id), expected }));
   return createEvalRun({
     manifest: {
       runId,
-      startedAt: 'synthetic',
-      labelsSource: { kind: opts.kind ?? 'synthetic', ref: 'in-test' },
+      startedAt: opts.startedAt ?? 'synthetic',
+      labelsSource: { kind: opts.kind ?? 'synthetic', ref: opts.ref ?? 'in-test' },
       modelIds: {},
       promptVersions: {},
     },
