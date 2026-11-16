@@ -1,2 +1,9 @@
-// TODO: placeholder for @affidavit/judge. No logic yet.
-export {};
+export * from './artifact.js';
+export * from './canonical.js';
+export * from './executor.js';
+export * from './judge.js';
+export * from './rules.js';
+export * from './jail/harness.js';
+export * from './jail/jail.js';
+export * from './jail/executor.js';
+export * from './jail/containment.js';

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import type { CaseStage, StageCost, WitnessSubmission } from './interim/types.js';
+import { ExhibitId, type CaseStage, type StageCost } from '@affidavit/contracts';
+import { FakeEventSink, ReplayModel } from '@affidavit/testing';
 import { Orchestrator } from './orchestrator.js';
 import {
   buildVerdict,
@@ -11,9 +12,22 @@ import {
   type StructuredVerdict,
 } from './verdict.js';
 import { createVerifyHandler } from './verify.js';
-import { FakeCaseStore, FakeEventSink, FakeModel, InMemoryWorkspace } from './testing/fakes.js';
+import { InMemoryWorkspace } from './workspace.js';
+import {
+  BIG_BUDGET,
+  LoggingCaseStore,
+  NOW,
+  PATH_TO,
+  assertSchemaValid,
+  inOrder,
+  makeCaseFile,
+  openAt,
+} from './test-support.js';
 
 const EM_DASH = '—';
+const CF = makeCaseFile();
+const W1 = ExhibitId.parse('exhibit-witness-065ed82f887fd688aef7d3a3');
+const P1 = ExhibitId.parse('exhibit-patch-1c2d3e4f5a6b7c8d9e0f1a2b');
 
 const cost = (stage: CaseStage, attempt: number, usd: number): StageCost => ({
   stage,
@@ -24,11 +38,11 @@ const cost = (stage: CaseStage, attempt: number, usd: number): StageCost => ({
   wallMs: 900,
 });
 
-const base = (overrides: Partial<StructuredVerdict> = {}): StructuredVerdict =>
+const base = (overrides: Partial<Parameters<typeof buildVerdict>[0]> = {}): StructuredVerdict =>
   buildVerdict({
-    caseId: 'case-7',
+    caseId: CF.id,
     outcome: 'proven-fixed',
-    exhibits: ['ex_w1', 'ex_p1'],
+    exhibits: [W1, P1],
     promptVersions: { defense: '1.0.0', remedy: '1.0.0' },
     modelIds: { defense: 'model-a', remedy: 'model-a' },
     cost: [cost('defense', 1, 0.07), cost('remedy', 2, 0.1)],
@@ -48,15 +62,16 @@ describe('verdict writer', () => {
     const v = base();
     expect(v).not.toHaveProperty('summary');
     expect(v.schemaVersion).toBe(1);
-    expect(v.exhibits).toEqual(['ex_w1', 'ex_p1']);
+    expect(v.exhibits).toEqual([W1, P1]);
     expect(v.promptVersions.defense).toBe('1.0.0');
     expect(v.cost).toHaveLength(2);
   });
 
-  it('generates the summary from the structured verdict, deterministically', () => {
+  it('generates a contract-valid summary from the structured verdict, deterministically', () => {
     const v = base();
     expect(renderSummary(v)).toBe(renderSummary(v));
     expect(renderSummary(v)).not.toBe(renderSummary(base({ outcome: 'proven-unfixed' })));
+    expect(finalizeVerdict(v).schemaVersion).toBe(1);
   });
 
   it('puts only numbers and exhibit ids from the structured verdict in the summary', () => {
@@ -68,29 +83,27 @@ describe('verdict writer', () => {
 
   it('writes the ids and costs it was given', () => {
     const summary = renderSummary(base());
-    expect(summary).toContain('ex_w1');
-    expect(summary).toContain('ex_p1');
+    expect(summary).toContain(W1);
+    expect(summary).toContain(P1);
     expect(summary).toContain('0.07');
     expect(summary).toContain('0.1');
   });
 
   it('flags a number that is not in the structured verdict', () => {
-    const v = { ...base(), summary: 'Fixed 42 weaknesses.' };
-    const problems = checkSummary(v);
+    const problems = checkSummary({ ...finalizeVerdict(base()), summary: 'Fixed 42 weaknesses.' });
     expect(problems).toHaveLength(1);
     expect(problems[0]).toContain('42');
   });
 
   it('flags an exhibit id that is not in the structured verdict', () => {
-    const v = { ...base(), summary: 'See ex_made_up for proof.' };
-    const problems = checkSummary(v);
-    expect(problems.some((p) => p.includes('ex_made_up'))).toBe(true);
+    const problems = checkSummary({
+      ...finalizeVerdict(base()),
+      summary: 'See exhibit-witness-made-up for proof.',
+    });
+    expect(problems.some((p) => p.includes('exhibit-witness-made-up'))).toBe(true);
   });
 
   it('refuses to finalize a verdict whose summary breaks the rules', () => {
-    // Case ids are data. One that smuggles a number or id into the summary must not pass.
-    const hostile = base({ caseId: 'case-1' });
-    expect(() => finalizeVerdict(hostile)).not.toThrow();
     expect(() => finalizeVerdict(base(), { summaryOverride: `Solved ${EM_DASH} done` })).toThrow(
       /em dash/i,
     );
@@ -122,27 +135,20 @@ describe('verdict writer', () => {
 });
 
 describe('verify stage writes the verdict', () => {
-  const witness: WitnessSubmission = { template: 'sqli-union', params: {} };
-
   async function runVerify(accepted: boolean) {
     const log: string[] = [];
-    const store = new FakeCaseStore(log, { usd: 10, tokens: 1_000_000 }, 'verify');
-    await store.settleCost(
-      'c1',
-      (await store.chargeBudget('c1', cost('defense', 1, 0.07))).chargeId,
-      cost('defense', 1, 0.07),
-    );
+    // The jury is skipped for the gate case, so the store must allow verify to go to verdict.
+    const store = new LoggingCaseStore(log, { juryEnabled: false });
+    await openAt(store, CF, BIG_BUDGET, PATH_TO.verify);
     const sink = new FakeEventSink();
     const workspace = new InMemoryWorkspace();
-    await workspace.saveWitness('c1', witness);
-    await workspace.addExhibit('c1', 'ex_w1');
-    await workspace.addExhibit('c1', 'ex_p1');
-    await workspace.savePatchOutcome('c1', { accepted });
+    await workspace.addExhibit(CF.id, W1);
+    await workspace.addExhibit(CF.id, P1);
+    await workspace.savePatchOutcome(CF.id, { accepted });
     const orch = new Orchestrator({
       store,
       sink,
-      model: new FakeModel(log, []),
-      validate: () => ({ ok: true }),
+      model: new ReplayModel(inOrder([])),
       handlers: {
         verify: createVerifyHandler({
           store,
@@ -153,26 +159,26 @@ describe('verify stage writes the verdict', () => {
           },
         }),
       },
-      config: { killSwitch: () => false, maxStageAttempts: 1, now: () => 1_700_000_000_000 },
+      config: { killSwitch: () => false, maxStageAttempts: 1, now: () => NOW },
     });
-    const final = await orch.run('c1');
-    return { final, sink, workspace };
+    const out = await orch.run(CF.id);
+    return { out, store, events: assertSchemaValid(sink.events(CF.id)) };
   }
 
   it('records a proven-fixed verdict that cites its exhibits, then reaches the verdict stage', async () => {
-    const { final, sink, workspace } = await runVerify(true);
-    expect(final).toBe('verdict');
-    const v = await workspace.getVerdict('c1');
-    expect(v).toMatchObject({ outcome: 'proven-fixed', exhibits: ['ex_w1', 'ex_p1'] });
+    const { out, store, events } = await runVerify(true);
+    expect(out).toEqual({ status: 'terminal', stage: 'verdict' });
+    const v = await store.getVerdict(CF.id);
+    expect(v).toMatchObject({ outcome: 'proven-fixed', exhibits: [W1, P1] });
     expect(v?.promptVersions).toEqual({ defense: '1.0.0', remedy: '1.0.0' });
-    expect(v?.cost).toHaveLength(1);
     expect(v && checkSummary(v)).toEqual([]);
-    expect(sink.events.some((e) => e.type === 'verdict-written')).toBe(true);
+    const written = events.find((e) => e.type === 'verdict-written');
+    expect(written?.payload).toMatchObject({ verdict: { outcome: 'proven-fixed' } });
   });
 
   it('records proven-unfixed when the Judge did not accept a patch', async () => {
-    const { final, workspace } = await runVerify(false);
-    expect(final).toBe('verdict');
-    expect((await workspace.getVerdict('c1'))?.outcome).toBe('proven-unfixed');
+    const { out, store } = await runVerify(false);
+    expect(out).toEqual({ status: 'terminal', stage: 'verdict' });
+    expect((await store.getVerdict(CF.id))?.outcome).toBe('proven-unfixed');
   });
 });

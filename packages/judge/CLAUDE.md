@@ -2,7 +2,7 @@ Read docs/plan.md, then docs/implementation-plan.md section 6 (Lane 2) before wo
 
 # @affidavit/judge
 
-**Owner:** Lane 2 (Judge and Evidence)
+**Owner:** Lane 2 (Judge and Evidence), @Thearius123
 
 **Mission:** Rules of evidence and the witness runner; the only bridge between agents and the sandbox.
 
@@ -12,7 +12,9 @@ Run from this directory, or add `--filter @affidavit/judge` from the repo root.
 
 - `pnpm typecheck`
 - `pnpm lint`
-- `pnpm test`
+- `pnpm test` (unit tests, no Docker needed)
+- `pnpm test:sandbox-host` runs the witness jail against real gVisor (needs a sandbox host, see `docs/lanes/lane2/sandbox-runner.md`)
+- `pnpm containment` runs the L2-01 suite with every probe as a witness and updates `docs/lanes/lane2/containment.md`. Run it after every change to `src/jail` or `packages/sandbox`.
 
 ## Intended libraries (notes for later, not installed yet)
 
