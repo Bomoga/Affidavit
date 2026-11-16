@@ -5,8 +5,14 @@ import { REVIEW_REASON, STATUS_STAMP } from './status.js';
 // Everything below renders case content (summaries, ids, details) as React text children only.
 // Case content is untrusted: no raw HTML, no URLs or styles built from it.
 
-export function Stamp({ status }: { status: CaseView['status'] }) {
-  const { text, tone } = STATUS_STAMP[status];
+export function Stamp({ view }: { view: CaseView }) {
+  // The verified look comes only from the view model's own stamp field, never from status text.
+  const { text, tone } =
+    view.stamp === 'VERIFIED'
+      ? ({ text: view.stamp, tone: 'verified' } as const)
+      : view.status === 'verified'
+        ? STATUS_STAMP.unverified
+        : STATUS_STAMP[view.status];
   return <p className={`stamp stamp--${tone}`}>{text}</p>;
 }
 
@@ -34,7 +40,7 @@ function Collapsible({
           aria-controls={panelId}
           onClick={() => setOpen(!open)}
         >
-          {open ? '- ' : '+ '}
+          <span aria-hidden="true">{open ? '- ' : '+ '}</span>
           {title}
           {meta ? <span className="muted">{`  ${meta}`}</span> : null}
         </button>
@@ -96,10 +102,11 @@ export function CaseFile({ view, slug }: { view: CaseView; slug?: string }) {
     <article aria-labelledby="page-heading">
       <p className="label">{`Case file ${slug ?? view.caseId}`}</p>
       <h1 id="page-heading">{view.headline}</h1>
-      <Stamp status={view.status} />
+      <Stamp view={view} />
 
       <section aria-labelledby="summary-heading">
         <h2 id="summary-heading">Summary</h2>
+        <p className="label">Court summary</p>
         <p>{view.summary}</p>
         {view.status === 'unverified' && view.stampWithheld.length > 0 ? (
           <div className="panel">

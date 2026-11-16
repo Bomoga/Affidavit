@@ -110,13 +110,36 @@ function checkStructure(root: Element, out: string[]): void {
 
 type Token = keyof typeof TOKENS.color;
 
-function tokenOf(decl: string, props: readonly string[]): Token | undefined {
-  for (const p of props) {
-    const m = new RegExp(`(?:^|;|\\s)${p}\\s*:[^;]*var\\(--color-([a-z]+)\\)`).exec(decl);
-    const name = m?.[1];
-    if (name && name in TOKENS.color) return name as Token;
+const COLOR_PROP =
+  /^(color|background(-color)?|border(-(top|right|bottom|left))?(-color)?|outline(-color)?)$/;
+const LITERAL_COLOR = /#[0-9a-f]{3,8}\b|\b(?:rgba?|hsla?)\(/i;
+
+interface Decls {
+  fg: Token[];
+  bg: Token[];
+  border: Token[];
+}
+
+function readDecls(selector: string, decl: string, out: string[]): Decls {
+  const r: Decls = { fg: [], bg: [], border: [] };
+  for (const part of decl.split(';')) {
+    const i = part.indexOf(':');
+    if (i < 0) continue;
+    const prop = part.slice(0, i).trim().toLowerCase();
+    const value = part.slice(i + 1);
+    if (!COLOR_PROP.test(prop)) continue;
+    if (LITERAL_COLOR.test(value))
+      out.push('literal color in "' + selector + '" (' + prop + '); colors must come from tokens');
+    for (const m of value.matchAll(/var\(--color-([a-z]+)\)/g)) {
+      const name = m[1];
+      if (!name || !(name in TOKENS.color)) continue;
+      const t = name as Token;
+      if (prop === 'color') r.fg.push(t);
+      else if (prop.startsWith('background')) r.bg.push(t);
+      else r.border.push(t);
+    }
   }
-  return undefined;
+  return r;
 }
 
 function checkCss(css: string, out: string[]): void {
@@ -124,21 +147,16 @@ function checkCss(css: string, out: string[]): void {
   const grounds = [TOKENS.color.bg, TOKENS.color.surface];
   for (const m of stripped.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
     const selector = (m[1] ?? '').trim();
-    const decl = m[2] ?? '';
-    const fg = tokenOf(decl, ['color']);
-    const bg = tokenOf(decl, ['background', 'background-color']);
-    if (fg) {
-      const against = bg ? [TOKENS.color[bg]] : grounds;
+    const { fg, bg, border } = readDecls(selector, m[2] ?? '', out);
+    const against = bg.length > 0 ? bg.map((t) => TOKENS.color[t]) : grounds;
+    for (const f of fg)
       for (const g of against)
-        if (contrastRatio(TOKENS.color[fg], g) < AA_TEXT)
-          out.push(`text contrast below AA in "${selector}" (${fg})`);
-    }
-    const border = tokenOf(decl, ['border', 'border-color', 'outline']);
-    if (border) {
-      for (const g of bg ? [TOKENS.color[bg]] : grounds)
-        if (contrastRatio(TOKENS.color[border], g) < AA_NON_TEXT)
-          out.push(`non-text contrast below 3:1 in "${selector}" (${border})`);
-    }
+        if (contrastRatio(TOKENS.color[f], g) < AA_TEXT)
+          out.push('text contrast below AA in "' + selector + '" (' + f + ')');
+    for (const bd of border)
+      for (const g of against)
+        if (contrastRatio(TOKENS.color[bd], g) < AA_NON_TEXT)
+          out.push('non-text contrast below 3:1 in "' + selector + '" (' + bd + ')');
   }
   if (!/:focus-visible\s*\{[^}]*outline\s*:/.test(stripped)) out.push('no :focus-visible outline');
   const reduced = /@media\s*\(prefers-reduced-motion:\s*reduce\)\s*\{([\s\S]*?\})\s*\}/.exec(

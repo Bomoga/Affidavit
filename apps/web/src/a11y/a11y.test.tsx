@@ -108,10 +108,26 @@ describe('checker catches real problems', () => {
     expect(run(good('<h1>Two</h1>')).join()).toMatch(/exactly one h1/);
   });
 
+  it('flags literal colors in any color-bearing declaration', () => {
+    const decls = [
+      'color: #111; background: #000',
+      'color: rgb(1, 2, 3)',
+      'background-color: hsl(10, 10%, 10%)',
+      'border: 1px solid #fff',
+      'border-bottom-color: rgba(0,0,0,.5)',
+      'outline: 2px solid #3ddc84',
+    ];
+    for (const d of decls) expect(run(good(''), `.x { ${d}; }`).join(), d).toMatch(/literal color/);
+  });
+
   it('flags low-contrast CSS, missing focus style and missing reduced-motion handling', () => {
     expect(
       run(good(''), '.x { color: var(--color-bg); background: var(--color-surface); }').join(),
     ).toMatch(/contrast below AA/);
+    const lowBorder = '.y { border-left: 1px solid var(--color-bg); background: var(--color-bg); }';
+    expect(run(good(''), lowBorder).join()).toMatch(/non-text contrast/);
+    const lowBorderColor = '.y { border-top-color: var(--color-surface); }';
+    expect(run(good(''), lowBorderColor).join()).toMatch(/non-text contrast/);
     const noFocus = APP_CSS.replace(/:focus-visible\s*\{[^}]*\}/g, '');
     expect(run(good(''), noFocus).join()).toMatch(/focus-visible/);
     const noReduce = APP_CSS.replace(

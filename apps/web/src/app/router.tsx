@@ -16,12 +16,16 @@ import { APP_CSS } from './styles.js';
 function Layout() {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const mainRef = useRef<HTMLElement>(null);
-  const first = useRef(true);
+  const previous = useRef(pathname);
   // After a client-side navigation, move focus to the content so keyboard and screen reader
   // users land on the new page instead of the link they activated.
+  // Comparing with the previous path (not a first-run flag) keeps this correct when StrictMode
+  // runs the effect twice on mount.
   useEffect(() => {
-    if (first.current) first.current = false;
-    else mainRef.current?.focus();
+    if (previous.current !== pathname) {
+      previous.current = pathname;
+      mainRef.current?.focus();
+    }
   }, [pathname]);
   return (
     <>

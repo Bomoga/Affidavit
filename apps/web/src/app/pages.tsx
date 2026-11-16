@@ -1,7 +1,16 @@
 import { queryOptions, useQuery } from '@tanstack/react-query';
-import { Link, useParams } from '@tanstack/react-router';
+import { getRouteApi, Link } from '@tanstack/react-router';
+import { useEffect } from 'react';
 import { CaseFile, Stamp } from './CaseFile.js';
 import { CaseNotFoundError, loadCase, loadCaseList } from './data.js';
+
+const caseApi = getRouteApi('/cases/$caseId');
+
+function useDocumentTitle(title: string) {
+  useEffect(() => {
+    document.title = title;
+  }, [title]);
+}
 
 const caseListQuery = queryOptions({ queryKey: ['cases'], queryFn: loadCaseList });
 const caseQuery = (slug: string) =>
@@ -12,6 +21,7 @@ const caseQuery = (slug: string) =>
   });
 
 export function CaseListPage() {
+  useDocumentTitle('Case files - Affidavit');
   const q = useQuery(caseListQuery);
   return (
     <>
@@ -33,7 +43,7 @@ export function CaseListPage() {
                 {slug}
               </Link>
               <p>{view.headline}</p>
-              <Stamp status={view.status} />
+              <Stamp view={view} />
             </li>
           ))}
         </ul>
@@ -43,8 +53,14 @@ export function CaseListPage() {
 }
 
 export function CasePage() {
-  const { caseId = '' } = useParams({ strict: false });
+  const { caseId } = caseApi.useParams();
   const q = useQuery(caseQuery(caseId));
+  const title = q.data
+    ? `${q.data.headline} - Affidavit`
+    : q.error instanceof CaseNotFoundError
+      ? 'Case file not found - Affidavit'
+      : 'Case file - Affidavit';
+  useDocumentTitle(title);
   if (q.isPending) return <p role="status">Loading case file.</p>;
   if (q.error instanceof CaseNotFoundError) return <NotFoundPage />;
   if (q.isError) return <p role="alert">This case file could not be loaded.</p>;
@@ -52,6 +68,7 @@ export function CasePage() {
 }
 
 export function NotFoundPage() {
+  useDocumentTitle('Case file not found - Affidavit');
   return (
     <>
       <h1 id="page-heading">Case file not found</h1>

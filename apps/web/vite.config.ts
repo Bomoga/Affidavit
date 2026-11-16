@@ -3,10 +3,13 @@ import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   plugins: [react()],
-  // Fixtures live at the repo root, two levels up from this package.
-  server: { fs: { allow: ['../..'] } },
+  server: {
+    // The dev server must read the repo-root fixtures, workspace packages and hoisted deps.
+    fs: { allow: ['../..'] },
+  },
   test: {
     environment: 'jsdom',
     include: ['src/**/*.test.{ts,tsx}'],
+    setupFiles: ['./src/test-setup.ts'],
   },
 });

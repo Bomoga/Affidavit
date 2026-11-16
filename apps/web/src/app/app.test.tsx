@@ -84,8 +84,12 @@ describe('gate case view (nodegoat-sqli-001)', () => {
   it('lists the docket behind a disclosure', async () => {
     renderApp('/cases/nodegoat-sqli-001');
     const toggle = await screen.findByRole('button', { name: /Docket/ });
+    const list = document.querySelector('ol.docket');
+    if (!list) throw new Error('docket list missing');
+    expect(list.closest('[hidden]')).not.toBeNull();
     fireEvent.click(toggle);
-    expect(screen.getAllByRole('listitem').length).toBeGreaterThanOrEqual(19);
+    expect(list.closest('[hidden]')).toBeNull();
+    expect(within(list as HTMLElement).getAllByRole('listitem')).toHaveLength(19);
   });
 });
 
@@ -123,6 +127,22 @@ describe('escalated case view (escalated-001)', () => {
     expect(screen.queryByText('VERIFIED')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: /exhibit-witness-002/ }));
     expect(screen.getByText(/Rule: differential/)).toBeTruthy();
+  });
+});
+
+describe('document title', () => {
+  it('names each page', async () => {
+    renderApp('/cases/escalated-001');
+    await screen.findByRole('heading', { level: 1 });
+    expect(document.title).toBe('Needs human review - Affidavit');
+    cleanup();
+    renderApp('/cases/nope');
+    await screen.findByRole('heading', { level: 1, name: 'Case file not found' });
+    expect(document.title).toBe('Case file not found - Affidavit');
+    cleanup();
+    renderApp('/');
+    await screen.findByRole('heading', { level: 1, name: 'Case files' });
+    expect(document.title).toBe('Case files - Affidavit');
   });
 });
 
