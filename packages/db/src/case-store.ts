@@ -20,9 +20,8 @@ import {
   type Verdict,
 } from '@affidavit/contracts';
 import { and, eq, isNull, sql } from 'drizzle-orm';
-import type pg from 'pg';
 import * as t from './schema.js';
-import { withTenant, type Tx } from './tenant.js';
+import { withTenant, type AppPool, type Tx } from './tenant.js';
 import { rejectTransition } from './transition-rules.js';
 
 export interface PgCaseStoreOptions {
@@ -39,7 +38,7 @@ export class PgCaseStore implements CaseStore {
   private readonly juryEnabled: boolean;
 
   constructor(
-    private readonly pool: pg.Pool,
+    private readonly pool: AppPool,
     readonly tenantId: string,
     options: PgCaseStoreOptions = {},
   ) {

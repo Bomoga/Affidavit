@@ -10,6 +10,16 @@ export type Tx = Parameters<Parameters<Db['transaction']>[0]>[0];
 /** The two login roles the services may connect as. */
 export type LoginRole = 'affidavit_app' | 'affidavit_worker';
 
+declare const checkedRole: unique symbol;
+/**
+ * A pool that openPool() has verified connects as `R` with a safe role. The stores, the sink and
+ * the queue functions only accept a checked pool of the right role, so a pool built any other way
+ * (an admin URL, say) does not type-check.
+ */
+export type CheckedPool<R extends LoginRole> = pg.Pool & { readonly [checkedRole]: R };
+export type AppPool = CheckedPool<'affidavit_app'>;
+export type WorkerPool = CheckedPool<'affidavit_worker'>;
+
 /**
  * Creates an UNGUARDED pool (not exported: use openPool, which checks the role). An idle client erroring would otherwise crash the process, so errors are
  * reported to `onError` (default: one line on stderr, no connection details).
@@ -110,11 +120,11 @@ export async function assertSafeRole(pool: pg.Pool, expected: LoginRole): Promis
 }
 
 /** Creates a pool and refuses it unless the role is safe. Use this at process startup. */
-export async function openPool(
+export async function openPool<R extends LoginRole>(
   connectionString: string,
-  expected: LoginRole,
+  expected: R,
   onError?: (err: Error) => void,
-): Promise<pg.Pool> {
+): Promise<CheckedPool<R>> {
   const pool = createPool(connectionString, onError);
   try {
     await assertSafeRole(pool, expected);
@@ -122,7 +132,7 @@ export async function openPool(
     await pool.end();
     throw err;
   }
-  return pool;
+  return pool as CheckedPool<R>;
 }
 
 /**
@@ -133,7 +143,7 @@ export async function openPool(
  * and dropped if that fails.
  */
 export async function withTenant<T>(
-  pool: pg.Pool,
+  pool: AppPool,
   tenantId: string,
   fn: (tx: Tx) => Promise<T>,
 ): Promise<T> {

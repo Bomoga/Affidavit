@@ -246,9 +246,10 @@ describe('decideResume', () => {
     expect(d(run('running', past), 'defense', { caseVisit: 6 })).toBe('adopt-complete');
     expect(d(run('running', future), 'defense', { caseVisit: 6 })).toBe('wait');
   });
-  it('a completed attempt is done', () => {
-    expect(d(run('completed', past), 'defense')).toBe('done');
+  it('a completed attempt is done once the case has moved on, otherwise completed-not-advanced', () => {
+    expect(d(run('completed', past), 'defense')).toBe('completed-not-advanced');
     expect(d(run('completed', past), 'prosecution')).toBe('done');
+    expect(d(run('completed', past), 'defense', { caseVisit: 6 })).toBe('done');
   });
 });
 

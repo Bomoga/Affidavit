@@ -5,7 +5,7 @@ import { sql } from 'drizzle-orm';
 import pg from 'pg';
 import { expect, it } from 'vitest';
 import { PgCaseStore } from './case-store.js';
-import { openPool, UnsafeRoleError, withTenant } from './tenant.js';
+import { openPool, UnsafeRoleError, withTenant, type AppPool } from './tenant.js';
 import { BUDGET, describePg, sampleCase, useTestDatabase } from './test-support.js';
 
 const T = 'tenant-s';
@@ -52,7 +52,7 @@ describePg('session and role hardening', () => {
   });
 
   it('session state does not survive on a pooled connection', async () => {
-    const pool = new pg.Pool({ connectionString: db().appUrl, max: 1 });
+    const pool = new pg.Pool({ connectionString: db().appUrl, max: 1 }) as unknown as AppPool;
     try {
       await withTenant(pool, T, (tx) =>
         tx.execute(sql`select set_config('leak.value', 'secret', false)`),
@@ -68,7 +68,7 @@ describePg('session and role hardening', () => {
   });
 
   it('a pooled connection never keeps the tenant of the previous call', async () => {
-    const pool = new pg.Pool({ connectionString: db().appUrl, max: 1 });
+    const pool = new pg.Pool({ connectionString: db().appUrl, max: 1 }) as unknown as AppPool;
     try {
       const store = new PgCaseStore(pool, T);
       const file = sampleCase(T);

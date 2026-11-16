@@ -1,6 +1,6 @@
 {
-  "id": "2bf63f7a-58f6-4aa7-ab45-45b4099bbb88",
-  "prevId": "cc439323-1250-426d-b81c-1cca3f75422b",
+  "id": "69bb340e-fab5-4227-b635-98fa72f480d0",
+  "prevId": "9756362d-a314-4d20-87c1-18c310e9bd5f",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -72,7 +72,12 @@
       },
       "uniqueConstraints": {},
       "policies": {},
-      "checkConstraints": {},
+      "checkConstraints": {
+        "ballots_blob_matches": {
+          "name": "ballots_blob_matches",
+          "value": "\"ballots\".\"ballot\"->>'jurorId' = \"ballots\".\"juror_id\" and \"ballots\".\"ballot\"->>'question' = \"ballots\".\"question\""
+        }
+      },
       "isRLSEnabled": true
     },
     "public.cases": {
@@ -316,7 +321,7 @@
         },
         "cost_rows_values_valid": {
           "name": "cost_rows_values_valid",
-          "value": "\"cost_rows\".\"attempt\" >= 1 and \"cost_rows\".\"input_tokens\" >= 0 and \"cost_rows\".\"output_tokens\" >= 0 and \"cost_rows\".\"usd\" >= 0 and \"cost_rows\".\"wall_ms\" >= 0"
+          "value": "\"cost_rows\".\"attempt\" >= 1 and \"cost_rows\".\"input_tokens\" >= 0 and \"cost_rows\".\"output_tokens\" >= 0 and \"cost_rows\".\"usd\" >= 0 and \"cost_rows\".\"usd\" <> 'NaN'::numeric and \"cost_rows\".\"wall_ms\" >= 0"
         }
       },
       "isRLSEnabled": true
@@ -389,7 +394,12 @@
       },
       "uniqueConstraints": {},
       "policies": {},
-      "checkConstraints": {},
+      "checkConstraints": {
+        "escalations_blob_matches": {
+          "name": "escalations_blob_matches",
+          "value": "\"escalations\".\"escalation\"->>'caseId' = \"escalations\".\"case_id\" and \"escalations\".\"escalation\"->>'reason' = \"escalations\".\"reason\""
+        }
+      },
       "isRLSEnabled": true
     },
     "public.events": {
@@ -476,7 +486,12 @@
       },
       "uniqueConstraints": {},
       "policies": {},
-      "checkConstraints": {},
+      "checkConstraints": {
+        "events_blob_matches": {
+          "name": "events_blob_matches",
+          "value": "\"events\".\"event\"->>'type' = \"events\".\"type\" and \"events\".\"event\"->>'caseId' = \"events\".\"case_id\"\n        and (\"events\".\"event\"->>'seq')::int = \"events\".\"seq\""
+        }
+      },
       "isRLSEnabled": true
     },
     "public.exhibits": {
@@ -563,6 +578,14 @@
         "exhibits_kind_valid": {
           "name": "exhibits_kind_valid",
           "value": "\"exhibits\".\"kind\" in ('witness', 'counterexample', 'patch')"
+        },
+        "exhibits_blob_matches": {
+          "name": "exhibits_blob_matches",
+          "value": "\"exhibits\".\"exhibit\"->>'id' = \"exhibits\".\"id\" and \"exhibits\".\"exhibit\"->>'caseId' = \"exhibits\".\"case_id\"\n        and \"exhibits\".\"exhibit\"->>'kind' = \"exhibits\".\"kind\" and \"exhibits\".\"exhibit\"->>'author' = \"exhibits\".\"author\"\n        and \"exhibits\".\"exhibit\"->>'sha256' = \"exhibits\".\"sha256\""
+        },
+        "exhibits_result_valid": {
+          "name": "exhibits_result_valid",
+          "value": "\"exhibits\".\"result\" is null or (jsonb_typeof(\"exhibits\".\"result\") = 'object' and \"exhibits\".\"result\"->>'exhibitId' = \"exhibits\".\"id\")"
         }
       },
       "isRLSEnabled": true
@@ -958,7 +981,12 @@
       },
       "uniqueConstraints": {},
       "policies": {},
-      "checkConstraints": {},
+      "checkConstraints": {
+        "verdicts_blob_matches": {
+          "name": "verdicts_blob_matches",
+          "value": "\"verdicts\".\"verdict\"->>'caseId' = \"verdicts\".\"case_id\" and \"verdicts\".\"verdict\"->>'outcome' = \"verdicts\".\"outcome\""
+        }
+      },
       "isRLSEnabled": true
     }
   },

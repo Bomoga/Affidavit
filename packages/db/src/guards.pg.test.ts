@@ -323,6 +323,63 @@ describePg('database guards behind the store', () => {
       expect(Number(rows[0]!.n)).toBe(2);
     });
 
+    it('even the owner cannot change a lease token, and JSON blobs must agree with their columns', async () => {
+      const { store, file } = await openCase();
+      const run = { tenantId: T, caseId: file.id, stage: 'intake' as const, attempt: 1 };
+      await enqueueStage(db().app, run);
+      await claimStageRun(db().worker, run, 'w', 60);
+      await expect(
+        db().admin.query(`update stage_runs set lease_token = 'mine' where case_id = $1`, [
+          file.id,
+        ]),
+      ).rejects.toThrow(/identity is immutable/);
+      // exhibits.result: a JSON null (which would freeze the write-once column) or an object about
+      // another exhibit is rejected; a real result is accepted once.
+      const exhibit = Exhibit.parse({ ...(samples.Exhibit as object), caseId: file.id });
+      await store.putExhibit(exhibit);
+      for (const bad of [`'null'::jsonb`, `'{"exhibitId": "other"}'::jsonb`, `'[]'::jsonb`]) {
+        await expect(
+          db().admin.query(`update exhibits set result = ${bad} where case_id = $1`, [file.id]),
+          bad,
+        ).rejects.toThrow(/exhibits_result_valid/);
+      }
+      // Blobs: the verdict, event and exhibit JSON must say what the columns say.
+      await expect(
+        db().admin.query(
+          `insert into verdicts (tenant_id, case_id, outcome, verdict)
+           values ($1, $2, 'proven-fixed', '{"caseId": "x", "outcome": "proven-fixed"}')`,
+          [T, file.id],
+        ),
+      ).rejects.toThrow(/verdicts_blob_matches/);
+      await store.nextSeq(file.id);
+      await expect(
+        db().admin.query(
+          `insert into events (tenant_id, case_id, seq, type, event)
+           values ($1, $2, 0, 'stage-entered', $3::jsonb)`,
+          [T, file.id, JSON.stringify({ type: 'objection', caseId: file.id, seq: 0 })],
+        ),
+      ).rejects.toThrow(/events_blob_matches/);
+      await expect(
+        db().admin.query(
+          `insert into exhibits (tenant_id, case_id, id, kind, author, sha256, exhibit)
+           values ($1, $2, 'ex-2', 'witness', 'defense', 'a', $3::jsonb)`,
+          [T, file.id, JSON.stringify({ ...exhibit, kind: 'patch' })],
+        ),
+      ).rejects.toThrow(/exhibits_blob_matches/);
+    });
+
+    it('cost rows reject NaN', async () => {
+      const { store, file } = await openCase();
+      await store.transition(file.id, 'map');
+      await expect(
+        db().admin.query(
+          `insert into cost_rows (tenant_id, case_id, stage, attempt, input_tokens, output_tokens, usd, wall_ms)
+           values ($1, $2, 'map', 1, 1, 1, 'NaN', 1)`,
+          [T, file.id],
+        ),
+      ).rejects.toThrow(/cost_rows_values_valid/);
+    });
+
     it('case exhaustion never clears', async () => {
       const { store, file } = await openCase();
       await store.chargeBudget(file.id, {

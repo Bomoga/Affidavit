@@ -11,7 +11,7 @@ import {
   provisionTenant,
   setRolePassword,
 } from './migrate.js';
-import { openPool } from './tenant.js';
+import { openPool, type AppPool, type WorkerPool } from './tenant.js';
 
 /** Superuser or owner URL of a throwaway Postgres server, e.g. the compose one. */
 export const PG_ADMIN_URL = process.env.AFFIDAVIT_TEST_DATABASE_URL;
@@ -41,8 +41,8 @@ export interface TestDatabase {
   /** Superuser pool: for assertions about what exists, never for the code under test. */
   admin: pg.Pool;
   /** Pool for the non-owner application role. */
-  app: pg.Pool;
-  worker: pg.Pool;
+  app: AppPool;
+  worker: WorkerPool;
   workerUrl: string;
   drop(): Promise<void>;
 }

@@ -122,6 +122,18 @@ export const exhibits = pgTable(
     primaryKey({ columns: [t.tenantId, t.caseId, t.id] }),
     caseRef(t),
     check('exhibits_kind_valid', sql`${t.kind} in ('witness', 'counterexample', 'patch')`),
+    // The blob must say what the columns say, and a result is an object about this exhibit (a JSON
+    // null would otherwise freeze the write-once column).
+    check(
+      'exhibits_blob_matches',
+      sql`${t.exhibit}->>'id' = ${t.id} and ${t.exhibit}->>'caseId' = ${t.caseId}
+        and ${t.exhibit}->>'kind' = ${t.kind} and ${t.exhibit}->>'author' = ${t.author}
+        and ${t.exhibit}->>'sha256' = ${t.sha256}`,
+    ),
+    check(
+      'exhibits_result_valid',
+      sql`${t.result} is null or (jsonb_typeof(${t.result}) = 'object' and ${t.result}->>'exhibitId' = ${t.id})`,
+    ),
   ],
 ).enableRLS();
 
@@ -137,7 +149,14 @@ export const ballots = pgTable(
     ballot: jsonb('ballot').notNull(),
     createdAt: createdAt(),
   },
-  (t) => [primaryKey({ columns: [t.tenantId, t.caseId, t.seq] }), caseRef(t)],
+  (t) => [
+    primaryKey({ columns: [t.tenantId, t.caseId, t.seq] }),
+    caseRef(t),
+    check(
+      'ballots_blob_matches',
+      sql`${t.ballot}->>'jurorId' = ${t.jurorId} and ${t.ballot}->>'question' = ${t.question}`,
+    ),
+  ],
 ).enableRLS();
 
 /** Append-only: the application role has no UPDATE or DELETE grant, and a trigger backs it up. */
@@ -150,7 +169,14 @@ export const verdicts = pgTable(
     verdict: jsonb('verdict').notNull(),
     createdAt: createdAt(),
   },
-  (t) => [primaryKey({ columns: [t.tenantId, t.caseId] }), caseRef(t)],
+  (t) => [
+    primaryKey({ columns: [t.tenantId, t.caseId] }),
+    caseRef(t),
+    check(
+      'verdicts_blob_matches',
+      sql`${t.verdict}->>'caseId' = ${t.caseId} and ${t.verdict}->>'outcome' = ${t.outcome}`,
+    ),
+  ],
 ).enableRLS();
 
 export const costRows = pgTable(
@@ -173,7 +199,7 @@ export const costRows = pgTable(
     check('cost_rows_stage_valid', sql`${t.stage} in (${stageList})`),
     check(
       'cost_rows_values_valid',
-      sql`${t.attempt} >= 1 and ${t.inputTokens} >= 0 and ${t.outputTokens} >= 0 and ${t.usd} >= 0 and ${t.wallMs} >= 0`,
+      sql`${t.attempt} >= 1 and ${t.inputTokens} >= 0 and ${t.outputTokens} >= 0 and ${t.usd} >= 0 and ${t.usd} <> 'NaN'::numeric and ${t.wallMs} >= 0`,
     ),
   ],
 ).enableRLS();
@@ -190,7 +216,14 @@ export const escalations = pgTable(
     escalation: jsonb('escalation').notNull(),
     createdAt: createdAt(),
   },
-  (t) => [primaryKey({ columns: [t.tenantId, t.caseId, t.seq] }), caseRef(t)],
+  (t) => [
+    primaryKey({ columns: [t.tenantId, t.caseId, t.seq] }),
+    caseRef(t),
+    check(
+      'escalations_blob_matches',
+      sql`${t.escalation}->>'caseId' = ${t.caseId} and ${t.escalation}->>'reason' = ${t.reason}`,
+    ),
+  ],
 ).enableRLS();
 
 /** TrialEvent log, idempotent on (case_id, seq). Append-only like verdicts. */
@@ -208,6 +241,11 @@ export const events = pgTable(
     primaryKey({ columns: [t.tenantId, t.caseId, t.seq] }),
     caseRef(t),
     index('events_case_idx').on(t.tenantId, t.caseId),
+    check(
+      'events_blob_matches',
+      sql`${t.event}->>'type' = ${t.type} and ${t.event}->>'caseId' = ${t.caseId}
+        and (${t.event}->>'seq')::int = ${t.seq}`,
+    ),
   ],
 ).enableRLS();
 

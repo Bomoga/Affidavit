@@ -319,7 +319,7 @@ BEGIN
   IF NEW.lease_expires_at < OLD.lease_expires_at OR NEW.heartbeat_at < OLD.heartbeat_at THEN
     RAISE EXCEPTION 'a lease only moves forward' USING ERRCODE = 'check_violation';
   END IF;
-  -- Bounds: a lease is at most a day and a minute ahead (claim allows 86400 seconds), a heartbeat
+  -- Bounds: a lease is at most an hour and a minute ahead (claim and heartbeat allow 3600 seconds), a heartbeat
   -- at most a minute ahead, and an expired lease cannot be revived. Infinity is out of range.
   IF NEW.lease_expires_at > now() + interval '1 hour 1 minute' OR NEW.heartbeat_at > now() + interval '1 minute' THEN
     RAISE EXCEPTION 'lease or heartbeat is beyond the allowed bound' USING ERRCODE = 'check_violation';
@@ -554,6 +554,9 @@ BEGIN
                                        'verify', 'jury', 'verdict', 'dismissed', 'escalated') THEN
     RAISE EXCEPTION 'invalid stage' USING ERRCODE = 'invalid_parameter_value';
   END IF;
+  -- Serialise enqueue and claim for one case and stage (one lock key, shared with claim_stage_run),
+  -- so the existence check, the record and the queue insert cannot interleave with another caller.
+  PERFORM pg_advisory_xact_lock(hashtextextended(v_tenant || '/' || p_case_id || '/' || p_stage, 0));
   SELECT stage INTO v_current FROM public.cases WHERE tenant_id = v_tenant AND id = p_case_id;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'unknown case %', p_case_id USING ERRCODE = 'no_data_found';
@@ -612,6 +615,7 @@ BEGIN
      OR p_lease_seconds < 1 OR p_lease_seconds > 3600 THEN
     RAISE EXCEPTION 'invalid claim' USING ERRCODE = 'invalid_parameter_value';
   END IF;
+  PERFORM pg_advisory_xact_lock(hashtextextended(p_tenant || '/' || p_case_id || '/' || p_stage, 0));
   SELECT visit INTO v_job_visit FROM public.stage_jobs
     WHERE tenant_id = p_tenant AND case_id = p_case_id AND stage = p_stage AND attempt = p_attempt;
   IF NOT FOUND THEN
@@ -690,9 +694,26 @@ CREATE FUNCTION stage_run_complete(p_case_id text, p_stage text, p_attempt integ
 DECLARE
   v_tenant text := public.app_tenant_id();
   v_rows integer;
+  v_run_visit integer;
+  v_current text;
+  v_case_visit integer;
 BEGIN
   IF v_tenant IS NULL THEN
     RAISE EXCEPTION 'no tenant set' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  IF p_token IS NULL THEN
+    -- Adoption: only an attempt whose case has left its stage visit may be adopted.
+    SELECT visit INTO v_run_visit FROM public.stage_runs
+      WHERE tenant_id = v_tenant AND case_id = p_case_id AND stage = p_stage AND attempt = p_attempt;
+    IF NOT FOUND THEN
+      RETURN false;
+    END IF;
+    SELECT stage INTO v_current FROM public.cases WHERE tenant_id = v_tenant AND id = p_case_id;
+    SELECT coalesce(max(ordinal), 0) INTO v_case_visit FROM public.stages
+      WHERE tenant_id = v_tenant AND case_id = p_case_id;
+    IF v_current IS NOT DISTINCT FROM p_stage AND v_case_visit = v_run_visit THEN
+      RETURN false;
+    END IF;
   END IF;
   UPDATE public.stage_runs SET completed_at = now()
     WHERE tenant_id = v_tenant AND case_id = p_case_id AND stage = p_stage AND attempt = p_attempt

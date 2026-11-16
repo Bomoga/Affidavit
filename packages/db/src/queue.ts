@@ -2,7 +2,6 @@ import { randomUUID } from 'node:crypto';
 import { CaseId, CaseStage, TenantId } from '@affidavit/contracts';
 import { and, eq, sql } from 'drizzle-orm';
 import type { TaskList } from 'graphile-worker';
-import type pg from 'pg';
 import * as t from './schema.js';
 import {
   claimStageRun,
@@ -12,7 +11,7 @@ import {
   heartbeatStageRun,
   stageRunInfo,
 } from './stage-runs.js';
-import { withTenant, type Tx } from './tenant.js';
+import { withTenant, type AppPool, type Tx, type WorkerPool } from './tenant.js';
 
 /** What a stage job carries: ids only, never case content. */
 export interface StagePayload {
@@ -71,7 +70,7 @@ export function stageJobKey(p: StagePayload): string {
  * graphile_worker.jobs (columns key, attempts, max_attempts, last_error, locked_at). A test pins
  * those, so a Graphile Worker upgrade that changes them fails loudly.
  */
-export async function enqueueStage(pool: pg.Pool, p: StagePayload): Promise<boolean> {
+export async function enqueueStage(pool: AppPool, p: StagePayload): Promise<boolean> {
   const payload = parseStagePayload(p);
   return withTenant(pool, payload.tenantId, async (tx) => {
     const [row] = await tx
@@ -106,7 +105,7 @@ export interface FailedStageJob {
  * again and the orchestrator must use the next one.
  */
 export async function listFailedStageJobs(
-  workerPool: pg.Pool,
+  workerPool: WorkerPool,
   staleLockSeconds = DEFAULT_STALE_LOCK_SECONDS,
 ): Promise<FailedStageJob[]> {
   const { rows } = await workerPool.query<{
@@ -122,7 +121,8 @@ export async function listFailedStageJobs(
          or (locked_at is not null and locked_at < now() - make_interval(secs => $1)
              and not coalesce(public.stage_run_has_live_lease(
                j.payload->>'tenantId', j.payload->>'caseId', j.payload->>'stage',
-               (j.payload->>'attempt')::int), false)))
+               case when (j.payload->>'attempt') ~ '^[0-9]{1,9}$'
+                    then (j.payload->>'attempt')::int end), false)))
      order by id`,
     [staleLockSeconds],
   );
@@ -144,7 +144,7 @@ export type StageJobState = 'none' | 'queued' | 'running' | 'failed' | 'stale';
  * a live lease. `queued`: waiting.
  */
 export async function stageJobState(
-  workerPool: pg.Pool,
+  workerPool: WorkerPool,
   p: StagePayload,
   staleLockSeconds = DEFAULT_STALE_LOCK_SECONDS,
 ): Promise<StageJobState> {
@@ -195,9 +195,9 @@ export type StageHandler = (job: StagePayload, ctx: StageContext) => Promise<voi
 
 export interface StageTaskOptions {
   /** Application-role pool: tenant tables (completion, failure, heartbeat). */
-  appPool: pg.Pool;
+  appPool: AppPool;
   /** Worker-role pool: the claim function. */
-  workerPool: pg.Pool;
+  workerPool: WorkerPool;
   /** Identifies this process in leases (informational). Default: a random id per call. */
   workerId?: string;
   /** Lease length, 1 to 3600 seconds. The wrapper heartbeats about every third of it. */
@@ -241,18 +241,38 @@ export function stageTaskList(
       const token = await claimStageRun(options.workerPool, job, workerId, leaseSeconds);
       if (token === null) return;
       const abort = new AbortController();
+      // The lease expiry we last KNOW about (measured conservatively from when the request that
+      // confirmed it started). If we cannot confirm a heartbeat before it, the lease may be gone,
+      // so the signal aborts: once that expiry has passed, or after three failures in a row,
+      // whether the database answered no, errored, or did not answer at all.
+      let confirmedUntil = Date.now() + leaseSeconds * 1000;
+      let failures = 0;
+      const lose = (why: string) => {
+        if (!abort.signal.aborted) abort.abort(new Error(why));
+      };
       const beat = async (): Promise<boolean> => {
+        const startedAt = Date.now();
         try {
           const ok = await heartbeatStageRun(options.appPool, job, token, leaseSeconds);
-          if (!ok) abort.abort(new Error('lease lost'));
+          if (ok) {
+            confirmedUntil = Math.max(confirmedUntil, startedAt + leaseSeconds * 1000);
+            failures = 0;
+          } else {
+            lose('lease lost');
+          }
           return ok;
         } catch (err) {
+          failures += 1;
           log(`heartbeat failed for ${stageJobKey(job)}`, err);
+          if (failures >= 3 || Date.now() >= confirmedUntil) lose('heartbeat failed');
           return false;
         }
       };
       const timer = setInterval(
         () => {
+          // A heartbeat that hangs (network cut) never settles, so the expiry is checked here too.
+          if (Date.now() >= confirmedUntil)
+            lose('lease expiry passed without a confirmed heartbeat');
           void beat();
         },
         Math.max(250, (leaseSeconds * 1000) / 3),

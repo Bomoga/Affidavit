@@ -1,12 +1,11 @@
 import { Exhibit, Verdict, samples, TrialEvent, type CaseFile } from '@affidavit/contracts';
 import { sql } from 'drizzle-orm';
-import type pg from 'pg';
 import { beforeAll, expect, it } from 'vitest';
 import { PgCaseStore } from './case-store.js';
 import { PgEventSink } from './event-sink.js';
 import { enqueueStage } from './queue.js';
 import { claimStageRun } from './stage-runs.js';
-import { withTenant } from './tenant.js';
+import { withTenant, type AppPool, type WorkerPool } from './tenant.js';
 import { BUDGET, describePg, sampleCase, useTestDatabase } from './test-support.js';
 
 const A = 'tenant-a';
@@ -28,8 +27,8 @@ const TABLES = [
 ] as const;
 
 async function seed(
-  pool: pg.Pool,
-  workerPool: pg.Pool,
+  pool: AppPool,
+  workerPool: WorkerPool,
   tenant: string,
   caseFile: CaseFile,
 ): Promise<void> {

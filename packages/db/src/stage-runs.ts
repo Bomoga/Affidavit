@@ -1,8 +1,8 @@
+import { TERMINAL_STAGES } from '@affidavit/contracts';
 import { and, eq, sql } from 'drizzle-orm';
-import type pg from 'pg';
 import { stageJobState, type StageJobState, type StagePayload } from './queue.js';
 import * as t from './schema.js';
-import { withTenant, type Tx } from './tenant.js';
+import { withTenant, type AppPool, type Tx, type WorkerPool } from './tenant.js';
 
 export type StageRunState = 'unclaimed' | 'running' | 'completed' | 'failed';
 
@@ -35,7 +35,7 @@ const key = (p: StagePayload) =>
  * At-most-once start: a claimed attempt is never started again, even after the queue job is gone.
  */
 export async function claimStageRun(
-  workerPool: pg.Pool,
+  workerPool: WorkerPool,
   p: StagePayload,
   workerId: string,
   leaseSeconds = 300,
@@ -53,7 +53,7 @@ export async function claimStageRun(
  * The database enforces this (stage_run_heartbeat); the application role cannot UPDATE stage_runs.
  */
 export async function heartbeatStageRun(
-  appPool: pg.Pool,
+  appPool: AppPool,
   p: StagePayload,
   token: string,
   leaseSeconds = 300,
@@ -92,7 +92,7 @@ export async function completeStageRunIn(tx: Tx, p: StagePayload, token: string)
  * EXPIRED lease may be adopted, never a live one. False when nothing qualified.
  */
 export async function completeStageRun(
-  appPool: pg.Pool,
+  appPool: AppPool,
   p: StagePayload,
   token?: string,
 ): Promise<boolean> {
@@ -111,7 +111,7 @@ export async function completeStageRun(
  * false when nothing qualified.
  */
 export async function failStageRun(
-  appPool: pg.Pool,
+  appPool: AppPool,
   p: StagePayload,
   error: string,
   token?: string,
@@ -125,7 +125,7 @@ export async function failStageRun(
 }
 
 export async function stageRunInfo(
-  appPool: pg.Pool,
+  appPool: AppPool,
   p: StagePayload,
 ): Promise<StageRunInfo | null> {
   return withTenant(appPool, p.tenantId, async (tx) => {
@@ -151,7 +151,7 @@ export async function stageRunInfo(
   });
 }
 
-export async function stageRunState(appPool: pg.Pool, p: StagePayload): Promise<StageRunState> {
+export async function stageRunState(appPool: AppPool, p: StagePayload): Promise<StageRunState> {
   return (await stageRunInfo(appPool, p))?.state ?? 'unclaimed';
 }
 
@@ -163,8 +163,15 @@ export type ResumeAction =
    * claim or be refused at claim and fail): do nothing yet.
    */
   | 'wait'
-  /** The attempt is finished: completed, or failed after the case already left the visit. */
+  /** The attempt is finished: completed and the case moved on, or failed after the case left. */
   | 'done'
+  /**
+   * The attempt completed but the case is still at this visit of a non-terminal stage: the handler
+   * completed without advancing the case. Order matters in a handler: make the case's transition
+   * (or other last writes) first and call ctx.complete(tx) last. The orchestrator should advance
+   * the case or enqueue the next attempt; it must not treat the stage as finished.
+   */
+  | 'completed-not-advanced'
   /**
    * The case has left this stage visit and the lease is gone (or there never was a claim and no
    * job can still run), so the attempt counts as complete and must never be re-run. Adopt it with
@@ -207,16 +214,19 @@ export function decideResume(i: ResumeInput): ResumeAction {
     if (i.job === 'failed' || i.job === 'stale') return 'next-attempt';
     return 'start';
   }
-  if (i.run.state === 'completed') return 'done';
+  if (i.run.state === 'completed') {
+    const terminal = (TERMINAL_STAGES as readonly string[]).includes(i.jobStage);
+    return left || terminal ? 'done' : 'completed-not-advanced';
+  }
   if (i.run.state === 'failed') return left ? 'done' : 'next-attempt';
   if (i.run.leaseExpiresAt.getTime() > i.now.getTime()) return 'wait';
   return left ? 'adopt-complete' : 'next-attempt';
 }
 
 export interface ResumePools {
-  appPool: pg.Pool;
+  appPool: AppPool;
   /** Worker-role pool: reads the queue job state for the attempt. */
-  workerPool: pg.Pool;
+  workerPool: WorkerPool;
 }
 
 /** Reads the inputs for decideResume from the database and decides. */

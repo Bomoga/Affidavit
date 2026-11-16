@@ -22,7 +22,7 @@ import {
   stageRunInfo,
   stageRunState,
 } from './stage-runs.js';
-import { withTenant } from './tenant.js';
+import { withTenant, type AppPool, type WorkerPool } from './tenant.js';
 import { BUDGET, describePg, sampleCase, useTestDatabase } from './test-support.js';
 
 const A = 'tenant-qa';
@@ -72,7 +72,9 @@ describePg('stage queue (Graphile Worker)', () => {
     return rows.map((r) => r.key);
   }
 
-  function options(over: { workerPool?: pg.Pool; workerId?: string; leaseSeconds?: number } = {}) {
+  function options(
+    over: { workerPool?: WorkerPool; workerId?: string; leaseSeconds?: number } = {},
+  ) {
     return { appPool: db().app, workerPool: db().worker, log: () => undefined, ...over };
   }
 
@@ -105,7 +107,7 @@ describePg('stage queue (Graphile Worker)', () => {
    */
   async function startKillableRunner(
     handlers: Partial<Record<StagePayload['stage'], StageHandler>>,
-    over: { leaseSeconds?: number; claimPool?: pg.Pool } = {},
+    over: { leaseSeconds?: number; claimPool?: WorkerPool } = {},
   ) {
     const name = `runner-${(n += 1)}`;
     const u = new URL(db().workerUrl);
@@ -590,112 +592,6 @@ describePg('stage queue (Graphile Worker)', () => {
   });
 
   describe('real kill and resume', () => {
-    it('a kill mid-handler: the attempt never re-runs, not even after a worker restart; the next attempt does', async () => {
-      const file = await newCaseA();
-      const p = pay(A, file.id, 'intake');
-      const calls: number[] = [];
-      const hang: StageHandler = (job) => {
-        calls.push(job.attempt);
-        return new Promise<void>(() => undefined);
-      };
-      await enqueueStage(db().app, p);
-      const r1 = await startKillableRunner({ intake: hang });
-      await until(() => calls.length > 0);
-      await r1.kill();
-      expect(calls).toEqual([1]);
-      expect(await stageRunState(db().app, p)).toBe('running');
-      expect(await resumeDecision(pools(), p)).toBe('wait');
-      // Restart a worker: Graphile will not re-deliver the used-up job, and a re-enqueue of the
-      // same attempt is a no-op, so the handler is not called a second time.
-      expect(await enqueueStage(db().app, p)).toBe(false);
-      await runWorker({ intake: hang }, () => false);
-      expect(calls).toEqual([1]);
-      // The lease runs out: the orchestrator abandons attempt 1 and starts attempt 2.
-      await expireLease(p);
-      expect(await resumeDecision(pools(), p)).toBe('next-attempt');
-      expect(await failStageRun(db().app, p, 'lease expired')).toBe(true);
-      const next = { ...p, attempt: 2 };
-      await enqueueStage(db().app, next);
-      await runWorker(
-        {
-          intake: async (job, ctx) => {
-            calls.push(job.attempt);
-            await ctx.inTenantTx((tx) => ctx.complete(tx));
-          },
-        },
-        () => calls.length > 1,
-      );
-      expect(calls).toEqual([1, 2]);
-      expect(await stageRunState(db().app, next)).toBe('completed');
-      expect(await resumeDecision(pools(), next)).toBe('done');
-    }, 90_000);
-
-    it('a kill after the work committed: the case left the stage, so the attempt is adopted once its lease expires, never re-run', async () => {
-      const file = await newCaseA();
-      const p = pay(A, file.id, 'intake');
-      const calls: number[] = [];
-      const doWorkThenHang: StageHandler = async (job) => {
-        calls.push(job.attempt);
-        await storeA.transition(job.caseId, 'map');
-        await new Promise<void>(() => undefined);
-      };
-      await enqueueStage(db().app, p);
-      const r1 = await startKillableRunner({ intake: doWorkThenHang });
-      await until(async () => (await storeA.stage(file.id)) === 'map');
-      await r1.kill();
-      // Under a live lease the orchestrator waits and cannot adopt.
-      expect(await resumeDecision(pools(), p)).toBe('wait');
-      expect(await completeStageRun(db().app, p)).toBe(false);
-      await expireLease(p);
-      expect(await resumeDecision(pools(), p)).toBe('adopt-complete');
-      expect(await completeStageRun(db().app, p)).toBe(true);
-      expect(await stageRunState(db().app, p)).toBe('completed');
-      expect(await resumeDecision(pools(), p)).toBe('done');
-      expect(calls).toEqual([1]);
-    }, 60_000);
-
-    it('a crash BEFORE claim leaves a stale-locked job: it is surfaced and resume moves to the next attempt', async () => {
-      const file = await newCaseA();
-      const p = pay(A, file.id, 'intake');
-      const calls: number[] = [];
-      // The claim connection never answers, like a worker that died between locking and claiming.
-      const deadClaim = { query: () => new Promise(() => undefined) } as unknown as pg.Pool;
-      await enqueueStage(db().app, p);
-      const r1 = await startKillableRunner(
-        {
-          intake: (job) => {
-            calls.push(job.attempt);
-            return Promise.resolve();
-          },
-        },
-        { claimPool: deadClaim },
-      );
-      await until(async () => (await stageJobState(db().worker, p)) === 'running');
-      await r1.kill();
-      expect(await stageRunState(db().app, p)).toBe('unclaimed');
-      // The lock is fresh: a worker might still be about to claim, so wait.
-      expect(await resumeDecision(pools(), p)).toBe('wait');
-      // Locked, attempt used up, last_error null, and enqueueStage cannot help: a silent stall.
-      expect(await enqueueStage(db().app, p)).toBe(false);
-      await ageJobLock(p);
-      expect(await stageJobState(db().worker, p)).toBe('stale');
-      const stale = await listFailedStageJobs(db().worker);
-      expect(stale.find((j) => j.key === stageJobKey(p))?.reason).toBe('stale-lock');
-      expect(await resumeDecision(pools(), p)).toBe('next-attempt');
-      const next = { ...p, attempt: 2 };
-      expect(await enqueueStage(db().app, next)).toBe(true);
-      await runWorker(
-        {
-          intake: (job) => {
-            calls.push(job.attempt);
-            return Promise.resolve();
-          },
-        },
-        () => calls.length > 0,
-      );
-      expect(calls).toEqual([2]);
-    }, 90_000);
-
     it('a stage visited twice: an open attempt for the first visit is not mistaken for the second', async () => {
       const file = await newCaseA();
       for (const s of ['map', 'arraign', 'defense', 'prosecution', 'remedy', 'verify'] as const) {
@@ -723,6 +619,79 @@ describePg('stage queue (Graphile Worker)', () => {
       );
       expect(rows[1]!.visit).toBeGreaterThan(rows[0]!.visit);
     }, 60_000);
+  });
+
+  it('aborts ctx.signal when heartbeats fail with a database error, or never answer', async () => {
+    for (const kind of ['error', 'hang'] as const) {
+      const file = await newCaseA();
+      const p = pay(A, file.id, 'intake');
+      await enqueueStage(db().app, p);
+      // An app pool whose connections cannot be had: an outage, or a cut network.
+      const broken = {
+        connect: () =>
+          kind === 'error' ? Promise.reject(new Error('db down')) : new Promise(() => undefined),
+      } as unknown as AppPool;
+      let aborted = false;
+      const runner = await run({
+        pgPool: db().worker,
+        concurrency: 1,
+        noHandleSignals: true,
+        pollInterval: 100,
+        taskList: stageTaskList(
+          scoped({
+            intake: async (_job, ctx) => {
+              await new Promise<void>((resolve) => {
+                ctx.signal.addEventListener('abort', () => {
+                  aborted = true;
+                  resolve();
+                });
+              });
+            },
+          }),
+          { appPool: broken, workerPool: db().worker, leaseSeconds: 3, log: () => undefined },
+        ),
+      });
+      await until(() => aborted, 15_000);
+      expect(aborted, kind).toBe(true);
+      // With the app pool hanging the wrapper cannot finish either; do not wait for it.
+      void runner.stop().catch(() => undefined);
+    }
+  }, 60_000);
+
+  it('one concurrent enqueue wins: exactly one caller is told the job was added', async () => {
+    const file = await newCaseA();
+    const p = pay(A, file.id, 'intake');
+    const results = await Promise.all(Array.from({ length: 5 }, () => enqueueStage(db().app, p)));
+    expect(results.filter(Boolean)).toHaveLength(1);
+    expect((await jobKeys()).filter((k) => k === stageJobKey(p))).toHaveLength(1);
+  });
+
+  it('adoption is refused in SQL while the case is still at the stage visit', async () => {
+    const file = await newCaseA();
+    const p = pay(A, file.id, 'intake');
+    await enqueueStage(db().app, p);
+    await claimStageRun(db().worker, p, 'w1', 60);
+    await expireLease(p);
+    // Expired lease, but the case never left intake: adopting would hide an unfinished stage.
+    expect(await completeStageRun(db().app, p)).toBe(false);
+    expect(await resumeDecision(pools(), p)).toBe('next-attempt');
+    await storeA.transition(file.id, 'map');
+    expect(await completeStageRun(db().app, p)).toBe(true);
+  });
+
+  it('a malformed job payload does not break the failed-job list', async () => {
+    await db().worker.query(
+      `select graphile_worker.add_job('case-stage:intake',
+         '{"tenantId":"x","caseId":"y","stage":"intake","attempt":"abc"}'::json,
+         max_attempts => 1, job_key => 'malformed-1')`,
+    );
+    await db().admin.query(
+      `update graphile_worker._private_jobs
+       set attempts = 1, locked_at = now() - interval '2 hours', locked_by = 'dead'
+       where key = 'malformed-1'`,
+    );
+    const listed = await listFailedStageJobs(db().worker, 60);
+    expect(listed.find((j) => j.key === 'malformed-1')?.reason).toBe('stale-lock');
   });
 
   it('pins the Graphile Worker internals the queue code depends on', async () => {

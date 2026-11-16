@@ -5,9 +5,8 @@ import {
   type TrialEvent,
 } from '@affidavit/contracts';
 import { and, asc, eq, gt } from 'drizzle-orm';
-import type pg from 'pg';
 import * as t from './schema.js';
-import { pgErrorCode, withTenant } from './tenant.js';
+import { pgErrorCode, withTenant, type AppPool } from './tenant.js';
 
 /**
  * Postgres EventSink for one tenant. Idempotent on (caseId, seq): the first write wins and a
@@ -16,7 +15,7 @@ import { pgErrorCode, withTenant } from './tenant.js';
  */
 export class PgEventSink implements EventSink {
   constructor(
-    private readonly pool: pg.Pool,
+    private readonly pool: AppPool,
     readonly tenantId: string,
   ) {}
 

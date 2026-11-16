@@ -6,7 +6,8 @@ CREATE TABLE "ballots" (
 	"question" text NOT NULL,
 	"ballot" jsonb NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
-	CONSTRAINT "ballots_tenant_id_case_id_seq_pk" PRIMARY KEY("tenant_id","case_id","seq")
+	CONSTRAINT "ballots_tenant_id_case_id_seq_pk" PRIMARY KEY("tenant_id","case_id","seq"),
+	CONSTRAINT "ballots_blob_matches" CHECK ("ballots"."ballot"->>'jurorId' = "ballots"."juror_id" and "ballots"."ballot"->>'question' = "ballots"."question")
 );
 --> statement-breakpoint
 ALTER TABLE "ballots" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
@@ -49,7 +50,7 @@ CREATE TABLE "cost_rows" (
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	CONSTRAINT "cost_rows_tenant_id_case_id_id_pk" PRIMARY KEY("tenant_id","case_id","id"),
 	CONSTRAINT "cost_rows_stage_valid" CHECK ("cost_rows"."stage" in ('intake', 'map', 'arraign', 'defense', 'prosecution', 'remedy', 'verify', 'jury', 'verdict', 'dismissed', 'escalated')),
-	CONSTRAINT "cost_rows_values_valid" CHECK ("cost_rows"."attempt" >= 1 and "cost_rows"."input_tokens" >= 0 and "cost_rows"."output_tokens" >= 0 and "cost_rows"."usd" >= 0 and "cost_rows"."wall_ms" >= 0)
+	CONSTRAINT "cost_rows_values_valid" CHECK ("cost_rows"."attempt" >= 1 and "cost_rows"."input_tokens" >= 0 and "cost_rows"."output_tokens" >= 0 and "cost_rows"."usd" >= 0 and "cost_rows"."usd" <> 'NaN'::numeric and "cost_rows"."wall_ms" >= 0)
 );
 --> statement-breakpoint
 ALTER TABLE "cost_rows" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
@@ -61,7 +62,8 @@ CREATE TABLE "escalations" (
 	"detail" text NOT NULL,
 	"escalation" jsonb NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
-	CONSTRAINT "escalations_tenant_id_case_id_seq_pk" PRIMARY KEY("tenant_id","case_id","seq")
+	CONSTRAINT "escalations_tenant_id_case_id_seq_pk" PRIMARY KEY("tenant_id","case_id","seq"),
+	CONSTRAINT "escalations_blob_matches" CHECK ("escalations"."escalation"->>'caseId' = "escalations"."case_id" and "escalations"."escalation"->>'reason' = "escalations"."reason")
 );
 --> statement-breakpoint
 ALTER TABLE "escalations" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
@@ -72,7 +74,9 @@ CREATE TABLE "events" (
 	"type" text NOT NULL,
 	"event" jsonb NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
-	CONSTRAINT "events_tenant_id_case_id_seq_pk" PRIMARY KEY("tenant_id","case_id","seq")
+	CONSTRAINT "events_tenant_id_case_id_seq_pk" PRIMARY KEY("tenant_id","case_id","seq"),
+	CONSTRAINT "events_blob_matches" CHECK ("events"."event"->>'type' = "events"."type" and "events"."event"->>'caseId' = "events"."case_id"
+        and ("events"."event"->>'seq')::int = "events"."seq")
 );
 --> statement-breakpoint
 ALTER TABLE "events" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
@@ -87,7 +91,11 @@ CREATE TABLE "exhibits" (
 	"result" jsonb,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	CONSTRAINT "exhibits_tenant_id_case_id_id_pk" PRIMARY KEY("tenant_id","case_id","id"),
-	CONSTRAINT "exhibits_kind_valid" CHECK ("exhibits"."kind" in ('witness', 'counterexample', 'patch'))
+	CONSTRAINT "exhibits_kind_valid" CHECK ("exhibits"."kind" in ('witness', 'counterexample', 'patch')),
+	CONSTRAINT "exhibits_blob_matches" CHECK ("exhibits"."exhibit"->>'id' = "exhibits"."id" and "exhibits"."exhibit"->>'caseId' = "exhibits"."case_id"
+        and "exhibits"."exhibit"->>'kind' = "exhibits"."kind" and "exhibits"."exhibit"->>'author' = "exhibits"."author"
+        and "exhibits"."exhibit"->>'sha256' = "exhibits"."sha256"),
+	CONSTRAINT "exhibits_result_valid" CHECK ("exhibits"."result" is null or (jsonb_typeof("exhibits"."result") = 'object' and "exhibits"."result"->>'exhibitId' = "exhibits"."id"))
 );
 --> statement-breakpoint
 ALTER TABLE "exhibits" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
@@ -156,7 +164,8 @@ CREATE TABLE "verdicts" (
 	"outcome" text NOT NULL,
 	"verdict" jsonb NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
-	CONSTRAINT "verdicts_tenant_id_case_id_pk" PRIMARY KEY("tenant_id","case_id")
+	CONSTRAINT "verdicts_tenant_id_case_id_pk" PRIMARY KEY("tenant_id","case_id"),
+	CONSTRAINT "verdicts_blob_matches" CHECK ("verdicts"."verdict"->>'caseId' = "verdicts"."case_id" and "verdicts"."verdict"->>'outcome' = "verdicts"."outcome")
 );
 --> statement-breakpoint
 ALTER TABLE "verdicts" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
