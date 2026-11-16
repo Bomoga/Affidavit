@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { ARCHIVE_NAME } from './unscannable.js';
@@ -294,6 +294,67 @@ describe('writeWindows', () => {
     expect(new Set(entries.map((e) => e.original))).toEqual(new Set(['ok.txt']));
     expect(failed.map((f) => f.original)).toEqual([long]);
   });
+
+  it('windows an image with an archive-like name, but not a PDF with one', async () => {
+    const root = tmp();
+    const snap = join(root, 'snap');
+    mkdirSync(snap);
+    const png = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.alloc(40),
+    ]);
+    writeFileSync(join(snap, 'logo.brand.png'), png);
+    writeFileSync(
+      join(snap, 'doc.tar.pdf'),
+      Buffer.concat([Buffer.from('%PDF-1.4'), Buffer.alloc(40)]),
+    );
+    const { entries } = await writeWindows(snap, wdir(root));
+    expect(new Set(entries.map((e) => e.original))).toEqual(new Set(['logo.brand.png']));
+  });
+
+  it('leaves no window directory behind for a file whose windows could not be written', async (ctx) => {
+    const root = tmp();
+    const snap = join(root, 'snap');
+    mkdirSync(snap);
+    const long = 'a'.repeat(248) + '.gz.txt';
+    try {
+      writeFileSync(join(snap, long), randomText(41, 120_000, false));
+    } catch {
+      ctx.skip();
+      return;
+    }
+    writeFileSync(join(snap, 'zzz-ok.txt'), randomText(42, 120_000, false));
+    const windowsDir = wdir(root);
+    const { entries, failed } = await writeWindows(snap, windowsDir);
+    expect(failed.map((f) => f.original)).toEqual([long]);
+    const wanted = new Set(entries.map((e) => e.name.split('/')[0]));
+    // every window directory on disk is one that has entries; the failed file left none
+    expect(new Set(readdirSync(windowsDir))).toEqual(wanted);
+  });
+
+  // chmod does not restrict anything on Windows, or for root
+  const canRestrict = process.platform !== 'win32' && process.getuid?.() !== 0;
+  it.skipIf(!canRestrict)(
+    'reports unreadable files and directories instead of throwing',
+    async () => {
+      const root = tmp();
+      const snap = join(root, 'snap');
+      mkdirSync(join(snap, 'locked'), { recursive: true });
+      writeFileSync(join(snap, 'locked', 'inside.txt'), randomText(51, 120_000, false));
+      writeFileSync(join(snap, 'secret.txt'), randomText(52, 120_000, false));
+      writeFileSync(join(snap, 'fine.txt'), randomText(53, 120_000, false));
+      chmodSync(join(snap, 'locked'), 0o000);
+      chmodSync(join(snap, 'secret.txt'), 0o000);
+      try {
+        const { entries, failed } = await writeWindows(snap, wdir(root));
+        expect(new Set(entries.map((e) => e.original))).toEqual(new Set(['fine.txt']));
+        expect(failed.map((f) => f.original).sort()).toEqual(['locked', 'secret.txt']);
+      } finally {
+        chmodSync(join(snap, 'locked'), 0o700);
+        chmodSync(join(snap, 'secret.txt'), 0o600);
+      }
+    },
+  );
 
   it('creates nothing when there is nothing to window', async () => {
     const root = tmp();

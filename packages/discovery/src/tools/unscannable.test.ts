@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { ARCHIVE_NAME, ChunkRisk, classifyHead, neutralArchiveName } from './unscannable.js';
+import {
+  ARCHIVE_NAME,
+  ChunkRisk,
+  classifyHead,
+  neutralArchiveName,
+  signatureClass,
+} from './unscannable.js';
 import { repoRoot } from './manifest.js';
 
 const bytes = (...parts: (string | number[])[]): Buffer =>
@@ -205,6 +211,30 @@ describe('archive-like names', () => {
     for (const n of scanned) expect(classifyHead(n, text), n).toBeUndefined();
     expect(classifyHead('a.gz', bytes([0x1f, 0x8b, 8]))).toBe('skipped-file-type');
     expect(classifyHead('a.gz.txt', bytes([0x1f, 0x8b, 8]))).toBe('binary-header-mismatch');
+  });
+
+  it('also drops names with .s2, found by the exhaustive probe', () => {
+    for (const n of ['a.s2', 'a.s2.env', 'x.S2', 'f.s2x', 'a.S2.TXT', 'f.s2.txt']) {
+      expect(ARCHIVE_NAME.test(n), n).toBe(true);
+      expect(ARCHIVE_NAME.test(neutralArchiveName(n)), n).toBe(false);
+    }
+  });
+
+  it('checks the name before the media branch: an image or audio file with such a name is dropped', () => {
+    const png = bytes([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const gif = bytes('GIF89a', [1, 0, 1, 0, 0x80, 0, 0]);
+    const mp3 = bytes('ID3', [3, 0, 0, 0, 0, 0, 0x21]);
+    expect(classifyHead('logo.brand.png', png)).toBe('archive-name-mismatch');
+    expect(classifyHead('banner.gz.gif', gif)).toBe('archive-name-mismatch');
+    expect(classifyHead('anim.zip.gif', gif)).toBe('archive-name-mismatch');
+    expect(classifyHead('a.tar.mp3', mp3)).toBe('archive-name-mismatch');
+    // controls: the same content under an ordinary name is informational media
+    expect(classifyHead('logo.png', png)).toBe('binary-media');
+    expect(classifyHead('banner.gif', gif)).toBe('binary-media');
+    expect(signatureClass(png)).toBe('media');
+    expect(signatureClass(bytes('%PDF-1.4'))).toBe('other');
+    expect(signatureClass(bytes('PK\x03\x04', [0, 0]))).toBe('archive');
+    expect(signatureClass(bytes('plain'))).toBe('none');
   });
 
   it('neutralises the name so gitleaks no longer drops it, keeping the final extension', () => {

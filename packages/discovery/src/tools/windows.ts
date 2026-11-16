@@ -1,6 +1,7 @@
-import { lstat, mkdir, open, readdir, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, relative, sep } from 'node:path';
-import { classifyHead, neutralArchiveName } from './unscannable.js';
+import { classifyHead, neutralArchiveName, signatureClass } from './unscannable.js';
+import { NonUtf8NameError } from './walk.js';
 import { listDir } from './walk.js';
 
 /**
@@ -199,34 +200,48 @@ export async function writeWindows(
     size: number;
   }
   const candidates: Candidate[] = [];
+  const failed: { original: string; why: string }[] = [];
+  const whyOf = (err: unknown): string => (err as NodeJS.ErrnoException).code ?? String(err);
+  const rel = (p: string): string => relative(snapshotDir, p).split(sep).join('/');
   const walk = async (dir: string): Promise<void> => {
-    for (const e of await listDir(dir)) {
+    let listing;
+    try {
+      listing = await listDir(dir);
+    } catch (err) {
+      if (err instanceof NonUtf8NameError) throw err; // the same policy as every other host walk
+      failed.push({ original: rel(dir) || '.', why: whyOf(err) });
+      return;
+    }
+    for (const e of listing) {
       const full = join(dir, e.name);
       if (e.isDirectory) {
         await walk(full);
         continue;
       }
       if (!e.isFile) continue;
-      const st = await lstat(full);
-      const fh = await open(full, 'r');
-      let head: Buffer;
       try {
-        head = Buffer.alloc(BIG_FILE);
-        const { bytesRead } = await fh.read(head, 0, BIG_FILE, 0);
-        head = head.subarray(0, bytesRead);
-      } finally {
-        await fh.close();
+        const st = await lstat(full);
+        const fh = await open(full, 'r');
+        let head: Buffer;
+        try {
+          head = Buffer.alloc(BIG_FILE);
+          const { bytesRead } = await fh.read(head, 0, BIG_FILE, 0);
+          head = head.subarray(0, bytesRead);
+        } finally {
+          await fh.close();
+        }
+        const kind = classifyHead(e.name, head);
+        const big = st.size > BIG_FILE && kind === undefined;
+        // A name gitleaks reads as an archive: plain text or an image is worth windowing under a
+        // neutral name. A PDF or executable is skipped by gitleaks whatever it is called.
+        const archiveNamed =
+          kind === 'archive-name-mismatch' && st.size > 0 && signatureClass(head) !== 'other';
+        if (!big && !archiveNamed) continue;
+        candidates.push({ full, name: e.name, original: rel(full), size: st.size });
+      } catch (err) {
+        // an unreadable file must not lose the whole run: report it and go on
+        failed.push({ original: rel(full), why: whyOf(err) });
       }
-      const kind = classifyHead(e.name, head);
-      const big = st.size > BIG_FILE && kind === undefined;
-      const archiveNamed = kind === 'archive-name-mismatch' && st.size > 0;
-      if (!big && !archiveNamed) continue;
-      candidates.push({
-        full,
-        name: e.name,
-        original: relative(snapshotDir, full).split(sep).join('/'),
-        size: st.size,
-      });
     }
   };
   await walk(snapshotDir);
@@ -241,12 +256,12 @@ export async function writeWindows(
 
   const entries: WindowEntry[] = [];
   const skippedForBudget: string[] = [];
-  const failed: { original: string; why: string }[] = [];
   let bytes = 0;
   let fileNo = 0;
   for (const c of candidates) {
     const sub = `w${String(++fileNo).padStart(4, '0')}`;
     const mine: WindowEntry[] = [];
+    let mineBytes = 0;
     let part = 0;
     try {
       await windowFile(c.full, c.size, async (win, startLine, startColumn) => {
@@ -259,6 +274,7 @@ export async function writeWindows(
         await mkdir(dirname(target), { recursive: true });
         await writeFile(target, Buffer.concat([Buffer.from(WINDOW_PREFIX), win]));
         bytes += len;
+        mineBytes += len;
         mine.push({ name, original: c.original, startLine, startColumn });
       });
       entries.push(...mine);
@@ -267,11 +283,11 @@ export async function writeWindows(
         entries.push(...mine); // what was written is still valid; the rest is reported
         skippedForBudget.push(c.original);
       } else {
-        // a path that is too long, a full disk, a permission error: report this file and go on
-        failed.push({
-          original: c.original,
-          why: (err as NodeJS.ErrnoException).code ?? String(err),
-        });
+        // A path that is too long, a full disk, a permission error: report this file and go on.
+        // Its windows are removed, so no finding can carry a raw wNNNN path with no entry for it.
+        failed.push({ original: c.original, why: whyOf(err) });
+        bytes -= mineBytes;
+        await rm(join(windowsDir, sub), { recursive: true, force: true });
       }
     }
   }

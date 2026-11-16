@@ -936,6 +936,9 @@ describe.skipIf(!enabled)('tool images, offline', () => {
         'a.zstd',
         'a.tarx',
         'a.gzx',
+        'a.s2',
+        'a.s2.env',
+        'case5.S2',
         'case1.GZ',
         'case2.Zip',
         'case3.TAR',
@@ -992,6 +995,60 @@ describe.skipIf(!enabled)('tool images, offline', () => {
           ).toBe(true);
           expect(flagged.has(`/src/n/${n}`), `${n} is not flagged`).toBe(false);
         }
+      }, 300_000);
+    });
+
+    describe('media files whose names gitleaks reads as archives', () => {
+      const secret = Buffer.from('\nAFFIDAVIT_FAKE_KEY_0123456789ABCDEF\n');
+      const z = (n: number) => Buffer.alloc(n);
+      const png = Buffer.concat([
+        Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d]),
+        Buffer.from('IHDR'),
+        z(17),
+      ]);
+      const gif = Buffer.concat([
+        Buffer.from('GIF89a'),
+        Buffer.from([1, 0, 1, 0, 0x80, 0, 0]),
+        z(8),
+      ]);
+      const mp3 = Buffer.concat([Buffer.from('ID3'), Buffer.from([3, 0, 0, 0, 0, 0, 0x21]), z(16)]);
+      const files: Record<string, Buffer> = {
+        'logo.brand.png': png,
+        'banner.gz.gif': gif,
+        'anim.zip.gif': gif,
+        'a.tar.mp3': mp3,
+      };
+      const control = 'logo.png';
+
+      it('are flagged, dropped by gitleaks alone, and found by the windows pass', async () => {
+        const sc = scenario('repo', (src) => {
+          mkdirSync(join(src, 'm'));
+          for (const [n, head] of Object.entries(files))
+            writeFileSync(join(src, 'm', n), Buffer.concat([head, secret]));
+          writeFileSync(join(src, 'm', control), Buffer.concat([png, secret]));
+        });
+        const res = await runGitleaks(sc);
+        const main = mainFindings(sc);
+        const win = windowFindings(res);
+        const rule = 'affidavit-fake-fixture-key';
+        for (const n of Object.keys(files)) {
+          expect(has(main, rule, `m/${n}`), `gitleaks alone should drop ${n}`).toBe(false);
+          // (a window of binary media may also get a window-skipped note from the host heuristic)
+          const note = res.notifications.find(
+            (x) => x.id === 'archive-name-mismatch' && x.message.startsWith(`/src/m/${n} `),
+          );
+          expect(note?.id, n).toBe('archive-name-mismatch');
+          expect(has(win, rule, `m/${n}`), `the windows pass should find the key in ${n}`).toBe(
+            true,
+          );
+          expect(res.binaryMediaFiles).not.toContain(`/src/m/${n}`);
+        }
+        // the same content under an ordinary name is read by gitleaks and is only informational
+        expect(has(main, rule, `m/${control}`)).toBe(true);
+        expect(res.binaryMediaFiles).toContain(`/src/m/${control}`);
+        expect(res.notifications.some((x) => x.message.startsWith(`/src/m/${control} `))).toBe(
+          false,
+        );
       }, 300_000);
     });
 

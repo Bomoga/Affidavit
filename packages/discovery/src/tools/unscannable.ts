@@ -247,7 +247,7 @@ function hasOddControl(head: Uint8Array): boolean {
  * Not matched: `.tgz .tbz2 .txz .tzst .jar .war .Z .lzma .cpio .lzip .rpm .deb .cab .iso .bz`
  * and `.txt`, `.js`, `.env` and the like.
  */
-export const ARCHIVE_NAME = /\.(?:gz|zip|tar|bz2|xz|zst|lz4|br|sz|7z|rar|zz)|\.(?:lz|mz)$/i;
+export const ARCHIVE_NAME = /\.(?:gz|zip|tar|bz2|xz|zst|lz4|br|sz|7z|rar|s2|zz)|\.(?:lz|mz)$/i;
 
 /**
  * Renames the archive tokens in a file name so gitleaks no longer treats it as an archive, while
@@ -256,8 +256,35 @@ export const ARCHIVE_NAME = /\.(?:gz|zip|tar|bz2|xz|zst|lz4|br|sz|7z|rar|zz)|\.(
  */
 export function neutralArchiveName(name: string): string {
   return name
-    .replace(/\.(?=(?:gz|zip|tar|bz2|xz|zst|lz4|br|sz|7z|rar|zz))/gi, '._')
+    .replace(/\.(?=(?:gz|zip|tar|bz2|xz|zst|lz4|br|sz|7z|rar|s2|zz))/gi, '._')
     .replace(/\.(?=(?:lz|mz)$)/i, '._');
+}
+
+/** Extensions of the signatures in SIGS that are real archive or compression formats. */
+const ARCHIVE_SIG_EXTS = [
+  'zip',
+  'gz',
+  'tgz',
+  'bz2',
+  'tbz2',
+  'xz',
+  'txz',
+  '7z',
+  'rar',
+  'zst',
+  'lz4',
+  'lz',
+  'tar',
+  'ar',
+  'z',
+];
+
+/** What kind of signature a head carries: none, media, a real archive format, or something else. */
+export function signatureClass(head: Uint8Array): 'none' | 'media' | 'archive' | 'other' {
+  const sig = SIGS.find((x) => matches(head, x));
+  if (sig === undefined) return 'none';
+  if (isMedia(sig)) return 'media';
+  return ARCHIVE_SIG_EXTS.some((e) => sig.exts.includes(e)) ? 'archive' : 'other';
 }
 
 /**
@@ -268,8 +295,16 @@ export function neutralArchiveName(name: string): string {
 export function classifyHead(fileName: string, head: Uint8Array): UnscannableKind | undefined {
   const ext = extname(fileName).slice(1).toLowerCase();
   const sig = SIGS.find((x) => matches(head, x));
-  // A name gitleaks reads as an archive, with no signature to back it: the file is dropped.
-  if (sig === undefined && ARCHIVE_NAME.test(fileName)) return 'archive-name-mismatch';
+  // A name gitleaks reads as an archive. Unless the content really is an archive, gitleaks tries
+  // to extract it and drops it. That holds for plain text and equally for an image or media file
+  // (`logo.brand.png`, `anim.zip.gif`, `a.tar.mp3`), so the name is checked before the media
+  // branch below.
+  if (
+    ARCHIVE_NAME.test(fileName) &&
+    (sig === undefined || !ARCHIVE_SIG_EXTS.some((e) => sig.exts.includes(e)))
+  ) {
+    return 'archive-name-mismatch';
+  }
   if (sig) {
     if (!sig.exts.includes(ext)) return 'binary-header-mismatch';
     return isMedia(sig) ? 'binary-media' : 'skipped-file-type';

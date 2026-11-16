@@ -236,6 +236,11 @@ const KIND_TEXT: Record<Exclude<Unscannable['kind'], 'binary-media'>, string> = 
     'could not be read by the host user (mode or ownership), so the jailed gitleaks may not read it either',
 };
 
+// Files in the quarantine sidecar are scanned by the sidecar pass only, never windowed, so the
+// usual 'scanned in a window' wording would be wrong for them.
+const QUARANTINED_ARCHIVE_TEXT =
+  'was moved to the quarantine sidecar and has a name gitleaks reads as an archive but is not one, so gitleaks drops it and its content is NOT scanned (sidecar files are not windowed)';
+
 const KIND_ORDER = [
   'binary-header-mismatch',
   'non-text-content',
@@ -251,7 +256,7 @@ const KIND_ORDER = [
  * coverage loss: it becomes a notification, never truncated, listed by severity. gitleaks reads
  * media files as text (probed), so they lose nothing and are returned apart.
  */
-function coverageSplit(files: readonly Unscannable[]): {
+function coverageSplit(files: readonly (Unscannable & { quarantined?: boolean })[]): {
   notifications: ToolNotification[];
   binaryMediaFiles: string[];
 } {
@@ -262,7 +267,7 @@ function coverageSplit(files: readonly Unscannable[]): {
         notifications.push({
           level: 'warning',
           id: kind,
-          message: `/src/${f.path} ${KIND_TEXT[kind]}`,
+          message: `/src/${f.path} ${f.quarantined && kind === 'archive-name-mismatch' ? QUARANTINED_ARCHIVE_TEXT : KIND_TEXT[kind]}`,
         });
       }
     }
@@ -271,6 +276,27 @@ function coverageSplit(files: readonly Unscannable[]): {
     .filter((f) => f.kind === 'binary-media')
     .map((f) => `/src/${f.path}`);
   return { notifications, binaryMediaFiles };
+}
+
+/**
+ * The notification for a path in the windows directory that gitleaks may skip. A hit that does
+ * not map to a window (a directory, or anything else unexpected) is still reported, with its raw
+ * path, and never discarded.
+ */
+export function windowHitNotification(
+  hit: Unscannable,
+  byName: ReadonlyMap<string, { original: string; startLine: number }>,
+): ToolNotification {
+  const parts = windowPathParts(hit.path);
+  const w = parts === undefined ? undefined : byName.get(parts.name);
+  return {
+    level: 'warning',
+    id: 'window-skipped',
+    message:
+      w !== undefined
+        ? `/src/${w.original} has a window (from line ${w.startLine}) that gitleaks may skip (${hit.kind}), so a secret in that part may be missed`
+        : `a path in the windows directory that gitleaks may skip (${hit.kind}) could not be mapped to a window: ${hit.path}`,
+  };
 }
 
 /** Maps a sidecar entry (`q0001/...`) back to its original path under /src. */
@@ -440,7 +466,9 @@ export async function runTool(
   }
 
   if (name === 'gitleaks') {
-    const unscanned = await findGitleaksUnscannable(snapshot.dir);
+    const unscanned: (Unscannable & { quarantined?: boolean })[] = await findGitleaksUnscannable(
+      snapshot.dir,
+    );
     if (snapshot.sidecarDir !== null) {
       // git's index and object store are expected to be binary and are not walked at all. Every
       // other file inside a quarantined .git (config, info/exclude, hooks, refs, ...) is text
@@ -454,7 +482,8 @@ export async function runTool(
       });
       for (const f of side) {
         const original = mapSidecarPath(f.path, snapshot.mapping);
-        if (original !== undefined) unscanned.push({ path: original, kind: f.kind });
+        if (original !== undefined)
+          unscanned.push({ path: original, kind: f.kind, quarantined: true });
       }
     }
 
@@ -516,15 +545,7 @@ export async function runTool(
         // byte 257). Check every window with the same table and report hits against the original.
         const byName = new Map(win.entries.map((e) => [e.name, e]));
         for (const hit of await findGitleaksUnscannable(windowsDir)) {
-          const parts = windowPathParts(hit.path);
-          const w = parts === undefined ? undefined : byName.get(parts.name);
-          if (w !== undefined) {
-            notifications.push({
-              level: 'warning',
-              id: 'window-skipped',
-              message: `/src/${w.original} has a window (from line ${w.startLine}) that gitleaks may skip (${hit.kind}), so a secret in that part may be missed`,
-            });
-          }
+          notifications.push(windowHitNotification(hit, byName));
         }
         const winOut = `${outputDir}-windows`;
         await execute(

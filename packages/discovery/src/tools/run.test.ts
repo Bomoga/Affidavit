@@ -23,6 +23,7 @@ import {
   quarantineSnapshot,
   resolveQuarantinedUri,
   runTool,
+  windowHitNotification,
 } from './index.js';
 import { cleanupTmp, put, rawNames, snapDir, symlinks, tmp } from './testkit.js';
 
@@ -507,6 +508,35 @@ describe('runTool', () => {
       expect(
         readdirSync(join(snap.dir, '..')).filter((n) => n.startsWith('snap.windows-')),
       ).toEqual([]);
+    });
+
+    it('still reports a path in the windows directory that does not map to a window', () => {
+      const byName = new Map([['w0001/p0001', { original: 'src/big.txt', startLine: 1 }]]);
+      const mapped = windowHitNotification(
+        { path: 'w0001/p0001/src/big.txt', kind: 'skipped-file-type' },
+        byName,
+      );
+      expect(mapped.id).toBe('window-skipped');
+      expect(mapped.message).toContain('/src/src/big.txt');
+      const unmapped = windowHitNotification({ path: 'w0009/p0001', kind: 'unreadable' }, byName);
+      expect(unmapped.id).toBe('window-skipped');
+      expect(unmapped.message).toContain('w0009/p0001');
+      expect(unmapped.message).toContain('could not be mapped');
+    });
+
+    it('does not claim a window scan for an archive-named file in the quarantine sidecar', async () => {
+      const snap = await snapshot({
+        'src/app.js': 'x',
+        '.git/config': '[core]',
+        '.git/notes.gz': 'plain text',
+      });
+      const { runner } = fakeRunner((out) => writeFileSync(join(out, 'gitleaks.sarif'), sarif()));
+      const res = await runTool(runner, manifest, 'gitleaks', await options(snap));
+      const note = res.notifications.find((n) => n.id === 'archive-name-mismatch');
+      expect(note?.message).toContain('/src/.git/notes.gz');
+      expect(note?.message).toContain('quarantine sidecar');
+      expect(note?.message).toContain('NOT scanned');
+      expect(note?.message).not.toContain('window under a neutral name');
     });
 
     it('marks the run partial when the window byte budget runs out', async () => {
