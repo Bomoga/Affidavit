@@ -1,7 +1,11 @@
-import type { TrialEvent } from './types.js';
+import type { TrialEvent } from '@affidavit/contracts';
 
 export interface EventSource {
-  /** Yields events with seq greater than `afterSeq`, in order. Resuming never repeats or skips. */
+  /**
+   * Yields events in seq order. With no argument the stream starts from the beginning (seq 0
+   * included). With `afterSeq`, only events whose seq is greater are yielded, so passing the
+   * last seq seen resumes with no gap and no repeat.
+   */
   subscribe(afterSeq?: number): AsyncIterable<TrialEvent>;
 }
 
@@ -10,8 +14,8 @@ export function createFakeEventSource(events: readonly TrialEvent[]): EventSourc
   const ordered = [...events].sort((a, b) => a.seq - b.seq);
   return {
     // eslint-disable-next-line @typescript-eslint/require-await
-    async *subscribe(afterSeq = 0) {
-      for (const e of ordered) if (e.seq > afterSeq) yield e;
+    async *subscribe(afterSeq?: number) {
+      for (const e of ordered) if (afterSeq === undefined || e.seq > afterSeq) yield e;
     },
   };
 }
