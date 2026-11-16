@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { Dismissal, Verdict } from '@affidavit/contracts';
+import { Dismissal, Verdict, type CaseStage } from '@affidavit/contracts';
 import { FakeCaseStore, FakeEventSink, ReplayModel } from '@affidavit/testing';
 import { Orchestrator, type ModelTurnResult, type StageHandler } from './orchestrator.js';
 import {
@@ -12,8 +12,10 @@ import {
   turnCost,
 } from './test-support.js';
 import { buildVerdict, checkSummary, finalizeVerdict, plainDecimal } from './verdict.js';
+import { InMemoryWorkspace } from './workspace.js';
 
 const cf = makeCaseFile();
+const low = makeCaseFile({ candidate: { ...cf.candidate, score: 0.2 } });
 
 const asEscalate: StageHandler = {
   run: () =>
@@ -24,7 +26,21 @@ const asEscalate: StageHandler = {
     }),
 };
 
-class FlakyStore extends FakeCaseStore {
+const dismiss: StageHandler = {
+  async run(ctx) {
+    const dismissal = Dismissal.parse({
+      schemaVersion: 1,
+      candidateId: low.candidate.id,
+      reason: 'no-admissible-witness-below-floor',
+      detail: 'x',
+    });
+    await ctx.record('dismissed', { dismissal }, 'defense');
+    return { kind: 'advance', next: 'dismissed' };
+  },
+};
+
+/** Fails the first verdict append, like a store that is briefly down. */
+class FlakyAppendStore extends FakeCaseStore {
   failures = 1;
   override appendVerdict(v: Verdict): Promise<void> {
     if (this.failures-- > 0) return Promise.reject(new Error('store down'));
@@ -32,24 +48,37 @@ class FlakyStore extends FakeCaseStore {
   }
 }
 
+/** Refuses the first transition to a given stage, like a store applying its own rule. */
+class RefusingTransitionStore extends FakeCaseStore {
+  failures = 1;
+  constructor(private readonly refuse: CaseStage) {
+    super({ juryEnabled: false });
+  }
+  override transition(caseId: Parameters<FakeCaseStore['transition']>[0], to: CaseStage) {
+    if (to === this.refuse && this.failures-- > 0) return Promise.reject(new Error('refused'));
+    return super.transition(caseId, to);
+  }
+}
+
 const make = (
   store: FakeCaseStore,
   sink: FakeEventSink,
   handlers: Partial<Record<string, StageHandler>>,
-  model = new ReplayModel(new Map()),
+  opts: { model?: ReplayModel; workspace?: InMemoryWorkspace } = {},
 ) =>
   new Orchestrator({
     store,
     sink,
-    model,
+    model: opts.model ?? new ReplayModel(new Map()),
     handlers,
     config: { killSwitch: () => false, maxStageAttempts: 1, now: () => NOW },
+    ...(opts.workspace ? { workspace: opts.workspace } : {}),
   });
 
-const verdictOf = (outcome: Verdict['outcome'], summary = 'earlier') =>
+const verdictOf = (caseId: typeof cf.id, outcome: Verdict['outcome'], summary = 'earlier') =>
   Verdict.parse({
     schemaVersion: 1,
-    caseId: cf.id,
+    caseId,
     outcome,
     exhibits: [],
     ballots: [],
@@ -59,8 +88,8 @@ const verdictOf = (outcome: Verdict['outcome'], summary = 'earlier') =>
     cost: [],
   });
 
-const written = (sink: FakeEventSink) =>
-  assertSchemaValid(sink.events(cf.id)).filter((e) => e.type === 'verdict-written');
+const written = (sink: FakeEventSink, id = cf.id) =>
+  assertSchemaValid(sink.events(id)).filter((e) => e.type === 'verdict-written');
 
 describe('cost formatting in summaries', () => {
   const finalizeWith = (usds: number[]) =>
@@ -104,33 +133,61 @@ describe('cost formatting in summaries', () => {
 });
 
 describe('terminal verdict invariants', () => {
-  it('repairs a dismissed case whose verdict write failed, by rerunning the stage', async () => {
-    const low = makeCaseFile({ candidate: { ...cf.candidate, score: 0.2 } });
-    const store = new FlakyStore({ juryEnabled: false });
+  it('repairs a dismissed case with a NEW instance sharing the workspace', async () => {
+    const store = new FlakyAppendStore({ juryEnabled: false });
     await openAt(store, low, BIG_BUDGET, PATH_TO.defense);
     const sink = new FakeEventSink();
-    const dismiss: StageHandler = {
-      async run(ctx) {
-        const dismissal = Dismissal.parse({
-          schemaVersion: 1,
-          candidateId: low.candidate.id,
-          reason: 'no-admissible-witness-below-floor',
-          detail: 'x',
-        });
-        await ctx.record('dismissed', { dismissal }, 'defense');
-        return { kind: 'advance', next: 'dismissed' };
-      },
-    };
-    await expect(make(store, sink, { defense: dismiss }).run(low.id)).rejects.toThrow(/store down/);
-    expect(await store.stage(low.id)).toBe('defense');
+    const workspace = new InMemoryWorkspace();
+    await expect(
+      make(store, sink, { defense: dismiss }, { workspace }).run(low.id),
+    ).rejects.toThrow(/store down/);
+    // The transition happened, the verdict write did not.
+    expect(await store.stage(low.id)).toBe('dismissed');
+    expect(await store.getVerdict(low.id)).toBeNull();
 
-    const out = await make(store, sink, { defense: dismiss }).run(low.id);
+    const out = await make(store, sink, {}, { workspace }).run(low.id);
     expect(out).toEqual({ status: 'terminal', stage: 'dismissed' });
     expect(Verdict.parse(await store.getVerdict(low.id)).outcome).toBe('dismissed');
+    expect(written(sink, low.id)).toHaveLength(1);
   });
 
-  it('writes the missing verdict when a terminal case is run again', async () => {
-    const store = new FlakyStore({ juryEnabled: false });
+  it('cannot repair a dismissed case when no Dismissal was stored', async () => {
+    const store = new FlakyAppendStore({ juryEnabled: false });
+    await openAt(store, low, BIG_BUDGET, PATH_TO.defense);
+    const sink = new FakeEventSink();
+    await expect(make(store, sink, { defense: dismiss }).run(low.id)).rejects.toThrow(/store down/);
+    await expect(make(store, sink, {}).run(low.id)).rejects.toThrow(/no recorded dismissal/);
+    expect(await store.getVerdict(low.id)).toBeNull();
+    assertSchemaValid(sink.events(low.id));
+  });
+
+  it('leaves no verdict when the store refuses the dismissal transition', async () => {
+    const store = new RefusingTransitionStore('dismissed');
+    await openAt(store, low, BIG_BUDGET, PATH_TO.defense);
+    const sink = new FakeEventSink();
+    await expect(make(store, sink, { defense: dismiss }).run(low.id)).rejects.toThrow(/refused/);
+    expect(await store.stage(low.id)).toBe('defense');
+    expect(await store.getVerdict(low.id)).toBeNull();
+    assertSchemaValid(sink.events(low.id));
+  });
+
+  it('never leaves a verdict that conflicts with the final stage after a refused dismissal', async () => {
+    const store = new RefusingTransitionStore('dismissed');
+    await openAt(store, low, BIG_BUDGET, PATH_TO.defense);
+    const sink = new FakeEventSink();
+    const workspace = new InMemoryWorkspace();
+    await expect(
+      make(store, sink, { defense: dismiss }, { workspace }).run(low.id),
+    ).rejects.toThrow(/refused/);
+    // The rerun decides differently and escalates; the stored verdict must agree.
+    const out = await make(store, sink, { defense: asEscalate }, { workspace }).run(low.id);
+    expect(out).toEqual({ status: 'terminal', stage: 'escalated' });
+    expect(Verdict.parse(await store.getVerdict(low.id)).outcome).toBe('escalated');
+    assertSchemaValid(sink.events(low.id));
+  });
+
+  it('writes the missing verdict when a terminal escalated case is run again', async () => {
+    const store = new FlakyAppendStore({ juryEnabled: false });
     await openAt(store, cf, BIG_BUDGET, PATH_TO.defense);
     const sink = new FakeEventSink();
     await expect(make(store, sink, { defense: asEscalate }).run(cf.id)).rejects.toThrow(
@@ -162,28 +219,40 @@ describe('terminal verdict invariants', () => {
       run: () => Promise.resolve({ kind: 'advance', next: 'dismissed' }),
     };
     await expect(make(store, sink, { prosecution: toDismissed }).run(cf.id)).rejects.toThrow(
-      /no dismissal was recorded/,
+      /no recorded dismissal/,
     );
     expect(await store.getVerdict(cf.id)).toBeNull();
+    assertSchemaValid(sink.events(cf.id));
   });
 
-  it('throws when the case already has a verdict with a different outcome', async () => {
+  it('throws when a terminal case has a verdict with a different outcome', async () => {
     const store = new FakeCaseStore({ juryEnabled: false });
-    await openAt(store, cf, BIG_BUDGET, PATH_TO.defense);
-    await store.appendVerdict(verdictOf('proven-fixed'));
-    await expect(
-      make(store, new FakeEventSink(), { defense: asEscalate }).run(cf.id),
-    ).rejects.toThrow(/already has a proven-fixed verdict/);
-  });
-
-  it('accepts an existing verdict with the same outcome without writing another', async () => {
-    const store = new FakeCaseStore({ juryEnabled: false });
-    await openAt(store, cf, BIG_BUDGET, PATH_TO.defense);
-    await store.appendVerdict(verdictOf('escalated'));
+    await openAt(store, cf, BIG_BUDGET, [...PATH_TO.defense, 'escalated']);
+    await store.appendVerdict(verdictOf(cf.id, 'proven-fixed'));
     const sink = new FakeEventSink();
-    expect((await make(store, sink, { defense: asEscalate }).run(cf.id)).stage).toBe('escalated');
-    expect((await store.getVerdict(cf.id))?.summary).toBe('earlier');
-    expect(written(sink)).toHaveLength(0);
+    await expect(make(store, sink, {}).run(cf.id)).rejects.toThrow(
+      /already has a proven-fixed verdict/,
+    );
+    assertSchemaValid(sink.events(cf.id));
+  });
+
+  it('refuses to rerun agents for a case that is still in progress but has a verdict', async () => {
+    const store = new FakeCaseStore({ juryEnabled: false });
+    await openAt(store, cf, BIG_BUDGET, PATH_TO.defense);
+    await store.appendVerdict(verdictOf(cf.id, 'dismissed'));
+    const sink = new FakeEventSink();
+    let ran = false;
+    const handler: StageHandler = {
+      run: () => {
+        ran = true;
+        return Promise.resolve({ kind: 'advance', next: 'prosecution' });
+      },
+    };
+    await expect(make(store, sink, { defense: handler }).run(cf.id)).rejects.toThrow(
+      /refusing to rerun agents/,
+    );
+    expect(ran).toBe(false);
+    assertSchemaValid(sink.events(cf.id));
   });
 
   it('survives a cost too small to print without an exponent', async () => {
@@ -209,12 +278,13 @@ describe('terminal verdict invariants', () => {
     };
     const model = new ReplayModel(new Map());
     model.runTurn = () => Promise.resolve(tiny);
-    expect((await make(store, sink, { defense: handler }, model).run(cf.id)).stage).toBe(
+    expect((await make(store, sink, { defense: handler }, { model }).run(cf.id)).stage).toBe(
       'escalated',
     );
     const v = Verdict.parse(await store.getVerdict(cf.id));
     expect(v.cost[0]?.usd).toBe(5e-7);
     expect(v.summary).not.toMatch(/\de-\d/);
     expect(checkSummary(v)).toEqual([]);
+    assertSchemaValid(sink.events(cf.id));
   });
 });

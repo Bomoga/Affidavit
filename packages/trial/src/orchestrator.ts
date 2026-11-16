@@ -1,5 +1,6 @@
 import {
   Escalation,
+  type Dismissal,
   PromptId,
   TERMINAL_STAGES,
   TrialEvent,
@@ -18,6 +19,7 @@ import { digestOf } from './canonical.js';
 import type { SubmissionSpec } from './envelope.js';
 import { assertAllowedTools, type ModelRole } from './roles.js';
 import { buildVerdict, finalizeVerdict } from './verdict.js';
+import type { TrialWorkspace } from './workspace.js';
 
 export type ModelTurnRequest = Parameters<ModelPort['runTurn']>[0];
 export type ModelTurnResult = Awaited<ReturnType<ModelPort['runTurn']>>;
@@ -96,6 +98,11 @@ export interface OrchestratorDeps {
   model: ModelPort;
   handlers: Partial<Record<CaseStage, StageHandler>>;
   config: OrchestratorConfig;
+  /**
+   * Lane-internal hand-off store. When given, the recorded Dismissal is kept there so a dismissed
+   * case whose verdict write failed can be repaired by a new Orchestrator instance.
+   */
+  workspace?: TrialWorkspace;
 }
 
 /**
@@ -191,7 +198,7 @@ function overdrawn(b: BudgetState): boolean {
 export class Orchestrator {
   private readonly ledgers = new Map<CaseId, StageCost[]>();
   private readonly runInfos = new Map<CaseId, RunInfo>();
-  private readonly dismissed = new Set<CaseId>();
+  private readonly dismissals = new Map<CaseId, Dismissal>();
   /**
    * Every exhibit id this run saw submitted, resulted, or rejected, in first-seen order.
    * KNOWN GAP: in memory only, like the cost ledger. A case resumed in a new Orchestrator cites
@@ -222,6 +229,14 @@ export class Orchestrator {
       if (await config.killSwitch()) return { status: 'halted', stage, reason: 'kill-switch' };
       const handler = handlers[stage];
       if (!handler) throw new Error(`no handler for stage ${stage}`);
+      // A verdict on a case that is still in progress means an earlier run wrote it for a
+      // different ending. Rerunning agents could only contradict it, so stop.
+      const early = await store.getVerdict(caseId);
+      if (early !== null) {
+        throw new Error(
+          `case ${caseId} is at ${stage} but already has a ${early.outcome} verdict; refusing to rerun agents`,
+        );
+      }
 
       const outcome = await this.runStage(caseId, stage, handler);
       if (outcome.kind === 'halted') return { status: 'halted', stage, reason: 'kill-switch' };
@@ -229,12 +244,10 @@ export class Orchestrator {
       let next: CaseStage;
       if (outcome.kind === 'advance') {
         next = outcome.next;
-        // The dismissed verdict goes in BEFORE the transition: a crash after it leaves the case
-        // at this stage, so a rerun repeats the stage and hits the same-outcome early return. The
-        // Dismissal is only readable in the run that recorded it, so it cannot be repaired later.
-        // If the store then refuses the transition, an orphan dismissed verdict remains.
-        if (next === 'dismissed') await this.writeTerminalVerdict(caseId, stage, 'dismissed');
+        // Transition first, so a refused transition leaves no verdict behind. A crash between the
+        // transition and the write is repaired on re-entry (see above) from the stored Dismissal.
         await store.transition(caseId, next);
+        if (next === 'dismissed') await this.writeTerminalVerdict(caseId, stage, 'dismissed');
       } else {
         next = 'escalated';
         await this.escalate(caseId, stage, outcome.reason, outcome.detail);
@@ -472,12 +485,16 @@ export class Orchestrator {
         `case ${caseId} ended ${outcome} but already has a ${existing.outcome} verdict`,
       );
     }
-    // A dismissed verdict needs the recorded contract Dismissal it summarizes. Without one in
-    // this run (a dismissal in an earlier run is not readable from here) refuse to invent it.
-    if (outcome === 'dismissed' && !this.dismissed.has(caseId)) {
-      throw new Error(
-        `case ${caseId} is dismissed but no dismissal was recorded in this run; not writing a dismissed verdict`,
-      );
+    // A dismissed verdict needs the recorded contract Dismissal it summarizes, from this run or
+    // read back from the workspace. Without one, refuse to invent it.
+    if (outcome === 'dismissed') {
+      const dismissal =
+        this.dismissals.get(caseId) ?? (await this.deps.workspace?.getDismissal(caseId));
+      if (!dismissal) {
+        throw new Error(
+          `case ${caseId} is dismissed but no recorded dismissal was found; not writing a dismissed verdict`,
+        );
+      }
     }
     const { promptVersions, modelIds } = this.info(caseId);
     const verdict = finalizeVerdict(
@@ -495,7 +512,6 @@ export class Orchestrator {
   }
 
   private noteExhibits(event: TrialEvent): void {
-    if (event.type === 'dismissed') this.dismissed.add(event.caseId);
     let id: ExhibitId | undefined;
     if (event.type === 'exhibit-submitted' || event.type === 'exhibit-inadmissible') {
       id = event.payload.exhibitId;
@@ -528,5 +544,10 @@ export class Orchestrator {
     });
     await sink.emit(event);
     this.noteExhibits(event);
+    if (event.type === 'dismissed') {
+      // Kept where another instance can read it back, so a dismissed case can be repaired.
+      this.dismissals.set(caseId, event.payload.dismissal);
+      await this.deps.workspace?.saveDismissal(caseId, event.payload.dismissal);
+    }
   }
 }

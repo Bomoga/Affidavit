@@ -1,5 +1,6 @@
 import type {
   CaseId,
+  Dismissal,
   ExhibitId,
   ExhibitResult,
   PatchExhibit,
@@ -25,6 +26,9 @@ export interface TrialWorkspace {
   getExhibits(caseId: CaseId): Promise<ExhibitId[]>;
   savePatchOutcome(caseId: CaseId, outcome: PatchOutcome): Promise<void>;
   getPatchOutcome(caseId: CaseId): Promise<PatchOutcome | undefined>;
+  /** The contract Dismissal recorded for the case, so a new instance can repair its verdict. */
+  saveDismissal(caseId: CaseId, dismissal: Dismissal): Promise<void>;
+  getDismissal(caseId: CaseId): Promise<Dismissal | undefined>;
 }
 
 /** What Remedy ended with. `accepted` is true only when the Judge's VerifyResult says so. */
@@ -39,6 +43,17 @@ export class InMemoryWorkspace implements TrialWorkspace {
   private readonly witnesses = new Map<CaseId, AdmittedWitness>();
   private readonly exhibits = new Map<CaseId, ExhibitId[]>();
   private readonly patches = new Map<CaseId, PatchOutcome>();
+
+  private readonly dismissals = new Map<CaseId, Dismissal>();
+
+  saveDismissal(caseId: CaseId, dismissal: Dismissal): Promise<void> {
+    this.dismissals.set(caseId, dismissal);
+    return Promise.resolve();
+  }
+
+  getDismissal(caseId: CaseId): Promise<Dismissal | undefined> {
+    return Promise.resolve(this.dismissals.get(caseId));
+  }
 
   savePatchOutcome(caseId: CaseId, outcome: PatchOutcome): Promise<void> {
     this.patches.set(caseId, outcome);
