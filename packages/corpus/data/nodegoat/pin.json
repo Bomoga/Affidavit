@@ -1,0 +1,18 @@
+{
+  "id": "nodegoat",
+  "repoUrl": "https://github.com/OWASP/NodeGoat.git",
+  "commit": "c5cb68a7084e4ae7dcc60e6a98768720a81841e8",
+  "tree": "839d7b6856ec6da992d649b2423d5f9fcefdcf1f",
+  "archiveSha256": "e5660ba80b7851e34f58579ec7acf8343c76a9cbaeed98470fa28ffb362cb29b",
+  "archiveNote": "sha256 of the uncompressed tar from `git -c core.autocrlf=false -c core.eol=lf archive --format=tar <commit>`, pinned to LF so it does not depend on the machine git config",
+  "patches": {
+    "safe-allocations-where-int": {
+      "path": "patches/safe-allocations-where-int.patch",
+      "sha256": "d2bf5b2e937f56bc4e9016b3137f9a1cd0144f6f17e9697054d7200fdd25ddab"
+    },
+    "negative-control-constant-where": {
+      "path": "patches/negative-control-constant-where.patch",
+      "sha256": "25df2386968605a4a5a5e1934a54d057f6ac650a69b5e607963bc1ed8fa292d0"
+    }
+  }
+}
