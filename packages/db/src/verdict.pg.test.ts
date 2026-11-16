@@ -6,7 +6,7 @@ import { BUDGET, describePg, sampleCase, useTestDatabase } from './test-support.
 const T = 'tenant-v';
 
 describePg('verdicts are append-only', () => {
-  const db = useTestDatabase();
+  const db = useTestDatabase([T]);
   const file = sampleCase(T);
 
   beforeAll(async () => {

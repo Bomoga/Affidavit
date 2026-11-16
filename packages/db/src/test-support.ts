@@ -2,8 +2,14 @@ import { randomBytes } from 'node:crypto';
 import { CaseFile, samples } from '@affidavit/contracts';
 import pg from 'pg';
 import { afterAll, beforeAll, describe } from 'vitest';
-import { APP_ROLE, applyMigrations, setAppRolePassword } from './migrate.js';
-import { createPool } from './tenant.js';
+import {
+  APP_ROLE,
+  WORKER_ROLE,
+  applyMigrations,
+  provisionTenant,
+  setRolePassword,
+} from './migrate.js';
+import { openPool } from './tenant.js';
 
 /** Superuser or owner URL of a throwaway Postgres server, e.g. the compose one. */
 export const PG_ADMIN_URL = process.env.AFFIDAVIT_TEST_DATABASE_URL;
@@ -31,6 +37,8 @@ export interface TestDatabase {
   admin: pg.Pool;
   /** Pool for the non-owner application role. */
   app: pg.Pool;
+  worker: pg.Pool;
+  workerUrl: string;
   drop(): Promise<void>;
 }
 
@@ -45,7 +53,7 @@ function withDb(url: string, name: string, user?: { name: string; password: stri
 }
 
 /** A fresh database on the test server, migrated, with the application role able to log in. */
-export async function createTestDatabase(): Promise<TestDatabase> {
+export async function createTestDatabase(tenants: readonly string[] = []): Promise<TestDatabase> {
   if (!PG_ADMIN_URL) throw new Error(SKIP_REASON);
   const name = `affidavit_test_${randomBytes(6).toString('hex')}`;
   const root = new pg.Pool({ connectionString: PG_ADMIN_URL, max: 1 });
@@ -60,19 +68,27 @@ export async function createTestDatabase(): Promise<TestDatabase> {
     await r.end();
     throw err;
   }
-  const password = randomBytes(18).toString('hex');
-  await setAppRolePassword(adminUrl, password);
-  const appUrl = withDb(PG_ADMIN_URL, name, { name: APP_ROLE, password });
+  for (const t of tenants) await provisionTenant(adminUrl, t);
+  const appPassword = randomBytes(18).toString('hex');
+  const workerPassword = randomBytes(18).toString('hex');
+  await setRolePassword(adminUrl, APP_ROLE, appPassword);
+  await setRolePassword(adminUrl, WORKER_ROLE, workerPassword);
+  const appUrl = withDb(PG_ADMIN_URL, name, { name: APP_ROLE, password: appPassword });
+  const workerUrl = withDb(PG_ADMIN_URL, name, { name: WORKER_ROLE, password: workerPassword });
   const admin = new pg.Pool({ connectionString: adminUrl });
-  const app = createPool(appUrl);
+  const app = await openPool(appUrl);
+  const worker = await openPool(workerUrl);
   return {
     name,
     adminUrl,
     appUrl,
     admin,
     app,
+    worker,
+    workerUrl,
     async drop() {
       await app.end();
+      await worker.end();
       await admin.end();
       const r = new pg.Pool({ connectionString: PG_ADMIN_URL, max: 1 });
       await r.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
@@ -82,10 +98,10 @@ export async function createTestDatabase(): Promise<TestDatabase> {
 }
 
 /** Registers beforeAll/afterAll for a fresh database and returns an accessor for it. */
-export function useTestDatabase(): () => TestDatabase {
+export function useTestDatabase(tenants: readonly string[] = []): () => TestDatabase {
   let db: TestDatabase | undefined;
   beforeAll(async () => {
-    db = await createTestDatabase();
+    db = await createTestDatabase(tenants);
   }, 120_000);
   afterAll(async () => {
     await db?.drop();

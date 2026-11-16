@@ -15,7 +15,7 @@ import { BUDGET, describePg, sampleCase, uniqueId, useTestDatabase } from './tes
 const TENANT = 'tenant-a';
 
 describePg('PgCaseStore', () => {
-  const db = useTestDatabase();
+  const db = useTestDatabase([TENANT]);
 
   function store(juryEnabled = true): PgCaseStore {
     return new PgCaseStore(db().app, TENANT, { juryEnabled });

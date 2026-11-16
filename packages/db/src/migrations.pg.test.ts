@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest';
-import { applyMigrations, APP_ROLE } from './migrate.js';
+import { applyMigrations, APP_ROLE, WORKER_ROLE } from './migrate.js';
 import { describePg, useTestDatabase } from './test-support.js';
 
 describePg('migrations on a fresh Postgres', () => {
@@ -27,6 +27,7 @@ describePg('migrations on a fresh Postgres', () => {
       'events',
       'exhibits',
       'repos',
+      'stage_runs',
       'stages',
       'tenants',
       'verdicts',
@@ -38,19 +39,32 @@ describePg('migrations on a fresh Postgres', () => {
     }
   });
 
-  it('the application role is not a superuser, does not bypass RLS, and owns nothing', async () => {
-    const role = await db().admin.query<{ rolsuper: boolean; rolbypassrls: boolean }>(
-      `select rolsuper, rolbypassrls from pg_roles where rolname = $1`,
-      [APP_ROLE],
-    );
-    expect(role.rows).toEqual([{ rolsuper: false, rolbypassrls: false }]);
-    const owned = await db().admin.query(
-      `select 1 from pg_class c join pg_roles r on r.oid = c.relowner
-       join pg_namespace n on n.oid = c.relnamespace
-       where r.rolname = $1 and n.nspname = 'public'`,
-      [APP_ROLE],
-    );
-    expect(owned.rows).toHaveLength(0);
+  it('both login roles are plain: not superuser, no BYPASSRLS, no members, own nothing', async () => {
+    for (const role of [APP_ROLE, WORKER_ROLE]) {
+      const r = await db().admin.query(
+        `select rolsuper, rolbypassrls, rolcreaterole, rolcreatedb, rolinherit from pg_roles where rolname = $1`,
+        [role],
+      );
+      expect(r.rows, role).toEqual([
+        {
+          rolsuper: false,
+          rolbypassrls: false,
+          rolcreaterole: false,
+          rolcreatedb: false,
+          rolinherit: false,
+        },
+      ]);
+      const member = await db().admin.query(
+        `select 1 from pg_auth_members m join pg_roles r on r.oid = m.member where r.rolname = $1`,
+        [role],
+      );
+      expect(member.rows, role).toHaveLength(0);
+      const owned = await db().admin.query(
+        `select 1 from pg_class c join pg_roles r on r.oid = c.relowner where r.rolname = $1`,
+        [role],
+      );
+      expect(owned.rows, role).toHaveLength(0);
+    }
     const who = await db().app.query<{ current_user: string }>('select current_user');
     expect(who.rows[0]!.current_user).toBe(APP_ROLE);
   });

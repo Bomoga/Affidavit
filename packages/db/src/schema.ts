@@ -196,3 +196,27 @@ export const events = pgTable(
     index('events_case_idx').on(t.tenantId, t.caseId),
   ],
 ).enableRLS();
+
+/**
+ * Durable record that a stage attempt has started. The task wrapper inserts the row before
+ * running a handler and skips the handler when the row already exists, so an attempt runs at
+ * most once even after Graphile Worker has deleted its finished job. `completed_at` is set once
+ * when the handler returns; a row with no `completed_at` is an attempt that crashed or is running.
+ */
+export const stageRuns = pgTable(
+  'stage_runs',
+  {
+    tenantId: tenantId(),
+    caseId: text('case_id').notNull(),
+    stage: text('stage').notNull(),
+    attempt: integer('attempt').notNull(),
+    claimedAt: timestamp('claimed_at', { withTimezone: true }).notNull().defaultNow(),
+    completedAt: timestamp('completed_at', { withTimezone: true }),
+  },
+  (t) => [
+    primaryKey({ columns: [t.tenantId, t.caseId, t.stage, t.attempt] }),
+    caseRef(t),
+    check('stage_runs_stage_valid', sql`${t.stage} in (${stageList})`),
+    check('stage_runs_attempt_valid', sql`${t.attempt} >= 1`),
+  ],
+).enableRLS();

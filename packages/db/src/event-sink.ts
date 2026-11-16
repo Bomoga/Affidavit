@@ -22,6 +22,16 @@ export class PgEventSink implements EventSink {
 
   async emit(eventIn: TrialEvent): Promise<void> {
     const event = TrialEventSchema.parse(eventIn);
+    // A payload that names another case must not land in this case's side tables.
+    const inner =
+      event.type === 'escalated' || event.type === 'budget-exhausted'
+        ? event.payload.escalation.caseId
+        : event.type === 'verdict-written'
+          ? event.payload.verdict.caseId
+          : event.caseId;
+    if (inner !== event.caseId) {
+      throw new Error(`event for case ${event.caseId} carries a payload for case ${inner}`);
+    }
     try {
       await withTenant(this.pool, this.tenantId, async (tx) => {
         const inserted = await tx

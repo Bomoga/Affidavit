@@ -93,6 +93,19 @@ CREATE TABLE "repos" (
 );
 --> statement-breakpoint
 ALTER TABLE "repos" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
+CREATE TABLE "stage_runs" (
+	"tenant_id" text NOT NULL,
+	"case_id" text NOT NULL,
+	"stage" text NOT NULL,
+	"attempt" integer NOT NULL,
+	"claimed_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"completed_at" timestamp with time zone,
+	CONSTRAINT "stage_runs_tenant_id_case_id_stage_attempt_pk" PRIMARY KEY("tenant_id","case_id","stage","attempt"),
+	CONSTRAINT "stage_runs_stage_valid" CHECK ("stage_runs"."stage" in ('intake', 'map', 'arraign', 'defense', 'prosecution', 'remedy', 'verify', 'jury', 'verdict', 'dismissed', 'escalated')),
+	CONSTRAINT "stage_runs_attempt_valid" CHECK ("stage_runs"."attempt" >= 1)
+);
+--> statement-breakpoint
+ALTER TABLE "stage_runs" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
 CREATE TABLE "stages" (
 	"tenant_id" text NOT NULL,
 	"case_id" text NOT NULL,
@@ -128,6 +141,7 @@ ALTER TABLE "escalations" ADD CONSTRAINT "escalations_tenant_id_case_id_cases_te
 ALTER TABLE "events" ADD CONSTRAINT "events_tenant_id_case_id_cases_tenant_id_id_fk" FOREIGN KEY ("tenant_id","case_id") REFERENCES "public"."cases"("tenant_id","id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "exhibits" ADD CONSTRAINT "exhibits_tenant_id_case_id_cases_tenant_id_id_fk" FOREIGN KEY ("tenant_id","case_id") REFERENCES "public"."cases"("tenant_id","id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "repos" ADD CONSTRAINT "repos_tenant_id_tenants_tenant_id_fk" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("tenant_id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "stage_runs" ADD CONSTRAINT "stage_runs_tenant_id_case_id_cases_tenant_id_id_fk" FOREIGN KEY ("tenant_id","case_id") REFERENCES "public"."cases"("tenant_id","id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "stages" ADD CONSTRAINT "stages_tenant_id_case_id_cases_tenant_id_id_fk" FOREIGN KEY ("tenant_id","case_id") REFERENCES "public"."cases"("tenant_id","id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "verdicts" ADD CONSTRAINT "verdicts_tenant_id_case_id_cases_tenant_id_id_fk" FOREIGN KEY ("tenant_id","case_id") REFERENCES "public"."cases"("tenant_id","id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 CREATE INDEX "events_case_idx" ON "events" USING btree ("tenant_id","case_id");

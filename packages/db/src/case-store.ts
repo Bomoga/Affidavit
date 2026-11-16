@@ -19,7 +19,7 @@ import {
   type StageCost,
   type Verdict,
 } from '@affidavit/contracts';
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq, isNull, sql } from 'drizzle-orm';
 import type pg from 'pg';
 import * as t from './schema.js';
 import { withTenant, type Tx } from './tenant.js';
@@ -61,7 +61,12 @@ export class PgCaseStore implements CaseStore {
       throw new Error(`case ${caseFile.id} belongs to another tenant than this store`);
     }
     await this.run(async (tx) => {
-      await tx.insert(t.tenants).values({ tenantId: this.tenantId }).onConflictDoNothing();
+      // Tenants are provisioned by the owner (provisionTenant), never by the application role.
+      const [tenant] = await tx
+        .select({ id: t.tenants.tenantId })
+        .from(t.tenants)
+        .where(eq(t.tenants.tenantId, this.tenantId));
+      if (!tenant) throw new Error(`unknown tenant ${this.tenantId}`);
       await tx
         .insert(t.repos)
         .values({ tenantId: this.tenantId, id: caseFile.target.repo })
@@ -134,9 +139,9 @@ export class PgCaseStore implements CaseStore {
         })
         .where(this.caseWhere(caseId));
       await tx.execute(sql`
-        insert into stages (tenant_id, case_id, ordinal, stage)
+        insert into public.stages (tenant_id, case_id, ordinal, stage)
         select ${this.tenantId}, ${caseId}, coalesce(max(ordinal), 0) + 1, ${to}
-        from stages where tenant_id = ${this.tenantId} and case_id = ${caseId}`);
+        from public.stages where tenant_id = ${this.tenantId} and case_id = ${caseId}`);
     });
   }
 
@@ -145,7 +150,7 @@ export class PgCaseStore implements CaseStore {
     return this.run(async (tx) => {
       // One atomic UPDATE: concurrent charges never lose a deduction.
       const updated = await tx.execute(sql`
-        update cases set
+        update public.cases set
           remaining_input_tokens = remaining_input_tokens - ${cost.inputTokens},
           remaining_output_tokens = remaining_output_tokens - ${cost.outputTokens},
           remaining_usd = round(remaining_usd - ${cost.usd}::numeric, 6),
@@ -271,10 +276,14 @@ export class PgCaseStore implements CaseStore {
             eq(t.exhibits.tenantId, this.tenantId),
             eq(t.exhibits.caseId, caseId),
             eq(t.exhibits.id, result.exhibitId),
+            isNull(t.exhibits.result),
           ),
         )
         .returning({ id: t.exhibits.id });
-      if (rows.length === 0) throw new Error(`unknown exhibit ${result.exhibitId}`);
+      // Write-once: a result already recorded is rejected here and by a trigger in the database.
+      if (rows.length === 0) {
+        throw new Error(`unknown exhibit ${result.exhibitId}, or its result is already recorded`);
+      }
     });
   }
 

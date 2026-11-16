@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { type CaseStage } from '@affidavit/contracts';
+import { STAGE_TRANSITIONS, type CaseStage } from '@affidavit/contracts';
+import { scramVerifier } from './migrate.js';
 import { getTableConfig, type PgTable } from 'drizzle-orm/pg-core';
 import { describe, expect, it } from 'vitest';
 import * as schema from './schema.js';
@@ -57,6 +58,7 @@ describe('schema and migrations', () => {
     schema.ballots,
     schema.verdicts,
     schema.costRows,
+    schema.stageRuns,
     schema.escalations,
     schema.events,
   ];
@@ -66,7 +68,7 @@ describe('schema and migrations', () => {
     'utf8',
   );
 
-  it('declares ten tables', () => {
+  it('declares eleven tables', () => {
     expect(tables.map((t) => getTableConfig(t).name).sort()).toEqual([
       'ballots',
       'cases',
@@ -75,6 +77,7 @@ describe('schema and migrations', () => {
       'events',
       'exhibits',
       'repos',
+      'stage_runs',
       'stages',
       'tenants',
       'verdicts',
@@ -89,10 +92,10 @@ describe('schema and migrations', () => {
         `${cfg.name} has tenant_id`,
       ).toBe(true);
       expect(security, `${cfg.name} forced`).toContain(
-        `ALTER TABLE ${cfg.name} FORCE ROW LEVEL SECURITY;`,
+        `ALTER TABLE public.${cfg.name} FORCE ROW LEVEL SECURITY;`,
       );
       expect(security, `${cfg.name} policy`).toContain(
-        `CREATE POLICY tenant_isolation ON ${cfg.name} `,
+        `CREATE POLICY tenant_isolation ON public.${cfg.name} `,
       );
     }
   });
@@ -101,7 +104,42 @@ describe('schema and migrations', () => {
     const grants = security.split('\n').filter((l) => l.startsWith('GRANT'));
     for (const g of grants) {
       expect(g).not.toMatch(/DELETE|TRUNCATE|ALL/);
+      if (/UPDATE/.test(g)) expect(g).toMatch(/(.*)/s);
       if (/UPDATE/.test(g)) expect(g).not.toMatch(/verdicts|events/);
     }
+  });
+});
+
+describe('SQL guards', () => {
+  const security = readFileSync(
+    fileURLToPath(new URL('../drizzle/0001_security.sql', import.meta.url)),
+    'utf8',
+  );
+
+  it('the transition table in cases_guard lists exactly STAGE_TRANSITIONS', () => {
+    const block = /NOT IN \(([\s\S]*?)\) THEN/.exec(security)![1]!;
+    const sqlPairs = [...block.matchAll(/\('(\w+)', '(\w+)'\)/g)]
+      .map((m) => `${m[1]}>${m[2]}`)
+      .sort();
+    const tablePairs = Object.entries(STAGE_TRANSITIONS)
+      .flatMap(([from, tos]) => tos.map((to) => `${from}>${to}`))
+      .sort();
+    expect(sqlPairs).toEqual(tablePairs);
+  });
+
+  it('every function pins search_path, and temp objects are revoked', () => {
+    const fns = security.match(/CREATE FUNCTION[\s\S]*?\$\$;/g) ?? [];
+    expect(fns.length).toBeGreaterThanOrEqual(8);
+    for (const f of fns) expect(f).toContain('SET search_path = pg_catalog, public');
+    expect(security).toContain('REVOKE TEMPORARY ON DATABASE');
+  });
+});
+
+describe('scramVerifier', () => {
+  it('has the SCRAM-SHA-256 verifier shape and a fresh salt each time', () => {
+    const v = scramVerifier('pw');
+    expect(v).toMatch(/^SCRAM-SHA-256\$4096:[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+$/);
+    expect(v).not.toContain('pw');
+    expect(scramVerifier('pw')).not.toBe(v);
   });
 });
