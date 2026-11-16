@@ -2,7 +2,7 @@ Read docs/plan.md, then docs/implementation-plan.md section 6 (Lane 2) before wo
 
 # @affidavit/evidence
 
-**Owner:** Lane 2 (Judge and Evidence)
+**Owner:** Lane 2 (Judge and Evidence), @Thearius123
 
 **Mission:** Evidence bundles, replay, and signing.
 

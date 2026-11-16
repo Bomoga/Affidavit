@@ -1,15 +1,24 @@
-import type {
-  Budget,
-  CaseFile,
-  JudgePort,
-  PromptRenderer,
-  TrialWorkspace,
-  WitnessSubmission,
-} from './interim/types.js';
+import {
+  Dismissal,
+  ExhibitId,
+  WitnessId,
+  type Budget,
+  type CaseFile,
+  type CaseId,
+  type ExhibitResult,
+  type JudgePort,
+  type TargetVariant,
+  type Witness,
+} from '@affidavit/contracts';
+import { renderPrompt, type PromptId } from '@affidavit/prompts';
+import { canonicalJson, sha256Hex } from './canonical.js';
+import type { WitnessSubmission } from './envelope.js';
+import { SUBMISSIONS } from './envelope.js';
 import type { StageContext, StageHandler, StageResult } from './orchestrator.js';
+import type { TrialWorkspace } from './workspace.js';
 
 export interface DefenseAttemptConfig {
-  promptId: string;
+  promptId: PromptId;
   model: string;
 }
 
@@ -24,17 +33,56 @@ export interface DefenseConfig {
 }
 
 export interface DefenseDeps {
-  loadCaseFile: (caseId: string) => Promise<CaseFile>;
+  loadCaseFile: (caseId: CaseId) => Promise<CaseFile>;
   judge: JudgePort;
-  render: PromptRenderer;
   config: DefenseConfig;
-  /** Where an admitted witness is handed to later stages. */
+  /** Where an admitted witness and its exhibit id are handed to later stages. */
   workspace?: TrialWorkspace;
 }
 
 interface AttemptOutcome {
   admitted: boolean;
   feedback: string[];
+}
+
+/** Builds the full contract Witness around what the agent submitted. Code, not the agent, sets ids and authorship. */
+function buildWitness(caseId: CaseId, caseFile: CaseFile, sub: WitnessSubmission): Witness {
+  const sha256 = sha256Hex(canonicalJson({ template: sub.template, params: sub.params }));
+  return {
+    schemaVersion: 1,
+    id: WitnessId.parse(`witness-${sha256.slice(0, 24)}`),
+    caseId,
+    cls: caseFile.candidate.cls,
+    template: sub.template,
+    params: sub.params,
+    author: 'defense',
+    sha256,
+  };
+}
+
+/**
+ * The id the Judge will mint for this witness (docs/lanes/lane2/rules-of-evidence.md,
+ * "Exhibit ids"), so the submitted event and the result event point at the same exhibit.
+ */
+function submittedExhibitId(witness: Witness): ExhibitId {
+  const hash = sha256Hex(
+    canonicalJson({
+      caseId: witness.caseId,
+      kind: 'witness',
+      params: witness.params,
+      template: witness.template,
+    }),
+  );
+  return ExhibitId.parse(`exhibit-witness-${hash.slice(0, 24)}`);
+}
+
+function describeRejection(r: ExhibitResult): string {
+  if (r.rejectedBy) return r.rejectedBy;
+  const flags = [
+    r.vulnPass ? null : 'did not pass on the vulnerable code',
+    r.safeVariantFail === false ? 'also passed on the safe variant' : null,
+  ].filter((f): f is string => f !== null);
+  return flags.length > 0 ? flags.join(', ') : 'witness did not pass';
 }
 
 export function createDefenseHandler(deps: DefenseDeps): StageHandler {
@@ -56,7 +104,14 @@ export function createDefenseHandler(deps: DefenseDeps): StageHandler {
       if (caseFile.candidate.score < caseFile.escalationFloor) {
         await ctx.record(
           'dismissed',
-          { reason: 'no-admissible-witness-below-floor', candidateId: caseFile.candidate.id },
+          {
+            dismissal: Dismissal.parse({
+              schemaVersion: 1,
+              candidateId: caseFile.candidate.id,
+              reason: 'no-admissible-witness-below-floor',
+              detail: `score ${caseFile.candidate.score} is below the floor ${caseFile.escalationFloor}; one Defense attempt produced no admissible witness`,
+            }),
+          },
           'defense',
         );
         return { kind: 'advance', next: 'dismissed' };
@@ -83,7 +138,7 @@ async function attempt(
   which: DefenseAttemptConfig,
   priorFeedback: readonly string[],
 ): Promise<AttemptOutcome> {
-  const { config, judge, render } = deps;
+  const { config, judge } = deps;
   const feedback: string[] = [];
 
   for (let i = 0; i < config.maxIterations; i++) {
@@ -99,19 +154,22 @@ async function attempt(
     const notes = [...priorFeedback, ...feedback];
     if (notes.length > 0) blocks.push({ label: 'judge-feedback', content: notes.join('\n') });
 
-    const rendered = render(which.promptId, blocks);
-    const res = await ctx.runAgentValidated({
-      actor: 'defense',
-      promptId: rendered.promptId,
-      promptVersion: rendered.version,
-      model: which.model,
-      system: rendered.system,
-      user: rendered.user,
-      tools: ['submit_witness'],
-      outputSchemaRef: rendered.outputSchemaRef,
-      maxTurns: config.maxTurns,
-      budget: config.turnBudget,
-    });
+    const rendered = renderPrompt(which.promptId, blocks);
+    const res = await ctx.runAgentValidated(
+      {
+        actor: 'defense',
+        promptId: rendered.promptId,
+        promptVersion: rendered.version,
+        model: which.model,
+        system: rendered.system,
+        user: rendered.user,
+        tools: ['submit_witness'],
+        outputSchemaRef: rendered.outputSchemaRef,
+        maxTurns: config.maxTurns,
+        budget: config.turnBudget,
+      },
+      SUBMISSIONS.defense,
+    );
 
     if (res.outcome === 'no-submission') {
       feedback.push('no witness was submitted');
@@ -122,32 +180,25 @@ async function attempt(
       continue;
     }
 
-    const witness = res.value as WitnessSubmission;
+    const witness = buildWitness(ctx.caseId, caseFile, res.value);
     await ctx.record(
       'exhibit-submitted',
-      { kind: 'witness', template: witness.template },
+      { exhibitId: submittedExhibitId(witness), kind: 'witness' },
       'defense',
     );
     // Pass or fail comes only from the Judge. Anything the agent claims about it is ignored.
-    const verdict = await judge.runWitness(caseFile, witness);
-    await ctx.record(
-      'exhibit-result',
-      {
-        exhibitId: verdict.exhibitId,
-        admissible: verdict.admissible,
-        passed: verdict.passed,
-        rejectedBy: verdict.rejectedBy ?? null,
-      },
-      'judge',
-    );
-    if (verdict.admissible && verdict.passed) {
+    const variants: TargetVariant[] = caseFile.safeVariant
+      ? ['vulnerable', 'safe']
+      : ['vulnerable'];
+    const result = await judge.runWitness(caseFile, witness, variants);
+    await ctx.record('exhibit-result', { result }, 'judge');
+    if (result.admissible && result.passed) {
       await deps.workspace?.saveWitness(ctx.caseId, witness);
+      await deps.workspace?.addExhibit(ctx.caseId, result.exhibitId);
       return { admitted: true, feedback };
     }
 
-    feedback.push(
-      `judge: ${verdict.rejectedBy ?? 'witness did not pass'}${verdict.detail ? ` (${verdict.detail})` : ''}`,
-    );
+    feedback.push(`judge: ${describeRejection(result)}`);
   }
   return { admitted: false, feedback };
 }

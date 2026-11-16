@@ -1,72 +1,61 @@
 import { describe, expect, it } from 'vitest';
-import type {
-  CaseFile,
-  CaseStage,
-  ModelTurnResult,
-  PromptRenderer,
-  StageCost,
-  VerifyResult,
-  WitnessSubmission,
-} from './interim/types.js';
-import { Orchestrator, type StageHandler } from './orchestrator.js';
-import { createRemedyHandler, type RemedyConfig } from './remedy.js';
 import {
-  FakeCaseStore,
-  FakeEventSink,
-  FakeJudge,
-  FakeModel,
-  InMemoryWorkspace,
-} from './testing/fakes.js';
+  ExhibitResult,
+  samples,
+  type CaseFile,
+  type CaseStage,
+  type ExhibitId,
+  type VerifyResult,
+  type Witness,
+} from '@affidavit/contracts';
+import { FakeEventSink, FakeJudge, ReplayModel } from '@affidavit/testing';
+import { buildPatchExhibit, createRemedyHandler, type RemedyConfig } from './remedy.js';
+import { Orchestrator, type ModelTurnResult, type StageHandler } from './orchestrator.js';
+import {
+  BIG_BUDGET,
+  LoggingCaseStore,
+  NOW,
+  PATH_TO,
+  assertSchemaValid,
+  inOrder,
+  makeCaseFile,
+  openAt,
+  turnCost,
+} from './test-support.js';
+import { InMemoryWorkspace } from './workspace.js';
 
-const caseFile: CaseFile = {
-  id: 'c1',
-  escalationFloor: 0.6,
-  candidate: { id: 'cand-1', cls: 'injection', score: 0.9 },
-  slices: [{ file: 'routes/a.js', code: 'db.query("select * from t where id=" + id)' }],
+const CF: CaseFile = makeCaseFile();
+const CASE = CF.id;
+const witness: Witness = {
+  ...(samples.Witness as Witness),
+  caseId: CASE,
 };
-const witness: WitnessSubmission = { template: 'sqli-union', params: { n: 1 } };
 
-const cost: StageCost = {
-  stage: 'remedy',
-  attempt: 1,
-  inputTokens: 10,
-  outputTokens: 5,
-  usd: 0.01,
-  wallMs: 1,
-};
-const patch = (extra: object = {}): ModelTurnResult => ({
+const diffFor = (n: number): string =>
+  `--- a/routes/a.js\n+++ b/routes/a.js\n@@ -1 +1 @@\n-q(id${n})\n+q(?, [id${n}])\n`;
+const shaOf = (n: number): string => buildPatchExhibit(CASE, diffFor(n))!.sha256;
+const idOf = (n: number): ExhibitId => buildPatchExhibit(CASE, diffFor(n))!.id;
+
+const patch = (n: number, extra: object = {}): ModelTurnResult => ({
   outcome: 'submitted',
-  submission: {
-    diff: '--- a\n+++ b\n-q(id)\n+q(?, [id])',
-    filesTouched: ['routes/a.js'],
-    linesChanged: 2,
-    ...extra,
-  },
-  cost,
+  submission: { diff: diffFor(n), ...extra },
+  cost: turnCost('remedy'),
 });
-const none: ModelTurnResult = { outcome: 'no-submission', cost };
+const none: ModelTurnResult = { outcome: 'no-submission', cost: turnCost('remedy') };
 
-const good: VerifyResult = {
+const good = (n: number): VerifyResult => ({
+  schemaVersion: 1,
+  patchExhibitId: idOf(n),
   familyFlipped: true,
   suitePassed: true,
   rescanClean: true,
   counterexamples: [],
-};
-const bad = (rejectedBy: VerifyResult['rejectedBy'], detail = ''): VerifyResult => ({
+});
+const bad = (n: number, rejectedBy: VerifyResult['rejectedBy']): VerifyResult => ({
+  ...good(n),
   familyFlipped: rejectedBy !== 'literal-only-patch',
   suitePassed: rejectedBy !== 'suite-fails',
-  rescanClean: true,
-  counterexamples: [],
   rejectedBy,
-  detail,
-});
-
-const render: PromptRenderer = (id, blocks) => ({
-  promptId: id,
-  version: '1.0.0',
-  outputSchemaRef: 'PatchExhibit',
-  system: `SYSTEM:${id}`,
-  user: blocks.map((b) => `[${b.label}]\n${b.content}`).join('\n'),
 });
 
 const config: RemedyConfig = {
@@ -77,18 +66,22 @@ const config: RemedyConfig = {
   turnBudget: { maxInputTokens: 1000, maxOutputTokens: 500, maxUsd: 0.1 },
 };
 
-function run(
+async function run(
   modelScript: ModelTurnResult[],
-  verifyScript: VerifyResult[],
-  opts: { witness?: WitnessSubmission | null } = {},
+  verifyScript: Record<string, VerifyResult>,
+  opts: { withWitness?: boolean } = {},
 ) {
   const log: string[] = [];
-  const store = new FakeCaseStore(log, { usd: 10, tokens: 1_000_000 }, 'remedy');
+  const store = new LoggingCaseStore(log);
+  await openAt(store, CF, BIG_BUDGET, PATH_TO.remedy);
   const sink = new FakeEventSink();
-  const model = new FakeModel(log, modelScript);
-  const judge = new FakeJudge([], verifyScript);
+  const model = new ReplayModel(inOrder(modelScript));
+  const judge = new FakeJudge({
+    witnessResults: { [witness.sha256]: ExhibitResult.parse(samples.ExhibitResult) },
+    verifyResults: verifyScript,
+  });
   const workspace = new InMemoryWorkspace();
-  if (opts.witness !== null) void workspace.saveWitness('c1', opts.witness ?? witness);
+  if (opts.withWitness !== false) await workspace.saveWitness(CASE, witness);
   const next = (to: CaseStage): StageHandler => ({
     run: () => Promise.resolve({ kind: 'advance', next: to }),
   });
@@ -96,115 +89,159 @@ function run(
     store,
     sink,
     model,
-    validate: (_ref: string, v: unknown) =>
-      typeof v === 'object' && v !== null && 'diff' in v
-        ? { ok: true }
-        : { ok: false, errors: ['missing diff'] },
     handlers: {
       remedy: createRemedyHandler({
-        loadCaseFile: () => Promise.resolve(caseFile),
+        loadCaseFile: () => Promise.resolve(CF),
         judge,
-        render,
         workspace,
         config,
       }),
-      verify: next('verdict'),
+      verify: next('jury'),
+      jury: next('verdict'),
     },
-    config: { killSwitch: () => false, maxStageAttempts: 1, now: () => 1_700_000_000_000 },
+    config: { killSwitch: () => false, maxStageAttempts: 1, now: () => NOW },
   });
-  return { orch, store, sink, model, judge, workspace };
+  return {
+    orch,
+    store,
+    sink,
+    model,
+    judge,
+    workspace,
+    events: () => assertSchemaValid(sink.events(CASE)),
+  };
 }
+
+describe('buildPatchExhibit', () => {
+  it('computes files touched and lines changed from the diff, not from the agent', () => {
+    const p = buildPatchExhibit(CASE, diffFor(1))!;
+    expect(p.filesTouched).toEqual(['routes/a.js']);
+    expect(p.linesChanged).toBe(2);
+    expect(p.kind).toBe('patch');
+    expect(p.author).toBe('remedy');
+  });
+
+  it('refuses a diff that names no file or changes no line', () => {
+    expect(buildPatchExhibit(CASE, 'just prose')).toBeUndefined();
+    expect(buildPatchExhibit(CASE, '--- a/x.js\n+++ b/x.js\n')).toBeUndefined();
+  });
+
+  it('gives the same id and hash for the same diff, and different ones for different diffs', () => {
+    expect(buildPatchExhibit(CASE, diffFor(1))!.id).toBe(buildPatchExhibit(CASE, diffFor(1))!.id);
+    expect(buildPatchExhibit(CASE, diffFor(1))!.sha256).not.toBe(shaOf(2));
+  });
+});
 
 describe('Remedy', () => {
   it('accepts a patch the Judge verifies and moves to verify', async () => {
-    const { orch, sink, workspace, judge, model } = run([patch()], [good]);
-    expect(await orch.run('c1')).toBe('verdict');
+    const { orch, workspace, judge, model, events } = await run([patch(1)], {
+      [shaOf(1)]: good(1),
+    });
+    expect(await orch.run(CASE)).toEqual({ status: 'terminal', stage: 'verdict' });
     expect(model.requests[0]?.tools).toEqual(['submit_patch']);
-    expect(judge.patches).toHaveLength(1);
-    expect(
-      sink.events.some((e) => e.type === 'patch-verified' && e.payload.accepted === true),
-    ).toBe(true);
-    expect((await workspace.getPatchOutcome('c1'))?.accepted).toBe(true);
+    expect(judge.calls.filter((c) => c.method === 'verifyPatch')).toHaveLength(1);
+    expect((await workspace.getPatchOutcome(CASE))?.accepted).toBe(true);
+    expect(await workspace.getExhibits(CASE)).toContain(idOf(1));
+    expect(events().some((e) => e.type === 'exhibit-submitted' && e.payload.kind === 'patch')).toBe(
+      true,
+    );
   });
 
-  it.each([
-    ['literal-only-patch', 'only the exact literal changed'],
-    ['diff-too-large', 'over the diff cap'],
-    ['suite-fails', 'tests failed'],
-  ] as const)(
+  it.each(['literal-only-patch', 'diff-too-large', 'suite-fails'] as const)(
     'rejects for %s, records the rule, and retries with feedback',
-    async (rule, detail) => {
-      const { orch, sink, model, workspace } = run([patch(), patch()], [bad(rule, detail), good]);
-      expect(await orch.run('c1')).toBe('verdict');
+    async (rule) => {
+      const { orch, model, workspace, events } = await run([patch(1), patch(2)], {
+        [shaOf(1)]: bad(1, rule),
+        [shaOf(2)]: good(2),
+      });
+      expect(await orch.run(CASE)).toEqual({ status: 'terminal', stage: 'verdict' });
 
-      const rejection = sink.events.find((e) => e.type === 'patch-rejected');
-      expect(rejection?.payload).toMatchObject({ rule });
+      const rejection = events().find((e) => e.type === 'exhibit-inadmissible');
+      expect(rejection?.payload).toMatchObject({ rejectedBy: rule, exhibitId: idOf(1) });
       expect(model.requests).toHaveLength(2);
-      expect(model.requests[1]?.user).toContain('[judge-feedback]');
+      expect(model.requests[1]?.user).toContain('source=judge-feedback');
       expect(model.requests[1]?.user).toContain(rule);
-      expect((await workspace.getPatchOutcome('c1'))?.accepted).toBe(true);
+      expect((await workspace.getPatchOutcome(CASE))?.accepted).toBe(true);
     },
   );
 
   it.each(['literal-only-patch', 'diff-too-large', 'suite-fails'] as const)(
     'moves to verify with a not-accepted outcome when %s persists to the cap',
     async (rule) => {
-      const { orch, workspace, store } = run([patch(), patch()], [bad(rule), bad(rule)]);
-      expect(await orch.run('c1')).toBe('verdict');
-      const outcome = await workspace.getPatchOutcome('c1');
+      const { orch, workspace, events } = await run([patch(1), patch(2)], {
+        [shaOf(1)]: bad(1, rule),
+        [shaOf(2)]: bad(2, rule),
+      });
+      expect(await orch.run(CASE)).toEqual({ status: 'terminal', stage: 'verdict' });
+      const outcome = await workspace.getPatchOutcome(CASE);
       expect(outcome).toMatchObject({ accepted: false });
       expect(outcome?.result?.rejectedBy).toBe(rule);
-      expect(store.escalations).toEqual([]);
+      expect(events().some((e) => e.type === 'escalated')).toBe(false);
     },
   );
 
-  it('does not accept a result that lacks a flipped family even without a named rule', async () => {
-    const weak: VerifyResult = { ...good, familyFlipped: false };
-    const { orch, workspace } = run([patch(), patch()], [weak, weak]);
-    await orch.run('c1');
-    expect((await workspace.getPatchOutcome('c1'))?.accepted).toBe(false);
+  it('does not accept a result with an unflipped family even when no rule is named', async () => {
+    const weak: VerifyResult = { ...good(1), familyFlipped: false };
+    const { orch, workspace } = await run([patch(1), patch(2)], {
+      [shaOf(1)]: weak,
+      [shaOf(2)]: { ...weak, patchExhibitId: idOf(2) },
+    });
+    await orch.run(CASE);
+    expect((await workspace.getPatchOutcome(CASE))?.accepted).toBe(false);
   });
 
   it('takes acceptance only from the Judge, not from the agent', async () => {
-    const { orch, workspace } = run(
-      [patch({ accepted: true, familyFlipped: true }), patch({ accepted: true })],
-      [bad('suite-fails'), bad('suite-fails')],
+    const { orch, workspace } = await run(
+      [patch(1, { accepted: true, familyFlipped: true }), patch(2, { accepted: true })],
+      { [shaOf(1)]: bad(1, 'suite-fails'), [shaOf(2)]: bad(2, 'suite-fails') },
     );
-    await orch.run('c1');
-    expect((await workspace.getPatchOutcome('c1'))?.accepted).toBe(false);
+    await orch.run(CASE);
+    expect((await workspace.getPatchOutcome(CASE))?.accepted).toBe(false);
   });
 
-  it('records no patch outcome as not accepted when the agent submits nothing', async () => {
-    const { orch, workspace, judge } = run([none], []);
-    expect(await orch.run('c1')).toBe('verdict');
-    expect(judge.patches).toHaveLength(0);
-    expect(await workspace.getPatchOutcome('c1')).toMatchObject({ accepted: false });
+  it('records not accepted when the agent submits nothing, without calling the Judge', async () => {
+    const { orch, workspace, judge } = await run([none], {});
+    expect(await orch.run(CASE)).toEqual({ status: 'terminal', stage: 'verdict' });
+    expect(judge.calls.filter((c) => c.method === 'verifyPatch')).toHaveLength(0);
+    expect(await workspace.getPatchOutcome(CASE)).toMatchObject({ accepted: false });
   });
 
   it('records schema failures as inadmissible and feeds them back', async () => {
     const badShape: ModelTurnResult = {
       outcome: 'submitted',
       submission: { prose: 'fixed' },
-      cost,
+      cost: turnCost('remedy'),
     };
-    const { orch, sink, model } = run([badShape, patch()], [good]);
-    expect(await orch.run('c1')).toBe('verdict');
-    expect(sink.events.some((e) => e.type === 'exhibit-inadmissible')).toBe(true);
-    expect(model.requests[1]?.user).toContain('missing diff');
+    const { orch, events, model } = await run([badShape, patch(1)], { [shaOf(1)]: good(1) });
+    expect(await orch.run(CASE)).toEqual({ status: 'terminal', stage: 'verdict' });
+    expect(events().some((e) => e.type === 'exhibit-inadmissible')).toBe(true);
+    expect(model.requests[1]?.user).toContain('diff');
   });
 
-  it('shows the agent the admitted witness as untrusted data and the case slices', async () => {
-    const { orch, model } = run([patch()], [good]);
-    await orch.run('c1');
+  it('treats a diff that names no file as a schema failure and does not call the Judge', async () => {
+    const empty: ModelTurnResult = {
+      outcome: 'submitted',
+      submission: { diff: 'I rewrote the query' },
+      cost: turnCost('remedy'),
+    };
+    const { orch, judge, model } = await run([empty, patch(1)], { [shaOf(1)]: good(1) });
+    await orch.run(CASE);
+    expect(judge.calls.filter((c) => c.method === 'verifyPatch')).toHaveLength(1);
+    expect(model.requests[1]?.user).toContain('names no file');
+  });
+
+  it('shows the agent the admitted witness as untrusted data, with the case slices', async () => {
+    const { orch, model } = await run([patch(1)], { [shaOf(1)]: good(1) });
+    await orch.run(CASE);
     const user = model.requests[0]?.user ?? '';
-    expect(user).toContain('[witness]');
-    expect(user).toContain('sqli-union');
-    expect(user).toContain('[case-file-slice]');
-    expect(model.requests[0]?.system).toBe('SYSTEM:remedy');
+    expect(user).toContain('source=witness');
+    expect(user).toContain(witness.template);
+    expect(user).toContain('source=case-file-slice');
+    expect(user.indexOf('<<<BEGIN UNTRUSTED DATA')).toBeLessThan(user.indexOf(witness.template));
   });
 
   it('fails loudly when no admitted witness was handed over', async () => {
-    const { orch } = run([patch()], [good], { witness: null });
-    await expect(orch.run('c1')).rejects.toThrow(/no admitted witness/);
+    const { orch } = await run([patch(1)], { [shaOf(1)]: good(1) }, { withWitness: false });
+    await expect(orch.run(CASE)).rejects.toThrow(/no admitted witness/);
   });
 });
