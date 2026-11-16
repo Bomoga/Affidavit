@@ -11,4 +11,12 @@ export * from './quarantine.js';
 export * from './lockfiles.js';
 export * from './run.js';
 export * from './unscannable.js';
+export {
+  WindowsDirNotFreshError,
+  remapWindowReport,
+  writeWindows,
+  OVERLAP_BYTES,
+  WINDOW_BYTES,
+  type WindowEntry,
+} from './windows.js';
 export { NonUtf8NameError } from './walk.js';

@@ -12,6 +12,7 @@ import {
   type QuarantinedSnapshot,
 } from './quarantine.js';
 import { findGitleaksUnscannable, type Unscannable } from './unscannable.js';
+import { remapWindowReport, writeWindows } from './windows.js';
 
 export type RunToolOptions = Omit<ToolRunOptions, 'sourceDir'> & {
   /** The quarantined scan copy. Its removed-path list is passed through on the result. */
@@ -33,7 +34,7 @@ export interface ToolReport {
   /** Absolute host path of a report file. */
   file: string;
   /** `quarantine` reports cover the files moved out of the snapshot; paths are mapped back. */
-  origin: 'snapshot' | 'quarantine';
+  origin: 'snapshot' | 'quarantine' | 'windows';
 }
 
 /**
@@ -60,6 +61,13 @@ export interface ToolRunResult {
    * executables are NOT here: gitleaks skips them, so they are coverage losses.
    */
   binaryMediaFiles: string[];
+  /**
+   * Text files over 100,000 bytes that were also scanned in overlapping windows (see windows.ts),
+   * as `/src/<path>`. The windows report (origin 'windows') maps findings back to these files and
+   * lines. A finding can appear in both the snapshot report and the windows report; merge them by
+   * rule, path and region.
+   */
+  windowedFiles: string[];
   /** The output directory the run wrote into (the one passed in options). */
   outputPath: string;
   /** Name of the main report file. When `empty`, no file was written under this name. */
@@ -70,9 +78,9 @@ export interface ToolRunResult {
   quarantined: readonly string[];
 }
 
-type Pass = 'snapshot' | 'quarantine';
+type Pass = 'snapshot' | 'quarantine' | 'windows';
 
-const where = (pass: Pass) => (pass === 'quarantine' ? ' (quarantine pass)' : '');
+const where = (pass: Pass) => (pass === 'snapshot' ? '' : ` (${pass} pass)`);
 
 /** The tool exited normally but did not leave a regular, non-empty, valid report where expected. */
 export class ToolOutputMissingError extends Error {
@@ -389,6 +397,7 @@ export async function runTool(
       partial: false,
       notifications: [],
       binaryMediaFiles: [],
+      windowedFiles: [],
       reports: [],
     };
   }
@@ -398,6 +407,7 @@ export async function runTool(
   const reports: ToolReport[] = [{ file, origin: 'snapshot' }];
   const notifications: ToolNotification[] = [];
   let binaryMediaFiles: string[] = [];
+  let windowedFiles: string[] = [];
 
   if (name === 'semgrep') notifications.push(...semgrepNotifications(doc));
 
@@ -463,6 +473,32 @@ export async function runTool(
       await rewriteSidecarReport(sideFile, sideDoc, snapshot.mapping);
       reports.push({ file: sideFile, origin: 'quarantine' });
     }
+    // Windows pass: every plain text file over 100,000 bytes again, in overlapping windows under
+    // 100,000 bytes, so gitleaks reads each window in one piece and cannot cut through a secret.
+    const windowsDir = `${resolve(snapshot.dir)}.windows`;
+    const entries = await writeWindows(snapshot.dir, windowsDir);
+    if (entries.length > 0) {
+      const winOut = `${outputDir}-windows`;
+      await execute(
+        runner,
+        manifest,
+        name,
+        {
+          ...rest,
+          sourceDir: windowsDir,
+          outputDir: winOut,
+          scratchDir: `${scratchDir}-windows`,
+        },
+        q,
+        'windows',
+      );
+      const winFile = join(winOut, run.inv.outputFile);
+      const winDoc = await readJsonReport(name, winFile, q, 'windows', maxBytes);
+      remapWindowReport(winDoc, entries);
+      await writeFile(winFile, JSON.stringify(winDoc));
+      reports.push({ file: winFile, origin: 'windows' });
+      windowedFiles = [...new Set(entries.map((e) => `/src/${e.original}`))];
+    }
     const split = coverageSplit(unscanned.sort((a, b) => a.path.localeCompare(b.path)));
     notifications.push(...split.notifications);
     binaryMediaFiles = split.binaryMediaFiles;
@@ -474,6 +510,7 @@ export async function runTool(
     partial: notifications.length > 0,
     notifications,
     binaryMediaFiles,
+    windowedFiles,
     reports,
   };
 }

@@ -81,6 +81,40 @@ describe('PrivateKeyScan', () => {
     for (const size of [13, 100, 4_097]) expect(scan(marker, size).risky, String(size)).toBe(true);
   });
 
+  it('a decoy begin marker above the real key does not close the block early', () => {
+    const real = key('');
+    const decoys = [
+      `// -----BEGIN RSA PRIVATE KEY-----\n${real}`,
+      `-----BEGIN PRIVATE KEY\n${real}`,
+      `# see -----BEGIN PRIVATE KEY----- in the docs\n${'z'.repeat(1000)}\n${real}`,
+      real.replace(
+        '-----BEGIN RSA PRIVATE KEY-----\n',
+        '-----BEGIN RSA PRIVATE KEY-----\nxKEY-----\n',
+      ),
+    ];
+    for (const [i, k] of decoys.entries()) {
+      expect(scan(big(k)).risky, `decoy ${i}`).toBe(true);
+      expect(scan(big(k), 4_097).risky, `decoy ${i} in small reads`).toBe(true);
+    }
+  });
+
+  it('gives the same answer for every read split of a doubled header', () => {
+    const k = key('').replace(
+      '-----BEGIN RSA PRIVATE KEY-----',
+      '-----BEGIN PRIVATE KEY PRIVATE KEY-----',
+    );
+    const text = filler(100_100) + k + filler(2_000);
+    const start = text.indexOf('-----BEGIN');
+    expect(scan(text, text.length).risky).toBe(true);
+    for (let cut = start - 3; cut < start + 45; cut++) {
+      const a = new PrivateKeyScan();
+      const data = Buffer.from(text);
+      a.feed(data.subarray(0, cut));
+      a.feed(data.subarray(cut));
+      expect(a.risky, `split at ${cut - start}`).toBe(true);
+    }
+  });
+
   it('uses constant memory: many repeated markers do not grow state', () => {
     const sink = new PrivateKeyScan();
     const chunk = Buffer.from(`${'-----BEGIN RSA PRIVATE KEY-----\n'.repeat(1000)}`);
@@ -92,6 +126,18 @@ describe('PrivateKeyScan', () => {
 });
 
 describe('ChunkRisk blank lines', () => {
+  it('is not defeated by a whitespace-only line that straddles the 100,000-byte point', () => {
+    // 100,000 bytes ending "y\n " (newline at 99,998, space at 99,999), then 300 more spaces and
+    // a newline, then non-blank 80-byte lines. gitleaks cannot cut at that line, because its first
+    // newline is before the point, so the stretch really runs on to the hard limit.
+    const head = `${'x'.repeat(79)}\n`.repeat(1249) + `${'x'.repeat(77)}y\n `;
+    expect(head.length).toBe(100_000);
+    const text = `${head}${' '.repeat(300)}\n${`${'x'.repeat(79)}\n`.repeat(310)}`;
+    const r = new ChunkRisk();
+    r.feed(Buffer.from(text));
+    expect(r.risky).toBe(true);
+  });
+
   it('treats whitespace-only lines as blank', () => {
     const unit = `${'a'.repeat(79)}\n`.repeat(100) + '   \t\n';
     const r = new ChunkRisk();

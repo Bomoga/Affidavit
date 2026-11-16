@@ -285,7 +285,11 @@ export class ChunkRisk {
       }
       if (nl < 0) break;
       const blank = this.segWs;
-      if (blank) this.run = 0;
+      // A blank line restarts the stretch AT that line, not after it: gitleaks only cuts early at
+      // a blank line whose newlines both come after the 100,000-byte point, so a whitespace-only
+      // line that straddles it does not help. Starting the new run with the line's own bytes
+      // keeps the stretch conservative.
+      if (blank) this.run = this.segLen + 1;
       else this.run += this.segLen + 1;
       this.segLen = 0;
       this.segWs = true;
@@ -306,6 +310,7 @@ const PK_BEGIN = /-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY/gi;
 const PK_END = /KEY(?: BLOCK)?-----/gi;
 /** Longest begin marker is 11 + 100 + 11 characters; keep a margin so no marker is cut in two. */
 const PK_CARRY = 160;
+const PK_MIN_BODY = 64;
 const HAS_NON_WS = /[^ \t\r]/;
 
 /**
@@ -367,10 +372,17 @@ export class PrivateKeyScan {
           this.open = true;
           this.beginEnd = e.end;
           this.blank = false;
+        } else {
+          // A second begin marker (a decoy comment, a stray marker, or a header written twice) must
+          // not end the block early: gitleaks reads on past it. Keep the block and its blank flag,
+          // and move the header end forward.
+          this.beginEnd = Math.max(this.beginEnd, e.end);
         }
       } else if (e.kind === 'blank') {
         if (this.open) this.blank = true;
-      } else if (this.open && e.at >= this.beginEnd) {
+      } else if (this.open && e.at >= this.beginEnd + PK_MIN_BODY) {
+        // gitleaks needs at least 64 characters between the header and the close marker, so a
+        // close marker sooner than that (an \`xKEY-----\` line right after the header) is not one.
         if (this.blank) this.flagged = true;
         this.open = false;
       }

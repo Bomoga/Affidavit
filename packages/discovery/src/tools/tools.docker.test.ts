@@ -718,6 +718,190 @@ describe.skipIf(!enabled)('tool images, offline', () => {
     expect(res.partial).toBe(true);
   }, 300_000);
 
+  describe('secrets the pinned gitleaks misses at a chunk cut', () => {
+    // A tiny seeded generator keeps every run reproducible.
+    const rng = (seed: number) => {
+      let a = seed >>> 0;
+      return () => {
+        a = (a + 0x6d2b79f5) >>> 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    };
+    const ALNUM = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    const randomChars = (r: () => number, n: number, set = ALNUM) =>
+      Array.from({ length: n }, () => set[Math.floor(r() * set.length)]).join('');
+
+    const body = Array.from({ length: 4 }, (_, i) =>
+      Buffer.from(`affidavit-fake-key-body-1-${i}-`.repeat(3)).toString('base64').slice(0, 64),
+    );
+    const pem = (above = '', afterHeader = '') =>
+      `${above}-----BEGIN RSA PRIVATE KEY-----\n${afterHeader}${body[0]}\n${body[1]}\n\n${body[2]}\n${body[3]}\n-----END RSA PRIVATE KEY-----\n`;
+    /** JS with a blank line every ~1.6 KB, the layout of the probe that found the misses. */
+    const filler = (bytes: number) => {
+      let out = '';
+      let n = 0;
+      while (out.length < bytes) {
+        out += `var v${n} = '${'x'.repeat(60)}';\n`;
+        if (++n % 20 === 0) out += '\n';
+      }
+      return `${out.slice(0, bytes - 1)}\n`;
+    };
+    /** Lines with no blank line at all. */
+    const dense = (bytes: number) => {
+      const line = `${'x'.repeat(79)}\n`;
+      return line.repeat(Math.floor(bytes / 80)) + 'y'.repeat(bytes % 80);
+    };
+
+    type Findings = { ruleId?: string; uri: string }[];
+    const mainFindings = (sc: Scenario): Findings =>
+      sarifFindings(readFileSync(join(sc.out('gitleaks'), 'gitleaks.sarif'), 'utf8')).map((f) => ({
+        ruleId: f.ruleId,
+        uri: f.uri,
+      }));
+    const windowFindings = (res: ToolRunResult): Findings => {
+      const rep = res.reports.find((r) => r.origin === 'windows');
+      return rep
+        ? sarifFindings(readFileSync(rep.file, 'utf8')).map((f) => ({
+            ruleId: f.ruleId,
+            uri: f.uri,
+          }))
+        : [];
+    };
+    const has = (f: Findings, rule: string, path: string) =>
+      f.some((x) => x.ruleId === rule && x.uri.endsWith(path));
+
+    async function runGitleaks(sc: Scenario) {
+      const snap = await quarantineSnapshot(sc.src);
+      const { sourceDir: _ignored, ...rest } = sc.options('gitleaks');
+      void _ignored;
+      return runTool(sc.runner, manifest, 'gitleaks', { ...rest, snapshot: snap });
+    }
+
+    it('decoy begin markers cannot hide a key: gitleaks misses it, the windows pass finds it, and it is flagged', async () => {
+      const decoys: Record<string, string> = {
+        commentAbove: pem('// -----BEGIN RSA PRIVATE KEY-----\n'),
+        noCloseAbove: pem('-----BEGIN PRIVATE KEY\n'),
+        kilobyteAbove: pem(`# see -----BEGIN PRIVATE KEY----- in the docs\n${'z'.repeat(1000)}\n`),
+        fakeCloseAfterHeader: pem('', 'xKEY-----\n'),
+      };
+      const files: string[] = [];
+      const sc = scenario('repo', (src) => {
+        mkdirSync(join(src, 'd'));
+        for (const [name, k] of Object.entries(decoys)) {
+          for (const off of [105_000, 186_000]) {
+            const f = `d_${name}_${off}.js`;
+            files.push(f);
+            writeFileSync(join(src, 'd', f), filler(off) + k + filler(300_000 - off - k.length));
+          }
+        }
+      });
+      const res = await runGitleaks(sc);
+      const main = mainFindings(sc);
+      const win = windowFindings(res);
+      const flagged = new Set(
+        res.notifications
+          .filter((n) => n.id === 'multiline-split-risk')
+          .map((n) => n.message.split(' ')[0]),
+      );
+      // Whether gitleaks alone misses a given file depends on where its cuts fall relative to the
+      // key; some of these are found. The test needs real misses to mean anything, and for every
+      // file discovery must find it in the windows pass and flag it.
+      const missed = files.filter((f) => !has(main, 'private-key', `d/${f}`));
+      expect(missed.length, 'gitleaks alone really misses several of these').toBeGreaterThanOrEqual(
+        4,
+      );
+      for (const f of files) {
+        expect(has(win, 'private-key', `d/${f}`), `windows pass should find ${f}`).toBe(true);
+        expect(flagged.has(`/src/d/${f}`), `${f} should be flagged`).toBe(true);
+      }
+    }, 300_000);
+
+    it('a whitespace-only line that straddles byte 100,000 cannot hide a token across the hard cut', async () => {
+      const r = rng(42);
+      const token = `ghp_${randomChars(r, 36)}`;
+      // 100,000 bytes ending "y\n " (newline at 99,998, space at 99,999), then 300 spaces and a
+      // newline, then non-blank lines, with the token across offset 125,001
+      const head = `${'x'.repeat(79)}\n`.repeat(1249) + `${'x'.repeat(77)}y\n `;
+      const ws = `${' '.repeat(300)}\n`;
+      const pre = head + ws;
+      const before = dense(124_990 - pre.length);
+      const text = `${pre}${before}token ${token}\n${dense(20_000)}`;
+      expect(text.indexOf(token)).toBeLessThan(125_001);
+      expect(text.indexOf(token) + token.length).toBeGreaterThan(125_001);
+      const sc = scenario('repo', (src) => writeFileSync(join(src, 'src', 'straddle.txt'), text));
+      const res = await runGitleaks(sc);
+      expect(
+        has(mainFindings(sc), 'github-pat', 'src/straddle.txt'),
+        'gitleaks alone should miss it',
+      ).toBe(false);
+      expect(
+        has(windowFindings(res), 'github-pat', 'src/straddle.txt'),
+        'windows pass finds it',
+      ).toBe(true);
+      expect(
+        res.notifications.some(
+          (n) => n.id === 'chunk-split-risk' && n.message.includes('straddle.txt'),
+        ),
+      ).toBe(true);
+    }, 300_000);
+
+    it('a keyword and value split by a blank line just past byte 100,000 are found by the windows pass', async () => {
+      const r = rng(7);
+      const hex = (n: number) => randomChars(r, n, '0123456789abcdef');
+      const uuid = `${hex(8)}-${hex(4)}-${hex(4)}-${hex(4)}-${hex(12)}`;
+      const text = `${dense(99_985)}heroku_api_key =\n\n"${uuid}"\n${dense(30_000)}`;
+      const sc = scenario('repo', (src) => writeFileSync(join(src, 'src', 'heroku.txt'), text));
+      const res = await runGitleaks(sc);
+      expect(
+        has(mainFindings(sc), 'heroku-api-key', 'src/heroku.txt'),
+        'gitleaks alone should miss it',
+      ).toBe(false);
+      expect(
+        has(windowFindings(res), 'heroku-api-key', 'src/heroku.txt'),
+        'windows pass finds it',
+      ).toBe(true);
+      expect(res.windowedFiles).toContain('/src/src/heroku.txt');
+    }, 300_000);
+
+    it('seeded sweep: a decoy-wrapped key is always found or flagged, never silently missed', async () => {
+      const r = rng(2024);
+      const shapes = [
+        (k: string) => k,
+        (k: string) => `// -----BEGIN PRIVATE KEY\n${k}`,
+        (k: string) => `-----BEGIN RSA PRIVATE KEY-----\n${k}`,
+        (k: string) => `${'#'.repeat(500)} -----BEGIN PRIVATE KEY-----\n${k}`,
+      ];
+      const picks: { f: string; k: string; off: number }[] = [];
+      for (let i = 0; i < 12; i++) {
+        const k = shapes[Math.floor(r() * shapes.length)]!(pem());
+        const off = 96_000 + Math.floor(r() * 38) * 3_000;
+        picks.push({ f: `sweep_${i}_${off}.js`, k, off });
+      }
+      const sc = scenario('repo', (src) => {
+        mkdirSync(join(src, 'sw'));
+        for (const p of picks) {
+          writeFileSync(
+            join(src, 'sw', p.f),
+            filler(p.off) + p.k + filler(300_000 - p.off - p.k.length),
+          );
+        }
+      });
+      const res = await runGitleaks(sc);
+      const main = mainFindings(sc);
+      const win = windowFindings(res);
+      const flagged = new Set(res.notifications.map((n) => n.message.split(' ')[0]));
+      for (const p of picks) {
+        const ok =
+          has(main, 'private-key', `sw/${p.f}`) ||
+          has(win, 'private-key', `sw/${p.f}`) ||
+          flagged.has(`/src/sw/${p.f}`);
+        expect(ok, `silently missed: ${p.f} at ${p.off}`).toBe(true);
+      }
+    }, 300_000);
+  });
+
   it('flags a secret that straddles gitleaks chunk boundary, in dense lines and in one long line', async () => {
     const secret = 'AFFIDAVIT_FAKE_KEY_0123456789ABCDEF';
     const s = scenario('repo', (src) => {
