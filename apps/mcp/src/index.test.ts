@@ -1,4 +1,6 @@
 import { readFileSync } from 'node:fs';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -8,6 +10,7 @@ import {
   ApiError,
   ApiSchemaError,
   TOOL_NAME,
+  VerdictOutput,
   configFromEnv,
   createAffidavitMcpServer,
   createHttpApi,
@@ -143,6 +146,7 @@ describe('request_verdict over an in-memory MCP transport', () => {
     });
     const bundle = res.structured?.['bundle'] as { message: string };
     expect(bundle.message).toMatch(/no bundle yet/i);
+    expect(VerdictOutput.safeParse(res.structured).success).toBe(true);
   });
 
   it('returns the bundle link when the verdict has a bundle', async () => {
@@ -192,12 +196,15 @@ describe('request_verdict error results', () => {
     const missing = await call(client, {});
     expect(missing.isError).toBe(true);
     expect(missing.data['kind']).toBe('invalid-input');
+    const both = await call(client, { caseId: CASE_ID, repoUrl: REPO_URL, commit: COMMIT });
+    expect(both.isError).toBe(true);
+    expect(both.data['kind']).toBe('invalid-input');
     expect(calls).toEqual([]);
   });
 
   it('returns an error result for a schema-invalid API response', async () => {
     const http = createHttpApi({
-      baseUrl: 'http://api.test/',
+      baseUrl: 'https://api.test/',
       fetch: () =>
         Promise.resolve(
           new Response(JSON.stringify({ schemaVersion: 1, caseId: 'x', stage: 'nonsense' }), {
@@ -295,6 +302,30 @@ describe('escalated and dismissed verdicts', () => {
   });
 });
 
+describe('bundle link checks', () => {
+  it('withholds a bundle whose sha256 differs from the verdict', async () => {
+    const { api } = fakeApi({
+      verdict: { ...baseVerdict, bundleSha256: BUNDLE_SHA },
+      bundle: { ...BUNDLE, sha256: 'd'.repeat(64) },
+    });
+    const res = await call(await connect(api), { caseId: CASE_ID });
+    expect(res.isError).toBe(false);
+    expect(res.structured?.['bundle']).toMatchObject({ status: 'unavailable' });
+    expect(JSON.stringify(res.structured)).not.toContain(BUNDLE.url);
+  });
+
+  it('withholds a bundle link with embedded credentials', async () => {
+    const url = 'https://user:pw@bundles.example.test/x';
+    const { api } = fakeApi({
+      verdict: { ...baseVerdict, bundleSha256: BUNDLE_SHA },
+      bundle: { ...BUNDLE, url },
+    });
+    const res = await call(await connect(api), { caseId: CASE_ID });
+    expect(res.structured?.['bundle']).toMatchObject({ status: 'unavailable' });
+    expect(JSON.stringify(res.structured)).not.toContain('pw@');
+  });
+});
+
 describe('bundle link scheme', () => {
   it.each(['javascript:alert(1)', 'file:///etc/passwd', 'data:text/html,hi', 'http://x.test/b'])(
     'does not report %s as available',
@@ -315,7 +346,7 @@ describe('http client', () => {
   it('uses the configured base URL and token, and parses with the contract', async () => {
     const seen: { url: string; auth: string | null }[] = [];
     const api = createHttpApi({
-      baseUrl: 'http://api.test/',
+      baseUrl: 'https://api.test/',
       token: 'test-token',
       fetch: ((url: string, init: RequestInit) => {
         seen.push({ url, auth: new Headers(init.headers).get('authorization') });
@@ -325,14 +356,14 @@ describe('http client', () => {
     const v = await api.getVerdict(CASE_ID);
     expect(v.outcome).toBe(baseVerdict['outcome']);
     expect(seen[0]).toEqual({
-      url: `http://api.test/cases/${CASE_ID}/verdict`,
+      url: `https://api.test/cases/${CASE_ID}/verdict`,
       auth: 'Bearer test-token',
     });
   });
 
   it('throws ApiError on non-2xx and on network failure', async () => {
     const mk = (f: typeof fetch): AffidavitApi =>
-      createHttpApi({ baseUrl: 'http://api.test', fetch: f });
+      createHttpApi({ baseUrl: 'https://api.test', fetch: f });
     await expect(
       mk(() => Promise.resolve(new Response('x', { status: 500 }))).getVerdict(CASE_ID),
     ).rejects.toBeInstanceOf(ApiError);
@@ -359,19 +390,79 @@ describe('http client', () => {
     expect(requests).toBe(0);
   });
 
-  it('rejects an unsafe caseId in the createCase response', async () => {
+  it('refuses plain http, credentials and bad tokens in createHttpApi itself', () => {
+    expect(() => createHttpApi({ baseUrl: 'http://api.example.test', token: 't' })).toThrow(
+      /https/,
+    );
+    expect(() => createHttpApi({ baseUrl: 'https://u:p@api.example.test' })).toThrow(/credentials/);
+    expect(() => createHttpApi({ baseUrl: 'https://api.test', token: 'a b' })).toThrow(/TOKEN/);
+  });
+
+  it('refuses tokens with a newline or non-Latin-1 characters without echoing them', () => {
+    for (const token of ['SECRET-abc\ndef', 'SECRET-Δ☃']) {
+      for (const make of [
+        () => configFromEnv({ AFFIDAVIT_API_URL: 'https://a.test', AFFIDAVIT_API_TOKEN: token }),
+        () => createHttpApi({ baseUrl: 'https://a.test', token }),
+      ]) {
+        let message = '';
+        try {
+          make();
+        } catch (err) {
+          message = err instanceof Error ? err.message : '';
+        }
+        expect(message).toMatch(/AFFIDAVIT_API_TOKEN/);
+        expect(message).not.toContain('SECRET');
+      }
+    }
+  });
+
+  it('does not leak the token through a fetch error that echoes it', async () => {
+    const token = 'SECRET-abc';
     const api = createHttpApi({
       baseUrl: 'https://api.test',
-      fetch: () =>
-        Promise.resolve(
-          new Response(JSON.stringify({ schemaVersion: 1, caseId: '..', stage: 'intake' }), {
-            status: 200,
-          }),
-        ),
+      token,
+      fetch: () => Promise.reject(new Error(`Headers.append: "Bearer ${token}" is invalid`)),
     });
-    await expect(api.createCase({ repoUrl: REPO_URL, commit: COMMIT })).rejects.toBeInstanceOf(
-      ApiSchemaError,
-    );
+    const res = await call(await connect(api), { caseId: CASE_ID });
+    expect(res.isError).toBe(true);
+    expect(res.data['kind']).toBe('api-error');
+    expect(JSON.stringify(res)).not.toContain(token);
+  });
+
+  it('maps a body-read timeout to a timeout ApiError, not a schema error', async () => {
+    const api = createHttpApi({
+      baseUrl: 'https://api.test',
+      timeoutMs: 20,
+      fetch: () => {
+        const res = new Response('{}', { status: 200 });
+        const stalled = Object.assign(res, {
+          json: () => Promise.reject(new DOMException('timed out', 'TimeoutError')),
+        });
+        return Promise.resolve(stalled);
+      },
+    });
+    const err: unknown = await api.getVerdict(CASE_ID).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).message).toMatch(/timed out/);
+  });
+
+  it('talks to a local node:http server serving the fixture verdict', async () => {
+    const seenAuth: (string | undefined)[] = [];
+    const server = createServer((req, res) => {
+      seenAuth.push(req.headers.authorization);
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify(baseVerdict));
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const { port } = server.address() as AddressInfo;
+      const api = createHttpApi({ baseUrl: `http://127.0.0.1:${port}/v1/`, token: 'tok' });
+      const v = await api.getVerdict(CASE_ID);
+      expect(v.summary).toBe(SUMMARY);
+      expect(seenAuth).toEqual(['Bearer tok']);
+    } finally {
+      server.close();
+    }
   });
 
   it('sets a timeout signal and refuses redirects', async () => {
@@ -431,6 +522,16 @@ describe('configFromEnv', () => {
     );
     expect(() => configFromEnv({ AFFIDAVIT_API_URL: 'http://api.example.test' })).toThrow(/https/);
     expect(() => configFromEnv({ AFFIDAVIT_API_URL: 'ftp://localhost' })).toThrow(/https/);
+  });
+
+  it('rejects a query or fragment and normalises the path', () => {
+    for (const u of ['https://a.test/?x=1', 'https://a.test/#f', 'https://a.test/v1?k=v']) {
+      expect(() => configFromEnv({ AFFIDAVIT_API_URL: u })).toThrow(/query or fragment/);
+    }
+    expect(configFromEnv({ AFFIDAVIT_API_URL: 'https://a.test/' }).baseUrl).toBe('https://a.test');
+    expect(configFromEnv({ AFFIDAVIT_API_URL: 'https://a.test/v1/' }).baseUrl).toBe(
+      'https://a.test/v1',
+    );
   });
 
   it('rejects a missing, malformed or credential-bearing URL', () => {

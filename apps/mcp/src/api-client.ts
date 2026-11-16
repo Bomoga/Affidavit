@@ -48,13 +48,14 @@ export interface HttpApiConfig {
   fetch?: typeof fetch;
 }
 
+/** Printable ASCII only: a token with whitespace, control or non-ASCII characters is refused. */
+const TOKEN_RE = /^[\x21-\x7E]+$/;
+
 /**
- * Reads AFFIDAVIT_API_URL (required), AFFIDAVIT_API_TOKEN (optional) and AFFIDAVIT_API_TIMEOUT_MS
- * (optional). The URL must be https, except for localhost and 127.0.0.1, and carry no credentials.
+ * Validates an API base URL and returns origin plus path without a trailing slash. It must be
+ * https (http only for localhost and 127.0.0.1) and carry no credentials, query or fragment.
  */
-export function configFromEnv(env: Record<string, string | undefined>): HttpApiConfig {
-  const raw = env['AFFIDAVIT_API_URL'];
-  if (!raw) throw new Error('AFFIDAVIT_API_URL is not set');
+export function normalizeBaseUrl(raw: string): string {
   let url: URL;
   try {
     url = new URL(raw);
@@ -64,13 +65,35 @@ export function configFromEnv(env: Record<string, string | undefined>): HttpApiC
   if (url.username || url.password) {
     throw new Error('AFFIDAVIT_API_URL must not contain embedded credentials');
   }
+  if (url.search || url.hash) {
+    throw new Error('AFFIDAVIT_API_URL must not contain a query or fragment');
+  }
   const local = url.hostname === 'localhost' || url.hostname === '127.0.0.1';
   if (url.protocol !== 'https:' && !(url.protocol === 'http:' && local)) {
     throw new Error('AFFIDAVIT_API_URL must use https (http is allowed only for localhost)');
   }
-  const config: HttpApiConfig = { baseUrl: raw };
+  return url.origin + url.pathname.replace(/\/+$/, '');
+}
+
+function checkToken(token: string): void {
+  if (!TOKEN_RE.test(token)) {
+    throw new Error('AFFIDAVIT_API_TOKEN must be printable ASCII with no whitespace');
+  }
+}
+
+/**
+ * Reads AFFIDAVIT_API_URL (required), AFFIDAVIT_API_TOKEN (optional) and AFFIDAVIT_API_TIMEOUT_MS
+ * (optional). See normalizeBaseUrl for the URL rules.
+ */
+export function configFromEnv(env: Record<string, string | undefined>): HttpApiConfig {
+  const raw = env['AFFIDAVIT_API_URL'];
+  if (!raw) throw new Error('AFFIDAVIT_API_URL is not set');
+  const config: HttpApiConfig = { baseUrl: normalizeBaseUrl(raw) };
   const token = env['AFFIDAVIT_API_TOKEN'];
-  if (token) config.token = token;
+  if (token) {
+    checkToken(token);
+    config.token = token;
+  }
   const timeout = env['AFFIDAVIT_API_TIMEOUT_MS'];
   if (timeout !== undefined && timeout !== '') {
     const ms = Number(timeout);
@@ -89,8 +112,14 @@ export function errorText(err: unknown): string {
 /** Thin fetch wrapper. Every response body is parsed with its contract schema. */
 export function createHttpApi(config: HttpApiConfig): AffidavitApi {
   const doFetch = config.fetch ?? fetch;
-  const base = config.baseUrl.replace(/\/+$/, '');
+  // Validate here, not only in configFromEnv, so this function cannot send a token over plain http.
+  const base = normalizeBaseUrl(config.baseUrl);
+  if (config.token !== undefined) checkToken(config.token);
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const redact = (text: string): string =>
+    config.token ? text.replaceAll(config.token, '[redacted]') : text;
+  const isAbort = (err: unknown): boolean =>
+    err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError');
 
   function safeId(id: string): string {
     if (!SAFE_ID.test(id)) throw new ApiError('refusing to build a request path from an unsafe id');
@@ -120,40 +149,35 @@ export function createHttpApi(config: HttpApiConfig): AffidavitApi {
     try {
       res = await doFetch(`${base}${path}`, init);
     } catch (err) {
-      if (err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
-        throw new ApiError(`${method} ${path} timed out after ${timeoutMs} ms`);
-      }
-      throw new ApiError(`request to ${method} ${path} failed: ${errorText(err)}`);
+      // Fixed messages only: raw fetch errors can echo request headers, which hold the token.
+      if (isAbort(err)) throw new ApiError(`${method} ${path} timed out after ${timeoutMs} ms`);
+      throw new ApiError(`request to ${method} ${path} failed: network error`);
     }
     if (!res.ok) throw new ApiError(`${method} ${path} returned HTTP ${res.status}`, res.status);
     let json: unknown;
     try {
       json = await res.json();
-    } catch {
+    } catch (err) {
+      if (isAbort(err)) throw new ApiError(`${method} ${path} timed out after ${timeoutMs} ms`);
       throw new ApiSchemaError(`${method} ${path} returned a body that is not JSON`);
     }
     try {
       return schema.parse(json);
     } catch (err) {
       throw new ApiSchemaError(
-        `${method} ${path} returned a body that does not match the contract: ${errorText(err)}`,
+        `${method} ${path} returned a body that does not match the contract: ${redact(errorText(err))}`,
       );
     }
   }
 
   return {
-    createCase: async (request) => {
-      const created = await call(
+    createCase: async (request) =>
+      await call(
         'POST',
         '/cases',
         ApiRoutes.createCase.response,
         ApiRoutes.createCase.request.parse(request),
-      );
-      if (!SAFE_ID.test(created.caseId)) {
-        throw new ApiSchemaError('POST /cases returned a caseId with unsafe characters');
-      }
-      return created;
-    },
+      ),
     getCase: async (caseId) =>
       await call('GET', `/cases/${safeId(caseId)}`, ApiRoutes.getCase.response),
     getVerdict: async (caseId) =>

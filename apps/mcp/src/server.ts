@@ -1,6 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
-import { ApiRoutes, CaseId, TERMINAL_STAGES, type Verdict } from '@affidavit/contracts';
+import { ApiRoutes, BudgetState, CaseId, TERMINAL_STAGES, Verdict } from '@affidavit/contracts';
 import { ApiError, ApiSchemaError, SAFE_ID, errorText, type AffidavitApi } from './api-client.js';
 
 export const TOOL_NAME = 'request_verdict';
@@ -34,23 +34,52 @@ function success(body: Record<string, unknown>): CallToolResult {
   return { content: [{ type: 'text', text: JSON.stringify(body) }], structuredContent: body };
 }
 
-function isHttps(url: string): boolean {
+/** Only a plain https link, with no embedded credentials, is ever handed to the client. */
+function isSafeLink(url: string): boolean {
   try {
-    return new URL(url).protocol === 'https:';
+    const u = new URL(url);
+    return u.protocol === 'https:' && !u.username && !u.password;
   } catch {
     return false;
   }
 }
 
+/**
+ * Output schema built only from schemas the contracts package exports, so apps/mcp needs no zod
+ * dependency. Loose string fields reuse `Verdict.shape.summary` as a plain string schema.
+ */
+const Str = Verdict.shape.summary;
+const BundleOutput = ApiRoutes.getBundle.response
+  .pick({ sha256: true, url: true, expiresAt: true })
+  .partial()
+  .extend({ status: Str, message: Str.optional() });
+export const VerdictOutput = Verdict.pick({
+  caseId: true,
+  outcome: true,
+  summary: true,
+  severity: true,
+}).extend({
+  status: Str,
+  needsHumanReview: BudgetState.shape.exhausted.optional(),
+  bundle: BundleOutput,
+});
+
 async function bundleField(api: AffidavitApi, verdict: Verdict): Promise<Record<string, unknown>> {
   if (!verdict.bundleSha256) return { status: 'none', message: NO_BUNDLE_MESSAGE };
   try {
     const b = await api.getBundle(verdict.bundleSha256);
-    if (!isHttps(b.url)) {
+    if (b.sha256 !== verdict.bundleSha256) {
       return {
         status: 'unavailable',
         sha256: verdict.bundleSha256,
-        message: 'Bundle link was withheld because it is not an https link.',
+        message: 'Bundle link was withheld because it is for a different bundle.',
+      };
+    }
+    if (!isSafeLink(b.url)) {
+      return {
+        status: 'unavailable',
+        sha256: verdict.bundleSha256,
+        message: 'Bundle link was withheld because it is not a plain https link.',
       };
     }
     return { status: 'available', sha256: b.sha256, url: b.url, expiresAt: b.expiresAt };
@@ -68,6 +97,10 @@ async function run(
   input: { repoUrl?: string | undefined; commit?: string | undefined; caseId?: string | undefined },
 ): Promise<CallToolResult> {
   let caseId: CaseId;
+  const hasChange = input.repoUrl !== undefined || input.commit !== undefined;
+  if (input.caseId !== undefined && hasChange) {
+    return failure('invalid-input', 'Provide either caseId, or repoUrl and commit, not both.');
+  }
   if (input.caseId !== undefined) {
     caseId = CaseId.parse(input.caseId);
   } else if (input.repoUrl !== undefined && input.commit !== undefined) {
@@ -119,7 +152,11 @@ export function createAffidavitMcpServer(api: AffidavitApi): McpServer {
   const server = new McpServer({ name: 'affidavit', version: '0.0.0' });
   server.registerTool(
     TOOL_NAME,
-    { description: TOOL_DESCRIPTION, inputSchema: RequestVerdictInput },
+    {
+      description: TOOL_DESCRIPTION,
+      inputSchema: RequestVerdictInput,
+      outputSchema: VerdictOutput,
+    },
     async (input) => {
       try {
         return await run(api, input);
