@@ -46,3 +46,15 @@ export { createRemedyHandler } from './remedy.js';
 export type { RemedyConfig, RemedyDeps } from './remedy.js';
 export { buildPatchExhibit, diffStats, isAccepted, rejectionRule } from './patch.js';
 export type { DiffStats } from './patch.js';
+export {
+  buildVerdict,
+  checkSummary,
+  decideOutcome,
+  finalizeVerdict,
+  lintGeneratedText,
+  renderSummary,
+} from './verdict.js';
+export type { StructuredVerdict, VerdictInput, VerdictOutcome } from './verdict.js';
+export { createVerifyHandler } from './verify.js';
+export type { VerifyDeps } from './verify.js';
+export type { RunInfo } from './orchestrator.js';
