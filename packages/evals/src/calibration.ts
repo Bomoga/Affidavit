@@ -1,4 +1,4 @@
-import type { Ballot, CaseId } from '@affidavit/contracts';
+import { Verdict, type Ballot, type CaseId } from '@affidavit/contracts';
 import type { ReplayResult, TrialOutcome } from './replay.js';
 
 /** Branded so a bare string cannot stand in for a run id. */
@@ -84,12 +84,40 @@ export function createEvalRun(input: {
   replays: readonly TaggedReplay[];
   baseline?: readonly BaselineDecision[];
 }): EvalRun {
-  const { runId } = input.manifest;
+  // Clone first, then validate and freeze the clone, so the caller cannot swap values between
+  // the checks and the use.
+  const copy = structuredClone({
+    manifest: input.manifest,
+    labels: [...input.labels],
+    replays: [...input.replays],
+    baseline: [...(input.baseline ?? [])],
+  });
+  const { runId } = copy.manifest;
   if (typeof runId !== 'string' || !RUN_ID_PATTERN.test(runId)) {
     throw new Error('manifest.runId is required and must match ^[A-Za-z0-9._:-]{1,128}$');
   }
-  const baseline = input.baseline ?? [];
-  for (const r of input.replays) {
+  const kind: unknown = (copy.manifest.labelsSource as LabelsSource | undefined)?.kind;
+  if (kind !== 'corpus' && kind !== 'synthetic') {
+    throw new Error("manifest.labelsSource.kind must be exactly 'corpus' or 'synthetic'");
+  }
+  const outcomes: readonly string[] = Verdict.shape.outcome.options;
+  const checkOutcome = (what: string, outcome: unknown): void => {
+    if (typeof outcome !== 'string' || !outcomes.includes(outcome)) {
+      throw new Error(`${what} has unknown outcome ${String(outcome)}`);
+    }
+  };
+  for (const l of copy.labels) checkOutcome(`label for ${l.caseId}`, l.expected);
+  for (const b of copy.baseline) checkOutcome(`baseline for ${b.caseId}`, b.outcome);
+  for (const r of copy.replays) {
+    checkOutcome(`replay for ${r.result.caseId}`, r.result.outcome);
+    for (const usd of [r.result.cost.usd, ...r.result.costRows.map((c) => c.usd)]) {
+      if (!Number.isFinite(usd) || usd < 0) {
+        throw new Error(`replay for ${r.result.caseId} has invalid cost ${String(usd)}`);
+      }
+    }
+  }
+  const baseline = copy.baseline;
+  for (const r of copy.replays) {
     const seen = new Set<string>();
     for (const b of r.result.ballots) {
       voteIndex(b); // throws on a vote outside the contract scale
@@ -102,17 +130,17 @@ export function createEvalRun(input: {
   }
   assertUnique(
     'replays',
-    input.replays.map((r) => r.result.caseId),
+    copy.replays.map((r) => r.result.caseId),
   );
   assertUnique(
     'labels',
-    input.labels.map((l) => l.caseId),
+    copy.labels.map((l) => l.caseId),
   );
   assertUnique(
     'baseline',
     baseline.map((b) => b.caseId),
   );
-  for (const r of input.replays) {
+  for (const r of copy.replays) {
     if (r.runId !== runId)
       throw new Error(`replay for ${r.result.caseId} is tagged ${r.runId}, not ${runId}`);
   }
@@ -120,13 +148,7 @@ export function createEvalRun(input: {
     if (b.runId !== runId)
       throw new Error(`baseline for ${b.caseId} is tagged ${b.runId}, not ${runId}`);
   }
-  // Deep copies, then deep freeze: later mutation of the caller's objects cannot change a run.
-  const run: EvalRun = deepFreeze({
-    manifest: structuredClone(input.manifest),
-    labels: structuredClone([...input.labels]),
-    replays: structuredClone([...input.replays]),
-    baseline: structuredClone([...baseline]),
-  });
+  const run: EvalRun = deepFreeze(copy);
   created.add(run);
   return run;
 }
@@ -161,7 +183,7 @@ function measured(run: EvalRun, value: number, n: number, cases = n): Metric {
     n,
     cases,
     runId: run.manifest.runId,
-    synthetic: run.manifest.labelsSource.kind === 'synthetic',
+    synthetic: run.manifest.labelsSource.kind !== 'corpus',
   };
 }
 
@@ -396,14 +418,17 @@ export function compareToBaseline(
   return wrongCorrelation.value <= policy.maxWrongCaseCorrelation ? 'supported' : 'not-supported';
 }
 
-/** minCases must be a finite integer of at least 1; the correlation cap finite and in [-1, 1). */
+/**
+ * A policy may only be as strict as the defaults or stricter: `minCases` a finite integer at or
+ * above the default, and the correlation cap finite, within [-1, 1] and at or below the default.
+ */
 export function validatePolicy(p: ComparisonPolicy): boolean {
   return (
     Number.isInteger(p.minCases) &&
-    p.minCases >= 1 &&
+    p.minCases >= DEFAULT_POLICY.minCases &&
     Number.isFinite(p.maxWrongCaseCorrelation) &&
     p.maxWrongCaseCorrelation >= -1 &&
-    p.maxWrongCaseCorrelation < 1
+    p.maxWrongCaseCorrelation <= DEFAULT_POLICY.maxWrongCaseCorrelation
   );
 }
 

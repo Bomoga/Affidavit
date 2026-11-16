@@ -15,8 +15,10 @@ import {
   jurorCorrelation,
   tagReplay,
   type Metric,
+  type RunManifest,
 } from './calibration.js';
-import { ballot, cid, makeRun, replay } from './synthetic.test-helpers.js';
+import type { TrialOutcome } from './replay.js';
+import { ballot, cid, makeRun, replay, winRun } from './synthetic.test-helpers.js';
 
 const value = (m: Metric): number => {
   if (m.status !== 'measured') throw new Error(`unmeasured: ${m.reason}`);
@@ -309,32 +311,24 @@ describe('compareToBaseline', () => {
     expect(() => juryAccuracy(forged)).toThrow(/createEvalRun/);
   });
 
-  it('never supports a win under an invalid policy', () => {
-    const ids = Array.from({ length: 12 }, (_, i) => `c${i}`);
-    const run = makeRun({
-      kind: 'corpus',
-      labels: ids.map((id) => [id, 'proven-fixed']),
-      replays: ids.map((id, i) =>
-        i < 2
-          ? replay(id, 'not-proven', i === 0 ? ['low', 'critical'] : ['critical', 'low'])
-          : replay(id, 'proven-fixed', ['high', 'high']),
-      ),
-      baseline: ids.map((id) => [id, 'not-proven']),
-    });
+  it('never supports a win under an invalid or looser policy', () => {
+    const run = winRun();
     for (const bad of [
       { minCases: Number.NaN },
       { minCases: 0 },
+      { minCases: 5 },
       { minCases: 1.5 },
       { maxWrongCaseCorrelation: Number.POSITIVE_INFINITY },
       { maxWrongCaseCorrelation: 1 },
+      { maxWrongCaseCorrelation: 0.9 },
       { maxWrongCaseCorrelation: Number.NaN },
     ]) {
       expect(computeReport(run, bad).juryVsBaseline).not.toBe('supported');
     }
-    // A valid policy with the same data can support, so the guard is what blocks the others.
-    expect(computeReport(run, { minCases: 2 }).juryVsBaseline).toBe('supported');
+    // The default policy with the same data supports, so the guard is what blocks the others.
+    expect(computeReport(run).juryVsBaseline).toBe('supported');
     expect(validatePolicy({ minCases: 10, maxWrongCaseCorrelation: 0.5 })).toBe(true);
-    expect(validatePolicy({ minCases: 10, maxWrongCaseCorrelation: -1 })).toBe(true);
+    expect(validatePolicy({ minCases: 20, maxWrongCaseCorrelation: -1 })).toBe(true);
   });
 
   it('applies the minimum-sample gate before the accuracy comparison', () => {
@@ -367,6 +361,64 @@ describe('compareToBaseline', () => {
     }).toThrow(TypeError);
     const m = juryAccuracy(run);
     expect(m.status === 'measured' && m.synthetic).toBe(true);
+  });
+
+  it('rejects any labels kind other than exactly corpus or synthetic', () => {
+    for (const kind of ['Corpus', undefined, 'other', 'real', '']) {
+      expect(() =>
+        createEvalRun({
+          manifest: {
+            runId: asRunId('run-kind'),
+            startedAt: 'x',
+            labelsSource: { kind, ref: 'r' },
+            modelIds: {},
+            promptVersions: {},
+          } as unknown as RunManifest,
+          labels: [],
+          replays: [],
+        }),
+      ).toThrow(/exactly 'corpus' or 'synthetic'/);
+    }
+  });
+
+  it('rejects unknown outcomes and invalid costs', () => {
+    const bad = 'proven-ish' as unknown as TrialOutcome;
+    expect(() => makeRun({ labels: [['a', bad]], replays: [] })).toThrow(/unknown outcome/);
+    expect(() => makeRun({ labels: [], replays: [replay('a', bad, [])] })).toThrow(
+      /unknown outcome/,
+    );
+    expect(() => makeRun({ labels: [], replays: [], baseline: [['a', bad]] })).toThrow(
+      /unknown outcome/,
+    );
+    for (const usd of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() =>
+        makeRun({ labels: [], replays: [replay('a', 'proven-fixed', [], usd)] }),
+      ).toThrow(/invalid cost/);
+    }
+  });
+
+  it('validates the clone, not the caller object', () => {
+    let reads = 0;
+    const labelsSource = {
+      get kind() {
+        reads += 1;
+        return reads === 1 ? 'synthetic' : 'corpus';
+      },
+      ref: 'r',
+    };
+    const run = createEvalRun({
+      manifest: {
+        runId: asRunId('run-clone'),
+        startedAt: 'x',
+        labelsSource: labelsSource,
+        modelIds: {},
+        promptVersions: {},
+      },
+      labels: [],
+      replays: [],
+    });
+    expect(run.manifest.labelsSource.kind).toBe('synthetic');
+    expect(run.manifest.labelsSource.kind).toBe('synthetic');
   });
 
   it('rejects unsafe run ids', () => {
@@ -403,7 +455,11 @@ describe('compareToBaseline', () => {
   });
 
   it('labels non-finite values distinctly', () => {
-    const run = makeRun({ labels: [], replays: [replay('a', 'proven-fixed', [], Number.NaN)] });
+    // Each cost is finite, but the sum overflows to Infinity.
+    const run = makeRun({
+      labels: [],
+      replays: [replay('a', 'proven-fixed', [], 1.7e308), replay('b', 'proven-fixed', [], 1.7e308)],
+    });
     const m = costPerCase(run);
     expect(m.status === 'unmeasured' && m.reason).toBe('non-finite value');
   });
@@ -415,7 +471,7 @@ describe('compareToBaseline', () => {
       replays: [replay('a', 'proven-fixed', ['low', 'high'])],
       baseline: [['a', 'not-proven']],
     });
-    expect(computeReport(run, { minCases: 1 }).juryVsBaseline).toBe('undetermined');
+    expect(computeReport(run).juryVsBaseline).toBe('undetermined');
   });
 
   it('computeReport marks synthetic runs unmeasured end to end', () => {

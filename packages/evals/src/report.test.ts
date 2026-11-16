@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { asRunId, computeReport } from './calibration.js';
 import { renderReport } from './report.js';
-import { makeRun, replay } from './synthetic.test-helpers.js';
+import { makeRun, replay, winRun } from './synthetic.test-helpers.js';
 
 const EM_DASH = '—';
 
@@ -29,59 +29,35 @@ describe('renderReport', () => {
   });
 
   it('prints numbers with run ids for corpus labels, and says when the jury does not beat the baseline', () => {
+    const ids = Array.from({ length: 10 }, (_, i) => `c${i}`);
     const run = makeRun({
       kind: 'corpus',
       runId: 'run-abc',
-      labels: [
-        ['a', 'proven-fixed'],
-        ['b', 'not-proven'],
-      ],
-      replays: [
-        replay('a', 'proven-fixed', ['high', 'high'], 1),
-        replay('b', 'proven-fixed', ['low', 'low'], 3),
-      ],
-      baseline: [
-        ['a', 'proven-fixed'],
-        ['b', 'not-proven'],
-      ],
+      labels: ids.map((id) => [id, 'proven-fixed']),
+      replays: ids.map((id, i) =>
+        replay(id, i < 5 ? 'proven-fixed' : 'not-proven', ['high', 'high'], 2),
+      ),
+      baseline: ids.map((id) => [id, 'proven-fixed']),
     });
-    const md = renderReport(computeReport(run, { minCases: 1 }));
-    expect(md).toContain('run run-abc');
-    expect(md).toContain('Run id: run-abc');
+    const md = renderReport(computeReport(run));
+    expect(md).toContain('run `run-abc`');
+    expect(md).toContain('Run id: `run-abc`');
     expect(md).toContain('$2.0000');
     expect(md).toContain('The jury does not beat the single reviewer');
     expect(md).not.toContain(EM_DASH);
   });
 
   it('claims a win only when supported', () => {
-    const run = makeRun({
-      kind: 'corpus',
-      runId: 'run-win',
-      labels: [
-        ['a', 'proven-fixed'],
-        ['b', 'not-proven'],
-        ['c', 'proven-fixed'],
-        ['d', 'proven-fixed'],
-      ],
-      replays: [
-        replay('a', 'proven-fixed', ['low', 'critical']),
-        replay('b', 'not-proven', ['low', 'critical']),
-        replay('c', 'not-proven', ['critical', 'low']),
-        replay('d', 'not-proven', ['low', 'critical']),
-      ],
-      baseline: [
-        ['a', 'not-proven'],
-        ['b', 'not-proven'],
-        ['c', 'not-proven'],
-        ['d', 'not-proven'],
-      ],
-    });
-    expect(computeReport(run).juryVsBaseline).toBe('undetermined');
-    const report = computeReport(run, { minCases: 1 });
+    const report = computeReport(winRun('run-win', 12));
     expect(report.juryVsBaseline).toBe('supported');
     const md = renderReport(report);
     expect(md).toContain('Both conditions held');
-    expect(md).toContain('Minimum cases before a win may be claimed: 1');
+    expect(md).toContain('Minimum cases before a win may be claimed: 10');
+    expect(md).toContain('cases=12');
+    // Too few wrong cases for the default policy: no claim.
+    const few = renderReport(computeReport(winRun('run-few', 3)));
+    expect(few).not.toContain('Both conditions held');
+    expect(few).toContain('undetermined');
   });
 
   it('says undetermined, not "does not beat", when wrong-case votes cannot be assessed', () => {
@@ -92,7 +68,7 @@ describe('renderReport', () => {
       replays: [replay('a', 'proven-fixed', ['low', 'high'])],
       baseline: [['a', 'not-proven']],
     });
-    const md = renderReport(computeReport(run, { minCases: 1 }));
+    const md = renderReport(computeReport(run));
     expect(md).toContain('The comparison is undetermined');
     expect(md).not.toContain('does not beat');
   });
@@ -133,7 +109,7 @@ describe('renderReport', () => {
       labels: [['a', 'proven-fixed']],
       replays: [replay('a', 'proven-fixed', ['low', 'high'], 1)],
     });
-    const good = computeReport(real, { minCases: 1 });
+    const good = computeReport(real);
     const metric = (v: number) =>
       ({
         status: 'measured',
@@ -197,7 +173,35 @@ describe('renderReport', () => {
       '## Cost',
       '## Jury versus single reviewer',
     ]);
-    expect(md).toContain('corpus \\# Injected heading');
+    expect(md).toContain('`corpus # Injected heading - [x](http://evil)`');
+    expect(md).toContain('`now ## Another`');
+  });
+
+  it('strips invisible format characters and backticks from metadata', () => {
+    const run = makeRun({
+      kind: 'corpus',
+      runId: 'run-fmt',
+      labels: [['a', 'proven-fixed']],
+      replays: [replay('a', 'proven-fixed', ['low', 'high'], 1)],
+      ref: 'a​b`c',
+      startedAt: 'ok',
+    });
+    const md = renderReport(computeReport(run));
+    expect(md).toContain("`ab'c`");
+  });
+
+  it('never prints a win or recommendation for an unexpected labels kind', () => {
+    const good = computeReport(winRun('run-kind', 12));
+    for (const kind of ['Corpus', undefined, 'other', 'real']) {
+      const forged = {
+        ...good,
+        manifest: { ...good.manifest, labelsSource: { ref: 'x', kind } },
+      } as unknown as typeof good;
+      const md = renderReport(forged);
+      expect(md).not.toContain('jury scored higher');
+      expect(md).not.toContain('does not beat');
+      expect(md).not.toMatch(/\d/);
+    }
   });
 
   it('notes that cost per verdict excludes escalated and dismissed spend', () => {

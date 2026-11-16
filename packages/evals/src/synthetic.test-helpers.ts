@@ -55,6 +55,25 @@ export function replay(
   return base;
 }
 
+/**
+ * Corpus-labelled run in which the jury is right on 2 cases and wrong on `nWrong`, with
+ * anti-correlated votes on the wrong cases, and a baseline that is wrong everywhere.
+ */
+export function winRun(runId = 'run-win', nWrong = 12): EvalRun {
+  const ids = Array.from({ length: nWrong + 2 }, (_, i) => `c${i}`);
+  return makeRun({
+    kind: 'corpus',
+    runId,
+    labels: ids.map((id) => [id, 'proven-fixed']),
+    replays: ids.map((id, i) =>
+      i < 2
+        ? replay(id, 'proven-fixed', ['high', 'high'])
+        : replay(id, 'not-proven', i % 2 === 0 ? ['low', 'critical'] : ['critical', 'low']),
+    ),
+    baseline: ids.map((id) => [id, 'not-proven']),
+  });
+}
+
 export function makeRun(opts: {
   runId?: string;
   kind?: LabelsSource['kind'];

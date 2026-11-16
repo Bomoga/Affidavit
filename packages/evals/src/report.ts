@@ -10,9 +10,18 @@ import {
 
 const PLACEHOLDER = '[metric]';
 
-/** One line of inert text: newlines collapse and markdown control characters are escaped. */
+/**
+ * Run metadata as an inline code span: whitespace collapses to one line, invisible format
+ * characters are dropped and backticks are replaced, so the value cannot break out, autolink or
+ * start a block.
+ */
 function inline(s: string): string {
-  return s.replace(/\s+/g, ' ').replace(/([\\`*_{}[\]<>#|!~])/g, '\\$1');
+  const flat = s
+    .replace(/\p{Cf}/gu, '')
+    .replace(/\s+/g, ' ')
+    .replace(/`/g, "'")
+    .trim();
+  return `\`${flat}\``;
 }
 
 /**
@@ -25,10 +34,17 @@ function isBacked(m: Metric, runId: RunId, trusted: boolean): boolean {
   );
 }
 
-function fmt(m: Metric, runId: RunId, trusted: boolean, kind: 'ratio' | 'usd' = 'ratio'): string {
+function fmt(
+  m: Metric,
+  runId: RunId,
+  trusted: boolean,
+  kind: 'ratio' | 'usd' = 'ratio',
+  showCases = false,
+): string {
   if (m.status !== 'measured' || !isBacked(m, runId, trusted)) return PLACEHOLDER;
   const v = kind === 'usd' ? `$${m.value.toFixed(4)}` : m.value.toFixed(3);
-  return `${v} (n=${m.n}, run ${inline(m.runId)})`;
+  const cases = showCases ? `, cases=${m.cases}` : '';
+  return `${v} (n=${m.n}${cases}, run ${inline(m.runId)})`;
 }
 
 /**
@@ -57,14 +73,17 @@ export function renderReport(r: CalibrationReport): string {
     m.status === 'measured' && m.runId !== runId
       ? { status: 'unmeasured', reason: 'run id mismatch' }
       : m;
+  // Only a trusted report (computed, exactly corpus labels) may print a win or a recommendation.
   const call: JuryVsBaseline = !computed
     ? 'undetermined'
-    : compareToBaseline(
-        sameRun(r.juryAccuracy),
-        sameRun(r.baselineAccuracy),
-        sameRun(r.correlationWrong),
-        r.policy,
-      );
+    : !trusted
+      ? 'unmeasured'
+      : compareToBaseline(
+          sameRun(r.juryAccuracy),
+          sameRun(r.baselineAccuracy),
+          sameRun(r.correlationWrong),
+          r.policy,
+        );
 
   let comparison: string;
   if (call === 'supported') {
@@ -96,10 +115,10 @@ export function renderReport(r: CalibrationReport): string {
     '',
     '## Inter-juror votes',
     '',
-    `- Pairwise agreement, all cases: ${fmt(r.agreementAll, runId, trusted)}`,
-    `- Vote correlation, all cases: ${fmt(r.correlationAll, runId, trusted)}`,
-    `- Pairwise agreement, wrong cases only: ${fmt(r.agreementWrong, runId, trusted)}`,
-    `- Vote correlation, wrong cases only: ${fmt(r.correlationWrong, runId, trusted)}`,
+    `- Pairwise agreement, all cases: ${fmt(r.agreementAll, runId, trusted, 'ratio', true)}`,
+    `- Vote correlation, all cases: ${fmt(r.correlationAll, runId, trusted, 'ratio', true)}`,
+    `- Pairwise agreement, wrong cases only: ${fmt(r.agreementWrong, runId, trusted, 'ratio', true)}`,
+    `- Vote correlation, wrong cases only: ${fmt(r.correlationWrong, runId, trusted, 'ratio', true)}`,
     '',
     '## Cost',
     '',
