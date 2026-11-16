@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { VerifyResult } from '@affidavit/contracts';
 import type { Exhibit, ParamSpace, PatchExhibit, Witness } from '@affidavit/contracts';
+import { canonicalJson } from './canonical.js';
 import type { ExecutionRequest, RawAttempt } from './executor.js';
-import { Judge } from './judge.js';
+import { Judge, counterexampleExhibitId, patchExhibitId } from './judge.js';
+import { renderDiff } from './patch/diff.js';
 import { DEFAULT_POLICY } from './rules.js';
 import {
   GATE_PATCH_DIFF,
@@ -61,17 +63,21 @@ const addLines = (lines: string[], path = 'app/data/allocations-dao.js'): string
     '',
   ].join('\n');
 
+/** The id the Judge mints for a counterexample run over the witness's family. */
+const cid = (c: Exhibit = counterexample()) => counterexampleExhibitId(c, PARAMS);
+const PATCH_ID = patchExhibitId(patchExhibit());
+
 describe('Judge.verifyPatch', () => {
   it('accepts the gate patch: the whole family flips and every check holds', async () => {
     const { exec, workbench, rescan, verify } = setup();
     const r = await verify();
     expect(VerifyResult.parse(r)).toEqual({
       schemaVersion: 1,
-      patchExhibitId: 'exhibit-patch-001',
+      patchExhibitId: PATCH_ID,
       familyFlipped: true,
       suitePassed: true,
       rescanClean: true,
-      counterexamples: [{ exhibitId: 'exhibit-counter-001', survived: false }],
+      counterexamples: [{ exhibitId: cid(), survived: false }],
     });
     expect(exec.requests.map((q) => `${q.variant}:${q.attempt}:${q.template}`)).toEqual([
       'vulnerable:1:witness source',
@@ -80,6 +86,13 @@ describe('Judge.verifyPatch', () => {
       'patched:1:witness source',
       'patched:2:witness source',
       'patched:3:witness source',
+      // The counterexample is admitted first, on vulnerable and safe, then rerun on the patch.
+      'vulnerable:1:counterexample source',
+      'vulnerable:2:counterexample source',
+      'vulnerable:3:counterexample source',
+      'safe:1:counterexample source',
+      'safe:2:counterexample source',
+      'safe:3:counterexample source',
       'patched:1:counterexample source',
       'patched:2:counterexample source',
       'patched:3:counterexample source',
@@ -103,7 +116,7 @@ describe('Judge.verifyPatch', () => {
     expect(r).toMatchObject({
       rejectedBy: 'literal-only-patch',
       familyFlipped: false,
-      counterexamples: [{ exhibitId: 'exhibit-counter-001', survived: true }],
+      counterexamples: [{ exhibitId: cid(), survived: true }],
     });
     expect(workbench.prepared).toHaveLength(0);
     expect(exec.requests).toHaveLength(0);
@@ -222,32 +235,74 @@ describe('Judge.verifyPatch', () => {
     });
   });
 
-  it('rejects with counterexample-survives and fails closed on a broken counterexample', async () => {
-    const { verify } = setup((req) =>
-      raw(PAYLOADS.map(() => req.variant === 'vulnerable' || req.template === 'still works')),
+  it('rejects with counterexample-survives only for an admissible counterexample', async () => {
+    // `still works` beats the patch; `passes everywhere` also passes on the safe variant, so it
+    // proves nothing and must not count against the patch.
+    const { exec, verify } = setup((req) =>
+      raw(
+        PAYLOADS.map(() =>
+          req.template === 'passes everywhere'
+            ? true
+            : req.variant === 'vulnerable' ||
+              (req.variant === 'patched' && req.template === 'still works'),
+        ),
+      ),
     );
+    const survivor = counterexample({ id: 'exhibit-counter-002' as never, code: 'still works' });
+    const unproven = counterexample({ code: 'passes everywhere' });
+    const otherCase = counterexample({ caseId: 'case-other' as never });
+    const malformed = { kind: 'counterexample', code: 1 } as unknown as Exhibit;
     const r = await verify(patchExhibit(), [
       counterexample(),
-      counterexample({ id: 'exhibit-counter-002' as never, code: 'still works' }),
-      counterexample({ id: 'exhibit-counter-003' as never, caseId: 'case-other' as never }),
+      survivor,
+      unproven,
+      otherCase,
+      malformed,
     ]);
     expect(r.rejectedBy).toBe('counterexample-survives');
-    expect(r.counterexamples).toEqual([
-      { exhibitId: 'exhibit-counter-001', survived: false },
-      { exhibitId: 'exhibit-counter-002', survived: true },
-      { exhibitId: 'exhibit-counter-003', survived: true },
+    expect(r.counterexamples.slice(0, 4)).toEqual([
+      { exhibitId: cid(), survived: false },
+      { exhibitId: cid(survivor), survived: true },
+      { exhibitId: cid(unproven), survived: false },
+      { exhibitId: cid(otherCase), survived: false },
     ]);
+    expect(r.counterexamples[4]?.exhibitId).toMatch(/^exhibit-counterexample-invalid-/);
+    expect(r.counterexamples[4]?.survived).toBe(false);
+    // An inadmissible counterexample is never rerun on the patch.
+    expect(
+      exec.requests.some((q) => q.template === 'passes everywhere' && q.variant === 'patched'),
+    ).toBe(false);
   });
 
-  it('counts a counterexample that never completes as surviving', async () => {
+  it('never echoes a submitted counterexample id', async () => {
+    const { verify } = setup();
+    const c = counterexample({ id: 'exhibit-counterexample-chosen-by-caller' as never });
+    const [out] = (await verify(patchExhibit(), [c])).counterexamples;
+    expect(out?.exhibitId).toBe(cid(c));
+    expect(out?.exhibitId).not.toBe(c.id);
+    expect(out?.exhibitId).toMatch(/^exhibit-counterexample-[0-9a-f]{24}$/);
+  });
+
+  it('accepts a patch when the only counterexample is inadmissible', async () => {
     const { verify } = setup((req) =>
       req.template === 'counterexample source'
         ? raw([], { exitCode: null, timedOut: true, artifact: null })
         : fixedByPatch(req),
     );
-    expect((await verify()).counterexamples).toEqual([
-      { exhibitId: 'exhibit-counter-001', survived: true },
-    ]);
+    const r = await verify();
+    expect(r.counterexamples).toEqual([{ exhibitId: cid(), survived: false }]);
+    expect(r.rejectedBy).toBeUndefined();
+  });
+
+  it('counts an admissible counterexample that never completes on the patch as surviving', async () => {
+    const { verify } = setup((req) =>
+      req.template === 'counterexample source' && req.variant === 'patched'
+        ? raw([], { exitCode: null, timedOut: true, artifact: null })
+        : fixedByPatch(req),
+    );
+    const r = await verify();
+    expect(r.counterexamples).toEqual([{ exhibitId: cid(), survived: true }]);
+    expect(r.rejectedBy).toBe('counterexample-survives');
   });
 
   it('reports a dirty re-scan as rescanClean false', async () => {
@@ -280,5 +335,130 @@ describe('Judge.verifyPatch', () => {
     await expect(judge.verifyPatch(gateCaseFile(), patchExhibit(), witness(), [])).rejects.toThrow(
       /PatchWorkbench/,
     );
+  });
+
+  describe('patch exhibit id', () => {
+    it('is minted from the case and diff, never echoed', async () => {
+      const { verify } = setup();
+      const r = await verify(patchExhibit(GATE_PATCH_DIFF, { id: 'exhibit-patch-mine' as never }));
+      expect(r.patchExhibitId).toBe(PATCH_ID);
+      expect(r.patchExhibitId).toMatch(/^exhibit-patch-[0-9a-f]{24}$/);
+      expect(patchExhibitId({ caseId: 'case-other' as never, diff: GATE_PATCH_DIFF })).not.toBe(
+        PATCH_ID,
+      );
+    });
+
+    it('matches the documented test vector and the recipe Lane 3 uses', () => {
+      // rules-of-evidence.md, "Patch exhibit ids".
+      expect(canonicalJson({ caseId: 'case-x', diff: 'd', kind: 'patch' })).toBe(
+        '{"caseId":"case-x","diff":"d","kind":"patch"}',
+      );
+      expect(patchExhibitId({ caseId: 'case-x' as never, diff: 'd' })).toBe(
+        'exhibit-patch-4252faa67f9f45500b6a7ce8',
+      );
+    });
+
+    it.each([
+      ['a sha256 that is not the hash of the diff', { sha256: '0'.repeat(64) }],
+      ['a code field that differs from the diff', { code: 'something else' }],
+    ])('rejects %s with schema, before building', async (_, over) => {
+      const { workbench, verify } = setup();
+      const r = await verify(patchExhibit(GATE_PATCH_DIFF, over));
+      expect(r).toMatchObject({ rejectedBy: 'schema', patchExhibitId: PATCH_ID });
+      expect(workbench.prepared).toHaveLength(0);
+    });
+  });
+
+  describe('test files in the patch', () => {
+    const newFile = (path: string, lines: string[]) =>
+      [
+        `--- /dev/null`,
+        `+++ b/${path}`,
+        `@@ -0,0 +1,${lines.length} @@`,
+        ...lines.map((l) => `+${l}`),
+        '',
+      ].join('\n');
+    /** The gate patch plus one more line in allocations-dao.js. */
+    const gateWith = (line: string) =>
+      GATE_PATCH_DIFF.replace('@@ -70,5 +70,6 @@', '@@ -70,5 +70,7 @@').replace(
+        '        const searchCriteria = () => {\n',
+        `        const searchCriteria = () => {\n+${line}\n`,
+      );
+
+    it('builds the witness target without the test files; the suite gets the whole patch', async () => {
+      const test = newFile('test/sqli.test.js', [`it('blocks', () => get("0' || '1'=='1"));`]);
+      const { workbench, verify } = setup();
+      const r = await verify(patchExhibit(GATE_PATCH_DIFF + test));
+      expect(r.rejectedBy).toBeUndefined();
+      const [plan] = workbench.plans;
+      expect(plan?.full.files.map((f) => f.path)).toEqual([
+        'app/data/allocations-dao.js',
+        'test/sqli.test.js',
+      ]);
+      expect(plan?.code.files.map((f) => f.path)).toEqual(['app/data/allocations-dao.js']);
+      expect(renderDiff(plan?.code ?? { files: [], linesChanged: 0 })).toBe(GATE_PATCH_DIFF);
+    });
+
+    it.each([
+      `            require('../../test/guard.test.js')(threshold);`,
+      `            require('./guard.test.js');`,
+      `            const guard = require("../../test/guard.test");`,
+    ])('rejects code that loads a test file from the same patch: %s', async (line) => {
+      // The special case sits in an exempt test file; the code only loads it.
+      const guard = newFile('test/guard.test.js', [
+        `module.exports = (t) => { if (t === "0' || '1'=='1") throw new Error('x'); };`,
+      ]);
+      const { workbench, verify } = setup();
+      const r = await verify(patchExhibit(gateWith(line) + guard));
+      expect(r.rejectedBy).toBe('literal-only-patch');
+      expect(workbench.prepared).toHaveLength(0);
+    });
+
+    it('treats a *.test.js file next to the code as code', async () => {
+      const guard = newFile('app/data/guard.test.js', [
+        `module.exports = (t) => t === "0' || '1'=='1";`,
+      ]);
+      const { verify } = setup();
+      expect((await verify(patchExhibit(GATE_PATCH_DIFF + guard))).rejectedBy).toBe(
+        'literal-only-patch',
+      );
+    });
+
+    it.each([
+      ['deletes a test file', '--- a/test/a.js\n+++ /dev/null\n@@ -1 +0,0 @@\n-it("x", f);\n'],
+      [
+        'removes a line from a test file',
+        '--- a/test/a.js\n+++ b/test/a.js\n@@ -1,2 +1,1 @@\n keep();\n-it("blocks sqli", f);\n',
+      ],
+      [
+        'rewrites the test script',
+        '--- a/package.json\n+++ b/package.json\n@@ -1,2 +1,2 @@\n {\n-  "test": "grunt test",\n+  "test": "true",\n',
+      ],
+    ])('rejects a patch that %s with suite-fails, before building', async (_, extra) => {
+      const { workbench, verify } = setup();
+      const r = await verify(patchExhibit(GATE_PATCH_DIFF + extra));
+      expect(r).toMatchObject({ rejectedBy: 'suite-fails', suitePassed: false });
+      expect(workbench.prepared).toHaveLength(0);
+    });
+  });
+
+  it('accepts an authorization fix that compares with -1 when 1 is a parameter', async () => {
+    const ids: ParamSpace = [{ name: 'userId', values: [1, 2] }];
+    const exec = new ScriptedExecutor((req) =>
+      raw(ids[0]!.values.map(() => req.variant === 'vulnerable')),
+    );
+    const workbench = new ScriptedWorkbench();
+    const judge = new Judge(exec, DEFAULT_POLICY, { workbench, rescan: new RecordingRescan() });
+    const diff = addLines([
+      `            if (req.session.allowed.indexOf(userId) === -1) return res.status(403).end();`,
+    ]);
+    const r = await judge.verifyPatch(
+      gateCaseFile(),
+      patchExhibit(diff),
+      { ...gateWitness(), template: 'witness source', params: ids },
+      [],
+    );
+    expect(r.rejectedBy).toBeUndefined();
+    expect(r.familyFlipped).toBe(true);
   });
 });

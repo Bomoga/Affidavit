@@ -5,7 +5,12 @@ import type { Candidate, ExhibitId, PatchExhibit, RescanPort } from '@affidavit/
 import { RESULT_ARTIFACT_VERSION } from './artifact.js';
 import { sha256Hex } from './canonical.js';
 import { parseUnifiedDiff } from './patch/diff.js';
-import type { PatchWorkbench, PrepareOutcome, PreparedPatch } from './patch/workbench.js';
+import type {
+  PatchPlan,
+  PatchWorkbench,
+  PrepareOutcome,
+  PreparedPatch,
+} from './patch/workbench.js';
 import type {
   Attempt,
   EvidenceVariant,
@@ -125,7 +130,7 @@ export function patchExhibit(
     caseId: 'case-nodegoat-sqli-001' as PatchExhibit['caseId'],
     author: 'remedy',
     kind: 'patch',
-    code: '',
+    code: diff,
     sha256: sha256Hex(diff),
     diff,
     filesTouched: parsed.ok ? parsed.diff.files.map((f) => f.path) : ['x'],
@@ -137,6 +142,7 @@ export function patchExhibit(
 /** Workbench that "builds" the patched target instantly and records what it was asked. */
 export class ScriptedWorkbench implements PatchWorkbench {
   readonly prepared: PatchExhibit[] = [];
+  readonly plans: PatchPlan[] = [];
   released = 0;
   suiteRuns = 0;
   constructor(
@@ -145,8 +151,9 @@ export class ScriptedWorkbench implements PatchWorkbench {
       suitePassed?: boolean;
     } = {},
   ) {}
-  prepare(_cf: CaseFile, patch: PatchExhibit): Promise<PrepareOutcome> {
+  prepare(_cf: CaseFile, patch: PatchExhibit, plan: PatchPlan): Promise<PrepareOutcome> {
     this.prepared.push(patch);
+    this.plans.push(plan);
     return Promise.resolve(this.script.prepare ?? { ok: true, prepared: PATCHED });
   }
   runSuite(): Promise<{ passed: boolean }> {
