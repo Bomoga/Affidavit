@@ -66,6 +66,13 @@ describe('Judge.runWitness', () => {
     expect(exec.requests[0]?.template).toBe(gateWitness().template);
   });
 
+  it("passes the Judge's own artifact limit to the executor, not a default", async () => {
+    const exec = new ScriptedExecutor(differentialTarget(3));
+    const policy = { ...DEFAULT_POLICY, maxArtifactBytes: 123_456 };
+    await new Judge(exec, policy).runWitness(gateCaseFile(), gateWitness(), ['vulnerable']);
+    expect(exec.requests.every((r) => r.maxArtifactBytes === 123_456)).toBe(true);
+  });
+
   it('runs the safe variant even when the caller only asks for vulnerable (F2)', async () => {
     const exec = new ScriptedExecutor(() => raw([true, true, true]));
     const result = await new Judge(exec).runWitness(gateCaseFile(), gateWitness(), ['vulnerable']);
