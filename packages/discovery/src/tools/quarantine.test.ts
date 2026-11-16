@@ -173,10 +173,14 @@ describe('tool-control path quarantine', () => {
     put(root, '.git/refs/heads/main', 'a'.repeat(40));
     put(root, '.git/refs/heads/big', 'x'.repeat(2000));
     put(root, '.git/index', 'DIRC');
+    put(root, '.git/objects/ab/cdef', 'x');
+    put(root, '.git/objects/pack/p.pack', 'x');
+    put(root, '.git/objects/loose.js', 'eval(x)');
     const snap = await quarantineSnapshot(root);
     expect(await gitDirExtraContent(snap)).toEqual([
       '.git/hooks/evil.js',
       '.git/info/payload.js',
+      '.git/objects/loose.js',
       '.git/refs/heads/big',
     ]);
   });

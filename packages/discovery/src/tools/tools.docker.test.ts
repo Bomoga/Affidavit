@@ -413,8 +413,8 @@ describe.skipIf(!enabled)('tool images, offline', () => {
     expect(results.gitleaks?.partial).toBe(true);
     const skipped = results.gitleaks?.notifications.map((n) => n.message).join('\n') ?? '';
     for (const f of ['src/doc.dat', 'src/utf16.txt']) expect(skipped).toContain(`/src/${f}`);
-    // A well-formed archive is informational, not a coverage loss (its contents were scanned).
-    expect(results.gitleaks?.skippedAssets).toContain('/src/src/secret.txt.gz');
+    // Archives are always a coverage loss: gitleaks unpacks some, but not members it cannot read.
+    expect(skipped).toContain('/src/src/secret.txt.gz');
     // OSV drops the malformed second lockfile without failing; discovery notices.
     expect(results['osv-scanner']?.partial).toBe(true);
     // Code hidden inside the quarantined .git was never seen by Semgrep or OSV.
@@ -535,6 +535,59 @@ describe.skipIf(!enabled)('tool images, offline', () => {
     const messages = res.notifications.map((n) => n.message);
     expect(messages.some((m) => m.startsWith('/src/package-lock.json '))).toBe(true);
     expect(messages.some((m) => m.startsWith('/src/extra/package-lock.json '))).toBe(false);
+  }, 240_000);
+
+  it('every file type gitleaks skips is a coverage loss, with plaintext secrets behind real headers', async () => {
+    const secret = Buffer.from('\nAFFIDAVIT_FAKE_KEY_0123456789ABCDEF\n');
+    const files: Record<string, Buffer> = {
+      'a.zip': Buffer.concat([Buffer.from('PK\x03\x04', 'latin1'), secret]),
+      'a.pdf': Buffer.concat([Buffer.from('%PDF-1.4'), secret]),
+      'a.sqlite': Buffer.concat([Buffer.from('SQLite format 3\0', 'latin1'), secret]),
+      'a.exe': Buffer.concat([Buffer.from('MZ'), Buffer.from([0x90, 0x00]), secret]),
+      'a.rtf': Buffer.concat([Buffer.from('{\\rtf1'), secret]),
+      'utf16.gz': gzipSync(Buffer.from('AFFIDAVIT_FAKE_KEY_0123456789ABCDEF', 'utf16le')),
+      'pdfmember.gz': gzipSync(Buffer.concat([Buffer.from('%PDF-1.4'), secret])),
+      'nested.gz': gzipSync(gzipSync(secret)),
+      'truncated.gz': gzipSync(Buffer.from(secret.toString().repeat(50))).subarray(0, 20),
+    };
+    const s = scenario('repo', (src) => {
+      mkdirSync(join(src, 'bin'));
+      for (const [n, b] of Object.entries(files)) writeFileSync(join(src, 'bin', n), b);
+    });
+    const snap = await quarantineSnapshot(s.src);
+    const { sourceDir: _ignored, ...rest } = s.options('gitleaks');
+    void _ignored;
+    const res = await runTool(s.runner, manifest, 'gitleaks', { ...rest, snapshot: snap });
+    expect(res.partial).toBe(true);
+    for (const n of Object.keys(files)) {
+      const note = res.notifications.find((x) => x.message.startsWith(`/src/bin/${n} `));
+      expect(note?.id, n).toBe('skipped-file-type');
+    }
+  }, 240_000);
+
+  it('images and fonts are read by gitleaks, so a secret inside is found and the run is not partial', async () => {
+    const secret = Buffer.from('\nAFFIDAVIT_FAKE_KEY_0123456789ABCDEF\n');
+    const s = scenario('repo', (src) => {
+      mkdirSync(join(src, 'm'));
+      writeFileSync(
+        join(src, 'm', 'logo.png'),
+        Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47]), secret]),
+      );
+      writeFileSync(join(src, 'm', 'font.woff'), Buffer.concat([Buffer.from('wOFF'), secret]));
+    });
+    const snap = await quarantineSnapshot(s.src);
+    const { sourceDir: _ignored, ...rest } = s.options('gitleaks');
+    void _ignored;
+    const res = await runTool(s.runner, manifest, 'gitleaks', { ...rest, snapshot: snap });
+    expect(res.partial).toBe(false);
+    expect(res.binaryMediaFiles).toEqual(
+      expect.arrayContaining(['/src/m/logo.png', '/src/m/font.woff']),
+    );
+    const found = sarifFindings(
+      readFileSync(join(s.out('gitleaks'), 'gitleaks.sarif'), 'utf8'),
+    ).map((f) => f.uri);
+    expect(found.some((u) => u.endsWith('m/logo.png'))).toBe(true);
+    expect(found.some((u) => u.endsWith('m/font.woff'))).toBe(true);
   }, 240_000);
 
   it('flags a secret that straddles gitleaks chunk boundary, in dense lines and in one long line', async () => {

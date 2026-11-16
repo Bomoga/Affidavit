@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { gzipSync } from 'node:zlib';
 import type { ToolRunnerPort } from '@affidavit/contracts';
 import { afterAll, describe, expect, it } from 'vitest';
 import {
@@ -363,7 +364,7 @@ describe('runTool', () => {
     const byPath: Record<string, string | undefined> = {};
     for (const n of res.notifications) byPath[n.message.split(' ')[0] ?? ''] = n.id;
     expect(byPath['/src/src/notes.txt']).toBe('binary-header-mismatch');
-    expect(byPath['/src/src/blob.dat']).toBe('non-text-header');
+    expect(byPath['/src/src/blob.dat']).toBe('non-text-content');
   });
 
   it('lists well-formed binary assets apart, without making the run partial', async () => {
@@ -377,7 +378,64 @@ describe('runTool', () => {
     const res = await runTool(runner, manifest, 'gitleaks', await options(snap));
     expect(res.partial).toBe(false);
     expect(res.notifications).toEqual([]);
-    expect(res.skippedAssets).toEqual(['/src/img/logo.png']);
+    expect(res.binaryMediaFiles).toEqual(['/src/img/logo.png']);
+  });
+
+  it('treats every file type gitleaks skips as a coverage loss, even with a matching extension', async () => {
+    const snap = await snapshot({ 'src/app.js': 'x' });
+    const secret = '\nAFFIDAVIT_FAKE_KEY_0123456789ABCDEF\n';
+    const files: Record<string, Buffer> = {
+      'a.zip': Buffer.concat([Buffer.from('PK\x03\x04', 'latin1'), Buffer.from(secret)]),
+      'a.pdf': Buffer.from(`%PDF-1.4${secret}`),
+      'a.sqlite': Buffer.from(`SQLite format 3\0${secret}`, 'latin1'),
+      'a.exe': Buffer.concat([Buffer.from('MZ'), Buffer.from([0x90, 0]), Buffer.from(secret)]),
+      'utf16.gz': gzipSync(Buffer.from('AFFIDAVIT_FAKE_KEY_0123456789ABCDEF', 'utf16le')),
+      'nested.gz': gzipSync(gzipSync(Buffer.from(secret))),
+      'truncated.gz': gzipSync(Buffer.from(secret.repeat(50))).subarray(0, 20),
+    };
+    mkdirSync(join(snap.dir, 'bin'));
+    for (const [n, b] of Object.entries(files)) writeFileSync(join(snap.dir, 'bin', n), b);
+    const { runner } = fakeRunner((out) => writeFileSync(join(out, 'gitleaks.sarif'), sarif()));
+    const res = await runTool(runner, manifest, 'gitleaks', await options(snap));
+    expect(res.partial).toBe(true);
+    for (const n of Object.keys(files)) {
+      const note = res.notifications.find((x) => x.message.startsWith(`/src/bin/${n} `));
+      expect(note?.id, n).toBe('skipped-file-type');
+    }
+    expect(res.binaryMediaFiles).toEqual([]);
+  });
+
+  it('checks the text files inside a quarantined .git, but not index or objects', async () => {
+    const snap = await snapshot({ 'src/app.js': 'x', '.git/HEAD': 'ref: refs/heads/main' });
+    const gitDir = join(snap.sidecarDir ?? '', [...snap.mapping.keys()][0] ?? '');
+    writeFileSync(join(gitDir, 'config'), Buffer.from('[core]\nkey=secret', 'utf16le'));
+    mkdirSync(join(gitDir, 'info'), { recursive: true });
+    writeFileSync(join(gitDir, 'info', 'exclude'), Buffer.from('x\0y'));
+    writeFileSync(join(gitDir, 'index'), Buffer.from('DIRC\0\0\0\u0002', 'latin1'));
+    mkdirSync(join(gitDir, 'objects', 'ab'), { recursive: true });
+    writeFileSync(join(gitDir, 'objects', 'ab', 'cdef'), Buffer.from([0, 1, 2]));
+    const { runner } = fakeRunner((out) => writeFileSync(join(out, 'gitleaks.sarif'), sarif()));
+    const res = await runTool(runner, manifest, 'gitleaks', await options(snap));
+    const messages = res.notifications.map((n) => n.message).join('\n');
+    expect(messages).toContain('/src/.git/config ');
+    expect(messages).toContain('/src/.git/info/exclude ');
+    expect(messages).not.toContain('/src/.git/index');
+    expect(messages).not.toContain('objects');
+  });
+
+  it('refuses to read a report larger than the cap', async () => {
+    const { runner } = fakeRunner((out) =>
+      writeFileSync(
+        join(out, 'gitleaks.sarif'),
+        JSON.stringify({ runs: [{ pad: 'x'.repeat(2000) }] }),
+      ),
+    );
+    const err = await runTool(runner, manifest, 'gitleaks', {
+      ...(await options()),
+      maxReportBytes: 1000,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ToolOutputMissingError);
+    expect((err as Error).message).toMatch(/report too large/);
   });
 
   it('never truncates coverage notifications, however many files', async () => {

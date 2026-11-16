@@ -7,7 +7,6 @@ import { isEmptyExit, isOkExit, type ToolManifest, type ToolName } from './manif
 import {
   assertSnapshotClean,
   gitDirExtraContent,
-  isGitMetadataEntry,
   prepareOutput,
   prepareScratch,
   type QuarantinedSnapshot,
@@ -17,7 +16,11 @@ import { findGitleaksUnscannable, type Unscannable } from './unscannable.js';
 export type RunToolOptions = Omit<ToolRunOptions, 'sourceDir'> & {
   /** The quarantined scan copy. Its removed-path list is passed through on the result. */
   snapshot: QuarantinedSnapshot;
+  /** Largest report file runTool will read, in bytes. Default 128 MiB. */
+  maxReportBytes?: number | undefined;
 };
+
+const DEFAULT_MAX_REPORT_BYTES = 128 * 1024 * 1024;
 
 export interface ToolNotification {
   level: string;
@@ -51,10 +54,12 @@ export interface ToolRunResult {
   partial: boolean;
   notifications: ToolNotification[];
   /**
-   * Well-formed binary files (images, fonts, archives) that gitleaks does not scan. Informational:
-   * unlike everything in `notifications`, they do not make the run `partial`.
+   * Image, audio, video and font files. gitleaks reads these as text (probed on the pinned image),
+   * so a plaintext secret inside is found; they are listed for information only and, unlike
+   * everything in `notifications`, do not make the run `partial`. Archives, PDFs, SQLite files and
+   * executables are NOT here: gitleaks skips them, so they are coverage losses.
    */
-  skippedAssets: string[];
+  binaryMediaFiles: string[];
   /** The output directory the run wrote into (the one passed in options). */
   outputPath: string;
   /** Name of the main report file. When `empty`, no file was written under this name. */
@@ -113,6 +118,7 @@ async function readJsonReport(
   file: string,
   q: readonly string[],
   pass: Pass,
+  maxBytes: number,
 ): Promise<unknown> {
   let st;
   try {
@@ -129,6 +135,15 @@ async function readJsonReport(
   }
   if (!st.isFile()) throw new ToolOutputMissingError(tool, file, 'not a regular file', q, pass);
   if (st.size === 0) throw new ToolOutputMissingError(tool, file, 'file is empty', q, pass);
+  if (st.size > maxBytes) {
+    throw new ToolOutputMissingError(
+      tool,
+      file,
+      `report too large (${st.size} bytes, limit ${maxBytes}); not read`,
+      q,
+      pass,
+    );
+  }
   let doc: unknown;
   try {
     doc = JSON.parse(await readFile(file, 'utf8')) as unknown;
@@ -194,32 +209,35 @@ function osvMissingLockfiles(doc: unknown, lockfiles: readonly string[]): string
   );
 }
 
-const KIND_TEXT: Record<Unscannable['kind'], string> = {
-  'binary-asset': 'is a binary file, which gitleaks does not scan',
+const KIND_TEXT: Record<Exclude<Unscannable['kind'], 'binary-media'>, string> = {
   'binary-header-mismatch':
-    'starts with a binary file signature that does not match its extension, so gitleaks may skip it; a secret could be hidden behind that header',
-  'non-text-header':
+    'starts with a file signature gitleaks skips (archive, PDF, executable, database and similar) that does not match its extension, so a secret could be hidden behind that header',
+  'skipped-file-type':
+    'is a file type gitleaks skips (archive, PDF, SQLite, executable and similar). Archives it can unpack are searched, but members it cannot read (UTF-16, another skipped header) are not, and discovery does not unpack them',
+  'non-text-content':
     'is not plain text (control characters at the start, or NUL bytes or invalid UTF-8 anywhere, as in UTF-16 text), so gitleaks may skip it',
   'chunk-split-risk':
     'is over 100 KB with a 25 KB stretch that has no blank line, so gitleaks may cut a chunk through a secret and miss it',
-  unreadable: 'could not be read (mode or ownership), so the jailed gitleaks cannot read it either',
+  unreadable:
+    'could not be read by the host user (mode or ownership), so the jailed gitleaks may not read it either',
 };
 
-const KIND_ORDER: Unscannable['kind'][] = [
+const KIND_ORDER = [
   'binary-header-mismatch',
-  'non-text-header',
+  'non-text-content',
   'unreadable',
+  'skipped-file-type',
   'chunk-split-risk',
-];
+] as const;
 
 /**
- * Splits gitleaks coverage findings. Everything except well-formed binary assets is a coverage
- * loss: it becomes a notification, never truncated, listed by severity. Well-formed assets (a real
- * PNG, font, archive) lose nothing a text scanner could find and are returned apart.
+ * Splits gitleaks coverage findings. Everything except image, audio, video and font files is a
+ * coverage loss: it becomes a notification, never truncated, listed by severity. gitleaks reads
+ * media files as text (probed), so they lose nothing and are returned apart.
  */
 function coverageSplit(files: readonly Unscannable[]): {
   notifications: ToolNotification[];
-  skippedAssets: string[];
+  binaryMediaFiles: string[];
 } {
   const notifications: ToolNotification[] = [];
   for (const kind of KIND_ORDER) {
@@ -233,8 +251,10 @@ function coverageSplit(files: readonly Unscannable[]): {
       }
     }
   }
-  const skippedAssets = files.filter((f) => f.kind === 'binary-asset').map((f) => `/src/${f.path}`);
-  return { notifications, skippedAssets };
+  const binaryMediaFiles = files
+    .filter((f) => f.kind === 'binary-media')
+    .map((f) => `/src/${f.path}`);
+  return { notifications, binaryMediaFiles };
 }
 
 /** Maps a sidecar entry (`q0001/...`) back to its original path under /src. */
@@ -328,7 +348,8 @@ export async function runTool(
   name: ToolName,
   options: RunToolOptions,
 ): Promise<ToolRunResult> {
-  const { snapshot, ...rest } = options;
+  const { snapshot, maxReportBytes, ...rest } = options;
+  const maxBytes = maxReportBytes ?? DEFAULT_MAX_REPORT_BYTES;
   const q = snapshot.removed;
   const outputDir = resolve(options.outputDir);
   const scratchDir = resolve(options.scratchDir);
@@ -364,16 +385,16 @@ export async function runTool(
       empty: true,
       partial: false,
       notifications: [],
-      skippedAssets: [],
+      binaryMediaFiles: [],
       reports: [],
     };
   }
 
   const file = join(outputDir, run.inv.outputFile);
-  const doc = await readJsonReport(name, file, q, 'snapshot');
+  const doc = await readJsonReport(name, file, q, 'snapshot', maxBytes);
   const reports: ToolReport[] = [{ file, origin: 'snapshot' }];
   const notifications: ToolNotification[] = [];
-  let skippedAssets: string[] = [];
+  let binaryMediaFiles: string[] = [];
 
   if (name === 'semgrep') notifications.push(...semgrepNotifications(doc));
 
@@ -403,15 +424,19 @@ export async function runTool(
   if (name === 'gitleaks') {
     const unscanned = await findGitleaksUnscannable(snapshot.dir);
     if (snapshot.sidecarDir !== null) {
-      const side = await findGitleaksUnscannable(snapshot.sidecarDir);
+      // git's index and object store are expected to be binary and are not walked at all. Every
+      // other file inside a quarantined .git (config, info/exclude, hooks, refs, ...) is text
+      // and is checked like any other.
+      const isGitBulk = (rel: string): boolean => {
+        const original = mapSidecarPath(rel, snapshot.mapping);
+        return original !== undefined && /(?:^|\/)\.git\/(?:index|objects)(?:\/|$)/i.test(original);
+      };
+      const side = await findGitleaksUnscannable(snapshot.sidecarDir, {
+        skip: (rel) => isGitBulk(rel),
+      });
       for (const f of side) {
         const original = mapSidecarPath(f.path, snapshot.mapping);
-        if (original === undefined) continue;
-        // git's own bookkeeping (index, objects, packs, refs, HEAD, config, ...) is expected to
-        // be binary and is skipped. Anything else inside a quarantined .git is still checked.
-        const inGit = /(?:^|\/)\.git\/([^/]+)/i.exec(original);
-        if (inGit?.[1] !== undefined && isGitMetadataEntry(inGit[1])) continue;
-        unscanned.push({ path: original, kind: f.kind });
+        if (original !== undefined) unscanned.push({ path: original, kind: f.kind });
       }
     }
 
@@ -431,13 +456,13 @@ export async function runTool(
         'quarantine',
       );
       const sideFile = join(sideOut, run.inv.outputFile);
-      const sideDoc = await readJsonReport(name, sideFile, q, 'quarantine');
+      const sideDoc = await readJsonReport(name, sideFile, q, 'quarantine', maxBytes);
       await rewriteSidecarReport(sideFile, sideDoc, snapshot.mapping);
       reports.push({ file: sideFile, origin: 'quarantine' });
     }
     const split = coverageSplit(unscanned.sort((a, b) => a.path.localeCompare(b.path)));
     notifications.push(...split.notifications);
-    skippedAssets = split.skippedAssets;
+    binaryMediaFiles = split.binaryMediaFiles;
   }
 
   return {
@@ -445,7 +470,7 @@ export async function runTool(
     empty: false,
     partial: notifications.length > 0,
     notifications,
-    skippedAssets,
+    binaryMediaFiles,
     reports,
   };
 }

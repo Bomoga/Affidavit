@@ -306,6 +306,13 @@ export async function gitDirExtraContent(snapshot: QuarantinedSnapshot): Promise
         for (const h of await listDir(join(dir, e.name))) {
           if (!GIT_INFO.has(h.name)) extras.push(`${at}/${h.name}`);
         }
+      } else if (lower === 'objects' && e.isDirectory) {
+        // Only the two-hex-digit fan-out directories, pack and info belong in an object store.
+        for (const h of await listDir(join(dir, e.name))) {
+          if (!/^[0-9a-f]{2}$/.test(h.name) && h.name !== 'pack' && h.name !== 'info') {
+            extras.push(`${at}/${h.name}`);
+          }
+        }
       } else if (lower === 'refs' && e.isDirectory) {
         extras.push(...(await oddRefs(join(dir, e.name), at)));
       }
