@@ -13,14 +13,6 @@ export interface AdmittedWitness {
   result: ExhibitResult;
 }
 
-/** What Remedy leaves for the verify stage. Acceptance comes only from the Judge's result. */
-export interface PatchOutcome {
-  accepted: boolean;
-  patch?: PatchExhibit;
-  result?: VerifyResult;
-  reason?: string;
-}
-
 /**
  * Hand-off between stages inside one trial. Lane-internal state, not a contract: it holds contract
  * objects built in code and results returned by the Judge, never agent claims.
@@ -35,10 +27,27 @@ export interface TrialWorkspace {
   getPatchOutcome(caseId: CaseId): Promise<PatchOutcome | undefined>;
 }
 
+/** What Remedy ended with. `accepted` is true only when the Judge's VerifyResult says so. */
+export interface PatchOutcome {
+  accepted: boolean;
+  patch?: PatchExhibit;
+  result?: VerifyResult;
+  reason: string;
+}
+
 export class InMemoryWorkspace implements TrialWorkspace {
   private readonly witnesses = new Map<CaseId, AdmittedWitness>();
   private readonly exhibits = new Map<CaseId, ExhibitId[]>();
-  private readonly outcomes = new Map<CaseId, PatchOutcome>();
+  private readonly patches = new Map<CaseId, PatchOutcome>();
+
+  savePatchOutcome(caseId: CaseId, outcome: PatchOutcome): Promise<void> {
+    this.patches.set(caseId, outcome);
+    return Promise.resolve();
+  }
+
+  getPatchOutcome(caseId: CaseId): Promise<PatchOutcome | undefined> {
+    return Promise.resolve(this.patches.get(caseId));
+  }
 
   saveWitness(caseId: CaseId, admitted: AdmittedWitness): Promise<void> {
     this.witnesses.set(caseId, admitted);
@@ -58,14 +67,5 @@ export class InMemoryWorkspace implements TrialWorkspace {
 
   getExhibits(caseId: CaseId): Promise<ExhibitId[]> {
     return Promise.resolve([...(this.exhibits.get(caseId) ?? [])]);
-  }
-
-  savePatchOutcome(caseId: CaseId, outcome: PatchOutcome): Promise<void> {
-    this.outcomes.set(caseId, outcome);
-    return Promise.resolve();
-  }
-
-  getPatchOutcome(caseId: CaseId): Promise<PatchOutcome | undefined> {
-    return Promise.resolve(this.outcomes.get(caseId));
   }
 }

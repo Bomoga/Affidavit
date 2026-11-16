@@ -1,19 +1,18 @@
-import {
+import type {
+  Budget,
+  CaseFileSource,
+  Exhibit,
   ExhibitId,
-  type AdmissibilityRule,
-  type Budget,
-  type PromptId,
-  type CaseFileSource,
-  type CaseId,
-  type JudgePort,
-  type PatchExhibit,
-  type VerifyResult,
+  JudgePort,
+  PromptId,
 } from '@affidavit/contracts';
-import { canonicalJson, sha256Hex } from './canonical.js';
+import type { UntrustedBlock } from '@affidavit/prompts';
+import { digestOf } from './canonical.js';
 import { loadCaseFile, type PromptRenderer } from './defense.js';
 import { SUBMISSIONS } from './envelope.js';
 import type { StageHandler, StageResult } from './orchestrator.js';
-import type { TrialWorkspace } from './workspace.js';
+import { buildPatchExhibit, describeVerify, isAccepted, rejectionRule } from './patch.js';
+import type { PatchOutcome, TrialWorkspace } from './workspace.js';
 
 export interface RemedyConfig {
   promptId: PromptId;
@@ -30,67 +29,17 @@ export interface RemedyDeps {
   render: PromptRenderer;
   workspace: TrialWorkspace;
   config: RemedyConfig;
-}
-
-/**
- * Builds the contract PatchExhibit around a submitted diff. Files touched and lines changed are
- * computed here from the diff, never taken from the agent. Returns undefined when the diff names
- * no file or changes no line, which the contract does not allow.
- */
-export function buildPatchExhibit(caseId: CaseId, diff: string): PatchExhibit | undefined {
-  const files = new Set<string>();
-  let linesChanged = 0;
-  for (const line of diff.split('\n')) {
-    const header = /^\+\+\+ (?:b\/)?(\S+)/.exec(line);
-    if (header) {
-      if (header[1] !== '/dev/null') files.add(header[1]!);
-    } else if (/^--- /.test(line)) {
-      continue;
-    } else if (line.startsWith('+') || line.startsWith('-')) {
-      linesChanged += 1;
-    }
-  }
-  if (files.size === 0 || linesChanged === 0) return undefined;
-
-  const sha256 = sha256Hex(canonicalJson({ caseId, kind: 'patch', diff }));
-  return {
-    schemaVersion: 1,
-    id: ExhibitId.parse(`exhibit-patch-${sha256.slice(0, 24)}`),
-    caseId,
-    author: 'remedy',
-    kind: 'patch',
-    code: diff,
-    sha256,
-    diff,
-    filesTouched: [...files],
-    linesChanged,
-  };
-}
-
-export function isAccepted(r: VerifyResult): boolean {
-  return (
-    r.rejectedBy === undefined &&
-    r.familyFlipped &&
-    r.suitePassed &&
-    r.rescanClean &&
-    r.counterexamples.every((c) => !c.survived)
-  );
-}
-
-function describeVerify(r: VerifyResult): string {
-  const flags = [
-    r.familyFlipped ? null : 'witness family not flipped',
-    r.suitePassed ? null : 'test suite failed',
-    r.rescanClean ? null : 'rescan not clean',
-    r.counterexamples.some((c) => c.survived) ? 'a counterexample survived' : null,
-  ].filter((f): f is string => f !== null);
-  return `judge: ${r.rejectedBy ?? 'not accepted'}${flags.length ? ` [${flags.join(', ')}]` : ''}`;
+  /**
+   * Admissible counterexamples the patch must defeat. Prosecution (L3-08) supplies them; until it
+   * exists the list is empty.
+   */
+  counterexamples?: (caseId: string) => Promise<readonly Exhibit[]>;
 }
 
 /**
  * Remedy writes a patch and submits it to the Judge's verifyPatch. Acceptance comes only from the
- * Judge's result. The stage always moves on to verify, carrying the outcome in the workspace, so
- * a fix that cannot be proven becomes a verdict, not a crash.
+ * Judge result. The stage always moves on to verify, carrying the outcome in the workspace, so a
+ * fix that cannot be proven becomes a proven-unfixed or not-proven verdict, not a crash.
  */
 export function createRemedyHandler(deps: RemedyDeps): StageHandler {
   const { config, judge, render, workspace } = deps;
@@ -100,19 +49,20 @@ export function createRemedyHandler(deps: RemedyDeps): StageHandler {
       const caseFile = await loadCaseFile(deps.caseFiles, ctx.caseId);
       const admitted = await workspace.getWitness(ctx.caseId);
       if (!admitted) throw new Error(`no admitted witness for case ${ctx.caseId}`);
-      const witness = admitted.witness;
+      const counterexamples = (await deps.counterexamples?.(ctx.caseId)) ?? [];
 
       const feedback: string[] = [];
-      let last: { patch?: PatchExhibit; result?: VerifyResult; reason: string } = {
-        reason: 'no patch was submitted',
-      };
+      let last: PatchOutcome = { accepted: false, reason: 'no patch was submitted' };
 
       for (let i = 0; i < config.maxIterations; i++) {
-        const blocks = [
+        const blocks: UntrustedBlock[] = [
           { label: 'candidate', content: JSON.stringify(caseFile.candidate) },
           {
             label: 'witness',
-            content: JSON.stringify({ template: witness.template, params: witness.params }),
+            content: JSON.stringify({
+              template: admitted.witness.template,
+              params: admitted.witness.params,
+            }),
           },
           ...caseFile.slices.map((s) => ({
             label: 'case-file-slice',
@@ -125,7 +75,6 @@ export function createRemedyHandler(deps: RemedyDeps): StageHandler {
         const rendered = render(config.promptId, blocks);
         const res = await ctx.runAgentValidated(
           {
-            actor: 'remedy',
             promptId: rendered.promptId,
             promptVersion: rendered.version,
             model: config.model,
@@ -140,49 +89,63 @@ export function createRemedyHandler(deps: RemedyDeps): StageHandler {
         );
 
         if (res.outcome === 'no-submission') {
-          last = { reason: 'no patch was submitted' };
+          last = { accepted: false, reason: 'no patch was submitted' };
           break;
         }
         if (res.outcome === 'inadmissible') {
-          const reason = `schema: ${res.errors.join('; ')}`;
-          feedback.push(reason);
-          last = { reason };
+          feedback.push(`schema: ${res.errors.join('; ')}`);
+          last = { accepted: false, reason: 'patch failed schema' };
           continue;
         }
 
-        const patch = buildPatchExhibit(ctx.caseId, res.value.diff);
-        if (!patch) {
-          const reason = 'schema: the diff names no file or changes no line';
-          feedback.push(reason);
-          last = { reason };
+        // Files touched and lines changed come from the diff, computed in code.
+        let patch;
+        try {
+          patch = buildPatchExhibit(caseFile, res.value.diff);
+        } catch (err) {
+          const why = err instanceof Error ? err.message : String(err);
+          await ctx.record(
+            'exhibit-inadmissible',
+            { exhibitId: rejectedPatchId(res.result.submission), rejectedBy: 'schema' },
+            'judge',
+          );
+          feedback.push(`schema: the diff could not be read as a patch (${why})`);
+          last = { accepted: false, reason: 'patch diff could not be read' };
           continue;
         }
 
         await ctx.record('exhibit-submitted', { exhibitId: patch.id, kind: 'patch' }, 'remedy');
-        // The Judge decides. Counterexamples join once Prosecution exists (L3-08).
-        const result = await judge.verifyPatch(caseFile, patch, witness, []);
+        const result = await judge.verifyPatch(caseFile, patch, admitted.witness, counterexamples);
 
         if (isAccepted(result)) {
-          await workspace.addExhibit(ctx.caseId, result.patchExhibitId);
-          await workspace.savePatchOutcome(ctx.caseId, { accepted: true, patch, result });
-          if (result.patchExhibitId) await workspace.addExhibit(ctx.caseId, result.patchExhibitId);
+          await workspace.addExhibit(ctx.caseId, patch.id);
+          await workspace.savePatchOutcome(ctx.caseId, {
+            accepted: true,
+            patch,
+            result,
+            reason: 'accepted by the Judge',
+          });
           return { kind: 'advance', next: 'verify' };
         }
 
-        const rule: AdmissibilityRule | undefined = result.rejectedBy;
+        const rule = rejectionRule(result);
         if (rule) {
           await ctx.record(
             'exhibit-inadmissible',
-            { exhibitId: result.patchExhibitId, rejectedBy: rule },
+            { exhibitId: patch.id, rejectedBy: rule },
             'judge',
           );
         }
         feedback.push(describeVerify(result));
-        last = { patch, result, reason: describeVerify(result) };
+        last = { accepted: false, patch, result, reason: describeVerify(result) };
       }
 
-      await workspace.savePatchOutcome(ctx.caseId, { accepted: false, ...last });
+      await workspace.savePatchOutcome(ctx.caseId, last);
       return { kind: 'advance', next: 'verify' };
     },
   };
+}
+
+function rejectedPatchId(submission: unknown): ExhibitId {
+  return `exhibit-patch-rejected-${digestOf(submission).slice(0, 24)}` as ExhibitId;
 }

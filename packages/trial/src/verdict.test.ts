@@ -144,7 +144,10 @@ describe('verify stage writes the verdict', () => {
     const workspace = new InMemoryWorkspace();
     await workspace.addExhibit(CF.id, W1);
     await workspace.addExhibit(CF.id, P1);
-    await workspace.savePatchOutcome(CF.id, { accepted });
+    await workspace.savePatchOutcome(CF.id, {
+      accepted,
+      reason: accepted ? 'the Judge verified the patch' : 'the Judge did not accept a patch',
+    });
     const orch = new Orchestrator({
       store,
       sink,
