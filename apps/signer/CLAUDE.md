@@ -2,7 +2,7 @@ Read docs/plan.md, then docs/implementation-plan.md section 6 (Lane 2) before wo
 
 # @affidavit/signer
 
-**Owner:** Lane 2 (Judge and Evidence)
+**Owner:** Lane 2 (Judge and Evidence), @Thearius123
 
 **Mission:** Holds the cosign signing key; the API and worker can request a signature but cannot read the key.
 

@@ -12,13 +12,16 @@
     "lint": "eslint src",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:sandbox-host": "AFFIDAVIT_SANDBOX_HOST=1 vitest run src/gvisor",
+    "containment": "tsx src/containment/cli.ts"
   },
   "dependencies": {
     "@affidavit/contracts": "workspace:*",
     "dockerode": "5.0.1"
   },
   "devDependencies": {
+    "@affidavit/testing": "workspace:*",
     "@types/dockerode": "4.0.2"
   }
 }
