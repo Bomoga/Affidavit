@@ -51,7 +51,7 @@ describePg('database guards behind the store', () => {
     await expect(store.open(sampleCase('tenant-unprovisioned'), BUDGET)).rejects.toThrow(
       /unknown tenant/,
     );
-    await provisionTenant(db().adminUrl, 'tenant-unprovisioned');
+    await provisionTenant(db().ownerUrl, 'tenant-unprovisioned');
     await expect(store.open(sampleCase('tenant-unprovisioned'), BUDGET)).resolves.toBeUndefined();
   });
 
@@ -220,7 +220,7 @@ describePg('database guards behind the store', () => {
           ]),
         ).rejects.toThrow(/inserted open/);
       }
-      const run = { tenantId: T, caseId: file.id, stage: 'map' as const, attempt: 2 };
+      const run = { tenantId: T, caseId: file.id, stage: 'intake' as const, attempt: 2 };
       await enqueueStage(db().app, run);
       await claimStageRun(db().worker, run, 'w', 60);
       const upd = (set: string) =>
@@ -237,6 +237,30 @@ describePg('database guards behind the store', () => {
       await expect(upd(`error = 'x'`)).rejects.toThrow(/only with failed_at/);
       await upd(`failed_at = now(), error = 'x'`);
       await expect(upd(`completed_at = now()`)).rejects.toThrow(/finished stage run is immutable/);
+    });
+
+    it('cost rows reject negative amounts and a zero attempt', async () => {
+      const { store, file } = await openCase();
+      await store.transition(file.id, 'map');
+      for (const [col, val] of [
+        ['input_tokens', '-1'],
+        ['output_tokens', '-1'],
+        ['usd', '-0.5'],
+        ['wall_ms', '-1'],
+        ['attempt', '0'],
+      ] as const) {
+        const row = {
+          input_tokens: '1',
+          output_tokens: '1',
+          usd: '1',
+          wall_ms: '1',
+          attempt: '1',
+          [col]: val,
+        };
+        const text = `insert into cost_rows (tenant_id, case_id, stage, attempt, input_tokens, output_tokens, usd, wall_ms)
+          values ($1, $2, 'map', ${row.attempt}, ${row.input_tokens}, ${row.output_tokens}, ${row.usd}, ${row.wall_ms})`;
+        expect(await asApp(text, [T, file.id]), col).toMatch(/cost_rows_values_valid/);
+      }
     });
 
     it('case exhaustion never clears', async () => {
@@ -309,7 +333,7 @@ describePg('database guards behind the store', () => {
     it('exhibits and stage runs can never be deleted', async () => {
       const { store, file } = await openCase();
       await store.putExhibit(Exhibit.parse({ ...(samples.Exhibit as object), caseId: file.id }));
-      const run = { tenantId: T, caseId: file.id, stage: 'map' as const, attempt: 1 };
+      const run = { tenantId: T, caseId: file.id, stage: 'intake' as const, attempt: 1 };
       await enqueueStage(db().app, run);
       await claimStageRun(db().worker, run, 'w', 60);
       await expect(db().admin.query(`delete from exhibits`)).rejects.toThrow(/never deleted/);

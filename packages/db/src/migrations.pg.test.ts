@@ -1,5 +1,6 @@
 import { expect, it } from 'vitest';
-import { applyMigrations, APP_ROLE, WORKER_ROLE } from './migrate.js';
+import pg from 'pg';
+import { applyMigrations, APP_ROLE, OWNER_ROLE, WORKER_ROLE, bootstrapRoles } from './migrate.js';
 import { describePg, useTestDatabase } from './test-support.js';
 
 describePg('migrations on a fresh Postgres', () => {
@@ -83,7 +84,62 @@ describePg('migrations on a fresh Postgres', () => {
     expect(rows).toEqual([]);
   });
 
+  it('everything runs as a non-superuser owner: objects, SECURITY DEFINER functions and owner policies', async () => {
+    const owner = await db().admin.query<{ rolsuper: boolean; rolbypassrls: boolean }>(
+      `select rolsuper, rolbypassrls from pg_roles where rolname = $1`,
+      [OWNER_ROLE],
+    );
+    expect(owner.rows).toEqual([{ rolsuper: false, rolbypassrls: false }]);
+    const dbOwner = await db().admin.query<{ owner: string }>(
+      `select r.rolname as owner from pg_database d join pg_roles r on r.oid = d.datdba
+       where d.datname = current_database()`,
+    );
+    expect(dbOwner.rows[0]!.owner).toBe(OWNER_ROLE);
+    const tables = await db().admin.query<{ owner: string }>(
+      `select distinct r.rolname as owner from pg_class c join pg_roles r on r.oid = c.relowner
+       join pg_namespace n on n.oid = c.relnamespace
+       where n.nspname in ('public', 'graphile_worker') and c.relkind in ('r', 'v')`,
+    );
+    expect(tables.rows).toEqual([{ owner: OWNER_ROLE }]);
+    const fns = await db().admin.query<{ proname: string; owner: string }>(
+      `select p.proname, r.rolname as owner from pg_proc p join pg_roles r on r.oid = p.proowner
+       join pg_namespace n on n.oid = p.pronamespace
+       where n.nspname = 'public' and p.prosecdef order by p.proname`,
+    );
+    expect(fns.rows).toEqual([
+      { proname: 'claim_stage_run', owner: OWNER_ROLE },
+      { proname: 'enqueue_stage', owner: OWNER_ROLE },
+    ]);
+    const pol = await db().admin.query<{ tablename: string; roles: string[] }>(
+      `select tablename, roles::text[] as roles from pg_policies
+       where schemaname = 'public' and policyname in ('owner_access', 'owner_read') order by tablename`,
+    );
+    expect(pol.rows.map((p) => p.tablename)).toEqual([
+      'cases',
+      'stage_jobs',
+      'stage_runs',
+      'stages',
+      'tenants',
+    ]);
+    for (const p of pol.rows) expect(p.roles).toEqual([OWNER_ROLE]);
+    // The owner really is subject to FORCE RLS: without its policy it would see nothing, and it
+    // sees no events (no owner policy there) even though rows exist.
+    const asOwner = new pg.Pool({ connectionString: db().ownerUrl, max: 1 });
+    try {
+      const seen = await asOwner.query(`select * from public.verdicts`);
+      expect(seen.rows).toHaveLength(0);
+      const tenants = await asOwner.query(`select * from public.tenants`);
+      expect(tenants.rows.length).toBeGreaterThan(-1);
+    } finally {
+      await asOwner.end();
+    }
+  });
+
+  it('bootstrapRoles is idempotent', async () => {
+    await expect(bootstrapRoles(db().adminUrl)).resolves.toBeUndefined();
+  });
+
   it('re-applying migrations is a no-op', async () => {
-    await expect(applyMigrations(db().adminUrl)).resolves.toBeUndefined();
+    await expect(applyMigrations(db().ownerUrl)).resolves.toBeUndefined();
   });
 });

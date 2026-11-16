@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { Verdict, samples } from '@affidavit/contracts';
 import { sql } from 'drizzle-orm';
 import pg from 'pg';
@@ -80,8 +82,8 @@ describePg('session and role hardening', () => {
   });
 
   it('startup refuses a superuser, an owner, and a role with BYPASSRLS', async () => {
-    await expect(openPool(db().adminUrl)).rejects.toBeInstanceOf(UnsafeRoleError);
-    await expect(openPool(db().adminUrl)).rejects.toThrow(/superuser/);
+    await expect(openPool(db().adminUrl, 'affidavit_app')).rejects.toBeInstanceOf(UnsafeRoleError);
+    await expect(openPool(db().adminUrl, 'affidavit_app')).rejects.toThrow(/superuser/);
     const roleName = 'affidavit_probe_bypass';
     await db().admin.query(`drop role if exists ${roleName}`);
     await db().admin.query(`create role ${roleName} login password 'probe-pw' bypassrls`);
@@ -89,7 +91,7 @@ describePg('session and role hardening', () => {
       const u = new URL(db().adminUrl);
       u.username = roleName;
       u.password = 'probe-pw';
-      await expect(openPool(u.toString())).rejects.toThrow(/BYPASSRLS/);
+      await expect(openPool(u.toString(), 'affidavit_app')).rejects.toThrow(/BYPASSRLS/);
     } finally {
       await db().admin.query(`drop role ${roleName}`);
     }
@@ -102,7 +104,7 @@ describePg('session and role hardening', () => {
       const u = new URL(db().adminUrl);
       u.username = ownerRole;
       u.password = 'probe-pw';
-      await expect(openPool(u.toString())).rejects.toThrow(/owns tables/);
+      await expect(openPool(u.toString(), 'affidavit_app')).rejects.toThrow(/owns tables/);
     } finally {
       await db().admin.query(`drop table public.probe_owned`);
       await db().admin.query(`drop role ${ownerRole}`);
@@ -129,7 +131,7 @@ describePg('session and role hardening', () => {
         const u = new URL(db().adminUrl);
         u.username = name;
         u.password = 'probe-pw';
-        await expect(openPool(u.toString()), name).rejects.toThrow(expected);
+        await expect(openPool(u.toString(), 'affidavit_app'), name).rejects.toThrow(expected);
       } finally {
         for (const s of teardown) await db().admin.query(s);
         await db().admin.query(`drop owned by ${name}`);
@@ -182,7 +184,7 @@ describePg('session and role hardening', () => {
       u.pathname = `/${owned}`;
       u.username = dbOwner;
       u.password = 'probe-pw';
-      await expect(openPool(u.toString())).rejects.toThrow(/owns the database/);
+      await expect(openPool(u.toString(), 'affidavit_app')).rejects.toThrow(/owns the database/);
     } finally {
       await rootPool.query(`drop database if exists ${owned} with (force)`);
       await rootPool.end();
@@ -190,8 +192,71 @@ describePg('session and role hardening', () => {
     }
   });
 
+  it('startup refuses any membership, REPLICATION, a role-level setting such as app.tenant_id, and the wrong role', async () => {
+    const attempt = async (name: string, setup: string[], expected: RegExp) => {
+      await db().admin.query(`drop role if exists ${name}`);
+      await db().admin.query(`create role ${name} login password 'probe-pw'`);
+      await db().admin.query(
+        `alter role ${name} in database ${db().name} set search_path = pg_catalog, public, pg_temp`,
+      );
+      try {
+        for (const s of setup) await db().admin.query(s);
+        const u = new URL(db().adminUrl);
+        u.username = name;
+        u.password = 'probe-pw';
+        await expect(openPool(u.toString(), 'affidavit_app'), name).rejects.toThrow(expected);
+      } finally {
+        await db().admin.query(`drop owned by ${name}`);
+        await db().admin.query(`drop role ${name}`);
+      }
+    };
+    await attempt(
+      'probe_member',
+      ['create role probe_plain nologin', 'grant probe_plain to probe_member'],
+      /member of another role/,
+    );
+    await db().admin.query(`drop role probe_plain`);
+    await attempt('probe_repl', ['alter role probe_repl replication'], /REPLICATION/);
+    await attempt(
+      'probe_setting',
+      [`alter role probe_setting set app.tenant_id = 'tenant-b'`],
+      /role-level settings besides search_path: app.tenant_id/,
+    );
+    await attempt('probe_other', [], /connected as probe_other, expected affidavit_app/);
+    // The real worker role is not the application role.
+    await expect(openPool(db().workerUrl, 'affidavit_app')).rejects.toThrow(
+      /expected affidavit_app/,
+    );
+  });
+
+  it('the tenant setting is transaction-local (pinned in the source)', async () => {
+    const src = readFileSync(fileURLToPath(new URL('./tenant.ts', import.meta.url)), 'utf8');
+    // A mutation to set_config(..., false) would make the tenant stick to the pooled connection
+    // and rely on DISCARD ALL alone. Keep the third argument true.
+    expect(src).toMatch(/set_config\('app\.tenant_id', \$\{tenant\}, true\)/);
+    expect(src).not.toMatch(/set_config\('app\.tenant_id', \$\{tenant\}, false\)/);
+    // And behaviourally: inside one transaction the setting is visible, after it it is gone, even
+    // on a connection that never went through withTenant's DISCARD ALL.
+    const c = await db().app.connect();
+    try {
+      await c.query('begin');
+      await c.query(`select set_config('app.tenant_id', $1, true)`, [T]);
+      await c.query('commit');
+      const { rows } = await c.query<{ v: string | null }>(
+        `select nullif(current_setting('app.tenant_id', true), '') as v`,
+      );
+      expect(rows[0]!.v).toBeNull();
+    } finally {
+      c.release();
+    }
+  });
+
   it('startup accepts the application and worker roles', async () => {
-    await expect(openPool(db().appUrl).then((p) => p.end())).resolves.toBeUndefined();
-    await expect(openPool(db().workerUrl).then((p) => p.end())).resolves.toBeUndefined();
+    await expect(
+      openPool(db().appUrl, 'affidavit_app').then((p) => p.end()),
+    ).resolves.toBeUndefined();
+    await expect(
+      openPool(db().workerUrl, 'affidavit_worker').then((p) => p.end()),
+    ).resolves.toBeUndefined();
   });
 });

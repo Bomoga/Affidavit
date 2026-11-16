@@ -43,7 +43,8 @@ CREATE TABLE "cost_rows" (
 	"wall_ms" bigint NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	CONSTRAINT "cost_rows_tenant_id_case_id_id_pk" PRIMARY KEY("tenant_id","case_id","id"),
-	CONSTRAINT "cost_rows_stage_valid" CHECK ("cost_rows"."stage" in ('intake', 'map', 'arraign', 'defense', 'prosecution', 'remedy', 'verify', 'jury', 'verdict', 'dismissed', 'escalated'))
+	CONSTRAINT "cost_rows_stage_valid" CHECK ("cost_rows"."stage" in ('intake', 'map', 'arraign', 'defense', 'prosecution', 'remedy', 'verify', 'jury', 'verdict', 'dismissed', 'escalated')),
+	CONSTRAINT "cost_rows_values_valid" CHECK ("cost_rows"."attempt" >= 1 and "cost_rows"."input_tokens" >= 0 and "cost_rows"."output_tokens" >= 0 and "cost_rows"."usd" >= 0 and "cost_rows"."wall_ms" >= 0)
 );
 --> statement-breakpoint
 ALTER TABLE "cost_rows" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
@@ -98,6 +99,7 @@ CREATE TABLE "stage_jobs" (
 	"case_id" text NOT NULL,
 	"stage" text NOT NULL,
 	"attempt" integer NOT NULL,
+	"visit" integer NOT NULL,
 	"enqueued_at" timestamp with time zone DEFAULT now() NOT NULL,
 	CONSTRAINT "stage_jobs_tenant_id_case_id_stage_attempt_pk" PRIMARY KEY("tenant_id","case_id","stage","attempt"),
 	CONSTRAINT "stage_jobs_stage_valid" CHECK ("stage_jobs"."stage" in ('intake', 'map', 'arraign', 'defense', 'prosecution', 'remedy', 'verify', 'jury', 'verdict', 'dismissed', 'escalated')),

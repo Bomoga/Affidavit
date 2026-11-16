@@ -4,8 +4,10 @@ import pg from 'pg';
 import { afterAll, beforeAll, describe } from 'vitest';
 import {
   APP_ROLE,
+  OWNER_ROLE,
   WORKER_ROLE,
   applyMigrations,
+  bootstrapRoles,
   provisionTenant,
   setRolePassword,
 } from './migrate.js';
@@ -31,9 +33,12 @@ export function describePg(name: string, fn: () => void): void {
 
 export interface TestDatabase {
   name: string;
+  /** Superuser URL of this database: for bootstrap and assertions, never for the code under test. */
   adminUrl: string;
+  /** URL of the non-superuser database owner, who runs the migrations. */
+  ownerUrl: string;
   appUrl: string;
-  /** Owner/superuser pool: for assertions about what exists, never for the code under test. */
+  /** Superuser pool: for assertions about what exists, never for the code under test. */
   admin: pg.Pool;
   /** Pool for the non-owner application role. */
   app: pg.Pool;
@@ -60,15 +65,21 @@ export async function createTestDatabase(tenants: readonly string[] = []): Promi
   await root.query(`CREATE DATABASE ${name}`);
   await root.end();
   const adminUrl = withDb(PG_ADMIN_URL, name);
+  const ownerPassword = randomBytes(18).toString('hex');
+  const ownerUrl = withDb(PG_ADMIN_URL, name, { name: OWNER_ROLE, password: ownerPassword });
   try {
-    await applyMigrations(adminUrl);
+    // Superuser, once: roles, flags, role settings, database owner. Then everything else,
+    // including the migrations and the SECURITY DEFINER functions, runs as the non-superuser owner.
+    await bootstrapRoles(adminUrl);
+    await setRolePassword(adminUrl, OWNER_ROLE, ownerPassword);
+    await applyMigrations(ownerUrl);
   } catch (err) {
     const r = new pg.Pool({ connectionString: PG_ADMIN_URL, max: 1 });
     await r.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
     await r.end();
     throw err;
   }
-  for (const t of tenants) await provisionTenant(adminUrl, t);
+  for (const t of tenants) await provisionTenant(ownerUrl, t);
   const appPassword = randomBytes(18).toString('hex');
   const workerPassword = randomBytes(18).toString('hex');
   await setRolePassword(adminUrl, APP_ROLE, appPassword);
@@ -76,11 +87,12 @@ export async function createTestDatabase(tenants: readonly string[] = []): Promi
   const appUrl = withDb(PG_ADMIN_URL, name, { name: APP_ROLE, password: appPassword });
   const workerUrl = withDb(PG_ADMIN_URL, name, { name: WORKER_ROLE, password: workerPassword });
   const admin = new pg.Pool({ connectionString: adminUrl });
-  const app = await openPool(appUrl);
-  const worker = await openPool(workerUrl);
+  const app = await openPool(appUrl, APP_ROLE);
+  const worker = await openPool(workerUrl, WORKER_ROLE);
   return {
     name,
     adminUrl,
+    ownerUrl,
     appUrl,
     admin,
     app,

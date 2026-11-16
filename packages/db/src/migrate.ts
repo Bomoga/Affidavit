@@ -8,6 +8,8 @@ import pg from 'pg';
 
 /** Tenant-facing login role: tenant tables under RLS, and enqueue_stage(). */
 export const APP_ROLE = 'affidavit_app';
+/** Non-superuser database owner: runs the migrations and owns every object. */
+export const OWNER_ROLE = 'affidavit_owner';
 /** Queue-runner login role: the Graphile Worker schema only, no tenant tables. */
 export const WORKER_ROLE = 'affidavit_worker';
 
@@ -18,8 +20,43 @@ function quoteIdent(name: string): string {
 }
 
 /**
+ * One-time superuser step (PG16 lets only a superuser set NOSUPERUSER, NOBYPASSRLS or role-level
+ * settings, and change a database owner). Run once per database, connected to that database as a
+ * superuser. It creates the owner and the two login roles with their flags, pins the login roles'
+ * search_path, and makes the owner the database owner. Idempotent: it re-asserts the flags every
+ * time. The migration only verifies what this does. After it, nothing needs superuser except
+ * setRolePassword.
+ *
+ * Production owner model: affidavit_owner (non-superuser, database owner) runs applyMigrations;
+ * affidavit_app and affidavit_worker are the only logins the services use.
+ */
+export async function bootstrapRoles(superuserUrl: string): Promise<void> {
+  const pool = new pg.Pool({ connectionString: superuserUrl, max: 1 });
+  try {
+    await pool.query(`
+      DO $$
+      DECLARE r text;
+      BEGIN
+        FOREACH r IN ARRAY ARRAY['${OWNER_ROLE}', '${APP_ROLE}', '${WORKER_ROLE}'] LOOP
+          IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
+            EXECUTE format('CREATE ROLE %I NOLOGIN', r);
+          END IF;
+          EXECUTE format('ALTER ROLE %I NOSUPERUSER NOBYPASSRLS NOINHERIT NOCREATEROLE NOCREATEDB NOREPLICATION', r);
+        END LOOP;
+        FOREACH r IN ARRAY ARRAY['${APP_ROLE}', '${WORKER_ROLE}'] LOOP
+          EXECUTE format('ALTER ROLE %I IN DATABASE %I SET search_path = pg_catalog, public, pg_temp', r, current_database());
+        END LOOP;
+        EXECUTE format('ALTER DATABASE %I OWNER TO %I', current_database(), '${OWNER_ROLE}');
+      END
+      $$`);
+  } finally {
+    await pool.end();
+  }
+}
+
+/**
  * Applies the Drizzle migrations and the Graphile Worker schema, then sets queue access for the
- * worker role only. Run as the database owner (an admin URL), never as an application role.
+ * worker role only. Run as the database owner (affidavit_owner, after bootstrapRoles), never as an application role.
  * Safe to run repeatedly.
  */
 export async function applyMigrations(adminUrl: string): Promise<void> {
@@ -118,7 +155,7 @@ export function scramVerifier(password: string, iterations = 4096): string {
  */
 export async function setRolePassword(
   adminUrl: string,
-  role: typeof APP_ROLE | typeof WORKER_ROLE,
+  role: typeof OWNER_ROLE | typeof APP_ROLE | typeof WORKER_ROLE,
   password: string,
 ): Promise<void> {
   const pool = new pg.Pool({ connectionString: adminUrl, max: 1 });

@@ -1,32 +1,43 @@
 -- Hand-written security migration (drizzle-kit generate --custom). Statements are split by the
 -- breakpoint markers because the migrator runs them one at a time.
 --
--- Model: migrations run as the designated database owner (a non-superuser role in production; the
--- migrating role is recorded in the owner policies below, so always migrate as that role). Two
--- login roles exist, both created NOLOGIN here (a password is set at provisioning, never here):
---   affidavit_app     tenant-facing. Tenant tables under row-level security, and enqueue_stage().
+-- Model: three roles, created and flagged by bootstrapRoles() as a SUPERUSER, once (PG16 lets only a
+-- superuser set NOSUPERUSER, NOBYPASSRLS, role-level settings or a database owner):
+--   affidavit_owner   non-superuser database owner. Runs this migration, Graphile Worker's own
+--                     migrations, and owns every object (including the SECURITY DEFINER functions).
+--   affidavit_app     tenant-facing login. Tenant tables under row-level security, and enqueue_stage().
 --                     No access to the queue schema.
---   affidavit_worker  runs the Graphile Worker runner. Queue schema, and claim_stage_run() only.
---                     No tenant tables.
--- Neither role is a superuser, bypasses RLS, owns anything, or may create temp objects.
--- Triggers below stop the application roles; the owner could still disable them.
+--   affidavit_worker  queue-runner login. Queue schema, and claim_stage_run() only. No tenant tables.
+-- This migration only VERIFIES the two login roles (it cannot create or alter them) and then does
+-- everything an owner may do. Passwords are set at provisioning, never here. Triggers below stop
+-- the application roles; the owner could still disable them.
 
 DO $$
 DECLARE
   r text;
+  v pg_roles%ROWTYPE;
 BEGIN
   IF current_user IN ('affidavit_app', 'affidavit_worker') THEN
     RAISE EXCEPTION 'migrations must run as the owner, not as an application role';
   END IF;
   FOREACH r IN ARRAY ARRAY['affidavit_app', 'affidavit_worker'] LOOP
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
-      EXECUTE format('CREATE ROLE %I NOLOGIN', r);
+    SELECT * INTO v FROM pg_roles WHERE rolname = r;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'role % is missing: run bootstrapRoles() as a superuser first', r;
     END IF;
-    -- Always re-assert the flags, so a pre-existing role cannot stay privileged.
-    EXECUTE format('ALTER ROLE %I NOSUPERUSER NOBYPASSRLS NOINHERIT NOCREATEROLE NOCREATEDB NOREPLICATION', r);
-    EXECUTE format('ALTER ROLE %I IN DATABASE %I SET search_path = pg_catalog, public, pg_temp', r, current_database());
-    IF EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles x ON x.oid = m.member WHERE x.rolname = r) THEN
+    IF v.rolsuper OR v.rolbypassrls OR v.rolcreaterole OR v.rolcreatedb OR v.rolreplication OR v.rolinherit THEN
+      RAISE EXCEPTION 'role % has privileged flags: run bootstrapRoles() as a superuser', r;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_auth_members m WHERE m.member = v.oid) THEN
       RAISE EXCEPTION 'role % must not be a member of any other role', r;
+    END IF;
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_db_role_setting st
+      WHERE st.setrole = v.oid
+        AND st.setdatabase = (SELECT oid FROM pg_database WHERE datname = current_database())
+        AND st.setconfig = ARRAY['search_path=pg_catalog, public, pg_temp']
+    ) THEN
+      RAISE EXCEPTION 'role % must have exactly the role-in-database setting search_path = pg_catalog, public, pg_temp', r;
     END IF;
   END LOOP;
   -- No temporary tables for anyone: unqualified names resolve to pg_temp first by default, and a
@@ -123,6 +134,9 @@ BEGIN
   EXECUTE format('CREATE POLICY owner_access ON public.tenants FOR ALL TO %I USING (true) WITH CHECK (true)', current_user);
   EXECUTE format('CREATE POLICY owner_access ON public.stage_jobs FOR ALL TO %I USING (true) WITH CHECK (true)', current_user);
   EXECUTE format('CREATE POLICY owner_access ON public.stage_runs FOR ALL TO %I USING (true) WITH CHECK (true)', current_user);
+  -- enqueue_stage() reads the case and its stage history.
+  EXECUTE format('CREATE POLICY owner_read ON public.cases FOR SELECT TO %I USING (true)', current_user);
+  EXECUTE format('CREATE POLICY owner_read ON public.stages FOR SELECT TO %I USING (true)', current_user);
 END
 $$;
 --> statement-breakpoint
@@ -302,6 +316,14 @@ BEGIN
   IF NEW.lease_expires_at < OLD.lease_expires_at OR NEW.heartbeat_at < OLD.heartbeat_at THEN
     RAISE EXCEPTION 'a lease only moves forward' USING ERRCODE = 'check_violation';
   END IF;
+  -- Bounds: a lease is at most a day and a minute ahead (claim allows 86400 seconds), a heartbeat
+  -- at most a minute ahead, and an expired lease cannot be revived. Infinity is out of range.
+  IF NEW.lease_expires_at > now() + interval '1 day 1 minute' OR NEW.heartbeat_at > now() + interval '1 minute' THEN
+    RAISE EXCEPTION 'lease or heartbeat is beyond the allowed bound' USING ERRCODE = 'check_violation';
+  END IF;
+  IF NEW.lease_expires_at > OLD.lease_expires_at AND OLD.lease_expires_at <= now() THEN
+    RAISE EXCEPTION 'an expired lease cannot be extended' USING ERRCODE = 'check_violation';
+  END IF;
   RETURN NEW;
 END
 $$;
@@ -423,6 +445,54 @@ CREATE TRIGGER stages_guard BEFORE INSERT ON public.stages
   FOR EACH ROW EXECUTE FUNCTION stages_guard();
 --> statement-breakpoint
 
+-- Events: the seq must have been handed out by nextSeq (below the case counter), so a future seq
+-- cannot be pre-inserted to shadow a real event. A case the role cannot see is an unknown case
+-- (foreign_key_violation, which the sink reports as such).
+CREATE FUNCTION events_insert_guard() RETURNS trigger
+  LANGUAGE plpgsql
+  SET search_path = pg_catalog, public
+  AS $$
+DECLARE
+  v_next integer;
+BEGIN
+  SELECT seq INTO v_next FROM public.cases WHERE tenant_id = NEW.tenant_id AND id = NEW.case_id;
+  IF v_next IS NULL THEN
+    RAISE EXCEPTION 'unknown case %', NEW.case_id USING ERRCODE = 'foreign_key_violation';
+  END IF;
+  IF NEW.seq < 0 OR NEW.seq >= v_next THEN
+    RAISE EXCEPTION 'event seq % was not assigned by nextSeq', NEW.seq USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NEW;
+END
+$$;
+--> statement-breakpoint
+CREATE TRIGGER events_insert_guard BEFORE INSERT ON public.events
+  FOR EACH ROW EXECUTE FUNCTION events_insert_guard();
+--> statement-breakpoint
+-- Ballots and escalations are projections of events: each needs its event row of the right type.
+CREATE FUNCTION event_projection_guard() RETURNS trigger
+  LANGUAGE plpgsql
+  SET search_path = pg_catalog, public
+  AS $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM public.events e
+    WHERE e.tenant_id = NEW.tenant_id AND e.case_id = NEW.case_id AND e.seq = NEW.seq
+      AND e.type = ANY (TG_ARGV)
+  ) THEN
+    RAISE EXCEPTION '% needs a matching % event', TG_TABLE_NAME, TG_ARGV[0] USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NEW;
+END
+$$;
+--> statement-breakpoint
+CREATE TRIGGER ballots_event_guard BEFORE INSERT ON public.ballots
+  FOR EACH ROW EXECUTE FUNCTION event_projection_guard('ballot-cast');
+--> statement-breakpoint
+CREATE TRIGGER escalations_event_guard BEFORE INSERT ON public.escalations
+  FOR EACH ROW EXECUTE FUNCTION event_projection_guard('escalated', 'budget-exhausted');
+--> statement-breakpoint
+
 -- The only way the application role can enqueue work. SECURITY DEFINER, search_path pinned, and
 -- the tenant is taken from the transaction setting, never an argument. It writes a durable
 -- stage_jobs record (the case must exist for the tenant) and then the queue job, idempotent on
@@ -436,24 +506,33 @@ DECLARE
   v_tenant text := public.app_tenant_id();
   v_key text;
   v_existed boolean;
+  v_current text;
+  v_visit integer;
 BEGIN
   IF v_tenant IS NULL THEN
     RAISE EXCEPTION 'no tenant set' USING ERRCODE = 'insufficient_privilege';
   END IF;
-  IF p_case_id IS NULL OR p_case_id = '' OR p_attempt IS NULL OR p_attempt < 1 THEN
+  IF p_case_id IS NULL OR p_case_id = '' OR p_attempt IS NULL OR p_attempt < 1 OR p_attempt > 100 THEN
+    -- Attempts are bounded at 100 per case and stage so attempt numbers cannot be used to flood the queue.
     RAISE EXCEPTION 'invalid stage job' USING ERRCODE = 'invalid_parameter_value';
   END IF;
   IF p_stage IS NULL OR p_stage NOT IN ('intake', 'map', 'arraign', 'defense', 'prosecution', 'remedy',
                                        'verify', 'jury', 'verdict', 'dismissed', 'escalated') THEN
     RAISE EXCEPTION 'invalid stage' USING ERRCODE = 'invalid_parameter_value';
   END IF;
-  BEGIN
-    INSERT INTO public.stage_jobs (tenant_id, case_id, stage, attempt)
-      VALUES (v_tenant, p_case_id, p_stage, p_attempt)
-      ON CONFLICT DO NOTHING;
-  EXCEPTION WHEN foreign_key_violation THEN
+  -- The job must be for the stage the case is at now; the visit is that stage entry's ordinal in
+  -- the stage history, so a later return to the same stage is a different visit.
+  SELECT stage INTO v_current FROM public.cases WHERE tenant_id = v_tenant AND id = p_case_id;
+  IF NOT FOUND THEN
     RAISE EXCEPTION 'unknown case %', p_case_id USING ERRCODE = 'no_data_found';
-  END;
+  END IF;
+  IF v_current <> p_stage THEN
+    RAISE EXCEPTION 'case % is at stage %, not %', p_case_id, v_current, p_stage USING ERRCODE = 'check_violation';
+  END IF;
+  SELECT coalesce(max(ordinal), 0) INTO v_visit FROM public.stages WHERE tenant_id = v_tenant AND case_id = p_case_id;
+  INSERT INTO public.stage_jobs (tenant_id, case_id, stage, attempt, visit)
+    VALUES (v_tenant, p_case_id, p_stage, p_attempt, v_visit)
+    ON CONFLICT DO NOTHING;
   v_key := '[' || to_json(v_tenant)::text || ',' || to_json(p_case_id)::text || ',' ||
            to_json(p_stage)::text || ',' || p_attempt::text || ']';
   -- add_job with unsafe_dedupe returns the existing job on a repeat, so look first.

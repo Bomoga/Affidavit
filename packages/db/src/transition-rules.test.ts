@@ -188,23 +188,50 @@ describe('decideResume', () => {
     state,
     leaseExpiresAt,
   });
-  const d = (r: ReturnType<typeof run> | null, caseStage: string) =>
-    decideResume({ run: r, caseStage, jobStage: 'defense', now });
+  type Job = Parameters<typeof decideResume>[0]['job'];
+  const d = (
+    r: ReturnType<typeof run> | null,
+    caseStage: string,
+    over: { job?: Job; caseVisit?: number } = {},
+  ) =>
+    decideResume({
+      run: r,
+      job: over.job ?? 'none',
+      caseStage,
+      caseVisit: over.caseVisit ?? 4,
+      jobStage: 'defense',
+      jobVisit: 4,
+      now,
+    });
 
-  it('starts an unclaimed attempt only while the case is still at the stage', () => {
+  it('starts an unclaimed attempt only while the case is still at the visit and no job is in flight', () => {
     expect(d(null, 'defense')).toBe('start');
+    expect(d(null, 'defense', { job: 'queued' })).toBe('wait');
+    expect(d(null, 'defense', { job: 'running' })).toBe('wait');
     expect(d(null, 'prosecution')).toBe('adopt-complete');
+  });
+  it('an unclaimed attempt whose job failed or went stale before claiming means the next attempt', () => {
+    expect(d(null, 'defense', { job: 'failed' })).toBe('next-attempt');
+    expect(d(null, 'defense', { job: 'stale' })).toBe('next-attempt');
   });
   it('waits for a live lease, and moves on once it has expired', () => {
     expect(d(run('running', future), 'defense')).toBe('wait');
     expect(d(run('running', past), 'defense')).toBe('next-attempt');
   });
-  it('a failed attempt at the same stage means the next attempt', () => {
+  it('a live lease means wait even if the case has already moved on', () => {
+    expect(d(run('running', future), 'prosecution')).toBe('wait');
+  });
+  it('a failed attempt at the same visit means the next attempt', () => {
     expect(d(run('failed', future), 'defense')).toBe('next-attempt');
   });
-  it('an attempt whose case already left the stage counts as complete, never re-run', () => {
+  it('an attempt whose case left the stage counts as complete once the lease is gone', () => {
     expect(d(run('running', past), 'prosecution')).toBe('adopt-complete');
     expect(d(run('failed', past), 'prosecution')).toBe('adopt-complete');
+  });
+  it('a return to the same stage is a new visit, so the old attempt is adopted, not re-run', () => {
+    // verify (visit 4), remedy (5), verify again (6): the old verify attempt is for visit 4.
+    expect(d(run('running', past), 'defense', { caseVisit: 6 })).toBe('adopt-complete');
+    expect(d(run('running', future), 'defense', { caseVisit: 6 })).toBe('wait');
   });
   it('a completed attempt is done', () => {
     expect(d(run('completed', past), 'defense')).toBe('done');

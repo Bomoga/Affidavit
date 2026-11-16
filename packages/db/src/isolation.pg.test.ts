@@ -50,6 +50,9 @@ async function seed(
   const run = { tenantId: tenant, caseId: caseFile.id, stage: 'map' as const, attempt: 1 };
   await enqueueStage(pool, run);
   await claimStageRun(workerPool, run, 'seed-worker', 60);
+  // Event seqs 0 and 1 are handed out by the store, as the trial does.
+  await store.nextSeq(caseFile.id);
+  await store.nextSeq(caseFile.id);
   const base = {
     schemaVersion: 1,
     caseId: caseFile.id,

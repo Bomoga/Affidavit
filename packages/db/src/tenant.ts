@@ -7,12 +7,14 @@ import * as schema from './schema.js';
 export type Db = NodePgDatabase<typeof schema>;
 export type Tx = Parameters<Parameters<Db['transaction']>[0]>[0];
 
+/** The two login roles the services may connect as. */
+export type LoginRole = 'affidavit_app' | 'affidavit_worker';
+
 /**
- * Creates a pool. The URL must name a non-owner login role (`affidavit_app` or
- * `affidavit_worker`). An idle client erroring would otherwise crash the process, so errors are
+ * Creates an UNGUARDED pool (not exported: use openPool, which checks the role). An idle client erroring would otherwise crash the process, so errors are
  * reported to `onError` (default: one line on stderr, no connection details).
  */
-export function createPool(
+function createPool(
   connectionString: string,
   onError: (err: Error) => void = (err) => {
     console.error(`[@affidavit/db] idle pool client error: ${err.message}`);
@@ -39,13 +41,17 @@ export const EXPECTED_SEARCH_PATH = 'pg_catalog, public, pg_temp';
  * roles) of a privileged role or a predefined pg_* role (pg_write_all_data and friends). Its
  * search_path must be the pinned one. A mistaken admin URL fails here, loudly.
  */
-export async function assertSafeRole(pool: pg.Pool): Promise<void> {
+export async function assertSafeRole(pool: pg.Pool, expected: LoginRole): Promise<void> {
   const { rows } = await pool.query<{
     rolname: string;
     rolsuper: boolean;
     rolbypassrls: boolean;
     rolcreaterole: boolean;
     rolcreatedb: boolean;
+    rolreplication: boolean;
+    any_membership: boolean;
+    bad_settings: string | null;
+    tenant_setting: string | null;
     owns_relation: boolean;
     owns_function: boolean;
     owns_schema: boolean;
@@ -58,7 +64,13 @@ export async function assertSafeRole(pool: pg.Pool): Promise<void> {
       union
       select m.roleid from pg_auth_members m join memb on m.member = memb.oid
     )
-    select me.rolname, me.rolsuper, me.rolbypassrls, me.rolcreaterole, me.rolcreatedb,
+    select me.rolname, me.rolsuper, me.rolbypassrls, me.rolcreaterole, me.rolcreatedb, me.rolreplication,
+      exists (select 1 from pg_auth_members m where m.member = me.oid) as any_membership,
+      (select string_agg(c, ', ') from pg_db_role_setting st, unnest(st.setconfig) c
+        where st.setrole = me.oid
+          and st.setdatabase in (0, (select oid from pg_database where datname = current_database()))
+          and c not like 'search_path=%') as bad_settings,
+      current_setting('app.tenant_id', true) as tenant_setting,
       exists (select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace
               where c.relowner = me.oid and n.nspname <> 'information_schema'
                 and n.nspname not like 'pg\\_%') as owns_relation,
@@ -76,6 +88,12 @@ export async function assertSafeRole(pool: pg.Pool): Promise<void> {
   if (!r) throw new UnsafeRoleError(['current role not found']);
   const reasons: string[] = [];
   const n = r.rolname;
+  if (n !== expected) reasons.push(`connected as ${n}, expected ${expected}`);
+  if (r.rolreplication) reasons.push(`${n} has REPLICATION`);
+  if (r.any_membership) reasons.push(`${n} is a member of another role`);
+  if (r.bad_settings)
+    reasons.push(`${n} has role-level settings besides search_path: ${r.bad_settings}`);
+  if (r.tenant_setting) reasons.push(`${n} starts a session with app.tenant_id set`);
   if (r.rolsuper) reasons.push(`${n} is a superuser`);
   if (r.rolbypassrls) reasons.push(`${n} has BYPASSRLS`);
   if (r.rolcreaterole) reasons.push(`${n} can create roles`);
@@ -94,11 +112,12 @@ export async function assertSafeRole(pool: pg.Pool): Promise<void> {
 /** Creates a pool and refuses it unless the role is safe. Use this at process startup. */
 export async function openPool(
   connectionString: string,
+  expected: LoginRole,
   onError?: (err: Error) => void,
 ): Promise<pg.Pool> {
   const pool = createPool(connectionString, onError);
   try {
-    await assertSafeRole(pool);
+    await assertSafeRole(pool, expected);
   } catch (err) {
     await pool.end();
     throw err;
@@ -125,6 +144,8 @@ export async function withTenant<T>(
       await tx.execute(sql`select set_config('app.tenant_id', ${tenant}, true)`);
       return fn(tx);
     });
+  } catch (err) {
+    throw unwrapDriverError(err);
   } finally {
     try {
       await client.query('DISCARD ALL');
@@ -133,6 +154,17 @@ export async function withTenant<T>(
       client.release(err instanceof Error ? err : new Error(String(err)));
     }
   }
+}
+
+/**
+ * Drizzle wraps driver errors in a "Failed query" message. Callers want the Postgres message and
+ * code, so a wrapped driver error (one with a string `code`) is rethrown as itself.
+ */
+function unwrapDriverError(err: unknown): unknown {
+  const cause = (err as { cause?: unknown } | null)?.cause;
+  if (cause instanceof Error && typeof (cause as { code?: unknown }).code === 'string')
+    return cause;
+  return err;
 }
 
 /** The Postgres error code behind a driver or Drizzle error, if any. */

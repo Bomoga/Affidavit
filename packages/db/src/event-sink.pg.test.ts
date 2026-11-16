@@ -9,9 +9,12 @@ const T = 'tenant-e';
 describePg('PgEventSink', () => {
   const db = useTestDatabase([T]);
 
-  async function setup() {
+  /** Opens a case and hands out `seqs` event numbers, as the trial would via nextSeq. */
+  async function setup(seqs = 0) {
     const file = sampleCase(T);
-    await new PgCaseStore(db().app, T).open(file, BUDGET);
+    const store = new PgCaseStore(db().app, T);
+    await store.open(file, BUDGET);
+    for (let i = 0; i < seqs; i++) await store.nextSeq(file.id);
     return { file, sink: new PgEventSink(db().app, T) };
   }
 
@@ -31,7 +34,7 @@ describePg('PgEventSink', () => {
   };
 
   it('is idempotent on (caseId, seq): the same seq with different content keeps the first', async () => {
-    const { file, sink } = await setup();
+    const { file, sink } = await setup(1);
     const first = TrialEvent.parse({
       ...base(file.id, 0),
       stage: 'map',
@@ -54,7 +57,7 @@ describePg('PgEventSink', () => {
   });
 
   it('writes ballot and escalation side rows once, however often the event is emitted', async () => {
-    const { file, sink } = await setup();
+    const { file, sink } = await setup(6);
     const ballot = TrialEvent.parse({
       ...base(file.id, 3),
       stage: 'jury',
@@ -93,7 +96,7 @@ describePg('PgEventSink', () => {
   });
 
   it('rejects an escalation or verdict payload that names a different case', async () => {
-    const { file, sink } = await setup();
+    const { file, sink } = await setup(2);
     const other = sampleCase(T);
     await new PgCaseStore(db().app, T).open(other, BUDGET);
     const bad = TrialEvent.parse({
@@ -117,7 +120,7 @@ describePg('PgEventSink', () => {
   });
 
   it('lists events in seq order and resumes after a seq', async () => {
-    const { file, sink } = await setup();
+    const { file, sink } = await setup(3);
     for (const seq of [2, 0, 1]) {
       await sink.emit(
         TrialEvent.parse({
@@ -131,5 +134,41 @@ describePg('PgEventSink', () => {
     }
     expect((await sink.events(file.id)).map((e) => e.seq)).toEqual([0, 1, 2]);
     expect((await sink.events(file.id, 0)).map((e) => e.seq)).toEqual([1, 2]);
+  });
+
+  it('refuses a seq that nextSeq has not handed out, so a future seq cannot shadow a real event', async () => {
+    const { file, sink } = await setup(1);
+    const event = (seq: number) =>
+      TrialEvent.parse({
+        ...base(file.id, seq),
+        stage: 'map',
+        actor: 'judge',
+        type: 'stage-entered',
+        payload: {},
+      });
+    await expect(sink.emit(event(5))).rejects.toThrow(/not assigned by nextSeq/);
+    await expect(sink.emit(event(1))).rejects.toThrow(/not assigned by nextSeq/);
+    await sink.emit(event(0));
+    expect(await count('events', file.id)).toBe(1);
+  });
+
+  it('ballot and escalation rows need their event, even through raw SQL as the application role', async () => {
+    const { file } = await setup(1);
+    for (const q of [
+      `insert into ballots (tenant_id, case_id, seq, juror_id, question, ballot)
+       values ($1, $2, 0, 'j', 'severity', '{}')`,
+      `insert into escalations (tenant_id, case_id, seq, reason, detail, escalation)
+       values ($1, $2, 0, 'split-jury', 'd', '{}')`,
+    ]) {
+      const c = await db().app.connect();
+      try {
+        await c.query('begin');
+        await c.query(`select set_config('app.tenant_id', $1, true)`, [T]);
+        await expect(c.query(q, [T, file.id]), q).rejects.toThrow(/needs a matching/);
+      } finally {
+        await c.query('rollback');
+        c.release();
+      }
+    }
   });
 });

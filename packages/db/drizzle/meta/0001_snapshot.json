@@ -1,6 +1,6 @@
 {
-  "id": "4c47256e-0c54-4c82-bde6-a87347f7e992",
-  "prevId": "42c7b8b9-b093-4809-a572-b0adc4353689",
+  "id": "624dba28-315b-4ead-9c51-fbb64f025064",
+  "prevId": "bba305c9-94e1-47da-8433-fee9ca401a3a",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -305,6 +305,10 @@
         "cost_rows_stage_valid": {
           "name": "cost_rows_stage_valid",
           "value": "\"cost_rows\".\"stage\" in ('intake', 'map', 'arraign', 'defense', 'prosecution', 'remedy', 'verify', 'jury', 'verdict', 'dismissed', 'escalated')"
+        },
+        "cost_rows_values_valid": {
+          "name": "cost_rows_values_valid",
+          "value": "\"cost_rows\".\"attempt\" >= 1 and \"cost_rows\".\"input_tokens\" >= 0 and \"cost_rows\".\"output_tokens\" >= 0 and \"cost_rows\".\"usd\" >= 0 and \"cost_rows\".\"wall_ms\" >= 0"
         }
       },
       "isRLSEnabled": true
@@ -626,6 +630,12 @@
         },
         "attempt": {
           "name": "attempt",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "visit": {
+          "name": "visit",
           "type": "integer",
           "primaryKey": false,
           "notNull": true

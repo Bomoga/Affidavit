@@ -1,6 +1,6 @@
-import { and, eq, isNull, sql } from 'drizzle-orm';
+import { and, eq, isNull, lte, gt, sql } from 'drizzle-orm';
 import type pg from 'pg';
-import type { StagePayload } from './queue.js';
+import { stageJobState, type StageJobState, type StagePayload } from './queue.js';
 import * as t from './schema.js';
 import { withTenant, type Tx } from './tenant.js';
 
@@ -25,6 +25,12 @@ const key = (p: StagePayload) =>
     eq(t.stageRuns.attempt, p.attempt),
   );
 
+const open = and(isNull(t.stageRuns.completedAt), isNull(t.stageRuns.failedAt));
+
+/** A lease the database still considers live, judged with the database clock. */
+const liveLease = gt(t.stageRuns.leaseExpiresAt, sql`now()`);
+const expiredLease = lte(t.stageRuns.leaseExpiresAt, sql`now()`);
+
 /**
  * Claims a stage attempt as the worker role. The database checks the payload against the
  * stage_jobs record written by enqueue_stage() and throws for a forged or rewritten job. Returns
@@ -45,7 +51,11 @@ export async function claimStageRun(
   return rows[0]!.claimed;
 }
 
-/** Extends the lease of a running attempt held by `workerId`. False if it no longer holds it. */
+/**
+ * Extends the lease of an open attempt held by `workerId`, only while that lease is still live.
+ * Once it has expired the attempt belongs to the orchestrator and cannot be revived (the
+ * database refuses it too). False if the worker no longer holds a live lease.
+ */
 export async function heartbeatStageRun(
   appPool: pg.Pool,
   p: StagePayload,
@@ -59,14 +69,7 @@ export async function heartbeatStageRun(
         heartbeatAt: sql`now()`,
         leaseExpiresAt: sql`now() + make_interval(secs => ${leaseSeconds})`,
       })
-      .where(
-        and(
-          key(p),
-          eq(t.stageRuns.workerId, workerId),
-          isNull(t.stageRuns.completedAt),
-          isNull(t.stageRuns.failedAt),
-        ),
-      )
+      .where(and(key(p), eq(t.stageRuns.workerId, workerId), open, liveLease))
       .returning({ attempt: t.stageRuns.attempt });
     return rows.length === 1;
   });
@@ -74,33 +77,27 @@ export async function heartbeatStageRun(
 
 /**
  * Completes the attempt inside the caller's transaction, so a handler can make "the stage's work"
- * and "the stage is complete" one atomic commit. Throws if this worker no longer holds an open
- * attempt (it was failed or abandoned, or already completed), which rolls the caller's work back.
+ * and "the stage is complete" one atomic commit. Requires the same worker and a still-live lease.
+ * Throws otherwise (it was failed, abandoned, expired or already completed), which rolls the
+ * caller's work back, so an expired-lease zombie can never complete.
  */
 export async function completeStageRunIn(tx: Tx, p: StagePayload, workerId: string): Promise<void> {
   const rows = await tx
     .update(t.stageRuns)
     .set({ completedAt: sql`now()` })
-    .where(
-      and(
-        key(p),
-        eq(t.stageRuns.workerId, workerId),
-        isNull(t.stageRuns.completedAt),
-        isNull(t.stageRuns.failedAt),
-      ),
-    )
+    .where(and(key(p), eq(t.stageRuns.workerId, workerId), open, liveLease))
     .returning({ attempt: t.stageRuns.attempt });
   if (rows.length !== 1) {
     throw new Error(
-      `stage run ${p.stage}#${p.attempt} for case ${p.caseId} is not open for worker ${workerId}`,
+      `stage run ${p.stage}#${p.attempt} for case ${p.caseId} is not open under a live lease for worker ${workerId}`,
     );
   }
 }
 
 /**
- * Completes the attempt in its own transaction. With `workerId` it must be the holder; without it
- * (the orchestrator adopting an attempt whose case already left the stage) any open attempt
- * qualifies. False when it was not open.
+ * With `workerId`: completes the attempt in its own transaction, as the holder with a live lease.
+ * Without it: the orchestrator adopting an attempt whose case already left the stage; only an
+ * EXPIRED lease may be adopted, never a live one. False when nothing qualified.
  */
 export async function completeStageRun(
   appPool: pg.Pool,
@@ -114,9 +111,10 @@ export async function completeStageRun(
       .where(
         and(
           key(p),
-          workerId === undefined ? undefined : eq(t.stageRuns.workerId, workerId),
-          isNull(t.stageRuns.completedAt),
-          isNull(t.stageRuns.failedAt),
+          open,
+          workerId === undefined
+            ? expiredLease
+            : and(eq(t.stageRuns.workerId, workerId), liveLease),
         ),
       )
       .returning({ attempt: t.stageRuns.attempt });
@@ -125,8 +123,10 @@ export async function completeStageRun(
 }
 
 /**
- * Records that the attempt failed (a handler error, or the orchestrator abandoning an expired
- * lease), so a failure is never mistaken for a crash. Write-once; false when it was not open.
+ * Records that the attempt failed. With `workerId` it is the holder reporting its own handler
+ * error (allowed whatever the lease says). Without it, it is the orchestrator abandoning the
+ * attempt, which is only allowed once the lease has EXPIRED: a live lease is never abandoned.
+ * Write-once; false when nothing qualified.
  */
 export async function failStageRun(
   appPool: pg.Pool,
@@ -141,9 +141,8 @@ export async function failStageRun(
       .where(
         and(
           key(p),
-          workerId === undefined ? undefined : eq(t.stageRuns.workerId, workerId),
-          isNull(t.stageRuns.completedAt),
-          isNull(t.stageRuns.failedAt),
+          open,
+          workerId === undefined ? expiredLease : eq(t.stageRuns.workerId, workerId),
         ),
       )
       .returning({ attempt: t.stageRuns.attempt });
@@ -176,61 +175,104 @@ export async function stageRunState(appPool: pg.Pool, p: StagePayload): Promise<
 }
 
 export type ResumeAction =
-  /** Nothing claimed and the case is still at this stage: run the attempt. */
+  /** Nothing claimed, no job in flight, and the case is still at this visit: enqueue the attempt. */
   | 'start'
-  /** A live lease holds the attempt: do nothing yet. */
+  /** A live lease holds the attempt, or its queue job is still queued or running: do nothing yet. */
   | 'wait'
   /** The attempt is finished (completed). Nothing to do. */
   | 'done'
   /**
-   * The case has already left this stage, so the attempt counts as complete and must never be
-   * re-run. Adopt it with completeStageRun(pool, p) if it is still open.
+   * The case has left this stage visit and the lease is expired (or there never was a claim), so
+   * the attempt counts as complete and must never be re-run. Adopt it with
+   * completeStageRun(pool, p) if it is still open.
    */
   | 'adopt-complete'
   /**
-   * The attempt failed, or its lease expired with the case still at this stage. Abandon it with
-   * failStageRun(pool, p, 'lease expired') if still open, charge the budget, and enqueue
-   * attempt + 1.
+   * The attempt failed, its lease expired with the case still at this visit, or its queue job
+   * failed or went stale before claiming. Abandon it with failStageRun(pool, p, 'lease expired')
+   * if still open, charge the budget, and enqueue attempt + 1.
    */
   | 'next-attempt';
 
 export interface ResumeInput {
   run: Pick<StageRunInfo, 'state' | 'leaseExpiresAt'> | null;
-  /** cases.stage now. */
+  /** The queue job for this attempt's key. */
+  job: StageJobState;
+  /** cases.stage now, and the case's current stage-history ordinal. */
   caseStage: string;
-  /** The stage the attempt is for. */
+  caseVisit: number;
+  /** The stage and the visit (stage-history ordinal) the attempt was enqueued for. */
   jobStage: string;
+  jobVisit: number;
   now: Date;
 }
 
 /**
- * Pure resume decision for L1-10. "Left the stage" means cases.stage differs from the attempt's
- * stage; a case that loops back to the same stage (verify to remedy to verify) uses a fresh
- * attempt number, and the caller passes the attempt it is resuming.
+ * Pure resume decision for L1-10. An attempt belongs to one visit of a stage: the case has "left"
+ * it when the stage differs or the stage-history ordinal moved on, so a case that went
+ * verify, remedy, verify again never mistakes the old verify attempt for the new visit. A live
+ * lease always means wait, even if the case already moved on. Attempt numbers must be unique per
+ * (case, stage) across visits.
  */
 export function decideResume(i: ResumeInput): ResumeAction {
-  const left = i.caseStage !== i.jobStage;
-  if (i.run === null) return left ? 'adopt-complete' : 'start';
+  const left = i.caseStage !== i.jobStage || i.caseVisit !== i.jobVisit;
+  if (i.run === null) {
+    if (left) return 'adopt-complete';
+    if (i.job === 'failed' || i.job === 'stale') return 'next-attempt';
+    if (i.job === 'queued' || i.job === 'running') return 'wait';
+    return 'start';
+  }
   if (i.run.state === 'completed') return 'done';
+  if (i.run.state === 'running' && i.run.leaseExpiresAt.getTime() > i.now.getTime()) return 'wait';
   if (left) return 'adopt-complete';
-  if (i.run.state === 'failed') return 'next-attempt';
-  return i.run.leaseExpiresAt.getTime() > i.now.getTime() ? 'wait' : 'next-attempt';
+  return 'next-attempt';
 }
 
-/** Reads the inputs for decideResume from the database (tenant scoped) and decides. */
+export interface ResumePools {
+  appPool: pg.Pool;
+  /** Worker-role pool: reads the queue job state for the attempt. */
+  workerPool: pg.Pool;
+}
+
+/** Reads the inputs for decideResume from the database and decides. */
 export async function resumeDecision(
-  appPool: pg.Pool,
+  pools: ResumePools,
   p: StagePayload,
-  now: Date = new Date(),
+  options: { now?: Date; staleLockSeconds?: number } = {},
 ): Promise<ResumeAction> {
-  const run = await stageRunInfo(appPool, p);
-  const caseStage = await withTenant(appPool, p.tenantId, async (tx) => {
-    const [row] = await tx
+  const run = await stageRunInfo(pools.appPool, p);
+  const rows = await withTenant(pools.appPool, p.tenantId, async (tx) => {
+    const [c] = await tx
       .select({ stage: t.cases.stage })
       .from(t.cases)
       .where(and(eq(t.cases.tenantId, p.tenantId), eq(t.cases.id, p.caseId)));
-    if (!row) throw new Error(`unknown case ${p.caseId}`);
-    return row.stage;
+    if (!c) throw new Error(`unknown case ${p.caseId}`);
+    const [v] = await tx
+      .select({ visit: sql<number>`coalesce(max(${t.stages.ordinal}), 0)::int` })
+      .from(t.stages)
+      .where(and(eq(t.stages.tenantId, p.tenantId), eq(t.stages.caseId, p.caseId)));
+    const [j] = await tx
+      .select({ visit: t.stageJobs.visit })
+      .from(t.stageJobs)
+      .where(
+        and(
+          eq(t.stageJobs.tenantId, p.tenantId),
+          eq(t.stageJobs.caseId, p.caseId),
+          eq(t.stageJobs.stage, p.stage),
+          eq(t.stageJobs.attempt, p.attempt),
+        ),
+      );
+    return { caseStage: c.stage, caseVisit: v?.visit ?? 0, jobVisit: j?.visit };
   });
-  return decideResume({ run, caseStage, jobStage: p.stage, now });
+  // An attempt that was never enqueued has nothing to resume: treat the current visit as its own.
+  const job = await stageJobState(pools.workerPool, p, options.staleLockSeconds);
+  return decideResume({
+    run,
+    job,
+    caseStage: rows.caseStage,
+    caseVisit: rows.caseVisit,
+    jobStage: p.stage,
+    jobVisit: rows.jobVisit ?? rows.caseVisit,
+    now: options.now ?? new Date(),
+  });
 }

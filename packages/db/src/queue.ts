@@ -10,6 +10,7 @@ import {
   completeStageRunIn,
   failStageRun,
   heartbeatStageRun,
+  stageRunInfo,
 } from './stage-runs.js';
 import { withTenant, type Tx } from './tenant.js';
 
@@ -55,13 +56,20 @@ export function stageJobKey(p: StagePayload): string {
 /**
  * Enqueue the job for a case stage as `tenantId`. The application role cannot touch the queue
  * tables: this calls the SECURITY DEFINER enqueue_stage(), which takes the tenant from the
- * transaction setting (never an argument), checks the case exists for it, records a durable
- * stage_jobs row, and queues the job.
+ * transaction setting (never an argument), requires the case to be at that stage now (attempts
+ * are bounded at 100 per case and stage), records a durable stage_jobs row with the stage visit,
+ * and queues the job.
  *
- * Returns true when a job was added. False means the same key is already queued, running, or
- * FAILED before it could claim (max_attempts is 1, so a failed job stays in the queue and dedupes
- * the key). Callers must not treat false as "will run": check stageRunState, and for an
- * 'unclaimed' attempt with a failed job (see listFailedStageJobs) move to the next attempt.
+ * Returns true when a job row was added to the queue. That includes re-enqueueing a key whose
+ * earlier job FINISHED (Graphile deletes finished jobs): the new job is then skipped at claim
+ * because the attempt was already claimed. False means the same key is still in the queue:
+ * queued, running, or failed or stuck before it could claim (max_attempts is 1, so such a job
+ * keeps its key). Callers must not treat false as "will run": ask resumeDecision, which reads the
+ * job's state and says next-attempt for a failed or stale-locked job.
+ *
+ * Coupling: the duplicate check and stageJobState read graphile_worker._private_jobs and
+ * graphile_worker.jobs (columns key, attempts, max_attempts, last_error, locked_at). A test pins
+ * those, so a Graphile Worker upgrade that changes them fails loudly.
  */
 export async function enqueueStage(pool: pg.Pool, p: StagePayload): Promise<boolean> {
   const payload = parseStagePayload(p);
@@ -78,28 +86,79 @@ export async function enqueueStage(pool: pg.Pool, p: StagePayload): Promise<bool
   });
 }
 
+/** A job locked for longer than this with its single attempt used up is treated as dead. */
+export const DEFAULT_STALE_LOCK_SECONDS = 600;
+
 export interface FailedStageJob {
   key: string;
   attempts: number;
   lastError: string | null;
+  /** `failed`: errored out. `stale-lock`: locked by a worker that never reported back. */
+  reason: 'failed' | 'stale-lock';
 }
 
 /**
- * Queue jobs that exhausted their single attempt with an error, including ones that failed before
- * claiming (a forged payload, a database outage). Read as the worker role. Surface these; a
- * failed job keeps its key, so the same attempt cannot be enqueued again.
+ * Queue jobs that will never run again: those that exhausted their single attempt with an error
+ * (including failures before claiming, such as a forged payload or a database outage), and those
+ * still locked by a worker that died (locked longer than `staleLockSeconds` with the attempt used
+ * up and no error ever recorded). Read as the worker role. Surface these; such a job keeps its
+ * key, so the same attempt cannot be enqueued again and the orchestrator must use the next one.
  */
-export async function listFailedStageJobs(workerPool: pg.Pool): Promise<FailedStageJob[]> {
+export async function listFailedStageJobs(
+  workerPool: pg.Pool,
+  staleLockSeconds = DEFAULT_STALE_LOCK_SECONDS,
+): Promise<FailedStageJob[]> {
   const { rows } = await workerPool.query<{
     key: string;
     attempts: number;
     last_error: string | null;
+    stale: boolean;
   }>(
-    `select key, attempts, last_error from graphile_worker.jobs
-     where attempts >= max_attempts and last_error is not null and locked_at is null
+    `select key, attempts, last_error, (locked_at is not null) as stale from graphile_worker.jobs
+     where attempts >= max_attempts
+       and ((last_error is not null and locked_at is null)
+         or (locked_at is not null and locked_at < now() - make_interval(secs => $1)))
      order by id`,
+    [staleLockSeconds],
   );
-  return rows.map((r) => ({ key: r.key, attempts: r.attempts, lastError: r.last_error }));
+  return rows.map((r) => ({
+    key: r.key,
+    attempts: r.attempts,
+    lastError: r.last_error,
+    reason: r.stale ? 'stale-lock' : 'failed',
+  }));
+}
+
+export type StageJobState = 'none' | 'queued' | 'running' | 'failed' | 'stale';
+
+/**
+ * The queue job for a stage attempt's key, as the worker role sees it. `none`: no job (never
+ * enqueued, or finished and deleted). `failed`: errored with its attempt used up. `stale`: locked
+ * with the attempt used up for longer than `staleLockSeconds` (the worker died, possibly before
+ * claiming). `running`: locked recently. `queued`: waiting.
+ */
+export async function stageJobState(
+  workerPool: pg.Pool,
+  p: StagePayload,
+  staleLockSeconds = DEFAULT_STALE_LOCK_SECONDS,
+): Promise<StageJobState> {
+  const { rows } = await workerPool.query<{
+    attempts: number;
+    max_attempts: number;
+    last_error: string | null;
+    locked: boolean;
+    stale: boolean;
+  }>(
+    `select attempts, max_attempts, last_error, (locked_at is not null) as locked,
+            coalesce(locked_at < now() - make_interval(secs => $2), false) as stale
+     from graphile_worker.jobs where key = $1`,
+    [stageJobKey(p), staleLockSeconds],
+  );
+  const r = rows[0];
+  if (!r) return 'none';
+  if (r.locked) return r.stale && r.attempts >= r.max_attempts ? 'stale' : 'running';
+  if (r.attempts >= r.max_attempts && r.last_error !== null) return 'failed';
+  return 'queued';
 }
 
 export interface StageContext {
@@ -127,6 +186,8 @@ export interface StageTaskOptions {
   /** Identifies this process in leases. Default: a random id per call. */
   workerId?: string;
   leaseSeconds?: number;
+  /** Where ignored outcomes are reported. Default: console.error. */
+  log?: (message: string, err?: unknown) => void;
 }
 
 /**
@@ -146,6 +207,11 @@ export function stageTaskList(
 ): TaskList {
   const workerId = options.workerId ?? randomUUID();
   const leaseSeconds = options.leaseSeconds ?? 300;
+  const log =
+    options.log ??
+    ((message: string, err?: unknown) => {
+      console.error(`[@affidavit/db] ${message}`, err ?? '');
+    });
   const list: TaskList = {};
   for (const stage of CaseStage.options) {
     const handler = handlers[stage];
@@ -164,10 +230,23 @@ export function stageTaskList(
         await handler(job, ctx);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        await failStageRun(options.appPool, job, message, workerId).catch(() => false);
+        try {
+          if (!(await failStageRun(options.appPool, job, message, workerId))) {
+            log(`could not record the failure of ${stageJobKey(job)}: attempt no longer open`);
+          }
+        } catch (recordErr) {
+          log(`could not record the failure of ${stageJobKey(job)}`, recordErr);
+        }
         throw err;
       }
-      await completeStageRun(options.appPool, job, workerId);
+      // A handler that completed in its own transaction leaves nothing open, so false is expected
+      // then. False for an attempt that is still not completed (an expired lease) is logged.
+      if (!(await completeStageRun(options.appPool, job, workerId))) {
+        const info = await stageRunInfo(options.appPool, job).catch(() => null);
+        if (info?.state !== 'completed') {
+          log(`stage run ${stageJobKey(job)} was not completed after its handler returned`);
+        }
+      }
     };
   }
   return list;

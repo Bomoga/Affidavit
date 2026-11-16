@@ -161,6 +161,10 @@ export const costRows = pgTable(
     primaryKey({ columns: [t.tenantId, t.caseId, t.id] }),
     caseRef(t),
     check('cost_rows_stage_valid', sql`${t.stage} in (${stageList})`),
+    check(
+      'cost_rows_values_valid',
+      sql`${t.attempt} >= 1 and ${t.inputTokens} >= 0 and ${t.outputTokens} >= 0 and ${t.usd} >= 0 and ${t.wallMs} >= 0`,
+    ),
   ],
 ).enableRLS();
 
@@ -209,6 +213,8 @@ export const stageJobs = pgTable(
     caseId: text('case_id').notNull(),
     stage: text('stage').notNull(),
     attempt: integer('attempt').notNull(),
+    /** The stage-history ordinal of the case when this was enqueued: one visit to a stage. */
+    visit: integer('visit').notNull(),
     enqueuedAt: timestamp('enqueued_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
