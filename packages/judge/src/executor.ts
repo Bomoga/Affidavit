@@ -37,6 +37,11 @@ export interface RawAttempt {
   stdout: string;
   stderr: string;
   egressAttempts: number;
+  /**
+   * The jailed process wrote into the syscall trace in a way that could hide an attempt (see
+   * packages/sandbox/src/gvisor/trace.ts), so `egressAttempts` cannot be trusted for this run.
+   */
+  traceTampered: boolean;
   /** Raw bytes of the result artifact (see artifact.ts), or null when the runner wrote none. */
   artifact: string | null;
 }

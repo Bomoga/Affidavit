@@ -20,6 +20,8 @@
  *   cannot be hidden this way. See docs/lanes/lane2/sandbox-runner.md.
  */
 
+import { inCidr } from './cidr.js';
+
 export interface TraceObservations {
   egressAttempts: number;
   deniedReads: number;
@@ -40,6 +42,12 @@ export interface TraceOptions {
    * open one counts as a denied read, even when it fails with ENOENT because it is not mounted.
    */
   sensitivePaths: readonly string[];
+  /**
+   * IPv4 subnets of the case network (the target). Connects inside them are the witness doing its
+   * job, not egress. Everything else that is not loopback is egress, and so is Docker's embedded
+   * DNS resolver on 127.0.0.11, which forwards to the host.
+   */
+  localNetworks?: readonly string[];
 }
 
 /** gVisor's log prefix (glog): level, date, time, thread, source file and line. */
@@ -93,14 +101,32 @@ function firstPath(args: string): string | null {
   return m?.[1] ?? null;
 }
 
-/** An address outside the jail: an IPv4 or IPv6 socket address that is not loopback. */
-function isRemoteAddress(args: string): boolean {
+/**
+ * An address outside the jail: an IPv4 or IPv6 socket address that is neither loopback nor inside
+ * the case network. IPv4-mapped IPv6 addresses are judged as the IPv4 address they carry.
+ */
+function isRemoteAddress(args: string, localNetworks: readonly string[]): boolean {
   const m = /Family: (AF_INET6?), Addr: ([^,}]+)/.exec(args);
   if (!m) return false;
-  const addr = (m[2] ?? '').trim();
-  if (m[1] === 'AF_INET') return !addr.startsWith('127.');
-  return addr !== '::1' && !addr.startsWith('::ffff:127.');
+  let addr = (m[2] ?? '').trim();
+  if (m[1] === 'AF_INET6') {
+    if (addr === '::1') return false;
+    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(addr);
+    if (mapped === null) return true;
+    addr = mapped[1] ?? '';
+  }
+  // Docker's embedded DNS resolver sits on loopback inside every container on a user-defined
+  // network and forwards queries to the host's resolvers, so a DNS query is a channel out.
+  if (addr === DOCKER_EMBEDDED_DNS) return true;
+  if (addr.startsWith('127.')) return false;
+  return !localNetworks.some((net) => inCidr(addr, net));
 }
+
+/**
+ * Docker's embedded DNS server address on user-defined networks. It looks like loopback, but it
+ * resolves names through the host, so any send to it counts as egress.
+ */
+export const DOCKER_EMBEDDED_DNS = '127.0.0.11';
 
 const under = (path: string, root: string): boolean =>
   path === root || path.startsWith(root.endsWith('/') ? root : `${root}/`);
@@ -142,7 +168,7 @@ export function parseTrace(text: string, opts: TraceOptions): TraceObservations 
     const denied = failed && errno !== null && DENIED.has(errno);
 
     if (SENDS.has(name)) {
-      if (isRemoteAddress(args)) out.egressAttempts += 1;
+      if (isRemoteAddress(args, opts.localNetworks ?? [])) out.egressAttempts += 1;
     } else if (OPENS.has(name)) {
       const path = firstPath(args);
       const sensitive = path !== null && opts.sensitivePaths.some((p) => under(path, p));

@@ -1,6 +1,6 @@
 # Rules of evidence (L2-06)
 
-Code: `packages/judge/src/rules.ts` (the rules, pure), `judge.ts` (the `JudgePort` implementation), `artifact.ts` (the result artifact the runner writes), `executor.ts` (the port to the jail).
+Code: `packages/judge/src/rules.ts` (the rules, pure), `judge.ts` (the `JudgePort` implementation), `artifact.ts` (the result artifact the runner writes), `executor.ts` (the port to the jail), `jail/` (the real executor, L2-03; see `witness-jail.md`).
 
 ## How a witness is judged
 
@@ -14,7 +14,7 @@ Code: `packages/judge/src/rules.ts` (the rules, pure), `judge.ts` (the `JudgePor
 | 1     | `schema`       | The exhibit is malformed, or any result artifact is oversized, not JSON, has extra keys, or does not report every parameter exactly once |
 | 2     | `completes`    | Any attempt timed out, was OOM-killed, never exited, or exited without writing an artifact                                               |
 | 3     | `stable-3of3`  | On either variant, the three attempts disagree on any parameter                                                                          |
-| 4     | `no-egress`    | Any attempt recorded an egress attempt                                                                                                   |
+| 4     | `no-egress`    | Any attempt recorded an egress attempt, or its syscall trace was tampered with (so the absence of egress cannot be shown)                |
 | 5     | `time-budget`  | Any completed attempt took longer than `timeBudgetMs` (a soft budget below the hard kill timeout)                                        |
 | 6     | `differential` | Some parameter did not pass on `vulnerable`, or, with a safe variant, some parameter did not fail on `safe`                              |
 

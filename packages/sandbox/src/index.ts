@@ -6,3 +6,6 @@ export * from './gvisor/args.js';
 export * from './gvisor/mounts.js';
 export * from './gvisor/trace.js';
 export * from './gvisor/runner.js';
+export * from './containment/record.js';
+export * from './gvisor/cidr.js';
+export * from './gvisor/network.js';

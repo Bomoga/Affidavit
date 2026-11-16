@@ -1,3 +1,4 @@
+import { ipv4ToInt } from './cidr.js';
 import type { Mount } from './mounts.js';
 
 /** The Docker runtime registered by the sandbox host setup: runsc with a syscall trace. */
@@ -23,6 +24,17 @@ export const DEFAULT_LIMITS: Readonly<Limits> = {
   scratchMb: 64,
 };
 
+/** Name of a per-case network created by `createCaseNetwork`; nothing else can be joined. */
+export const CASE_NETWORK = /^affidavit-net-[0-9a-f]{16}$/;
+const HOST_ALIAS = /^[a-z][a-z0-9-]{0,62}$/;
+
+/** A per-case internal network, and the names the jail may use for hosts on it. */
+export interface JailNetwork {
+  name: string;
+  /** Host name to IPv4 address, written into the jail's /etc/hosts. */
+  hosts?: Readonly<Record<string, string>>;
+}
+
 /** An unprivileged uid and gid inside the jail (nobody). */
 export const JAIL_USER = '65534:65534';
 
@@ -37,6 +49,31 @@ export interface GvisorRunSpec {
   /** Keep stdin open (the containment suite feeds probe scripts on stdin). */
   stdin?: boolean;
   runtime?: string;
+  /** Join this per-case network instead of `--network none`. */
+  network?: JailNetwork;
+  /** Largest file the jail may write (`RLIMIT_FSIZE`); caps a mounted result file. */
+  maxFileBytes?: number;
+}
+
+function networkArgs(network: JailNetwork | undefined): string[] {
+  if (network === undefined) return ['--network', 'none'];
+  if (!CASE_NETWORK.test(network.name)) {
+    throw new Error(`only a per-case network can be joined: ${network.name}`);
+  }
+  const hosts = Object.entries(network.hosts ?? {}).flatMap(([host, ip]) => {
+    if (!HOST_ALIAS.test(host) || ipv4ToInt(ip) === null) {
+      throw new Error(`bad host entry: ${host} ${ip}`);
+    }
+    return ['--add-host', `${host}:${ip}`];
+  });
+  // `--dns-search .` keeps the host's search domains (which can name a private network) out.
+  return ['--network', network.name, '--dns-search', '.', ...hosts];
+}
+
+function fileSizeArgs(bytes: number | undefined): string[] {
+  if (bytes === undefined) return [];
+  if (!Number.isSafeInteger(bytes) || bytes <= 0) throw new Error(`bad maxFileBytes: ${bytes}`);
+  return ['--ulimit', `fsize=${bytes}:${bytes}`];
 }
 
 const isPinned = (image: string): boolean => /@sha256:[0-9a-f]{64}$/.test(image);
@@ -47,7 +84,7 @@ const isPinned = (image: string): boolean => /@sha256:[0-9a-f]{64}$/.test(image)
  * - gVisor runtime, so the process talks to gVisor's kernel, never the host's.
  * - `label=disable`: gVisor cannot run with an SELinux process label, so SELinux confinement of
  *   the container is replaced by gVisor's own sandbox. See docs/lanes/lane2/sandbox-runner.md.
- * - No network, read-only root, all capabilities dropped, no privilege gain, unprivileged user.
+ * - No network, or only a per-case internal network (see network.ts), read-only root, all capabilities dropped, no privilege gain, unprivileged user.
  * - Memory with swap equal to memory, so the limit cannot be stretched with swap (L2-01 finding).
  * - `/tmp` and `/dev/shm` are read-only tmpfs; `/scratch` is the only writable path.
  */
@@ -66,8 +103,7 @@ export function buildGvisorRunArgs(spec: GvisorRunSpec): string[] {
     spec.runtime ?? AUDIT_RUNTIME,
     '--security-opt',
     'label=disable',
-    '--network',
-    'none',
+    ...networkArgs(spec.network),
     '--read-only',
     '--cap-drop',
     'ALL',
@@ -85,6 +121,7 @@ export function buildGvisorRunArgs(spec: GvisorRunSpec): string[] {
     String(l.cpus),
     '--ulimit',
     'nofile=1024:1024',
+    ...fileSizeArgs(spec.maxFileBytes),
     '--log-driver',
     'none',
     '--tmpfs',
