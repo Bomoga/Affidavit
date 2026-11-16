@@ -229,8 +229,12 @@ export class Orchestrator {
       let next: CaseStage;
       if (outcome.kind === 'advance') {
         next = outcome.next;
-        await store.transition(caseId, next);
+        // The dismissed verdict goes in BEFORE the transition: a crash after it leaves the case
+        // at this stage, so a rerun repeats the stage and hits the same-outcome early return. The
+        // Dismissal is only readable in the run that recorded it, so it cannot be repaired later.
+        // If the store then refuses the transition, an orphan dismissed verdict remains.
         if (next === 'dismissed') await this.writeTerminalVerdict(caseId, stage, 'dismissed');
+        await store.transition(caseId, next);
       } else {
         next = 'escalated';
         await this.escalate(caseId, stage, outcome.reason, outcome.detail);
@@ -440,6 +444,9 @@ export class Orchestrator {
   ): Promise<void> {
     if (!isLegalTransition(stage, 'escalated')) throw new EscalationNotAllowedError(stage, reason);
     const escalation = Escalation.parse({ schemaVersion: 1, caseId, reason, detail });
+    // Crash gap: the transition comes first, so a crash before the events below leaves an
+    // escalated case with no `escalated` event. The verdict is repaired on rerun (see run());
+    // the missing events are not.
     await this.deps.store.transition(caseId, 'escalated');
     if (reason === 'budget-exhausted') {
       await this.emit(caseId, stage, 'budget-exhausted', { escalation });

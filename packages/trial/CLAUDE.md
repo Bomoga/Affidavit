@@ -21,7 +21,14 @@ Run from this directory, or add `--filter @affidavit/trial` from the repo root.
   new instance cites only exhibits seen after the resume. A fix needs a seen-exhibit record in
   `TrialWorkspace` (separate from the admitted-only `getExhibits`).
 - A dismissed case resumed in a new instance with no verdict cannot be repaired: the recorded
-  Dismissal is not readable from there, so the orchestrator throws instead of inventing one.
+  Dismissal is not readable from there, so the orchestrator throws instead of inventing one. To
+  avoid that, the dismissed verdict is written before the transition, so a crash leaves the case
+  at its stage and a rerun repeats it. If the store then refuses the transition, an orphan
+  dismissed verdict remains.
+- An escalated verdict repaired by a new instance (terminal case, no verdict) has empty
+  exhibits, cost, promptVersions and modelIds, because those are in memory only.
+- A crash between the escalation transition and its events leaves no `escalated` event; only the
+  verdict is repaired on rerun.
 
 ## Intended libraries (notes for later, not installed yet)
 

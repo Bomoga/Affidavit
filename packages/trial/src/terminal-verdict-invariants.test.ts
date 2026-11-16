@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { Verdict } from '@affidavit/contracts';
+import { Dismissal, Verdict } from '@affidavit/contracts';
 import { FakeCaseStore, FakeEventSink, ReplayModel } from '@affidavit/testing';
 import { Orchestrator, type ModelTurnResult, type StageHandler } from './orchestrator.js';
 import {
@@ -11,7 +11,7 @@ import {
   openAt,
   turnCost,
 } from './test-support.js';
-import { checkSummary } from './verdict.js';
+import { buildVerdict, checkSummary, finalizeVerdict, plainDecimal } from './verdict.js';
 
 const cf = makeCaseFile();
 
@@ -62,7 +62,73 @@ const verdictOf = (outcome: Verdict['outcome'], summary = 'earlier') =>
 const written = (sink: FakeEventSink) =>
   assertSchemaValid(sink.events(cf.id)).filter((e) => e.type === 'verdict-written');
 
+describe('cost formatting in summaries', () => {
+  const finalizeWith = (usds: number[]) =>
+    finalizeVerdict(
+      buildVerdict({
+        caseId: cf.id,
+        outcome: 'escalated',
+        exhibits: [],
+        promptVersions: {},
+        modelIds: {},
+        cost: usds.map((usd, i) => ({
+          stage: 'defense',
+          attempt: i + 1,
+          inputTokens: 1,
+          outputTokens: 1,
+          usd,
+          wallMs: 1,
+        })),
+      }),
+    );
+
+  it.each([7 * 3e-6, 5e-7, 0.1 + 0.2, 1e-10, 1.5e-7, 123456789012345680000, 0, 0.07])(
+    'finalizes with usd %s and prints a number that round-trips',
+    (usd) => {
+      const v = finalizeWith([usd]);
+      expect(checkSummary(v)).toEqual([]);
+      expect(Number(plainDecimal(usd))).toBe(usd);
+      expect(v.summary).not.toMatch(/\de[+-]\d/);
+    },
+  );
+
+  it('never throws for token count times price combinations', () => {
+    const prices = [3e-6, 1.5e-5, 7.5e-7, 1e-6, 0.000003, 2.5e-8, 1e-3 / 3];
+    for (let tokens = 1; tokens <= 400; tokens += 7) {
+      for (const price of prices) {
+        const usd = tokens * price;
+        expect(() => finalizeWith([usd, usd + 0.1, usd * 3])).not.toThrow();
+      }
+    }
+  });
+});
+
 describe('terminal verdict invariants', () => {
+  it('repairs a dismissed case whose verdict write failed, by rerunning the stage', async () => {
+    const low = makeCaseFile({ candidate: { ...cf.candidate, score: 0.2 } });
+    const store = new FlakyStore({ juryEnabled: false });
+    await openAt(store, low, BIG_BUDGET, PATH_TO.defense);
+    const sink = new FakeEventSink();
+    const dismiss: StageHandler = {
+      async run(ctx) {
+        const dismissal = Dismissal.parse({
+          schemaVersion: 1,
+          candidateId: low.candidate.id,
+          reason: 'no-admissible-witness-below-floor',
+          detail: 'x',
+        });
+        await ctx.record('dismissed', { dismissal }, 'defense');
+        return { kind: 'advance', next: 'dismissed' };
+      },
+    };
+    await expect(make(store, sink, { defense: dismiss }).run(low.id)).rejects.toThrow(/store down/);
+    expect(await store.stage(low.id)).toBe('defense');
+
+    const out = await make(store, sink, { defense: dismiss }).run(low.id);
+    expect(out).toEqual({ status: 'terminal', stage: 'dismissed' });
+    expect(Verdict.parse(await store.getVerdict(low.id)).outcome).toBe('dismissed');
+  });
+
   it('writes the missing verdict when a terminal case is run again', async () => {
     const store = new FlakyStore({ juryEnabled: false });
     await openAt(store, cf, BIG_BUDGET, PATH_TO.defense);

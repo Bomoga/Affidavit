@@ -93,6 +93,9 @@ function expectOneVerdictEvent(events: ReturnType<typeof assertSchemaValid>, sto
   expect(written).toHaveLength(1);
   expect(written[0]?.payload).toEqual({ verdict: stored });
   expect(written[0]?.actor).toBe('stenographer');
+  // Written inside the stage that ended the case, before its final stage-exited.
+  const types = events.map((e) => e.type);
+  expect(types.indexOf('verdict-written')).toBeLessThan(types.lastIndexOf('stage-exited'));
 }
 
 describe('dismissed cases get a dismissed Verdict', () => {
