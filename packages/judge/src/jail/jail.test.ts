@@ -7,6 +7,28 @@ import { parseResultArtifact } from '../artifact.js';
 import { asWitness } from './containment.js';
 import { RUNNER_BUILD_ARGS } from './harness.js';
 import { readArtifact } from './jail.js';
+import { capUtf8 } from './executor.js';
+
+describe('capUtf8', () => {
+  it('leaves output within the cap untouched', () => {
+    expect(capUtf8('abc', 3)).toBe('abc');
+    expect(capUtf8('', 0)).toBe('');
+  });
+
+  it('cuts output to the cap in UTF-8 bytes', () => {
+    expect(capUtf8('abcdef', 4)).toBe('abcd');
+    expect(capUtf8('abc', 0)).toBe('');
+  });
+
+  it('never splits a multi-byte character, so the result stays within the cap', () => {
+    // 'é' is 2 bytes and '\u{1F600}' is 4 bytes in UTF-8.
+    expect(capUtf8('ééé', 5)).toBe('éé');
+    expect(capUtf8('a\u{1F600}', 4)).toBe('a');
+    for (let cap = 0; cap < 12; cap++) {
+      expect(Buffer.byteLength(capUtf8('aé\u{1F600}bé', cap), 'utf8')).toBeLessThanOrEqual(cap);
+    }
+  });
+});
 
 describe('readArtifact', () => {
   // Created in beforeAll: a module-level directory leaks when a `-t` filter skips every test here,

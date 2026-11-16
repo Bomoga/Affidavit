@@ -35,6 +35,12 @@ export interface JudgePolicy {
   maxPatchLinesChanged: number;
   /** Most files one patch may touch. Over it fails `diff-too-large`. */
   maxPatchFiles: number;
+  /**
+   * Largest stdout or stderr, each in UTF-8 bytes, an executor may hand back for one attempt.
+   * The executor must cap the streams at this size while the run goes; output over it means the
+   * executor did not, and the Judge throws instead of judging.
+   */
+  maxOutputBytes: number;
 }
 
 export const DEFAULT_POLICY: Readonly<JudgePolicy> = {
@@ -46,6 +52,7 @@ export const DEFAULT_POLICY: Readonly<JudgePolicy> = {
   maxParamsBytes: 64 * 1024,
   maxPatchLinesChanged: 100,
   maxPatchFiles: 5,
+  maxOutputBytes: 1024 * 1024,
 };
 
 export interface ObservedAttempt extends RawAttempt {
@@ -75,8 +82,12 @@ const isCount = (n: unknown): boolean => Number.isSafeInteger(n) && (n as number
  * The executor is our code, but a bug there must never turn into a wrong verdict: an attempt
  * with a NaN egress count would otherwise slip past `no-egress`. Bad input throws.
  */
-function checkAttempt(a: ObservedAttempt): void {
+function checkAttempt(a: ObservedAttempt, policy: Readonly<JudgePolicy>): void {
   const problems: string[] = [];
+  const tooLong = (s: unknown): boolean =>
+    typeof s === 'string' && Buffer.byteLength(s, 'utf8') > policy.maxOutputBytes;
+  if (tooLong(a.stdout)) problems.push('stdout over maxOutputBytes');
+  if (tooLong(a.stderr)) problems.push('stderr over maxOutputBytes');
   if (a.exitCode !== null && !Number.isSafeInteger(a.exitCode)) problems.push('exitCode');
   if (typeof a.timedOut !== 'boolean') problems.push('timedOut');
   if (typeof a.oomKilled !== 'boolean') problems.push('oomKilled');
@@ -93,8 +104,12 @@ function checkAttempt(a: ObservedAttempt): void {
   }
 }
 
-function checkShape(attempts: readonly ObservedAttempt[], required: ExecutionVariant): void {
-  attempts.forEach(checkAttempt);
+function checkShape(
+  attempts: readonly ObservedAttempt[],
+  policy: Readonly<JudgePolicy>,
+  required: ExecutionVariant,
+): void {
+  attempts.forEach((a) => checkAttempt(a, policy));
   const variants = new Set(attempts.map((a) => a.variant));
   if (!variants.has(required)) throw new Error(`evidence has no ${required} runs`);
   for (const v of variants) {
@@ -217,7 +232,7 @@ function screen(
  */
 export function judgeEvidence(evidence: Evidence, policy: Readonly<JudgePolicy>): ExhibitResult {
   const { exhibitId, familySize, attempts } = evidence;
-  checkShape(attempts, 'vulnerable');
+  checkShape(attempts, policy, 'vulnerable');
   if (attempts.some((a) => a.variant === 'patched')) {
     throw new Error('patched runs are judged by judgePatchedFamily, not judgeEvidence');
   }
@@ -266,7 +281,7 @@ export function judgePatchedFamily(
   policy: Readonly<JudgePolicy>,
 ): FamilyOnPatch {
   const { exhibitId, familySize, attempts } = evidence;
-  checkShape(attempts, 'vulnerable');
+  checkShape(attempts, policy, 'vulnerable');
   if (!attempts.some((a) => a.variant === 'patched'))
     throw new Error('evidence has no patched runs');
   if (attempts.some((a) => a.variant === 'safe')) throw new Error('safe runs do not belong here');
@@ -283,7 +298,7 @@ export function judgePatchedFamily(
  */
 export function counterexampleSurvives(evidence: Evidence, policy: Readonly<JudgePolicy>): boolean {
   const { exhibitId, familySize, attempts } = evidence;
-  checkShape(attempts, 'patched');
+  checkShape(attempts, policy, 'patched');
   if (attempts.some((a) => a.variant !== 'patched')) {
     throw new Error('counterexamples are rerun on the patched target only');
   }

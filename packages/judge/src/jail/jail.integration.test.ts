@@ -256,6 +256,35 @@ describe.runIf(onSandboxHost)('witness jail on a sandbox host', { timeout: 300_0
     });
   });
 
+  it('creates case networks with IPv6 off and only IPv4 subnets', () => {
+    for (const net of nets) {
+      const out = execFileSync(
+        'docker',
+        [
+          'network',
+          'inspect',
+          '--format',
+          '{{.EnableIPv6}} {{range .IPAM.Config}}{{.Subnet}} {{end}}',
+          net.name,
+        ],
+        { encoding: 'utf8' },
+      ).trim();
+      const [ipv6, ...subnets] = out.split(/\s+/);
+      expect(ipv6).toBe('false');
+      expect(subnets.every((s) => !s.includes(':'))).toBe(true);
+    }
+  });
+
+  it("rejects a witness that queries Docker's embedded DNS resolver (no-egress)", async () => {
+    const r = await run(
+      `${HEADER}
+        import dns from 'node:dns/promises';
+        witness(async () => { await dns.resolve4('example.com').catch(() => {}); });`,
+    );
+    expect(r).toMatchObject({ admissible: false, rejectedBy: 'no-egress' });
+    expect(r.egressAttempts).toBeGreaterThan(0);
+  });
+
   it('rejects a witness that passes on both variants (differential)', async () => {
     const r = await run(
       `${HEADER} witness(async (_p, { target }) => {

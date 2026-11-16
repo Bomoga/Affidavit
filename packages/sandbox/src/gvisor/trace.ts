@@ -44,7 +44,8 @@ export interface TraceOptions {
   sensitivePaths: readonly string[];
   /**
    * IPv4 subnets of the case network (the target). Connects inside them are the witness doing its
-   * job, not egress. Everything else that is not loopback is egress.
+   * job, not egress. Everything else that is not loopback is egress, and so is Docker's embedded
+   * DNS resolver on 127.0.0.11, which forwards to the host.
    */
   localNetworks?: readonly string[];
 }
@@ -114,9 +115,18 @@ function isRemoteAddress(args: string, localNetworks: readonly string[]): boolea
     if (mapped === null) return true;
     addr = mapped[1] ?? '';
   }
+  // Docker's embedded DNS resolver sits on loopback inside every container on a user-defined
+  // network and forwards queries to the host's resolvers, so a DNS query is a channel out.
+  if (addr === DOCKER_EMBEDDED_DNS) return true;
   if (addr.startsWith('127.')) return false;
   return !localNetworks.some((net) => inCidr(addr, net));
 }
+
+/**
+ * Docker's embedded DNS server address on user-defined networks. It looks like loopback, but it
+ * resolves names through the host, so any send to it counts as egress.
+ */
+export const DOCKER_EMBEDDED_DNS = '127.0.0.11';
 
 const under = (path: string, root: string): boolean =>
   path === root || path.startsWith(root.endsWith('/') ? root : `${root}/`);

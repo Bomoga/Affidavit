@@ -12,9 +12,11 @@ Status on 2026-11-14: the containment suite passes 8 of 8 on gVisor, contained a
 A sandbox host needs Linux, Docker, and the two scripts in `docker/sandbox/`, run once as root:
 
 ```bash
-sudo bash docker/sandbox/install-gvisor.sh      # runsc, checksum-verified, pinned release
+sudo bash docker/sandbox/install-gvisor.sh      # runsc, checked against a pinned SHA-512, pinned release
 sudo bash docker/sandbox/setup-runsc-audit.sh   # the traced runtime, ends with "AUDIT OK"
 ```
+
+`install-gvisor.sh` checks the tarball against a SHA-512 per architecture written into the script, not against the `.sha512` file published in the same bucket as the tarball. The values are still the `[sha512]` placeholder, so the script refuses to install until a maintainer records the real hashes for the pinned release from a verified download.
 
 The second script registers a Docker runtime called `runsc-affidavit`: runsc with `--strace` for a fixed list of syscalls and `--debug-log=/var/lib/affidavit-runsc/%ID%.%COMMAND%.txt`. The directory is `root:docker`, mode 2770, with a docker group default ACL and the SELinux type `container_var_lib_t` so dockerd can write there. The user running the sandbox must be in the `docker` group, which can read and delete the traces. The trace is a file per container rather than a directory, because runsc creates per-container directories with mode 0750 and the group could not delete them.
 
@@ -67,7 +69,11 @@ gVisor cannot start under an SELinux process label (`SELinux is not supported: s
 | `pidsLimitHit`                | A fork or clone refused with `EAGAIN`, or gVisor's warning that the host refused it a process (below)                                                                                                    |
 | `oomKilled`, `timedOut`       | Docker's container state and the runner's own timer                                                                                                                                                      |
 
-The runner throws, rather than reporting a clean run, when Docker or the runtime is missing, the trace is missing or empty, or a container is left behind. The trace file is deleted after reading.
+The runner throws, rather than reporting a clean run, when Docker or the runtime is missing, the trace is missing or empty, or a container or volume is left behind. The trace file is deleted after reading.
+
+### No volumes
+
+An image that declares `VOLUME` gets an anonymous Docker volume per container, and that volume can outlive the container. The runner refuses such images before starting anything (`docker image inspect` on `Config.Volumes`, which must be empty), since the jail never needs one: `/scratch` is a tmpfs. An image that is not present locally cannot be inspected and is refused too, so images must be pulled (by digest) before a run, never implicitly by `docker run`. Teardown also reads the container's mounts before removing it, removes it with `docker rm --force --volumes`, and fails if any volume it had still exists.
 
 ### The trace is capped while the run goes
 
@@ -95,6 +101,6 @@ Docker's `--pids-limit` is enforced on the host, where it counts gVisor's own th
 ## Open items
 
 - Shared sandbox host and CI runner (P0-10, open decision 1). Until then `runner.integration.test.ts` is skipped in `pnpm test` (see `PROGRESS.md`).
-- Per-case internal network: done in L2-03 (`network.ts`, see `witness-jail.md`). Booting real targets on it is L2-04.
+- Target and witness on a per-case internal network, with no route out (L2-03 and L2-04). Today every run is `--network none`.
 - gVisor logs `SECCOMP WARNING: host filesystem enabled: syscall filters less restrictive` on this host. To evaluate with `--directfs=false` on the audit runtime before the shared host is signed off.
 - Lane 1's `LocalDockerToolRunner` can switch to `GvisorToolRunner` once the lead signs off the SELinux decision above.
