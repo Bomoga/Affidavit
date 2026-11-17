@@ -327,3 +327,31 @@ export const stageRuns = pgTable(
     check('stage_runs_attempt_valid', sql`${t.attempt} >= 1`),
   ],
 ).enableRLS();
+
+/**
+ * Durable "a person has to look" marker, written by the orchestration when a stage cannot be
+ * retried (attempts used up, budget exhausted). Insert-only, one row per attempt. The case is
+ * left where it is; nothing is dismissed. The shape is a stopgap until contracts say how such a
+ * case is escalated (docs/lanes/lane1/contract-requests.md).
+ */
+export const reviewFlags = pgTable(
+  'review_flags',
+  {
+    tenantId: tenantId(),
+    caseId: text('case_id').notNull(),
+    stage: text('stage').notNull(),
+    attempt: integer('attempt').notNull(),
+    reason: text('reason').notNull(),
+    detail: text('detail').notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.tenantId, t.caseId, t.stage, t.attempt] }),
+    caseRef(t),
+    check('review_flags_stage_valid', sql`${t.stage} in (${stageList})`),
+    check(
+      'review_flags_reason_valid',
+      sql`${t.reason} in ('attempts-exhausted', 'budget-exhausted')`,
+    ),
+  ],
+).enableRLS();
