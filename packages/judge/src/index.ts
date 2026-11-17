@@ -10,3 +10,4 @@ export * from './jail/harness.js';
 export * from './jail/jail.js';
 export * from './jail/executor.js';
 export * from './jail/containment.js';
+export * from './jail/booted.js';
