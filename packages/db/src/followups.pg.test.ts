@@ -26,7 +26,7 @@ import {
 } from './queue.js';
 import { listOpenCases, stageAttemptState } from './stage-attempts.js';
 import { claimStageRun, failStageRun, resumeDecision, stageRunState } from './stage-runs.js';
-import { withTenant, type AppPool, type WorkerPool } from './tenant.js';
+import { openPool, withTenant, type AppPool, type WorkerPool } from './tenant.js';
 import { BUDGET, describePg, sampleCase, useTestDatabase } from './test-support.js';
 
 const A = 'tenant-fa';
@@ -351,6 +351,46 @@ describePg('review follow-ups: leases, recovery scaling, visits and concurrency'
     });
     expect(page1[0]!.key).toBe(all[0]!.key);
     expect(page2[0]!.key).toBe(all[1]!.key);
+  });
+
+  it('a retry needs two app-pool connections (the lock holder and its work): a pool of 2 suffices for one reconciler', async () => {
+    const file = await newCase();
+    const a1 = pay(file.id, 'intake', 1);
+    await enqueueStage(db().app, a1);
+    await lockJob(a1, 7200); // dead
+    const small = await openPool(db().appUrl, 'affidavit_app', undefined, { max: 2 });
+    try {
+      const actions = mine(file.id)(await reconcileOnce(opts({ appPool: small })));
+      expect(actions).toMatchObject([{ kind: 'retried', nextAttempt: 2 }]);
+      expect(small.totalCount).toBeLessThanOrEqual(2);
+    } finally {
+      await small.end();
+    }
+  }, 60_000);
+
+  it('a failed job whose key was rewritten is never counted as handled', async () => {
+    const file = await newCase();
+    const a1 = pay(file.id, 'intake', 1);
+    await enqueueStage(db().app, a1);
+    await lockJob(a1, 7200); // dead
+    await enqueueStage(db().app, pay(file.id, 'intake', 2)); // supersedes attempt 1
+    const handled = async (key: string | null) =>
+      (
+        await db().admin.query<{ h: boolean }>(
+          `select public.stage_attempt_handled($1, $2, 'intake', 1, $3) as h`,
+          [A, file.id, key],
+        )
+      ).rows[0]!.h;
+    expect(await handled(stageJobKey(a1))).toBe(true);
+    expect(await handled('[wrong]')).toBe(false);
+    expect(await handled(null)).toBe(false);
+    // Rewrite the job's key (its payload still names the superseded attempt 1): it is not hidden.
+    await db().admin.query(`update graphile_worker._private_jobs set key = $2 where key = $1`, [
+      stageJobKey(a1),
+      `rewritten-${file.id}`,
+    ]);
+    const keys = (await listFailedStageJobs(db().worker, 60)).map((j) => j.key);
+    expect(keys).toContain(`rewritten-${file.id}`);
   });
 
   it('a Graphile-reset job whose attempt holds a live lease is running, not failed', async () => {

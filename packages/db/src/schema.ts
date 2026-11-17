@@ -106,7 +106,10 @@ export const stages = pgTable(
     /**
      * The case's event counter when the stage was entered (written by the trigger on cases). Events
      * of this visit have a seq at or above it; recordOnce compares only those. 0 on rows written
-     * before this column existed, which means "every event".
+     * before this column existed, which means "every event". Limits: rows from before the column
+     * were NOT backfilled (a visit entered earlier keeps 0, so recordOnce on such a case still
+     * sees every event of every visit), and seq values can have gaps (a counter bump whose event
+     * insert never committed after a crash), so entry_seq is a lower bound, never a count.
      */
     entrySeq: integer('entry_seq').notNull().default(0),
   },
@@ -365,7 +368,9 @@ export const reviewFlags = pgTable(
     /**
      * The stage visit (stage-history ordinal) the flag is for. A flag blocks retries only for its
      * own visit, so an appeal that returns to the stage starts afresh. 0 marks a row written
-     * before visits were stored: it matches every visit of its stage.
+     * before visits were stored: it matches every visit of its stage. Migration 0006 adds
+     * `review_flags_visit_positive` (visit >= 1, NOT VALID: drizzle cannot express that, so it is
+     * not in this table definition) so NEW rows cannot use 0; existing rows are untouched.
      */
     visit: integer('visit').notNull(),
     reason: text('reason').notNull(),
