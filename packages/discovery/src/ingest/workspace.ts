@@ -1,6 +1,7 @@
-import { chmod, lstat, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, open, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Redaction } from '@affidavit/contracts';
+import { signatureClass } from '../tools/unscannable.js';
 import { listDir } from '../tools/walk.js';
 import { entriesOf, holdsUtf16, redactBuffer, type SecretRedactor } from './redactor.js';
 import type { ExcludedFile, ExclusionReason } from './types.js';
@@ -21,6 +22,32 @@ export function isEnvName(name: string): boolean {
   // `prod.env`, `prod.env~`, `prod.env copy`, `a.env.local`: `.env` anywhere, not followed by a
   // letter (`.environment`).
   return /\.env(?![a-z])/.test(n);
+}
+
+/** The longest media signature in the tools table ends at byte 8 (`ftyp` at offset 4). */
+const HEAD_BYTES = 64;
+
+/**
+ * True when the file starts with an image, audio or video signature (the tools layer's table, the
+ * same one that classes a file `binary-media`). Judged on content alone: a media file under an
+ * archive-like or misleading name is still media. Such files are kept out whole, because the
+ * scanner's coverage of their bytes (UTF-16 text, text past a chunk cut) is not guaranteed and a
+ * binary cannot be rewritten safely.
+ */
+async function isMediaFile(abs: string): Promise<boolean> {
+  let fh;
+  try {
+    fh = await open(abs, 'r');
+  } catch {
+    return false; // unreadable: the later steps fail on it as before
+  }
+  try {
+    const buf = Buffer.alloc(HEAD_BYTES);
+    const { bytesRead } = await fh.read(buf, 0, HEAD_BYTES, 0);
+    return signatureClass(buf.subarray(0, bytesRead)) === 'media';
+  } finally {
+    await fh.close();
+  }
 }
 
 export interface BuiltWorkspace {
@@ -64,6 +91,11 @@ export async function buildWorkspace(
       }
       if (e.isDirectory) {
         await visit(childRel);
+        continue;
+      }
+      // Before the map's own reasons: whatever else is true of a media file, it does not leave.
+      if (e.isFile && (await isMediaFile(join(src, e.name)))) {
+        skip(childRel, 'media-file');
         continue;
       }
       const reason = mustExclude.get(childRel);

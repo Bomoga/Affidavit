@@ -275,20 +275,65 @@ describe.skipIf(!enabled)('ingest with the real gitleaks image', () => {
     expect(JSON.stringify(r)).not.toContain(key);
   });
 
-  it('a 24 KB private key block in a 175 KB file is never shipped', async () => {
-    // The reviewer's repro: a stretch longer than one window holds, with no blank line in it.
-    const body = randomBytes(18_000)
+  it('a 24 KB private key block in a windowed file is redacted by whole line, never shipped', async () => {
+    // 18,001 bytes: the base64 body is not a multiple of 64 characters, so the block does not end
+    // in a blank line (18,000 would, and then multiline-split-risk fires). The padding has a blank
+    // line every few bytes, so no chunk-split-risk either. The snapshot pass finds the key (its
+    // columns past 100 KB cannot be trusted), the map keeps whole lines.
+    const body = randomBytes(18_001)
       .toString('base64')
       .replace(/(.{64})/g, '$1\n');
     const pem = `-----BEGIN PRIVATE KEY-----\n${body}\n-----END PRIVATE KEY-----\n`;
-    const file = `${'// pad\n'.repeat(10_000)}${pem}${'// pad\n'.repeat(15_000)}`;
+    const file = `${'// pad\n\n'.repeat(10_000)}${pem}${'// pad\n\n'.repeat(15_000)}`;
     const marker = body.split('\n')[100] as string;
-    const r = await incompleteFor({ 'src/big.js': file }, [marker]);
-    expect(
-      r.coverage.notifications.some((n) =>
-        /chunk-split-risk|multiline-split-risk/.test(n.id ?? ''),
-      ),
-    ).toBe(true);
+    const { dir, shas } = makeRepo([
+      { 'package.json': EXPRESS_PKG, 'src/app.js': "require('express')();\n", 'src/big.js': file },
+    ]);
+    const r = await ingestRepo(
+      { runner, workRoot: tmpDir(), allowLocalSource: true, tools: { configDir } },
+      request({ source: dir, commit: shas[0] as string }),
+    );
+    expect(r.status).toBe('ok');
+    const ok = r as IngestOk;
+    expect(ok.scan.partial).toBe(false);
+    expect(ok.scan.lineFallbacks).toBeGreaterThan(0);
+    expect(everything(ok.workspacePath)).not.toContain(marker);
+    expect(JSON.stringify(ok)).not.toContain(marker);
+  });
+
+  it('a PNG with a UTF-16LE key and a 205 KB PNG with a key across the 125,000-byte cut are left out', async () => {
+    const utf16Key = fakeKey();
+    const cutKey = fakeKey();
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    // Filler without a newline byte, so gitleaks has no blank line to cut at and cuts hard.
+    const big = Buffer.alloc(205_000, 0x07);
+    png.copy(big, 0);
+    big.write(`k="${cutKey}"`, 124_990, 'latin1');
+    const { dir, shas } = makeRepo([
+      {
+        'package.json': EXPRESS_PKG,
+        'src/app.js': "require('express')();\n",
+        'public/logo.png': Buffer.concat([png, Buffer.from(`k="${utf16Key}"\n`, 'utf16le')]),
+        'public/big/logo.png': big,
+      },
+    ]);
+    const workRoot = tmpDir();
+    const r = await ingestRepo(
+      { runner, workRoot, allowLocalSource: true, tools: { configDir } },
+      request({ source: dir, commit: shas[0] as string }),
+    );
+    expect(r.status).toBe('ok');
+    const ok = r as IngestOk;
+    expect(ok.excluded.map((e) => [e.path, e.reason])).toEqual([
+      ['public/big/logo.png', 'media-file'],
+      ['public/logo.png', 'media-file'],
+    ]);
+    const out = Buffer.from(everything(ok.workspacePath), 'latin1');
+    for (const k of [utf16Key, cutKey]) {
+      expect(out.includes(Buffer.from(k))).toBe(false);
+      expect(out.includes(Buffer.from(k, 'utf16le'))).toBe(false);
+      expect(JSON.stringify(ok)).not.toContain(k);
+    }
   });
 
   it('a repo with no secrets ingests clean and not partial', async () => {
