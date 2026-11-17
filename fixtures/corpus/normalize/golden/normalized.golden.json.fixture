@@ -298,6 +298,8 @@
       "ruleId": "js/reflected-xss",
       "reason": "unmapped-class",
       "file": "src/routes.js",
+      "startLine": 30,
+      "endLine": 30,
       "cwe": [
         79
       ]

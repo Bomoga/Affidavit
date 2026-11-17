@@ -21,6 +21,8 @@ function byPreference(a: RawFinding, b: RawFinding): number {
   );
 }
 
+const span = (f: RawFinding): number => f.endLine - f.startLine;
+
 /** One input finding that ended up inside a candidate. */
 export interface MergedMember {
   tool: SourceTool;
@@ -48,12 +50,17 @@ export function candidateId(f: RawFinding): string {
   return `cand-${createHash('sha256').update(key).digest('hex').slice(0, 16)}`;
 }
 
+/**
+ * `cluster[0]` is the anchor (the narrowest member, see clusterByPrimary) and names the candidate:
+ * anchors of different clusters never share a range, so ids are unique. The displayed tool, rule
+ * and range are the most preferred member's.
+ */
 function build(cluster: RawFinding[]): { candidate: Candidate; record: MergedRecord } {
   const sorted = [...cluster].sort(byPreference);
   const primary = sorted[0] as RawFinding;
   const candidate = {
     schemaVersion: 1,
-    id: candidateId(primary),
+    id: candidateId(cluster[0] as RawFinding),
     tool: primary.tool,
     ruleId: primary.ruleId,
     cls: primary.cls,
@@ -91,14 +98,15 @@ function build(cluster: RawFinding[]): { candidate: Candidate; record: MergedRec
 }
 
 /**
- * Splits one file-and-class group into clusters. The preferred unassigned finding is a primary;
- * the unassigned findings whose lines overlap the PRIMARY's range join it. Overlap is never
+ * Splits one file-and-class group into clusters. The narrowest unassigned finding is a primary;
+ * unassigned findings join it while they overlap every member so far (a common line). Overlap is never
  * chained (a wide range does not bridge two separate issues), and each finding lands in exactly
  * one cluster. A segment tree over the start-sorted findings holds the largest end line still
  * unassigned, so a primary finds its members without scanning the whole group.
  */
 function clusterByPrimary(group: RawFinding[]): RawFinding[][] {
-  const byPref = [...group].sort(byPreference);
+  // Narrowest first, so a wide range reported by a preferred tool cannot swallow separate issues.
+  const byPref = [...group].sort((a, b) => span(a) - span(b) || byPreference(a, b));
   const byStart = [...group].sort((a, b) => a.startLine - b.startLine || byPreference(a, b));
   const n = byStart.length;
   let size = 1;
@@ -133,6 +141,10 @@ function clusterByPrimary(group: RawFinding[]): RawFinding[][] {
     const at = pos.get(primary) as number;
     if ((tree[size + at] as number) === -1) continue; // already in an earlier cluster
     remove(at);
+    // Running intersection of the members' ranges. A finding joins only if it overlaps it, and
+    // ranges that all contain a common line overlap each other pairwise.
+    let from = primary.startLine;
+    let to = primary.endLine;
     // Start-sorted findings whose start is within the primary's range.
     let lo = 0;
     let hi = n;
@@ -144,8 +156,14 @@ function clusterByPrimary(group: RawFinding[]): RawFinding[][] {
     const found: number[] = [];
     collect(1, 0, size, lo, primary.startLine, found);
     const cluster = [primary];
-    for (const i of found) {
-      cluster.push(byStart[i] as RawFinding);
+    const candidates = found
+      .map((i) => ({ i, f: byStart[i] as RawFinding }))
+      .sort((a, b) => span(a.f) - span(b.f) || byPreference(a.f, b.f));
+    for (const { i, f } of candidates) {
+      if (f.startLine > to || f.endLine < from) continue; // overlaps the primary, not every member
+      from = Math.max(from, f.startLine);
+      to = Math.min(to, f.endLine);
+      cluster.push(f);
       remove(i);
     }
     clusters.push(cluster);
@@ -156,9 +174,9 @@ function clusterByPrimary(group: RawFinding[]): RawFinding[][] {
 /**
  * Deduplicates findings and computes `toolAgreement`.
  *
- * Findings are grouped by file and class. Within a group the preferred finding is a primary and
- * every unassigned finding whose lines overlap the primary's range is merged into it, whichever
- * tool or rule reported it (no chaining, see clusterByPrimary). `toolAgreement` is the number of
+ * Findings are grouped by file and class. Within a group the narrowest finding anchors a cluster
+ * and unassigned findings that share a line with every member join it, whichever tool or rule
+ * reported it (no chaining, see clusterByPrimary). The candidate shows the most preferred member. `toolAgreement` is the number of
  * distinct tools in the cluster, so two Semgrep rules on one line count once. OSV findings have no
  * real range, so they merge only with the same advisory id in the same lockfile.
  *

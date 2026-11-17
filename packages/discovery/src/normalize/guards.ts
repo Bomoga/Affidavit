@@ -152,7 +152,12 @@ export function safeRepoPath(uri: string, decode: boolean): PathResult {
     return { ok: false, why: 'has a scheme or drive letter' };
   }
   if (path.length === 0) return { ok: false, why: 'empty path' };
-  for (const seg of path.split('/')) {
+  // A UNC-style name (`\\host\share`) is refused. A backslash is otherwise an ordinary name
+  // character on the Linux target, but a `..` between backslashes would be a traversal on any
+  // consumer that treats it as a separator, so segments are checked split on both.
+  if (uri.startsWith('\\\\') || path.startsWith('\\\\'))
+    return { ok: false, why: 'UNC-style path' };
+  for (const seg of path.split(/[/\\]/)) {
     if (seg === '' || seg === '.' || seg === '..') {
       return { ok: false, why: 'empty, "." or ".." path segment' };
     }

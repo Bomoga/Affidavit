@@ -131,7 +131,10 @@ export async function readToolRunReports(
       if (!before.isFile()) throw unreadable('not a regular file');
       // O_NOFOLLOW (where it exists) plus fstat on the opened handle, so a file swapped for a
       // symlink between the check and the open is not followed, and the size is the opened file's.
-      const handle = await open(report.file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+      const handle = await open(
+        report.file,
+        constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
+      );
       try {
         const st = await handle.stat();
         if (!st.isFile()) throw unreadable('not a regular file');

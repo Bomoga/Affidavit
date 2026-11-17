@@ -24,6 +24,9 @@ export interface SkippedFinding {
   reason: SkipReason;
   /** Absent for `no-location` and `unsafe-path` (an unsafe path is never echoed). */
   file?: string;
+  /** The region the tool reported, when one was read (`unmapped-class` from SARIF). */
+  startLine?: number;
+  endLine?: number;
   /** CWE numbers the tool attached, sorted. Empty when it attached none. */
   cwe: number[];
 }
@@ -125,7 +128,8 @@ export function parseSarif(tool: 'semgrep' | 'codeql', doc: unknown): Parsed {
       components.push(readComponent(g, e, `${rp}/tool/extensions/${i}`, budget));
     });
 
-    const results = g.arr(own(run, 'results'), `${rp}/results`, LIMITS.results);
+    // Absent `results` is an empty run; present but not an array (for example null) is an error.
+    const results = g.optArr(own(run, 'results'), `${rp}/results`, LIMITS.results);
     results.forEach((resRaw, i) => {
       const pp = `${rp}/results/${i}`;
       total += 1;
@@ -151,13 +155,6 @@ export function parseSarif(tool: 'semgrep' | 'codeql', doc: unknown): Parsed {
       const ruleIndex =
         index(g, ref === undefined ? undefined : own(ref, 'index'), `${pp}/rule/index`) ??
         index(g, own(res, 'ruleIndex'), `${pp}/ruleIndex`);
-      if (
-        ruleIndex !== undefined &&
-        component.ids.length > 0 &&
-        ruleIndex >= component.ids.length
-      ) {
-        g.fail('bad-rule', `${pp}/ruleIndex`, 'index outside the rules array');
-      }
 
       let ruleId: string | undefined;
       const rid = own(res, 'ruleId');
@@ -169,7 +166,10 @@ export function parseSarif(tool: 'semgrep' | 'codeql', doc: unknown): Parsed {
       if (ruleId === undefined) g.fail('bad-rule', pp, 'result has no rule id');
 
       let ruleTags: string[] = [];
-      const at = ruleIndex ?? component.byId.get(ruleId);
+      // A stale index (missing slot, or a slot naming another rule) falls back to a search by id.
+      let at =
+        ruleIndex !== undefined && component.ids[ruleIndex] === ruleId ? ruleIndex : undefined;
+      at ??= component.byId.get(ruleId);
       if (at !== undefined) ruleTags = component.tags[at] ?? [];
       else {
         for (const c of components) {
@@ -221,7 +221,7 @@ export function parseSarif(tool: 'semgrep' | 'codeql', doc: unknown): Parsed {
 
       const cls = classOf(cwe);
       if (cls === undefined) {
-        skipped.push({ tool, ruleId, reason: 'unmapped-class', file, cwe });
+        skipped.push({ tool, ruleId, reason: 'unmapped-class', file, startLine, endLine, cwe });
         return;
       }
       findings.push({ tool, ruleId, cls, file, startLine, endLine });
@@ -259,7 +259,25 @@ export function parseOsv(doc: unknown): Parsed {
     const pkgs = g.optArr(own(r, 'packages'), `${rp}/packages`, LIMITS.osvPackages);
     pkgTotal += pkgs.length;
     if (pkgTotal > LIMITS.osvPackages) g.fail('too-many', `${rp}/packages`, 'too many packages');
-    pkgs.forEach((pRaw, pi) => {
+
+    // Union-find over advisory ids for this lockfile: ids named together in any package's group are
+    // one advisory, so a GHSA id on one package and its CVE alias on another collapse too.
+    const parent = new Map<string, string>();
+    const find = (x: string): string => {
+      let root = x;
+      for (let up = parent.get(root); up !== undefined && up !== root; up = parent.get(root)) {
+        root = up;
+      }
+      parent.set(x, root);
+      return root;
+    };
+    const union = (a: string, b: string): void => {
+      const ra = find(a);
+      const rb = find(b);
+      if (ra !== rb) parent.set(cmp(ra, rb) < 0 ? rb : ra, cmp(ra, rb) < 0 ? ra : rb);
+    };
+
+    const infos = pkgs.map((pRaw, pi) => {
       const pp = `${rp}/packages/${pi}`;
       const p = g.obj(pRaw, pp);
       const pk = g.obj(own(p, 'package'), `${pp}/package`);
@@ -272,7 +290,6 @@ export function parseOsv(doc: unknown): Parsed {
       const vulns = g.optArr(own(p, 'vulnerabilities'), `${pp}/vulnerabilities`, LIMITS.osvVulns);
       vulnTotal += vulns.length;
       if (vulnTotal > LIMITS.osvVulns) g.fail('too-many', `${pp}/vulnerabilities`, 'too many');
-
       const items = vulns.map((vRaw, vi) => {
         const vp = `${pp}/vulnerabilities/${vi}`;
         const v = g.obj(vRaw, vp);
@@ -285,30 +302,42 @@ export function parseOsv(doc: unknown): Parsed {
             : g
                 .arr(ids, `${vp}/database_specific/cwe_ids`, LIMITS.osvCwe)
                 .filter((t): t is string => typeof t === 'string' && t.length <= LIMITS.string);
+        find(id);
         return { id, cwe };
       });
-
-      // Assign every vulnerability to exactly one group: the first `groups[]` entry naming its id,
-      // else a group of its own.
-      const groupIds = g.optArr(own(p, 'groups'), `${pp}/groups`, LIMITS.osvVulns).map((gr, gi) => {
-        const ids = own(g.obj(gr, `${pp}/groups/${gi}`), 'ids');
-        return new Set(
-          g
-            .optArr(ids, `${pp}/groups/${gi}/ids`, LIMITS.osvVulns)
-            .filter((x) => typeof x === 'string'),
-        );
+      g.optArr(own(p, 'groups'), `${pp}/groups`, LIMITS.osvVulns).forEach((gr, gi) => {
+        const ids = g
+          .optArr(
+            own(g.obj(gr, `${pp}/groups/${gi}`), 'ids'),
+            `${pp}/groups/${gi}/ids`,
+            LIMITS.osvVulns,
+          )
+          .filter((x): x is string => typeof x === 'string' && x.length <= LIMITS.ruleId);
+        for (const id of ids) union(ids[0] as string, id);
       });
-      const members = new Map<number, typeof items>();
-      for (const [k, item] of items.entries()) {
-        let at = groupIds.findIndex((set) => set.has(item.id));
-        if (at === -1) at = groupIds.length + k;
-        const list = members.get(at);
-        if (list) list.push(item);
-        else members.set(at, [item]);
+      return { pkg, items };
+    });
+
+    // One advisory per union-find component: named by its lowest id among the vulnerabilities
+    // present in the lockfile, with the CWEs of all its members.
+    const names = new Map<string, string>();
+    const cwes = new Map<string, number[]>();
+    for (const { items } of infos) {
+      for (const { id, cwe } of items) {
+        const root = find(id);
+        const cur = names.get(root);
+        if (cur === undefined || cmp(id, cur) < 0) names.set(root, id);
+        cwes.set(root, [...(cwes.get(root) ?? []), ...cweNumbers(cwe)]);
       }
-      for (const list of members.values()) {
-        const ruleId = list.map((m) => m.id).sort(cmp)[0] as string;
-        const cwe = cweNumbers(list.flatMap((m) => m.cwe));
+    }
+    for (const { pkg, items } of infos) {
+      const seen = new Set<string>();
+      for (const { id } of items) {
+        const root = find(id);
+        if (seen.has(root)) continue;
+        seen.add(root);
+        const ruleId = names.get(root) as string;
+        const cwe = [...new Set(cwes.get(root))].sort((a, b) => a - b);
         const cls = classOf(cwe);
         if (!path.ok) {
           skipped.push({ tool: 'osv', ruleId, reason: 'unsafe-path', cwe });
@@ -326,7 +355,7 @@ export function parseOsv(doc: unknown): Parsed {
           });
         }
       }
-    });
+    }
   });
   return { findings, skipped };
 }

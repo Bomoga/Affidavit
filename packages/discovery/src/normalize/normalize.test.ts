@@ -199,6 +199,56 @@ describe('golden output over recorded tool runs', () => {
     ]);
   });
 
+  it('a wide preferred range does not swallow separate narrow issues', () => {
+    const sg = (rule: string, region: unknown) => ({
+      ...sqlResult('/src/x.js', region),
+      ruleId: rule,
+    });
+    const rules = ['wide', 'a', 'b'].map((id) => ({ id, properties: { tags: ['CWE-89'] } }));
+    const semgrepDoc = sarif([sg('wide', { startLine: 1, endLine: 100 })], rules);
+    const codeqlDoc = sarif([sg('a', { startLine: 10 }), sg('b', { startLine: 90 })], rules);
+    const out = normalizeReports([
+      { tool: 'semgrep', doc: semgrepDoc },
+      { tool: 'codeql', doc: codeqlDoc },
+    ]);
+    expect(out.candidates).toHaveLength(2);
+    // The line-90 issue has a candidate of its own, and ids are unique.
+    expect(out.merged.some((m) => m.members.some((x) => x.ruleId === 'b'))).toBe(true);
+    const own90 = out.merged.find((m) => m.members.some((x) => x.ruleId === 'b'));
+    expect(own90?.members.map((x) => x.ruleId)).toEqual(['b']);
+    expect(new Set(out.candidates.map((c) => c.id)).size).toBe(2);
+    // The displayed rule and range of the merged candidate are the preferred tool's.
+    expect(out.candidates[0]).toMatchObject({
+      tool: 'semgrep',
+      ruleId: 'wide',
+      range: { startLine: 1, endLine: 100 },
+      toolAgreement: 2,
+    });
+  });
+
+  it('falls back to a search by id when the rule index is stale', () => {
+    const doc = sarif(
+      [
+        { ...sqlResult('/src/a.js'), ruleIndex: 5 },
+        { ...sqlResult('/src/b.js'), ruleIndex: 0 },
+      ],
+      [{ id: 'other' }, ...sqlRule],
+    );
+    const out = normalizeReports([{ tool: 'semgrep', doc }]);
+    expect(out.candidates.map((c) => c.file)).toEqual(['a.js', 'b.js']);
+  });
+
+  it('treats absent results as an empty run', () => {
+    const doc = { version: '2.1.0', runs: [{ tool: { driver: {} } }] };
+    expect(normalizeReports([{ tool: 'semgrep', doc }]).candidates).toEqual([]);
+  });
+
+  it('records the region of a skipped finding', () => {
+    const doc = sarif([sqlResult('/src/a.js', { startLine: 4, endLine: 6 })], [{ id: 'r.sql' }]);
+    const out = normalizeReports([{ tool: 'semgrep', doc }]);
+    expect(out.skipped[0]).toMatchObject({ reason: 'unmapped-class', startLine: 4, endLine: 6 });
+  });
+
   it('keeps disjoint ranges and files apart, and merges direct overlaps', () => {
     const doc = sarif(
       [
@@ -262,6 +312,15 @@ describe('golden output over recorded tool runs', () => {
       const members = out.merged.reduce((n, m) => n + m.members.length, 0);
       expect(members + out.skipped.length).toBe(expected);
       for (const m of out.merged) expect(m.members.length).toBeGreaterThan(0);
+      expect(new Set(out.candidates.map((c) => c.id)).size).toBe(out.candidates.length);
+      // Members of one candidate all share a line with each other, not just with a primary.
+      for (const m of out.merged) {
+        for (const a of m.members) {
+          for (const b of m.members) {
+            expect(a.startLine <= b.endLine && b.startLine <= a.endLine).toBe(true);
+          }
+        }
+      }
       // The same findings in the other order give the same answer.
       expect(normalizeReports([...docs].reverse())).toEqual(out);
     }
@@ -303,8 +362,11 @@ describe('malformed reports are rejected with a typed error', () => {
       'wrong-type',
     ],
     [
-      'results missing',
-      { tool: 'semgrep', doc: { version: '2.1.0', runs: [{ tool: { driver: {} } }] } },
+      'results null',
+      {
+        tool: 'semgrep',
+        doc: { version: '2.1.0', runs: [{ tool: { driver: {} }, results: null }] },
+      },
       'wrong-type',
     ],
     ['results not an array', { tool: 'semgrep', doc: sarif('x') }, 'wrong-type'],
@@ -313,8 +375,8 @@ describe('malformed reports are rejected with a typed error', () => {
     ['ruleId not a string', { tool: 'semgrep', doc: sarif([{ ruleId: 5 }]) }, 'wrong-type'],
     ['ruleId with a newline', { tool: 'semgrep', doc: sarif([{ ruleId: 'a\nb' }]) }, 'bad-string'],
     [
-      'bad ruleIndex',
-      { tool: 'semgrep', doc: sarif([{ ruleIndex: 7, ruleId: 'x' }], sqlRule) },
+      'negative ruleIndex',
+      { tool: 'semgrep', doc: sarif([{ ruleIndex: -5, ruleId: 'x' }], sqlRule) },
       'bad-rule',
     ],
     ['rules not an array', { tool: 'semgrep', doc: sarif([], 'x') }, 'wrong-type'],
@@ -447,6 +509,9 @@ describe('paths', () => {
     ['semgrep', '/src'],
     ['semgrep', '/src/'],
     ['semgrep', '/src/../etc/passwd'],
+    ['semgrep', '/src/a\\..\\b.js'],
+    ['semgrep', '\\\\host\\share\\x.js'],
+    ['codeql', '\\\\host\\share\\x.js'],
     ['semgrep', '../a.js'],
     ['semgrep', 'a/../../b.js'],
     ['semgrep', './a.js'],
@@ -603,6 +668,17 @@ describe('OSV aliases and packages', () => {
     expect(out.candidates.map((c) => c.ruleId).sort()).toEqual(['A', 'B']);
   });
 
+  it('collapses a GHSA id on one package and its CVE alias on another in one lockfile', () => {
+    const out = normalizeReports([
+      {
+        tool: 'osv',
+        doc: lock([pkg('p', ['GHSA-1'], [['GHSA-1', 'CVE-1']]), pkg('q', ['CVE-1'], [['CVE-1']])]),
+      },
+    ]);
+    expect(out.candidates.map((c) => c.ruleId)).toEqual(['CVE-1']);
+    expect(out.merged[0]?.members.map((m) => m.package?.name)).toEqual(['p', 'q']);
+  });
+
   it('records both packages when one advisory hits two packages in one lockfile', () => {
     const out = normalizeReports([
       { tool: 'osv', doc: lock([pkg('p', ['A'], [['A']]), pkg('q', ['A'], [['A']])]) },
@@ -653,7 +729,15 @@ describe('class mapping', () => {
     const out = normalizeReports([{ tool: 'semgrep', doc }]);
     expect(out.candidates).toEqual([]);
     expect(out.skipped).toEqual([
-      { tool: 'semgrep', ruleId: 'r.sql', reason: 'unmapped-class', file: 'a.js', cwe: [] },
+      {
+        tool: 'semgrep',
+        ruleId: 'r.sql',
+        reason: 'unmapped-class',
+        file: 'a.js',
+        startLine: 5,
+        endLine: 5,
+        cwe: [],
+      },
     ]);
   });
 

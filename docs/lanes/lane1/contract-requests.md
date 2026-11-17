@@ -50,3 +50,5 @@ Semgrep SARIF carries only a rule's `metadata.cwe` (as tags) in `properties.tags
 - Where the merged rule ids live: the normalizer returns them in a Lane 1 side record (`NormalizeResult.merged`, with the OSV package per member) because `Candidate` has one rule id and one range.
 - The CWE set: injection is 74, 77, 78, 89, 90, 91, 94, 95, 564, 643, 917, 943 and idor is 284, 285, 566, 639, 862, 863. Whether 284 and 285 belong in idor, and whether 1336 belongs in injection.
 - An unsafe path on one finding is now a `skipped` entry (reason `unsafe-path`), not a report failure; say if that should escalate.
+- Whether different CWEs in one class on the same range should stay separate candidates (today they merge into one).
+- Whether one bad result (for example a bad line number) should reject a whole report, as now, or be skipped and recorded.
