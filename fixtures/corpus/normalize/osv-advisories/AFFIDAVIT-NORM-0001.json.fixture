@@ -1,0 +1,13 @@
+{
+  "id": "AFFIDAVIT-NORM-0001",
+  "modified": "2026-01-01T00:00:00Z",
+  "published": "2026-01-01T00:00:00Z",
+  "summary": "Synthetic advisory (SQL injection class) for normalizer tests. Not a real vulnerability record.",
+  "database_specific": { "cwe_ids": ["CWE-89"], "severity": "HIGH" },
+  "affected": [
+    {
+      "package": { "ecosystem": "npm", "name": "sqlish" },
+      "ranges": [{ "type": "SEMVER", "events": [{ "introduced": "0" }, { "fixed": "1.0.1" }] }]
+    }
+  ]
+}
