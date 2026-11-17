@@ -1,0 +1,6 @@
+rules:
+  - id: affidavit.smoke.no-eval
+    message: eval() on a value that may be attacker controlled
+    severity: ERROR
+    languages: [javascript]
+    pattern: eval(...)
