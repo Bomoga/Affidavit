@@ -21,7 +21,8 @@ const HEADER = `# Affidavit's own rules. Written from scratch; no registry rule 
 # that compares the identifier with an id-like field of the signed-in user (req.session.userId,
 # req.user.id, ctx.state.user.id and similar; the receiver must be req, request or ctx, see AUTH_RE
 # and AUTH_FIELD_RE) and either
-#   - wraps the call in its then-branch (an else-branch does not count), or
+#   - wraps the call in its then-branch (any if with an else is ignored, because the call may be in
+#     the else-branch), or
 #   - sits in the same block as the call or in a block that encloses it, comes BEFORE the call, and
 #     ends the handler: its body is one return, throw or ctx.throw, or two or three statements
 #     whose last statement is one. A conditional return, a return in a catch block, a return in a

@@ -69,7 +69,10 @@ export function normalizeReports(inputs: readonly ReportInput[]): NormalizeResul
         cmp(a.tool, b.tool) ||
         cmp(a.file ?? '', b.file ?? '') ||
         cmp(a.ruleId, b.ruleId) ||
-        cmp(a.reason, b.reason),
+        cmp(a.reason, b.reason) ||
+        (a.startLine ?? 0) - (b.startLine ?? 0) ||
+        (a.endLine ?? 0) - (b.endLine ?? 0) ||
+        cmp(a.cwe.join(','), b.cwe.join(',')),
     );
     const partialTools = [...new Set(inputs.filter((i) => i.partial === true).map((i) => i.tool))];
     const { candidates, merged } = mergeFindings(findings);
@@ -121,6 +124,9 @@ export async function readToolRunReports(
 ): Promise<ReportInput[]> {
   const tool = sourceToolOf(run.name);
   const max = options.maxReportBytes ?? DEFAULT_MAX_REPORT_BYTES;
+  if (!Number.isSafeInteger(max) || max <= 0) {
+    throw new RangeError('maxReportBytes must be a positive finite integer');
+  }
   const out: ReportInput[] = [];
   for (const report of run.reports) {
     const unreadable = (why: string) =>

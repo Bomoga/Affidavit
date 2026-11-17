@@ -7,6 +7,7 @@ import {
   countAnnotations,
   evaluate,
   handlerEndLine,
+  handlerEndProblems,
   labelsHit,
   listRuleIds,
   parseNotification,
@@ -61,6 +62,7 @@ const expectations: Expectations = {
     [IDOR_P]: { catches: ['idor'], flagsControls: [] },
   },
   notTargeted: { eval: 'not an MVP class' },
+  idorHandlerEnds: { idor: 9 },
   unlabeledFindings: [],
   allowedNotifications: [
     { file: 'app/assets/vendor/jquery.min.js', rule: 'x' },
@@ -237,6 +239,79 @@ describe('handlerEndLine and IDOR labels', () => {
   });
 });
 
+describe('handlerEndLine edge cases', () => {
+  it('does not read // inside a string as a comment', () => {
+    const text = [
+      'a = {', // 1
+      '  h: () => {', // 2
+      '    const u = "http://x"; }', // 3  the } after the string closes h
+      '  ,',
+      '  g: () => {', // 5
+      '  },', // 6
+      '};',
+    ].join('\n');
+    // Stripping the comment before the string would drop the } and run on to line 6.
+    expect(handlerEndLine(text, 3)).toBe(3);
+  });
+
+  it('measures a source on the handler opening line to that handler, not the next one', () => {
+    const text = [
+      "app.get('/a/:id', (req, res) => { const id = req.params.id;", // 1
+      '  db.find(id);', // 2
+      '});', // 3
+      "app.get('/b/:id', (req, res) => {", // 4
+      '  db.find(1);', // 5
+      '});', // 6
+    ].join('\n');
+    expect(handlerEndLine(text, 1)).toBe(3);
+  });
+
+  it('skips braces in a multi-line template literal, also inside ${ }', () => {
+    const text = [
+      'const h = (req, res) => {', // 1
+      '  const id = req.params.id;', // 2
+      '  const q = `select {', // 3
+      '    ${ JSON.stringify({ a: 1 }) } }', // 4
+      '  {{`;', // 5
+      '  db.find(id);', // 6
+      '};', // 7
+      'const other = () => {', // 8
+      '};', // 9
+    ].join('\n');
+    expect(handlerEndLine(text, 2)).toBe(7);
+  });
+
+  it('skips braces in block comments', () => {
+    const text = ['f = () => {', '  /* } }', '  } */', '  x();', '};'].join('\n');
+    expect(handlerEndLine(text, 4)).toBe(5);
+  });
+});
+
+describe('pinned IDOR handler ends', () => {
+  const label = { ...corpus.labels[1]!, handlerEndLine: 9 };
+  it('accepts a computed end equal to the pin', () => {
+    expect(handlerEndProblems([label], { idorHandlerEnds: { idor: 9 } })).toEqual([]);
+  });
+  it('fails when the computed end differs, a pin is missing or a pin is stale', () => {
+    expect(handlerEndProblems([label], { idorHandlerEnds: { idor: 12 } }).join('\n')).toContain(
+      'computed as 9, pinned as 12',
+    );
+    expect(handlerEndProblems([label], { idorHandlerEnds: {} }).join('\n')).toContain(
+      'no pinned handler end',
+    );
+    expect(
+      handlerEndProblems([label], { idorHandlerEnds: { idor: 9, gone: 3 } }).join('\n'),
+    ).toContain('names no idor label: gone');
+  });
+  it('the expectations on disk pin every IDOR label of the corpus', () => {
+    const ids = loadCorpusLite()
+      .labels.filter((l) => l.cls === 'idor')
+      .map((l) => l.id)
+      .sort();
+    expect(Object.keys(loadExpectations().idorHandlerEnds).sort()).toEqual(ids);
+  });
+});
+
 describe('parseSemgrepSarif', () => {
   it('reads rule id, repo-relative file and lines, and skips malformed results', () => {
     const doc = {
@@ -332,6 +407,10 @@ describe('the rule files', () => {
       const text = readFileSync(join(root, 'semgrep', name), 'utf8');
       const pairs = [...text.matchAll(/^\s+cls:\s*(\w+)\s*\n\s+cwe:\s*'?(CWE-\d+)'?\s*$/gm)];
       expect(pairs.length, `${name} needs cls and cwe`).toBeGreaterThan(0);
+      expect(
+        [...text.matchAll(/^\s+cwe:/gm)].length,
+        `${name}: every cwe line must pair with a cls line`,
+      ).toBe(pairs.length);
       for (const [, cls, cwe] of pairs) {
         const ok = cls === 'idor' ? ['CWE-639'] : cls === 'injection' ? ['CWE-89', 'CWE-943'] : [];
         expect(ok, `${name}: unknown class ${String(cls)}`).not.toEqual([]);

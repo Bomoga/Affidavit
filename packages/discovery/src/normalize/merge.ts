@@ -31,6 +31,11 @@ export interface MergedMember {
   endLine: number;
   /** OSV only. */
   package?: { name: string; version: string };
+  /**
+   * OSV only, present when the package reported other ids than `ruleId` (the lowest id of the
+   * alias group): the ids it reported, so the original advisory id is not lost in the merge.
+   */
+  osvIds?: string[];
 }
 
 /**
@@ -92,6 +97,7 @@ function build(cluster: RawFinding[]): { candidate: Candidate; record: MergedRec
         startLine: f.startLine,
         endLine: f.endLine,
         ...(f.pkg ? { package: f.pkg } : {}),
+        ...(f.osvIds ? { osvIds: f.osvIds } : {}),
       })),
     },
   };
@@ -189,15 +195,15 @@ export function mergeFindings(findings: readonly RawFinding[]): {
 } {
   const groups = new Map<string, RawFinding[]>();
   for (const f of findings) {
-    const key = [f.file, f.cls, f.tool === 'osv' ? `osv:${f.ruleId}` : 'range'].join('\0');
+    const key = JSON.stringify([f.file, f.cls, f.tool === 'osv' ? ['osv', f.ruleId] : 'range']);
     const g = groups.get(key);
     if (g) g.push(f);
     else groups.set(key, [f]);
   }
 
   const built: { candidate: Candidate; record: MergedRecord }[] = [];
-  for (const [key, group] of groups) {
-    const clusters = key.endsWith('\0range') ? clusterByPrimary(group) : [group];
+  for (const group of groups.values()) {
+    const clusters = (group[0] as RawFinding).tool === 'osv' ? [group] : clusterByPrimary(group);
     for (const c of clusters) built.push(build(c));
   }
   built.sort(

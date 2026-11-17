@@ -62,6 +62,8 @@ export interface Expectations {
   app: string;
   rules: Record<string, { catches: string[]; flagsControls: string[] }>;
   notTargeted: Record<string, string>;
+  /** Pinned last line of the handler that holds each IDOR label's source (see handlerEndLine). */
+  idorHandlerEnds: Record<string, number>;
   unlabeledFindings: { ruleId: string; file: string; startLine: number }[];
   /** Exact (file, rule) pairs of tolerated Semgrep notifications. */
   allowedNotifications: { file: string; rule: string | null }[];
@@ -112,32 +114,121 @@ export function labelsHit(f: RuleFinding, corpus: CorpusLite): string[] {
     .map((l) => l.id);
 }
 
-const stripCode = (line: string): string =>
-  line
-    .replace(/\/\/.*$/, '')
-    .replace(/'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|`(?:\\.|[^`\\])*`/g, '""');
+/**
+ * Brace depth at the start and at the end of every line. One pass over the whole text, so a string
+ * is recognised before a comment (`"http://x"` is not a comment), a template literal can span
+ * lines and hold `${ ... }` expressions, and a block comment can too. Braces inside strings,
+ * templates and comments do not count. Regular expression literals are not recognised.
+ */
+function lineDepths(text: string): { start: number[]; end: number[] } {
+  const start: number[] = [0];
+  const end: number[] = [];
+  let mode: 'code' | 'single' | 'double' | 'template' | 'line' | 'block' = 'code';
+  let depth = 0;
+  // Brace depth at which each open `${` started; the `}` that returns to it closes the expression.
+  const templateStack: number[] = [];
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    const next = text[i + 1];
+    if (c === '\n') {
+      end.push(depth);
+      start.push(depth);
+      // A quote not closed on its line ends there; a line comment ends too.
+      if (mode === 'single' || mode === 'double' || mode === 'line') mode = 'code';
+      continue;
+    }
+    if (mode === 'line') continue;
+    if (mode === 'block') {
+      if (c === '*' && next === '/') {
+        mode = 'code';
+        i++;
+      }
+      continue;
+    }
+    if (mode === 'single' || mode === 'double' || mode === 'template') {
+      if (c === '\\') {
+        // The escaped character is skipped, unless it is the newline (counted above).
+        if (next !== undefined && next !== '\n') i++;
+      } else if (mode === 'single' && c === "'") mode = 'code';
+      else if (mode === 'double' && c === '"') mode = 'code';
+      else if (mode === 'template') {
+        if (c === '`') mode = 'code';
+        else if (c === '$' && next === '{') {
+          templateStack.push(depth);
+          mode = 'code';
+          i++;
+        }
+      }
+      continue;
+    }
+    if (c === '/' && next === '/') mode = 'line';
+    else if (c === '/' && next === '*') {
+      mode = 'block';
+      i++;
+    } else if (c === "'") mode = 'single';
+    else if (c === '"') mode = 'double';
+    else if (c === '`') mode = 'template';
+    else if (c === '{') depth++;
+    else if (c === '}') {
+      if (templateStack.length > 0 && templateStack[templateStack.length - 1] === depth) {
+        templateStack.pop();
+        mode = 'template';
+      } else depth--;
+    }
+  }
+  end.push(depth);
+  return { start, end };
+}
 
 /**
- * Last line of the innermost block that holds `startLine` (for a labeled source read directly in a
- * handler body, the handler): the first line, from `startLine` on, where the brace depth drops
- * below the depth at the start of that line. Approximate (strings and line
- * comments are skipped, block comments and regular expressions are not), which is enough for the
- * corpus handlers it is used on. Returns the last line of the file if no such line exists.
+ * Last line of the block that holds the labeled source (for a source read directly in a handler
+ * body, the handler). Two cases, decided by the line `startLine` itself:
+ *  - the line opens a block it does not close (`app.get(p, (req, res) => { const id = ...`): that
+ *    block is the handler, and it ends on the first line that brings the depth back to where the
+ *    line started;
+ *  - otherwise the innermost block that holds the line: the first line, from `startLine` on, where
+ *    the depth drops below the depth at the start of that line.
+ * Strings (also multi-line templates with `${ }`), line comments and block comments are skipped;
+ * regular expression literals are not. Returns the last line of the file if no end is found.
  */
 export function handlerEndLine(text: string, startLine: number): number {
-  const lines = text.replace(/\r\n/g, '\n').split('\n');
-  const delta = (l: string): number => {
-    const s = stripCode(l);
-    return (s.match(/\{/g)?.length ?? 0) - (s.match(/\}/g)?.length ?? 0);
-  };
-  let depth = 0;
-  for (let i = 0; i < startLine - 1 && i < lines.length; i++) depth += delta(lines[i] ?? '');
-  const base = depth;
-  for (let i = startLine - 1; i < lines.length; i++) {
-    depth += delta(lines[i] ?? '');
-    if (depth < base) return i + 1;
+  const { start, end } = lineDepths(text.replace(/\r\n/g, '\n'));
+  const at = Math.max(0, startLine - 1);
+  const base = start[at] ?? 0;
+  const opens = (end[at] ?? 0) > base;
+  for (let i = opens ? at + 1 : at; i < end.length; i++) {
+    const d = end[i] ?? 0;
+    if (opens ? d <= base : d < base) return i + 1;
   }
-  return lines.length;
+  return end.length;
+}
+
+/**
+ * Problems when the handler end computed for an IDOR label differs from the one pinned in the
+ * expectations, when an IDOR label has no pin, or when a pin names no IDOR label. An unpinned or
+ * drifting end would silently widen or narrow which findings count for the label.
+ */
+export function handlerEndProblems(
+  labels: readonly CorpusLabelLite[],
+  expectations: Pick<Expectations, 'idorHandlerEnds'>,
+): string[] {
+  const problems: string[] = [];
+  const pins = expectations.idorHandlerEnds;
+  const idor = labels.filter((l) => l.cls === 'idor');
+  for (const l of idor) {
+    const pinned = pins[l.id];
+    if (pinned === undefined) {
+      problems.push(`idor label ${l.id} has no pinned handler end in the expectations`);
+    } else if (l.handlerEndLine !== pinned) {
+      problems.push(
+        `idor label ${l.id}: handler end computed as ${String(l.handlerEndLine)}, pinned as ${String(pinned)}`,
+      );
+    }
+  }
+  for (const id of Object.keys(pins)) {
+    if (!idor.some((l) => l.id === id)) problems.push(`idorHandlerEnds names no idor label: ${id}`);
+  }
+  return problems;
 }
 
 export function controlsHit(f: RuleFinding, corpus: CorpusLite): string[] {
