@@ -416,6 +416,15 @@ async function reconcileAttempt(
  * the one enqueue_stage and claim_stage_run use, which would deadlock with the enqueue inside
  * `fn`). Concurrent reconcilers queue up here; each re-reads the state under the lock, so only the
  * first one retries, charges and enqueues.
+ *
+ * Pool requirement: this holds one app-pool connection, idle in a transaction, for as long as `fn`
+ * runs, and `fn` takes further connections from the SAME pool (each store and queue call checks
+ * one out). With R reconcilers at once the pool needs more than R connections, or all of them can
+ * be held by lock holders waiting for another one and nothing proceeds. `reconcileOnce` handles
+ * one case at a time and the worker runs one pass at a time, so reconcile alone needs 2; handlers
+ * on the same pool need theirs on top (concurrency plus heartbeats). Passing the held client into
+ * `fn` would remove the requirement but means threading a transaction through every store and
+ * queue call; not done. A test pins that a pool of 2 is enough for one reconciler.
  */
 async function withReconcileLock<T>(
   appPool: AppPool,
