@@ -31,6 +31,16 @@ The gate issue in NodeGoat at the pinned commit is MongoDB `$where` (NoSQL) inje
 
 **Request.** Say which of the two paths is intended, and whether the jury-enabled setting belongs on the case (so a database can enforce it) or stays store configuration.
 
+## CR-4: carry ingestion coverage with the case (raised by L1-01)
+
+**Problem.** `ingestRepo` returns three facts that the contracts have no place for: whether the gitleaks run was `partial` (files it may have skipped or cut), the files kept out of the workspace and why (`.env` files, archives or binaries holding a secret, files too large to rewrite), and the `unsupported` outcome for a repo that is not Express, Koa, Fastify or Next API routes. `CaseFile.redactions` carries redaction locations only, which is all it should carry.
+
+**Risk.** A partial secret scan is a signal that the redaction map may be incomplete. If it lives only in the worker's memory, a later stage or a reviewer cannot see that a case was ingested with gaps. Likewise `unsupported` has no `CaseStage` or `Dismissal` reason, so the worker (L1-10) has nowhere to record it except an ad hoc event.
+
+**Request.** Either add an optional `ingest: { partial: boolean, excludedFiles: { path, reason }[] }` object to `CaseFile` (or `BundleManifest`), or state that these are worker-internal events. Add a way to record an unsupported repo: a `Dismissal` reason such as `unsupported-repo`, or an explicit stage outcome.
+
+**Interim.** `@affidavit/discovery` exports typed `IngestOk.scan`, `IngestOk.excluded`, `IngestUnsupported` and `IngestIncomplete`; L1-10 decides how to persist them. `IngestIncomplete` (status `incomplete`, reason `partial-secret-scan`, with the coverage notifications) is what ingestion returns when the secret scan did not cover everything: it fails closed, keeps no workspace and never returns `ok`. The contracts have no stage outcome or `Dismissal` reason for it either, so the same request covers it: it needs a home (for example an escalation to human review, since a repo with an uncovered file cannot be ingested safely). The redaction map with values (`SecretRedactor`) is memory only and is never persisted; the workspace on disk is already redacted, so later stages that slice it never see a secret.
+
 ## CR-5: dependency findings have no class or location in `Candidate` (raised by L1-03)
 
 **Problem.** `Candidate.cls` is `injection | idor`, and `range` is a line range. An OSV-Scanner finding is a vulnerable package in a lockfile: it has no line, and most advisories are neither injection nor IDOR. The normalizer therefore (a) places an OSV candidate at line 1 of its lockfile, and (b) emits it only when the advisory's `database_specific.cwe_ids` maps to a MVP class. Every other advisory is returned in `skipped` with reason `unmapped-class`, so L1-06 can record it but cannot give it an `osv-no-path` dismissal (a `Dismissal` needs a `candidateId`).
