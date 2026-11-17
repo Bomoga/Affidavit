@@ -1,0 +1,176 @@
+# Affidavit's own rules. Written from scratch; no registry rule or rule text is used or copied.
+#
+# IDOR: an identifier the caller controls is read from the request and later passed to a
+# data-access call, with no comparison against the signed-in user. "Ownership check" means an if
+# statement after the read that compares the identifier with req.session.* or req.user.* (either
+# as a positive guard or as a guard that returns). A role check, a query scoped by the session
+# id, or a check in middleware or in the data layer is not seen, so these rules over-report and
+# the arraignment stage and the Judge decide.
+#
+# The finding is placed on the statement that reads the identifier from the request (the source),
+# not on the data-access call, so it lines up with how the corpus labels the source of an IDOR.
+#
+# The guard list below is long because Semgrep cannot negate a pattern together with a
+# metavariable regex. It is the same eight comparisons (=== !== == !=, identifier on either side)
+# for each of req.session and req.user.
+rules:
+  - id: affidavit.idor.route-param-to-data-access
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      A route parameter (req.params) is read here and later passed to a data-access call with no
+      comparison against the signed-in user. Any signed-in caller can change the parameter to read
+      or change another user's record. Take the owner from the session, or compare before the call.
+    metadata:
+      cls: idor
+      cwe: CWE-639
+      confidence: medium
+      note: Intra-file only. An ownership check in middleware or in the data layer is not seen.
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern: const { ..., $P, ... } = $REQ.params;
+              - pattern-inside: |
+                  const { ..., $P, ... } = $REQ.params;
+                  ...
+                  <... $OBJ.$M(..., <... $P ...>, ...) ...>;
+              - metavariable-regex:
+                  metavariable: $OBJ
+                  regex: '^((?i:.*(dao|repository|repo|store|model|collection))|[A-Z][A-Za-z0-9_]*|.*\))$'
+              - pattern-not-inside: |
+                  const { ..., $P, ... } = $REQ.params;
+                  ...
+                  if ($P === $REQ.session.$S) {...}
+              - pattern-not-inside: |
+                  const { ..., $P, ... } = $REQ.params;
+                  ...
+                  if ($REQ.session.$S === $P) {...}
+              - pattern-not-inside: |
+                  const { ..., $P, ... } = $REQ.params;
+                  ...
+                  if ($P !== $REQ.session.$S) {...}
+              - pattern-not-inside: |
+                  const { ..., $P, ... } = $REQ.params;
+                  ...
+                  if ($REQ.session.$S !== $P) {...}
+              - pattern-not-inside: |
+                  const { ..., $P, ... } = $REQ.params;
+                  ...
+                  if ($P == $REQ.session.$S) {...}
+              - pattern-not-inside: |
+                  const { ..., $P, ... } = $REQ.params;
+                  ...
+                  if ($REQ.session.$S == $P) {...}
+              - pattern-not-inside: |
+                  const { ..., $P, ... } = $REQ.params;
+                  ...
+                  if ($P != $REQ.session.$S) {...}
+              - pattern-not-inside: |
+                  const { ..., $P, ... } = $REQ.params;
+                  ...
+                  if ($REQ.session.$S != $P) {...}
+              - pattern-not-inside: |
+                  const { ..., $P, ... } = $REQ.params;
+                  ...
+                  if ($P === $REQ.user.$S) {...}
+              - pattern-not-inside: |
+                  const { ..., $P, ... } = $REQ.params;
+                  ...
+                  if ($REQ.user.$S === $P) {...}
+              - pattern-not-inside: |
+                  const { ..., $P, ... } = $REQ.params;
+                  ...
+                  if ($P !== $REQ.user.$S) {...}
+              - pattern-not-inside: |
+                  const { ..., $P, ... } = $REQ.params;
+                  ...
+                  if ($REQ.user.$S !== $P) {...}
+              - pattern-not-inside: |
+                  const { ..., $P, ... } = $REQ.params;
+                  ...
+                  if ($P == $REQ.user.$S) {...}
+              - pattern-not-inside: |
+                  const { ..., $P, ... } = $REQ.params;
+                  ...
+                  if ($REQ.user.$S == $P) {...}
+              - pattern-not-inside: |
+                  const { ..., $P, ... } = $REQ.params;
+                  ...
+                  if ($P != $REQ.user.$S) {...}
+              - pattern-not-inside: |
+                  const { ..., $P, ... } = $REQ.params;
+                  ...
+                  if ($REQ.user.$S != $P) {...}
+          - patterns:
+              - pattern: const $P = $REQ.params.$K;
+              - pattern-inside: |
+                  const $P = $REQ.params.$K;
+                  ...
+                  <... $OBJ.$M(..., <... $P ...>, ...) ...>;
+              - metavariable-regex:
+                  metavariable: $OBJ
+                  regex: '^((?i:.*(dao|repository|repo|store|model|collection))|[A-Z][A-Za-z0-9_]*|.*\))$'
+              - pattern-not-inside: |
+                  const $P = $REQ.params.$K;
+                  ...
+                  if ($P === $REQ.session.$S) {...}
+              - pattern-not-inside: |
+                  const $P = $REQ.params.$K;
+                  ...
+                  if ($REQ.session.$S === $P) {...}
+              - pattern-not-inside: |
+                  const $P = $REQ.params.$K;
+                  ...
+                  if ($P !== $REQ.session.$S) {...}
+              - pattern-not-inside: |
+                  const $P = $REQ.params.$K;
+                  ...
+                  if ($REQ.session.$S !== $P) {...}
+              - pattern-not-inside: |
+                  const $P = $REQ.params.$K;
+                  ...
+                  if ($P == $REQ.session.$S) {...}
+              - pattern-not-inside: |
+                  const $P = $REQ.params.$K;
+                  ...
+                  if ($REQ.session.$S == $P) {...}
+              - pattern-not-inside: |
+                  const $P = $REQ.params.$K;
+                  ...
+                  if ($P != $REQ.session.$S) {...}
+              - pattern-not-inside: |
+                  const $P = $REQ.params.$K;
+                  ...
+                  if ($REQ.session.$S != $P) {...}
+              - pattern-not-inside: |
+                  const $P = $REQ.params.$K;
+                  ...
+                  if ($P === $REQ.user.$S) {...}
+              - pattern-not-inside: |
+                  const $P = $REQ.params.$K;
+                  ...
+                  if ($REQ.user.$S === $P) {...}
+              - pattern-not-inside: |
+                  const $P = $REQ.params.$K;
+                  ...
+                  if ($P !== $REQ.user.$S) {...}
+              - pattern-not-inside: |
+                  const $P = $REQ.params.$K;
+                  ...
+                  if ($REQ.user.$S !== $P) {...}
+              - pattern-not-inside: |
+                  const $P = $REQ.params.$K;
+                  ...
+                  if ($P == $REQ.user.$S) {...}
+              - pattern-not-inside: |
+                  const $P = $REQ.params.$K;
+                  ...
+                  if ($REQ.user.$S == $P) {...}
+              - pattern-not-inside: |
+                  const $P = $REQ.params.$K;
+                  ...
+                  if ($P != $REQ.user.$S) {...}
+              - pattern-not-inside: |
+                  const $P = $REQ.params.$K;
+                  ...
+                  if ($REQ.user.$S != $P) {...}

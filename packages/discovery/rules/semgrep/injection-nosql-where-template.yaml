@@ -1,0 +1,48 @@
+# Affidavit's own rules. Written from scratch; no registry rule or rule text is used or copied.
+# Rule ids are kept as written (the tool wrapper passes --no-rewrite-rule-ids).
+rules:
+  - id: affidavit.injection.nosql-where-template
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      A MongoDB $where expression is built from a template string or string concatenation with a
+      value that is not a numeric literal and is not coerced to a number first. $where runs as
+      JavaScript in the database, so a request value that reaches it can break out of the quoted
+      literal. This is a pattern-level rule: it does not prove the value is attacker controlled.
+    metadata:
+      cls: injection
+      cwe: CWE-943
+      confidence: medium
+      note: Does not follow data across files; the arraignment stage decides reachability.
+    patterns:
+      - pattern-either:
+          - pattern: '{ $where: `...${$X}...`, ... }'
+          - pattern: '{ "$where": `...${$X}...`, ... }'
+          - pattern: '{ $where: "..." + $X, ... }'
+          - pattern: '{ "$where": "..." + $X, ... }'
+          - pattern: '{ $where: $X + "...", ... }'
+          - pattern: '{ "$where": $X + "...", ... }'
+          - pattern: '{ $where: "..." + $X + "...", ... }'
+          - pattern: '{ "$where": "..." + $X + "...", ... }'
+      # A value coerced to a number cannot carry a quote or code, so it is not reported.
+      - metavariable-pattern:
+          metavariable: $X
+          patterns:
+            - pattern-not: parseInt(...)
+            - pattern-not: parseFloat(...)
+            - pattern-not: Number(...)
+            - pattern-not: Math.$F(...)
+            - pattern-not: '"..."'
+      - metavariable-regex:
+          metavariable: $X
+          regex: ^(?![0-9]+(\.[0-9]+)?$)
+      # A name that an earlier statement in the same block set from a numeric coercion.
+      - pattern-not-inside: |
+          $X = parseInt(...);
+          ...
+      - pattern-not-inside: |
+          $X = Number(...);
+          ...
+      - pattern-not-inside: |
+          $X = parseFloat(...);
+          ...

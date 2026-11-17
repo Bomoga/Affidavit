@@ -1,0 +1,26 @@
+{
+  "app": "nodegoat",
+  "rules": {
+    "affidavit.injection.sql-concat": { "catches": [], "flagsControls": [] },
+    "affidavit.injection.sql-request-taint": { "catches": [], "flagsControls": [] },
+    "affidavit.injection.nosql-where-template": {
+      "catches": ["nodegoat-nosqli-allocations-where"],
+      "flagsControls": ["nodegoat-nc-constant-where"]
+    },
+    "affidavit.injection.nosql-operator-request": { "catches": [], "flagsControls": [] },
+    "affidavit.idor.route-param-to-data-access": {
+      "catches": ["nodegoat-idor-allocations-userid"],
+      "flagsControls": []
+    },
+    "affidavit.idor.request-id-to-data-access": {
+      "catches": ["nodegoat-idor-benefits-userid"],
+      "flagsControls": []
+    }
+  },
+  "notTargeted": {
+    "nodegoat-ssjs-contributions-eval": "Server-side JavaScript injection through eval. The MVP rules cover SQL and NoSQL injection and IDOR only.",
+    "nodegoat-loginj-login-username": "Log injection (CWE-117). Not an SQL, NoSQL or IDOR class, so no rule targets it."
+  },
+  "unlabeledFindings": [],
+  "allowedNotificationPathPrefixes": ["app/assets/vendor/"]
+}

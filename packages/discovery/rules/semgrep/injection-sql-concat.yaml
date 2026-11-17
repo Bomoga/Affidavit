@@ -1,0 +1,41 @@
+# Affidavit's own rules. Written from scratch; no registry rule or rule text is used or copied.
+# One rule per file, so each rule has its own test file in ../tests with the same base name.
+rules:
+  - id: affidavit.injection.sql-concat
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      A SQL statement is built by string concatenation or template interpolation and passed to a
+      query method. Values placed in the text of a statement are not parameters; pass them as
+      bound parameters instead. This is a pattern-level rule: it does not prove the value is
+      attacker controlled.
+    metadata:
+      cls: injection
+      cwe: CWE-89
+      confidence: medium
+      note: Does not follow data across files; the arraignment stage decides reachability.
+    patterns:
+      - pattern-either:
+          - pattern: $DB.$M(`...${$X}...`, ...)
+          - pattern: $DB.$M("..." + $X, ...)
+          - pattern: $DB.$M($X + "...", ...)
+          - pattern: $DB.$M("..." + $X + "...", ...)
+      - metavariable-regex:
+          metavariable: $M
+          regex: ^(query|execute|raw|queryRaw|\$queryRawUnsafe|\$executeRawUnsafe|unsafe)$
+      - metavariable-pattern:
+          metavariable: $X
+          patterns:
+            - pattern-not: parseInt(...)
+            - pattern-not: parseFloat(...)
+            - pattern-not: Number(...)
+            - pattern-not: '"..."'
+      - metavariable-regex:
+          metavariable: $X
+          regex: ^(?![0-9]+(\.[0-9]+)?$)
+      - pattern-not-inside: |
+          $X = parseInt(...);
+          ...
+      - pattern-not-inside: |
+          $X = Number(...);
+          ...

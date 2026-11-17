@@ -1,0 +1,36 @@
+# Affidavit's own rules. Written from scratch; no registry rule or rule text is used or copied.
+rules:
+  - id: affidavit.injection.sql-request-taint
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      A request value (req.body, req.query, req.params, req.headers or req.cookies) flows into the
+      text of a SQL statement in this file without a numeric coercion. Use bound parameters.
+    metadata:
+      cls: injection
+      cwe: CWE-89
+      confidence: high
+      note: Intra-file only. A value that crosses a file boundary before the query is not seen.
+    mode: taint
+    pattern-sources:
+      - pattern: $REQ.body
+      - pattern: $REQ.query
+      - pattern: $REQ.params
+      - pattern: $REQ.headers
+      - pattern: $REQ.cookies
+    pattern-sanitizers:
+      - pattern: parseInt(...)
+      - pattern: parseFloat(...)
+      - pattern: Number(...)
+    pattern-sinks:
+      - patterns:
+          - pattern: $DB.$M($Q, ...)
+          - focus-metavariable: $Q
+          - metavariable-regex:
+              metavariable: $M
+              regex: ^(query|execute|raw|queryRaw|\$queryRawUnsafe|\$executeRawUnsafe|unsafe)$
+          - metavariable-pattern:
+              metavariable: $Q
+              pattern-either:
+                - pattern: '`...${...}...`'
+                - pattern: '... + ...'
