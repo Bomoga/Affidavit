@@ -42,4 +42,8 @@ rules:
           - focus-metavariable: $Q
           - metavariable-regex:
               metavariable: $M
-              regex: ^(query|execute|raw|queryRaw|\$queryRawUnsafe|\$executeRawUnsafe|unsafe|whereRaw|orderByRaw|havingRaw|joinRaw)$
+              # Sequelize.literal(...) is a sink too. The TypeORM query builder (where, andWhere,
+              # orderBy) is not: it also takes an object of bound values, so a request object
+              # passed to it is not injection. Known miss: a request value built into a template
+              # and passed to those builder calls through a variable.
+              regex: ^(query|execute|raw|queryRaw|\$queryRawUnsafe|\$executeRawUnsafe|unsafe|whereRaw|orderByRaw|havingRaw|joinRaw|literal)$

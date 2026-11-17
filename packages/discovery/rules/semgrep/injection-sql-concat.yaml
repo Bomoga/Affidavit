@@ -36,7 +36,9 @@ rules:
           - pattern: '$DB.$M({ text: $X + $A, ... }, ...)'
       - metavariable-regex:
           metavariable: $M
-          regex: ^(query|execute|raw|queryRaw|\$queryRawUnsafe|\$executeRawUnsafe|unsafe|whereRaw|orderByRaw|havingRaw|joinRaw)$
+          # Also Sequelize.literal(...) and the TypeORM query builder (where, andWhere, orWhere,
+          # orderBy, addOrderBy, groupBy, having), which take SQL text.
+          regex: ^(query|execute|raw|queryRaw|\$queryRawUnsafe|\$executeRawUnsafe|unsafe|whereRaw|orderByRaw|havingRaw|joinRaw|literal|where|andWhere|orWhere|orderBy|addOrderBy|groupBy|having)$
       # A value coerced to a number, a number, or a string literal cannot carry SQL.
       - metavariable-pattern:
           metavariable: $X

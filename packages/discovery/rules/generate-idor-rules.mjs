@@ -19,18 +19,22 @@ const HEADER = `# Affidavit's own rules. Written from scratch; no registry rule 
 # IDOR: an identifier the caller controls is read from the request and passed to a data-access
 # call, with no ownership check on the path to that call. An ownership check is an if statement
 # that compares the identifier with an id-like field of the signed-in user (req.session.userId,
-# req.user.id, ctx.state.user.id and similar, see AUTH_RE and AUTH_FIELD_RE) and either
+# req.user.id, ctx.state.user.id and similar; the receiver must be req, request or ctx, see AUTH_RE
+# and AUTH_FIELD_RE) and either
 #   - wraps the call in its then-branch (an else-branch does not count), or
-#   - comes BEFORE the call and its body returns, throws, or calls ctx.throw (a bare next(...)
-#     without return does not stop the handler, so it does not count).
-# A guard that only logs does not count, and neither does a check placed after the call. Each data
-# call is judged on its own: a guarded call does not clear another call on the same identifier.
+#   - sits in the same block as the call or in a block that encloses it, comes BEFORE the call, and
+#     ends the handler: its body is one return, throw or ctx.throw, or two or three statements
+#     whose last statement is one. A conditional return, a return in a catch block, a return in a
+#     nested function, and a bare next(...) without return do not count.
+# A guard that only logs does not count, a check placed after the call does not count, and a check
+# in an unrelated if, a loop body, a callback or a function that is not the call's own block does
+# not count. Each data call is judged on its own: a guarded call does not clear another call on the
+# same identifier, not even a call to the same method.
 # A role check, a query scoped by the session id, or a check in middleware or in the data layer is
 # not seen, so these rules over-report and the arraignment stage and the Judge decide.
 #
-# Where the finding goes: when the identifier is first read into a variable, on the request
-# expression of that read (req.params, req.body and so on), so it lines up with how the corpus
-# labels IDOR sources; when it is used inline in the call, on the call.
+# Where the finding goes: always on the data-access call. The regression matches it to a labeled
+# IDOR when it is in the same handler as the labeled source.
 #
 # Known false positives: a data-access call already scoped to the owner some other way (for example
 # findOne({ _id: id, owner: req.session.userId })), and an identifier checked in a helper function
@@ -59,16 +63,21 @@ const METHOD_RE =
 
 // The signed-in user: req.session, req.user, req.auth, req.session.user, ctx.state.user, and an
 // id-like field of it. A field such as csrfToken is not an ownership check.
-const AUTH_RE = '^([\\w$]+\\.(session|user|auth)(\\.user)?|ctx\\.state\\.user)$';
+// The receiver is anchored to req, request or ctx, so a local such as `body.user.id` (request data)
+// is not mistaken for the signed-in user.
+const AUTH_RE = '^((req|request|ctx)\\.(session|user|auth)(\\.user)?|ctx\\.state\\.user)$';
 const AUTH_FIELD_RE = '^(id|_id|userId|user_id|userID|uid|sub)$';
 
 // Identifier names for the request-id rule.
 const ID_RE = '^(id|_id|\\w*[a-z](Id|ID)|\\w*_(id|ID))$';
 const ID_TAIL = '(id|_id|\\w*[a-z](Id|ID)|\\w*_(id|ID))';
 
-// What a failing guard may do: return, throw, or Koa's ctx.throw. Braced bodies with more than one
-// statement and braceless single statements are different shapes in Semgrep.
-const BODIES = ['return ...;', 'throw ...;', 'ctx.throw(...);'];
+// What a failing guard may end with: return, throw, or Koa's ctx.throw. Only fixed body shapes are
+// accepted, so the guard always stops the handler: one statement (braced or not), or two or three
+// statements whose LAST top-level statement is the return, throw or ctx.throw. A conditional
+// return, a return inside a catch block, or a return inside a nested function is none of these.
+const STOPS = ['return ...;', 'throw ...;', 'ctx.throw(...);'];
+const BODIES = STOPS.flatMap((stop) => [stop, `{ $A; ${stop} }`, `{ $A; $B; ${stop} }`]);
 
 // --- minimal YAML writer (strings, arrays, objects) -------------------------------------------
 
@@ -116,10 +125,7 @@ function guardPatterns(expr, wrapNeg, wrapPos) {
   for (const side of sides) {
     for (const op of ['!==', '!=']) {
       for (const cond of [`${expr} ${op} ${side}`, `${side} ${op} ${expr}`]) {
-        for (const body of BODIES) {
-          out.push({ pattern: wrapNeg(`if (${cond}) { ... ${body} }`) });
-          out.push({ pattern: wrapNeg(`if (${cond}) ${body}`) });
-        }
+        for (const body of BODIES) out.push({ pattern: wrapNeg(`if (${cond}) ${body}`) });
       }
     }
     for (const op of ['===', '==']) {
@@ -131,49 +137,31 @@ function guardPatterns(expr, wrapNeg, wrapPos) {
   return out;
 }
 
-function alt({ read, srcRe, expr, extra, inline }) {
-  const call = `<... $OBJ.$M(..., <... ${expr} ...>, ...) ...>;`;
-  const patterns = [];
-  let wrapNeg;
-  let wrapPos;
-  if (inline) {
-    patterns.push({ pattern: `$OBJ.$M(..., <... ${expr} ...>, ...)` });
-    // A fail-closed guard earlier in the block protects every later statement.
-    wrapNeg = (g) => `${g}\n...`;
-    // Only the then-branch counts, so an if with an else does not suppress.
-    wrapPos = (cond) => [
-      {
-        patterns: [
-          { pattern: `if (${cond}) {...}` },
-          { 'pattern-not': `if (${cond}) {...} else {...}` },
-        ],
-      },
-      {
-        patterns: [
-          { pattern: `if (${cond}) $STMT;` },
-          { 'pattern-not': `if (${cond}) $STMT; else $ELSE;` },
-        ],
-      },
-    ];
-  } else {
-    patterns.push({ pattern: `${read}\n...\n${call}` }, { 'focus-metavariable': '$SRC' });
-    // Order matters: the read, then the guard, then THIS call.
-    wrapNeg = (g) => `${read}\n...\n${g}\n...\n${call}`;
-    wrapPos = (cond) => [
-      {
-        patterns: [
-          { pattern: `${read}\n...\nif (${cond}) { ... ${call} ... }` },
-          { 'pattern-not': `${read}\n...\nif (${cond}) {...} else {...}` },
-        ],
-      },
-      {
-        patterns: [
-          { pattern: `${read}\n...\nif (${cond}) ${call}` },
-          { 'pattern-not': `${read}\n...\nif (${cond}) $STMT; else $ELSE;` },
-        ],
-      },
-    ];
-  }
+function alt({ read, srcRe, expr, extra }) {
+  // The finding is always THE CALL, so each call is judged on its own. When the identifier is first
+  // read into a variable, the read is a pattern-inside (it binds $P and $SRC). The regression
+  // matches a finding to a labeled IDOR when it is in the same handler as the labeled source.
+  const patterns = [{ pattern: `$OBJ.$M(..., <... ${expr} ...>, ...)` }];
+  if (read) patterns.push({ 'pattern-inside': `${read}\n...` });
+  // A fail-closed guard protects the rest of its own block: the negative range starts AT the guard
+  // and runs to the end of the block that holds it, so an earlier call is outside it, and so is a
+  // call after a guard that sits in a different block (an unrelated if, a loop body, a callback).
+  const wrapNeg = (g) => `${g}\n...`;
+  // A comparison that wraps the call. Only the then-branch counts, so an if with an else does not.
+  const wrapPos = (cond) => [
+    {
+      patterns: [
+        { pattern: `if (${cond}) {...}` },
+        { 'pattern-not': `if (${cond}) {...} else {...}` },
+      ],
+    },
+    {
+      patterns: [
+        { pattern: `if (${cond}) $STMT;` },
+        { 'pattern-not': `if (${cond}) $STMT; else $ELSE;` },
+      ],
+    },
+  ];
   patterns.push({ 'metavariable-regex': { metavariable: '$SRC', regex: srcRe } });
   for (const r of extra) patterns.push({ 'metavariable-regex': r });
   patterns.push(

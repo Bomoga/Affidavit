@@ -25,6 +25,8 @@ export interface CorpusLabelLite {
   file: string;
   range: LineRange;
   source: { file: string; range: LineRange };
+  /** Set by the Docker test for IDOR labels: last line of the handler that holds the source. */
+  handlerEndLine?: number;
 }
 
 export interface CorpusLite {
@@ -98,9 +100,44 @@ export function labelsHit(f: RuleFinding, corpus: CorpusLite): string[] {
     .filter(
       (l) =>
         (l.file === f.file && overlaps(range(f), l.range)) ||
-        (l.source.file === f.file && overlaps(range(f), l.source.range)),
+        (l.source.file === f.file && overlaps(range(f), l.source.range)) ||
+        // IDOR findings sit on the data-access call, which can be a few lines below the labeled
+        // source (where the identifier is read). They count when they are in the same handler:
+        // from the labeled source to the end of the function that holds it.
+        (l.handlerEndLine !== undefined &&
+          l.source.file === f.file &&
+          f.startLine >= l.source.range.startLine &&
+          f.endLine <= l.handlerEndLine),
     )
     .map((l) => l.id);
+}
+
+const stripCode = (line: string): string =>
+  line
+    .replace(/\/\/.*$/, '')
+    .replace(/'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|`(?:\\.|[^`\\])*`/g, '""');
+
+/**
+ * Last line of the innermost block that holds `startLine` (for a labeled source read directly in a
+ * handler body, the handler): the first line, from `startLine` on, where the brace depth drops
+ * below the depth at the start of that line. Approximate (strings and line
+ * comments are skipped, block comments and regular expressions are not), which is enough for the
+ * corpus handlers it is used on. Returns the last line of the file if no such line exists.
+ */
+export function handlerEndLine(text: string, startLine: number): number {
+  const lines = text.replace(/\r\n/g, '\n').split('\n');
+  const delta = (l: string): number => {
+    const s = stripCode(l);
+    return (s.match(/\{/g)?.length ?? 0) - (s.match(/\}/g)?.length ?? 0);
+  };
+  let depth = 0;
+  for (let i = 0; i < startLine - 1 && i < lines.length; i++) depth += delta(lines[i] ?? '');
+  const base = depth;
+  for (let i = startLine - 1; i < lines.length; i++) {
+    depth += delta(lines[i] ?? '');
+    if (depth < base) return i + 1;
+  }
+  return lines.length;
 }
 
 export function controlsHit(f: RuleFinding, corpus: CorpusLite): string[] {
@@ -376,6 +413,9 @@ export function regressionInputsDigest(repo: string): string {
     `${src}/tools/manifest.ts`,
     `${src}/tools/walk.ts`,
     `${src}/tools/index.ts`,
+    `${src}/tools/lockfiles.ts`,
+    `${src}/tools/unscannable.ts`,
+    `${src}/tools/windows.ts`,
   );
   for (const rel of files) add(rel, readText(rel));
 

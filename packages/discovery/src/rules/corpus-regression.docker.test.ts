@@ -36,6 +36,8 @@ import { loadToolManifest, quarantineSnapshot, repoRoot, runTool } from '../tool
 import {
   evaluate,
   formatEvaluation,
+  handlerEndLine,
+  type CorpusLite,
   listRuleIds,
   parseSemgrepSarif,
   regressionInputsDigest,
@@ -128,6 +130,7 @@ describe.skipIf(!enabled)('own Semgrep rules, Docker and corpus', { timeout: 900
   let work = '';
   const runs = {} as Record<TreeVariant, TreeRun>;
   let counter = 0;
+  const fetchedDirs: Partial<Record<TreeVariant, string>> = {};
 
   beforeAll(() => {
     work = mkdtempSync(join(tmpdir(), 'affidavit-rules-'));
@@ -211,6 +214,7 @@ describe.skipIf(!enabled)('own Semgrep rules, Docker and corpus', { timeout: 900
           ? (app.negativeControls[0]?.patches ?? [])
           : [];
     const fetched = join(work, `fetched-${id}`);
+    fetchedDirs[variant] = fetched;
     await mod.fetchPinned({
       repoUrl: pin.repoUrl,
       commit: pin.commit,
@@ -250,8 +254,25 @@ describe.skipIf(!enabled)('own Semgrep rules, Docker and corpus', { timeout: 900
     for (const variant of ['vulnerable', 'safe', 'negative-control'] as const) {
       runs[variant] = await scan(variant);
     }
-    const evaluation = evaluate(corpus, expectations, ruleIds, runs);
-    const table = formatEvaluation(evaluation, corpus);
+    // IDOR findings sit on the data-access call, so an IDOR label also counts findings in the same
+    // handler. The handler extent is read from the vulnerable tree.
+    const vulnerableDir = fetchedDirs['vulnerable'] ?? '';
+    const corpusWithExtents: CorpusLite = {
+      ...corpus,
+      labels: corpus.labels.map((l) =>
+        l.cls === 'idor'
+          ? {
+              ...l,
+              handlerEndLine: handlerEndLine(
+                readFileSync(join(vulnerableDir, l.source.file), 'utf8'),
+                l.source.range.startLine,
+              ),
+            }
+          : l,
+      ),
+    };
+    const evaluation = evaluate(corpusWithExtents, expectations, ruleIds, runs);
+    const table = formatEvaluation(evaluation, corpusWithExtents);
     console.log(
       [
         '',

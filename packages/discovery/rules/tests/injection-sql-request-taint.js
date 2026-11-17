@@ -1,5 +1,5 @@
 // Test file for rules/semgrep/injection-sql-request-taint.yaml. Not executed; only parsed by Semgrep.
-function cases(db, connection, pool, knex, req, res) {
+function cases(db, connection, pool, knex, qb, Sequelize, req, res) {
   // ruleid: affidavit.injection.sql-request-taint
   db.query(`SELECT * FROM users WHERE name = '${req.body.name}'`);
 
@@ -34,6 +34,13 @@ function cases(db, connection, pool, knex, req, res) {
 
   // ruleid: affidavit.injection.sql-request-taint
   db.query({ text: 'SELECT * FROM t WHERE id = ' + req.params.id });
+
+  // ruleid: affidavit.injection.sql-request-taint
+  Sequelize.literal(`id = ${req.query.id}`);
+
+  // A request object passed to a query builder is bound by the builder, not injected.
+  // ok: affidavit.injection.sql-request-taint
+  qb.where(req.query);
 
   // ok: affidavit.injection.sql-request-taint
   db.query({ text: 'SELECT * FROM t WHERE id = $1', values: [req.params.id] });

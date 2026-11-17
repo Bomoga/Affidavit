@@ -1,5 +1,5 @@
 // Test file for rules/semgrep/injection-sql-concat.yaml. Not executed; only parsed by Semgrep.
-function cases(db, pool, req, userId, cache) {
+function cases(db, pool, qb, Sequelize, req, userId, cache) {
   // ruleid: affidavit.injection.sql-concat
   db.query(`SELECT * FROM users WHERE name = '${req.body.name}'`);
 
@@ -32,6 +32,24 @@ function cases(db, pool, req, userId, cache) {
 
   // ruleid: affidavit.injection.sql-concat
   pool.query({ text: 'SELECT * FROM t WHERE id = ' + userId, values: [] });
+
+  // ruleid: affidavit.injection.sql-concat
+  Sequelize.literal(`id = ${userId}`);
+
+  // ruleid: affidavit.injection.sql-concat
+  qb.where(`user.id = ${userId}`);
+
+  // ruleid: affidavit.injection.sql-concat
+  qb.andWhere('user.name = ' + req.body.name);
+
+  // ruleid: affidavit.injection.sql-concat
+  qb.orderBy(`${userId} DESC`);
+
+  // ok: affidavit.injection.sql-concat
+  qb.where('user.id = :id', { id: userId });
+
+  // ok: affidavit.injection.sql-concat
+  Sequelize.literal('NOW()');
 
   // ok: affidavit.injection.sql-concat
   pool.query({ text: 'SELECT * FROM t WHERE id = $1', values: [userId] });

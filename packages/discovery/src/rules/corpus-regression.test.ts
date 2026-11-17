@@ -6,6 +6,8 @@ import { loadToolManifest, repoRoot } from '../tools/index.js';
 import {
   countAnnotations,
   evaluate,
+  handlerEndLine,
+  labelsHit,
   listRuleIds,
   parseNotification,
   parseSemgrepSarif,
@@ -194,6 +196,47 @@ describe('evaluate', () => {
   });
 });
 
+describe('handlerEndLine and IDOR labels', () => {
+  const text = [
+    'const x = {', // 1
+    '  handler: (req, res) => {', // 2
+    '    const { id } = req.params;', // 3
+    '    if (a) {', // 4
+    '      call(id);', // 5
+    '    }', // 6
+    '    const s = "}";', // 7  a brace in a string does not count
+    '    // } nor in a comment', // 8
+    '  },', // 9
+    '  other: () => {', // 10
+    '  },', // 11
+    '};', // 12
+  ].join('\n');
+
+  it('finds the line where the function holding the source closes', () => {
+    expect(handlerEndLine(text, 3)).toBe(9);
+    // From inside a nested block it is that block that closes.
+    expect(handlerEndLine(text, 5)).toBe(6);
+    expect(handlerEndLine('a\nb', 1)).toBe(2);
+  });
+
+  it('counts a call below the labeled source, in the same handler, as a hit', () => {
+    const idorLabel = {
+      id: 'idor',
+      cls: 'idor',
+      file: 'h.js',
+      range: { startLine: 3, endLine: 3 },
+      source: { file: 'h.js', range: { startLine: 3, endLine: 3 } },
+    };
+    const call = f(IDOR_P, 'h.js', 5, 5);
+    const other = f(IDOR_P, 'h.js', 10, 11);
+    const without = { ...corpus, labels: [idorLabel] };
+    expect(labelsHit(call, without)).toEqual([]);
+    const withEnd = { ...corpus, labels: [{ ...idorLabel, handlerEndLine: 9 }] };
+    expect(labelsHit(call, withEnd)).toEqual(['idor']);
+    expect(labelsHit(other, withEnd)).toEqual([]);
+  });
+});
+
 describe('parseSemgrepSarif', () => {
   it('reads rule id, repo-relative file and lines, and skips malformed results', () => {
     const doc = {
@@ -284,13 +327,18 @@ describe('the rule files', () => {
     }
   });
 
-  it('each name one CWE the task covers (SQL injection, NoSQL injection, IDOR)', () => {
-    const allowed = new Set(['CWE-89', 'CWE-943', 'CWE-639']);
+  it('name the CWE that fits the class: idor is CWE-639, injection is CWE-89 or CWE-943', () => {
     for (const name of readdirSync(join(root, 'semgrep')).filter((n) => /\.ya?ml$/.test(n))) {
       const text = readFileSync(join(root, 'semgrep', name), 'utf8');
-      const cwes = [...text.matchAll(/^\s+cwe:\s*'?(CWE-\d+)'?\s*$/gm)].map((m) => m[1]);
-      expect(cwes.length, `${name} needs a cwe`).toBeGreaterThan(0);
-      for (const c of cwes) expect(allowed.has(c ?? ''), `${name}: ${String(c)}`).toBe(true);
+      const pairs = [...text.matchAll(/^\s+cls:\s*(\w+)\s*\n\s+cwe:\s*'?(CWE-\d+)'?\s*$/gm)];
+      expect(pairs.length, `${name} needs cls and cwe`).toBeGreaterThan(0);
+      for (const [, cls, cwe] of pairs) {
+        const ok = cls === 'idor' ? ['CWE-639'] : cls === 'injection' ? ['CWE-89', 'CWE-943'] : [];
+        expect(ok, `${name}: unknown class ${String(cls)}`).not.toEqual([]);
+        expect(ok.includes(cwe ?? ''), `${name}: ${String(cls)} with ${String(cwe)}`).toBe(true);
+      }
+      // The id prefix names the class too (affidavit.idor.* or affidavit.injection.*).
+      for (const [, cls] of pairs) expect(text).toContain(`id: affidavit.${String(cls)}.`);
     }
   });
 

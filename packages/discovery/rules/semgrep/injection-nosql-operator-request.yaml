@@ -31,7 +31,7 @@ rules:
           - focus-metavariable: $Q
           - metavariable-regex:
               metavariable: $M
-              regex: ^(find|findOne|findById|findOneAndUpdate|findOneAndDelete|findOneAndReplace|updateOne|updateMany|replaceOne|deleteOne|deleteMany|countDocuments|aggregate|remove)$
+              regex: ^(find|findOne|findById|findOneAndUpdate|findOneAndDelete|findOneAndReplace|findOneAndRemove|findByIdAndDelete|findByIdAndUpdate|updateOne|updateMany|replaceOne|deleteOne|deleteMany|countDocuments|count|exists|aggregate|remove)$
       # The update document, the replacement, or distinct's filter (second argument), where a body
       # can carry operators.
       - patterns:

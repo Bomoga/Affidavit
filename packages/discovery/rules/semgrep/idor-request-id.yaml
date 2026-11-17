@@ -4,18 +4,22 @@
 # IDOR: an identifier the caller controls is read from the request and passed to a data-access
 # call, with no ownership check on the path to that call. An ownership check is an if statement
 # that compares the identifier with an id-like field of the signed-in user (req.session.userId,
-# req.user.id, ctx.state.user.id and similar, see AUTH_RE and AUTH_FIELD_RE) and either
+# req.user.id, ctx.state.user.id and similar; the receiver must be req, request or ctx, see AUTH_RE
+# and AUTH_FIELD_RE) and either
 #   - wraps the call in its then-branch (an else-branch does not count), or
-#   - comes BEFORE the call and its body returns, throws, or calls ctx.throw (a bare next(...)
-#     without return does not stop the handler, so it does not count).
-# A guard that only logs does not count, and neither does a check placed after the call. Each data
-# call is judged on its own: a guarded call does not clear another call on the same identifier.
+#   - sits in the same block as the call or in a block that encloses it, comes BEFORE the call, and
+#     ends the handler: its body is one return, throw or ctx.throw, or two or three statements
+#     whose last statement is one. A conditional return, a return in a catch block, a return in a
+#     nested function, and a bare next(...) without return do not count.
+# A guard that only logs does not count, a check placed after the call does not count, and a check
+# in an unrelated if, a loop body, a callback or a function that is not the call's own block does
+# not count. Each data call is judged on its own: a guarded call does not clear another call on the
+# same identifier, not even a call to the same method.
 # A role check, a query scoped by the session id, or a check in middleware or in the data layer is
 # not seen, so these rules over-report and the arraignment stage and the Judge decide.
 #
-# Where the finding goes: when the identifier is first read into a variable, on the request
-# expression of that read (req.params, req.body and so on), so it lines up with how the corpus
-# labels IDOR sources; when it is used inline in the call, on the call.
+# Where the finding goes: always on the data-access call. The regression matches it to a labeled
+# IDOR when it is in the same handler as the labeled source.
 #
 # Known false positives: a data-access call already scoped to the owner some other way (for example
 # findOne({ _id: id, owner: req.session.userId })), and an identifier checked in a helper function
@@ -45,11 +49,10 @@ rules:
     patterns:
       - pattern-either:
           - patterns:
-              - pattern: |
+              - pattern: '$OBJ.$M(..., <... $P ...>, ...)'
+              - pattern-inside: |
                   ({ ..., $P, ... } = $SRC);
                   ...
-                  <... $OBJ.$M(..., <... $P ...>, ...) ...>;
-              - focus-metavariable: '$SRC'
               - metavariable-regex:
                   metavariable: '$SRC'
                   regex: '^[\w$]+(\.request)?\.(body|query)$'
@@ -66,233 +69,148 @@ rules:
                   patterns:
                     - pattern-either:
                         - pattern: |
-                            ({ ..., $P, ... } = $SRC);
-                            ...
-                            if ($P !== $AUTH.$S) { ... return ...; }
-                            ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
-                        - pattern: |
-                            ({ ..., $P, ... } = $SRC);
-                            ...
                             if ($P !== $AUTH.$S) return ...;
                             ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            ({ ..., $P, ... } = $SRC);
+                            if ($P !== $AUTH.$S) { $A; return ...; }
                             ...
-                            if ($P !== $AUTH.$S) { ... throw ...; }
-                            ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            ({ ..., $P, ... } = $SRC);
+                            if ($P !== $AUTH.$S) { $A; $B; return ...; }
                             ...
+                        - pattern: |
                             if ($P !== $AUTH.$S) throw ...;
                             ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            ({ ..., $P, ... } = $SRC);
+                            if ($P !== $AUTH.$S) { $A; throw ...; }
                             ...
-                            if ($P !== $AUTH.$S) { ... ctx.throw(...); }
-                            ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            ({ ..., $P, ... } = $SRC);
+                            if ($P !== $AUTH.$S) { $A; $B; throw ...; }
                             ...
+                        - pattern: |
                             if ($P !== $AUTH.$S) ctx.throw(...);
                             ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            ({ ..., $P, ... } = $SRC);
+                            if ($P !== $AUTH.$S) { $A; ctx.throw(...); }
                             ...
-                            if ($AUTH.$S !== $P) { ... return ...; }
-                            ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            ({ ..., $P, ... } = $SRC);
+                            if ($P !== $AUTH.$S) { $A; $B; ctx.throw(...); }
                             ...
+                        - pattern: |
                             if ($AUTH.$S !== $P) return ...;
                             ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            ({ ..., $P, ... } = $SRC);
+                            if ($AUTH.$S !== $P) { $A; return ...; }
                             ...
-                            if ($AUTH.$S !== $P) { ... throw ...; }
-                            ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            ({ ..., $P, ... } = $SRC);
+                            if ($AUTH.$S !== $P) { $A; $B; return ...; }
                             ...
+                        - pattern: |
                             if ($AUTH.$S !== $P) throw ...;
                             ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            ({ ..., $P, ... } = $SRC);
+                            if ($AUTH.$S !== $P) { $A; throw ...; }
                             ...
-                            if ($AUTH.$S !== $P) { ... ctx.throw(...); }
-                            ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            ({ ..., $P, ... } = $SRC);
+                            if ($AUTH.$S !== $P) { $A; $B; throw ...; }
                             ...
+                        - pattern: |
                             if ($AUTH.$S !== $P) ctx.throw(...);
                             ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            ({ ..., $P, ... } = $SRC);
+                            if ($AUTH.$S !== $P) { $A; ctx.throw(...); }
                             ...
-                            if ($P != $AUTH.$S) { ... return ...; }
-                            ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            ({ ..., $P, ... } = $SRC);
+                            if ($AUTH.$S !== $P) { $A; $B; ctx.throw(...); }
                             ...
+                        - pattern: |
                             if ($P != $AUTH.$S) return ...;
                             ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            ({ ..., $P, ... } = $SRC);
+                            if ($P != $AUTH.$S) { $A; return ...; }
                             ...
-                            if ($P != $AUTH.$S) { ... throw ...; }
-                            ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            ({ ..., $P, ... } = $SRC);
+                            if ($P != $AUTH.$S) { $A; $B; return ...; }
                             ...
+                        - pattern: |
                             if ($P != $AUTH.$S) throw ...;
                             ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            ({ ..., $P, ... } = $SRC);
+                            if ($P != $AUTH.$S) { $A; throw ...; }
                             ...
-                            if ($P != $AUTH.$S) { ... ctx.throw(...); }
-                            ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            ({ ..., $P, ... } = $SRC);
+                            if ($P != $AUTH.$S) { $A; $B; throw ...; }
                             ...
+                        - pattern: |
                             if ($P != $AUTH.$S) ctx.throw(...);
                             ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            ({ ..., $P, ... } = $SRC);
+                            if ($P != $AUTH.$S) { $A; ctx.throw(...); }
                             ...
-                            if ($AUTH.$S != $P) { ... return ...; }
-                            ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            ({ ..., $P, ... } = $SRC);
+                            if ($P != $AUTH.$S) { $A; $B; ctx.throw(...); }
                             ...
+                        - pattern: |
                             if ($AUTH.$S != $P) return ...;
                             ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            ({ ..., $P, ... } = $SRC);
+                            if ($AUTH.$S != $P) { $A; return ...; }
                             ...
-                            if ($AUTH.$S != $P) { ... throw ...; }
-                            ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            ({ ..., $P, ... } = $SRC);
+                            if ($AUTH.$S != $P) { $A; $B; return ...; }
                             ...
+                        - pattern: |
                             if ($AUTH.$S != $P) throw ...;
                             ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            ({ ..., $P, ... } = $SRC);
+                            if ($AUTH.$S != $P) { $A; throw ...; }
                             ...
-                            if ($AUTH.$S != $P) { ... ctx.throw(...); }
-                            ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            ({ ..., $P, ... } = $SRC);
+                            if ($AUTH.$S != $P) { $A; $B; throw ...; }
                             ...
+                        - pattern: |
                             if ($AUTH.$S != $P) ctx.throw(...);
                             ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
+                        - pattern: |
+                            if ($AUTH.$S != $P) { $A; ctx.throw(...); }
+                            ...
+                        - pattern: |
+                            if ($AUTH.$S != $P) { $A; $B; ctx.throw(...); }
+                            ...
                         - patterns:
-                            - pattern: |
-                                ({ ..., $P, ... } = $SRC);
-                                ...
-                                if ($P === $AUTH.$S) { ... <... $OBJ.$M(..., <... $P ...>, ...) ...>; ... }
-                            - pattern-not: |
-                                ({ ..., $P, ... } = $SRC);
-                                ...
-                                if ($P === $AUTH.$S) {...} else {...}
+                            - pattern: 'if ($P === $AUTH.$S) {...}'
+                            - pattern-not: 'if ($P === $AUTH.$S) {...} else {...}'
                         - patterns:
-                            - pattern: |
-                                ({ ..., $P, ... } = $SRC);
-                                ...
-                                if ($P === $AUTH.$S) <... $OBJ.$M(..., <... $P ...>, ...) ...>;
-                            - pattern-not: |
-                                ({ ..., $P, ... } = $SRC);
-                                ...
-                                if ($P === $AUTH.$S) $STMT; else $ELSE;
+                            - pattern: 'if ($P === $AUTH.$S) $STMT;'
+                            - pattern-not: 'if ($P === $AUTH.$S) $STMT; else $ELSE;'
                         - patterns:
-                            - pattern: |
-                                ({ ..., $P, ... } = $SRC);
-                                ...
-                                if ($AUTH.$S === $P) { ... <... $OBJ.$M(..., <... $P ...>, ...) ...>; ... }
-                            - pattern-not: |
-                                ({ ..., $P, ... } = $SRC);
-                                ...
-                                if ($AUTH.$S === $P) {...} else {...}
+                            - pattern: 'if ($AUTH.$S === $P) {...}'
+                            - pattern-not: 'if ($AUTH.$S === $P) {...} else {...}'
                         - patterns:
-                            - pattern: |
-                                ({ ..., $P, ... } = $SRC);
-                                ...
-                                if ($AUTH.$S === $P) <... $OBJ.$M(..., <... $P ...>, ...) ...>;
-                            - pattern-not: |
-                                ({ ..., $P, ... } = $SRC);
-                                ...
-                                if ($AUTH.$S === $P) $STMT; else $ELSE;
+                            - pattern: 'if ($AUTH.$S === $P) $STMT;'
+                            - pattern-not: 'if ($AUTH.$S === $P) $STMT; else $ELSE;'
                         - patterns:
-                            - pattern: |
-                                ({ ..., $P, ... } = $SRC);
-                                ...
-                                if ($P == $AUTH.$S) { ... <... $OBJ.$M(..., <... $P ...>, ...) ...>; ... }
-                            - pattern-not: |
-                                ({ ..., $P, ... } = $SRC);
-                                ...
-                                if ($P == $AUTH.$S) {...} else {...}
+                            - pattern: 'if ($P == $AUTH.$S) {...}'
+                            - pattern-not: 'if ($P == $AUTH.$S) {...} else {...}'
                         - patterns:
-                            - pattern: |
-                                ({ ..., $P, ... } = $SRC);
-                                ...
-                                if ($P == $AUTH.$S) <... $OBJ.$M(..., <... $P ...>, ...) ...>;
-                            - pattern-not: |
-                                ({ ..., $P, ... } = $SRC);
-                                ...
-                                if ($P == $AUTH.$S) $STMT; else $ELSE;
+                            - pattern: 'if ($P == $AUTH.$S) $STMT;'
+                            - pattern-not: 'if ($P == $AUTH.$S) $STMT; else $ELSE;'
                         - patterns:
-                            - pattern: |
-                                ({ ..., $P, ... } = $SRC);
-                                ...
-                                if ($AUTH.$S == $P) { ... <... $OBJ.$M(..., <... $P ...>, ...) ...>; ... }
-                            - pattern-not: |
-                                ({ ..., $P, ... } = $SRC);
-                                ...
-                                if ($AUTH.$S == $P) {...} else {...}
+                            - pattern: 'if ($AUTH.$S == $P) {...}'
+                            - pattern-not: 'if ($AUTH.$S == $P) {...} else {...}'
                         - patterns:
-                            - pattern: |
-                                ({ ..., $P, ... } = $SRC);
-                                ...
-                                if ($AUTH.$S == $P) <... $OBJ.$M(..., <... $P ...>, ...) ...>;
-                            - pattern-not: |
-                                ({ ..., $P, ... } = $SRC);
-                                ...
-                                if ($AUTH.$S == $P) $STMT; else $ELSE;
+                            - pattern: 'if ($AUTH.$S == $P) $STMT;'
+                            - pattern-not: 'if ($AUTH.$S == $P) $STMT; else $ELSE;'
                     - metavariable-regex:
                         metavariable: '$S'
                         regex: '^(id|_id|userId|user_id|userID|uid|sub)$'
                     - metavariable-regex:
                         metavariable: '$AUTH'
-                        regex: '^([\w$]+\.(session|user|auth)(\.user)?|ctx\.state\.user)$'
+                        regex: '^((req|request|ctx)\.(session|user|auth)(\.user)?|ctx\.state\.user)$'
           - patterns:
-              - pattern: |
+              - pattern: '$OBJ.$M(..., <... $P ...>, ...)'
+              - pattern-inside: |
                   $P = $SRC;
                   ...
-                  <... $OBJ.$M(..., <... $P ...>, ...) ...>;
-              - focus-metavariable: '$SRC'
               - metavariable-regex:
                   metavariable: '$SRC'
                   regex: '^[\w$]+(\.request)?\.(body|query)\.(id|_id|\w*[a-z](Id|ID)|\w*_(id|ID))$'
@@ -306,227 +224,143 @@ rules:
                   patterns:
                     - pattern-either:
                         - pattern: |
-                            $P = $SRC;
-                            ...
-                            if ($P !== $AUTH.$S) { ... return ...; }
-                            ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
-                        - pattern: |
-                            $P = $SRC;
-                            ...
                             if ($P !== $AUTH.$S) return ...;
                             ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            $P = $SRC;
+                            if ($P !== $AUTH.$S) { $A; return ...; }
                             ...
-                            if ($P !== $AUTH.$S) { ... throw ...; }
-                            ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            $P = $SRC;
+                            if ($P !== $AUTH.$S) { $A; $B; return ...; }
                             ...
+                        - pattern: |
                             if ($P !== $AUTH.$S) throw ...;
                             ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            $P = $SRC;
+                            if ($P !== $AUTH.$S) { $A; throw ...; }
                             ...
-                            if ($P !== $AUTH.$S) { ... ctx.throw(...); }
-                            ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            $P = $SRC;
+                            if ($P !== $AUTH.$S) { $A; $B; throw ...; }
                             ...
+                        - pattern: |
                             if ($P !== $AUTH.$S) ctx.throw(...);
                             ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            $P = $SRC;
+                            if ($P !== $AUTH.$S) { $A; ctx.throw(...); }
                             ...
-                            if ($AUTH.$S !== $P) { ... return ...; }
-                            ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            $P = $SRC;
+                            if ($P !== $AUTH.$S) { $A; $B; ctx.throw(...); }
                             ...
+                        - pattern: |
                             if ($AUTH.$S !== $P) return ...;
                             ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            $P = $SRC;
+                            if ($AUTH.$S !== $P) { $A; return ...; }
                             ...
-                            if ($AUTH.$S !== $P) { ... throw ...; }
-                            ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            $P = $SRC;
+                            if ($AUTH.$S !== $P) { $A; $B; return ...; }
                             ...
+                        - pattern: |
                             if ($AUTH.$S !== $P) throw ...;
                             ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            $P = $SRC;
+                            if ($AUTH.$S !== $P) { $A; throw ...; }
                             ...
-                            if ($AUTH.$S !== $P) { ... ctx.throw(...); }
-                            ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            $P = $SRC;
+                            if ($AUTH.$S !== $P) { $A; $B; throw ...; }
                             ...
+                        - pattern: |
                             if ($AUTH.$S !== $P) ctx.throw(...);
                             ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            $P = $SRC;
+                            if ($AUTH.$S !== $P) { $A; ctx.throw(...); }
                             ...
-                            if ($P != $AUTH.$S) { ... return ...; }
-                            ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            $P = $SRC;
+                            if ($AUTH.$S !== $P) { $A; $B; ctx.throw(...); }
                             ...
+                        - pattern: |
                             if ($P != $AUTH.$S) return ...;
                             ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            $P = $SRC;
+                            if ($P != $AUTH.$S) { $A; return ...; }
                             ...
-                            if ($P != $AUTH.$S) { ... throw ...; }
-                            ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            $P = $SRC;
+                            if ($P != $AUTH.$S) { $A; $B; return ...; }
                             ...
+                        - pattern: |
                             if ($P != $AUTH.$S) throw ...;
                             ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            $P = $SRC;
+                            if ($P != $AUTH.$S) { $A; throw ...; }
                             ...
-                            if ($P != $AUTH.$S) { ... ctx.throw(...); }
-                            ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            $P = $SRC;
+                            if ($P != $AUTH.$S) { $A; $B; throw ...; }
                             ...
+                        - pattern: |
                             if ($P != $AUTH.$S) ctx.throw(...);
                             ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            $P = $SRC;
+                            if ($P != $AUTH.$S) { $A; ctx.throw(...); }
                             ...
-                            if ($AUTH.$S != $P) { ... return ...; }
-                            ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            $P = $SRC;
+                            if ($P != $AUTH.$S) { $A; $B; ctx.throw(...); }
                             ...
+                        - pattern: |
                             if ($AUTH.$S != $P) return ...;
                             ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            $P = $SRC;
+                            if ($AUTH.$S != $P) { $A; return ...; }
                             ...
-                            if ($AUTH.$S != $P) { ... throw ...; }
-                            ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            $P = $SRC;
+                            if ($AUTH.$S != $P) { $A; $B; return ...; }
                             ...
+                        - pattern: |
                             if ($AUTH.$S != $P) throw ...;
                             ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            $P = $SRC;
+                            if ($AUTH.$S != $P) { $A; throw ...; }
                             ...
-                            if ($AUTH.$S != $P) { ... ctx.throw(...); }
-                            ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
                         - pattern: |
-                            $P = $SRC;
+                            if ($AUTH.$S != $P) { $A; $B; throw ...; }
                             ...
+                        - pattern: |
                             if ($AUTH.$S != $P) ctx.throw(...);
                             ...
-                            <... $OBJ.$M(..., <... $P ...>, ...) ...>;
+                        - pattern: |
+                            if ($AUTH.$S != $P) { $A; ctx.throw(...); }
+                            ...
+                        - pattern: |
+                            if ($AUTH.$S != $P) { $A; $B; ctx.throw(...); }
+                            ...
                         - patterns:
-                            - pattern: |
-                                $P = $SRC;
-                                ...
-                                if ($P === $AUTH.$S) { ... <... $OBJ.$M(..., <... $P ...>, ...) ...>; ... }
-                            - pattern-not: |
-                                $P = $SRC;
-                                ...
-                                if ($P === $AUTH.$S) {...} else {...}
+                            - pattern: 'if ($P === $AUTH.$S) {...}'
+                            - pattern-not: 'if ($P === $AUTH.$S) {...} else {...}'
                         - patterns:
-                            - pattern: |
-                                $P = $SRC;
-                                ...
-                                if ($P === $AUTH.$S) <... $OBJ.$M(..., <... $P ...>, ...) ...>;
-                            - pattern-not: |
-                                $P = $SRC;
-                                ...
-                                if ($P === $AUTH.$S) $STMT; else $ELSE;
+                            - pattern: 'if ($P === $AUTH.$S) $STMT;'
+                            - pattern-not: 'if ($P === $AUTH.$S) $STMT; else $ELSE;'
                         - patterns:
-                            - pattern: |
-                                $P = $SRC;
-                                ...
-                                if ($AUTH.$S === $P) { ... <... $OBJ.$M(..., <... $P ...>, ...) ...>; ... }
-                            - pattern-not: |
-                                $P = $SRC;
-                                ...
-                                if ($AUTH.$S === $P) {...} else {...}
+                            - pattern: 'if ($AUTH.$S === $P) {...}'
+                            - pattern-not: 'if ($AUTH.$S === $P) {...} else {...}'
                         - patterns:
-                            - pattern: |
-                                $P = $SRC;
-                                ...
-                                if ($AUTH.$S === $P) <... $OBJ.$M(..., <... $P ...>, ...) ...>;
-                            - pattern-not: |
-                                $P = $SRC;
-                                ...
-                                if ($AUTH.$S === $P) $STMT; else $ELSE;
+                            - pattern: 'if ($AUTH.$S === $P) $STMT;'
+                            - pattern-not: 'if ($AUTH.$S === $P) $STMT; else $ELSE;'
                         - patterns:
-                            - pattern: |
-                                $P = $SRC;
-                                ...
-                                if ($P == $AUTH.$S) { ... <... $OBJ.$M(..., <... $P ...>, ...) ...>; ... }
-                            - pattern-not: |
-                                $P = $SRC;
-                                ...
-                                if ($P == $AUTH.$S) {...} else {...}
+                            - pattern: 'if ($P == $AUTH.$S) {...}'
+                            - pattern-not: 'if ($P == $AUTH.$S) {...} else {...}'
                         - patterns:
-                            - pattern: |
-                                $P = $SRC;
-                                ...
-                                if ($P == $AUTH.$S) <... $OBJ.$M(..., <... $P ...>, ...) ...>;
-                            - pattern-not: |
-                                $P = $SRC;
-                                ...
-                                if ($P == $AUTH.$S) $STMT; else $ELSE;
+                            - pattern: 'if ($P == $AUTH.$S) $STMT;'
+                            - pattern-not: 'if ($P == $AUTH.$S) $STMT; else $ELSE;'
                         - patterns:
-                            - pattern: |
-                                $P = $SRC;
-                                ...
-                                if ($AUTH.$S == $P) { ... <... $OBJ.$M(..., <... $P ...>, ...) ...>; ... }
-                            - pattern-not: |
-                                $P = $SRC;
-                                ...
-                                if ($AUTH.$S == $P) {...} else {...}
+                            - pattern: 'if ($AUTH.$S == $P) {...}'
+                            - pattern-not: 'if ($AUTH.$S == $P) {...} else {...}'
                         - patterns:
-                            - pattern: |
-                                $P = $SRC;
-                                ...
-                                if ($AUTH.$S == $P) <... $OBJ.$M(..., <... $P ...>, ...) ...>;
-                            - pattern-not: |
-                                $P = $SRC;
-                                ...
-                                if ($AUTH.$S == $P) $STMT; else $ELSE;
+                            - pattern: 'if ($AUTH.$S == $P) $STMT;'
+                            - pattern-not: 'if ($AUTH.$S == $P) $STMT; else $ELSE;'
                     - metavariable-regex:
                         metavariable: '$S'
                         regex: '^(id|_id|userId|user_id|userID|uid|sub)$'
                     - metavariable-regex:
                         metavariable: '$AUTH'
-                        regex: '^([\w$]+\.(session|user|auth)(\.user)?|ctx\.state\.user)$'
+                        regex: '^((req|request|ctx)\.(session|user|auth)(\.user)?|ctx\.state\.user)$'
           - patterns:
               - pattern: '$OBJ.$M(..., <... $SRC ...>, ...)'
               - metavariable-regex:
@@ -542,76 +376,112 @@ rules:
                   patterns:
                     - pattern-either:
                         - pattern: |
-                            if ($SRC !== $AUTH.$S) { ... return ...; }
-                            ...
-                        - pattern: |
                             if ($SRC !== $AUTH.$S) return ...;
                             ...
                         - pattern: |
-                            if ($SRC !== $AUTH.$S) { ... throw ...; }
+                            if ($SRC !== $AUTH.$S) { $A; return ...; }
+                            ...
+                        - pattern: |
+                            if ($SRC !== $AUTH.$S) { $A; $B; return ...; }
                             ...
                         - pattern: |
                             if ($SRC !== $AUTH.$S) throw ...;
                             ...
                         - pattern: |
-                            if ($SRC !== $AUTH.$S) { ... ctx.throw(...); }
+                            if ($SRC !== $AUTH.$S) { $A; throw ...; }
+                            ...
+                        - pattern: |
+                            if ($SRC !== $AUTH.$S) { $A; $B; throw ...; }
                             ...
                         - pattern: |
                             if ($SRC !== $AUTH.$S) ctx.throw(...);
                             ...
                         - pattern: |
-                            if ($AUTH.$S !== $SRC) { ... return ...; }
+                            if ($SRC !== $AUTH.$S) { $A; ctx.throw(...); }
+                            ...
+                        - pattern: |
+                            if ($SRC !== $AUTH.$S) { $A; $B; ctx.throw(...); }
                             ...
                         - pattern: |
                             if ($AUTH.$S !== $SRC) return ...;
                             ...
                         - pattern: |
-                            if ($AUTH.$S !== $SRC) { ... throw ...; }
+                            if ($AUTH.$S !== $SRC) { $A; return ...; }
+                            ...
+                        - pattern: |
+                            if ($AUTH.$S !== $SRC) { $A; $B; return ...; }
                             ...
                         - pattern: |
                             if ($AUTH.$S !== $SRC) throw ...;
                             ...
                         - pattern: |
-                            if ($AUTH.$S !== $SRC) { ... ctx.throw(...); }
+                            if ($AUTH.$S !== $SRC) { $A; throw ...; }
+                            ...
+                        - pattern: |
+                            if ($AUTH.$S !== $SRC) { $A; $B; throw ...; }
                             ...
                         - pattern: |
                             if ($AUTH.$S !== $SRC) ctx.throw(...);
                             ...
                         - pattern: |
-                            if ($SRC != $AUTH.$S) { ... return ...; }
+                            if ($AUTH.$S !== $SRC) { $A; ctx.throw(...); }
+                            ...
+                        - pattern: |
+                            if ($AUTH.$S !== $SRC) { $A; $B; ctx.throw(...); }
                             ...
                         - pattern: |
                             if ($SRC != $AUTH.$S) return ...;
                             ...
                         - pattern: |
-                            if ($SRC != $AUTH.$S) { ... throw ...; }
+                            if ($SRC != $AUTH.$S) { $A; return ...; }
+                            ...
+                        - pattern: |
+                            if ($SRC != $AUTH.$S) { $A; $B; return ...; }
                             ...
                         - pattern: |
                             if ($SRC != $AUTH.$S) throw ...;
                             ...
                         - pattern: |
-                            if ($SRC != $AUTH.$S) { ... ctx.throw(...); }
+                            if ($SRC != $AUTH.$S) { $A; throw ...; }
+                            ...
+                        - pattern: |
+                            if ($SRC != $AUTH.$S) { $A; $B; throw ...; }
                             ...
                         - pattern: |
                             if ($SRC != $AUTH.$S) ctx.throw(...);
                             ...
                         - pattern: |
-                            if ($AUTH.$S != $SRC) { ... return ...; }
+                            if ($SRC != $AUTH.$S) { $A; ctx.throw(...); }
+                            ...
+                        - pattern: |
+                            if ($SRC != $AUTH.$S) { $A; $B; ctx.throw(...); }
                             ...
                         - pattern: |
                             if ($AUTH.$S != $SRC) return ...;
                             ...
                         - pattern: |
-                            if ($AUTH.$S != $SRC) { ... throw ...; }
+                            if ($AUTH.$S != $SRC) { $A; return ...; }
+                            ...
+                        - pattern: |
+                            if ($AUTH.$S != $SRC) { $A; $B; return ...; }
                             ...
                         - pattern: |
                             if ($AUTH.$S != $SRC) throw ...;
                             ...
                         - pattern: |
-                            if ($AUTH.$S != $SRC) { ... ctx.throw(...); }
+                            if ($AUTH.$S != $SRC) { $A; throw ...; }
+                            ...
+                        - pattern: |
+                            if ($AUTH.$S != $SRC) { $A; $B; throw ...; }
                             ...
                         - pattern: |
                             if ($AUTH.$S != $SRC) ctx.throw(...);
+                            ...
+                        - pattern: |
+                            if ($AUTH.$S != $SRC) { $A; ctx.throw(...); }
+                            ...
+                        - pattern: |
+                            if ($AUTH.$S != $SRC) { $A; $B; ctx.throw(...); }
                             ...
                         - patterns:
                             - pattern: 'if ($SRC === $AUTH.$S) {...}'
@@ -642,4 +512,4 @@ rules:
                         regex: '^(id|_id|userId|user_id|userID|uid|sub)$'
                     - metavariable-regex:
                         metavariable: '$AUTH'
-                        regex: '^([\w$]+\.(session|user|auth)(\.user)?|ctx\.state\.user)$'
+                        regex: '^((req|request|ctx)\.(session|user|auth)(\.user)?|ctx\.state\.user)$'
