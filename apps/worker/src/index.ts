@@ -1,1 +1,11 @@
-export {};
+export { ConfigError, describeConfig, loadConfig } from './config.js';
+export type { Impl, WorkerConfig } from './config.js';
+export { GuardedCaseStore, GuardedEventSink, LeaseLostError } from './guard.js';
+export { NotWiredError, buildHandlers, selectCores, stageHandler } from './handlers.js';
+export type { HandlerHooks } from './handlers.js';
+export { reconcileOnce } from './reconcile.js';
+export type { ReconcileAction, ReconcileOptions } from './reconcile.js';
+export { PgCaseFileSource, record } from './stage.js';
+export type { StageCore, StageEnv } from './stage.js';
+export { startCase, startWorker } from './worker.js';
+export type { RunningWorker, StartOptions } from './worker.js';
