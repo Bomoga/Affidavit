@@ -2,7 +2,7 @@ import { chmod, lstat, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Redaction } from '@affidavit/contracts';
 import { listDir } from '../tools/walk.js';
-import { holdsUtf16, redactBuffer, type SecretRedactor } from './redactor.js';
+import { entriesOf, holdsUtf16, redactBuffer, type SecretRedactor } from './redactor.js';
 import type { ExcludedFile, ExclusionReason } from './types.js';
 
 /**
@@ -12,7 +12,10 @@ import type { ExcludedFile, ExclusionReason } from './types.js';
  */
 export function isEnvName(name: string): boolean {
   const n = name.toLowerCase();
-  return n === '.envs' || n === '.envrc' || /\.env(?:[-_.]|$)/.test(n);
+  if (n === '.envs' || n === '.envrc') return true;
+  // `.env~`, `.env1`, `.envlocal` and the like; `.environment` and `.envelope` are not env files.
+  if (/^\.env[a-z0-9~]*$/.test(n) && !/^\.(?:environ|envelope)/.test(n)) return true;
+  return /\.env(?:[-_.]|$)/.test(n);
 }
 
 export interface BuiltWorkspace {
@@ -36,7 +39,7 @@ export async function buildWorkspace(
   const excluded: ExcludedFile[] = [];
   const seen = new Set<string>();
   const redactions: Redaction[] = [];
-  const entries = redactor.all();
+  const entries = entriesOf(redactor);
   const safePath = (p: string): string => redactor.applyPath(p);
   const skip = (rel: string, reason: ExclusionReason): void => {
     excluded.push({ path: safePath(rel), reason });
@@ -110,14 +113,14 @@ export async function buildWorkspace(
  * searched for everywhere.
  */
 export async function findLeaks(wsDir: string, redactor: SecretRedactor): Promise<string[]> {
-  const globals = redactor.all().filter((e) => e.scope === 'global');
+  const globals = entriesOf(redactor).filter((e) => e.scope === 'global');
   if (globals.length === 0) return [];
   const leaks: string[] = [];
   const visit = async (rel: string): Promise<void> => {
     const dir = rel === '' ? wsDir : join(wsDir, ...rel.split('/'));
     for (const e of await listDir(dir)) {
       const childRel = rel === '' ? e.name : `${rel}/${e.name}`;
-      if (globals.some((g) => e.name.includes(g.value.toString('utf8')))) leaks.push(childRel);
+      if (globals.some((g) => childRel.includes(g.value.toString('utf8')))) leaks.push(childRel);
       if (e.isDirectory) await visit(childRel);
       else if (e.isFile) {
         const b = await readFile(join(dir, e.name));

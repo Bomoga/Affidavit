@@ -146,6 +146,10 @@ export interface IngestDeps {
   passProxyEnv?: boolean | undefined;
   /** Cap on fetched objects and on the checked-out tree, in bytes. Default 1 GiB. */
   maxRepoBytes?: number | undefined;
+  /** Cap on the number of files in the commit tree. Default 200,000. */
+  maxRepoFiles?: number | undefined;
+  /** Returns the text of `git version`. Tests stub it. */
+  gitVersionProbe?: (() => Promise<string>) | undefined;
   /** Tests and the CLI's local mode only. Off by default: the API accepts https URLs only. */
   allowLocalSource?: boolean | undefined;
   /** Path of the git executable. Defaults to `git` on PATH. */
@@ -166,20 +170,42 @@ export class IngestInputError extends Error {
 /** git could not produce the pinned commit (network, missing commit, refused protocol). */
 export class CloneFailedError extends Error {
   readonly step: string;
-  constructor(step: string, why: string) {
+  readonly timedOut: boolean;
+  constructor(step: string, why: string, timedOut = false) {
     super(`git ${step} failed: ${why}`);
     this.name = 'CloneFailedError';
     this.step = step;
+    this.timedOut = timedOut;
+  }
+}
+
+/** The case directory could not be removed after a failure. It may hold a raw checkout. */
+export class CleanupFailedError extends Error {
+  constructor(readonly dir: string) {
+    super(`could not remove ${dir}; remove it by hand, it may hold an unredacted checkout`);
+    this.name = 'CleanupFailedError';
+  }
+}
+
+/** https clones need git 2.37 or newer: older git ignores the address pin. */
+export class GitTooOldError extends Error {
+  constructor(
+    readonly found: string,
+    readonly required: string,
+  ) {
+    super(`git ${required} or newer is required for https clones, found: ${found}`);
+    this.name = 'GitTooOldError';
   }
 }
 
 /** A fetch or checkout grew past the byte cap and was killed. */
 export class RepoTooLargeError extends Error {
   constructor(
-    readonly phase: 'fetch' | 'checkout',
+    readonly phase: 'fetch' | 'tree' | 'checkout',
     readonly limit: number,
+    readonly what: 'bytes' | 'files' = 'bytes',
   ) {
-    super(`repository exceeds ${limit} bytes during ${phase}`);
+    super(`repository exceeds ${limit} ${what} during ${phase}`);
     this.name = 'RepoTooLargeError';
   }
 }

@@ -36,6 +36,9 @@ for (const [net, bits] of [
   ['198.18.0.0', 15],
   ['224.0.0.0', 4],
   ['240.0.0.0', 4],
+  ['192.0.2.0', 24],
+  ['198.51.100.0', 24],
+  ['203.0.113.0', 24],
 ] as const) {
   BLOCKED.addSubnet(net, bits, 'ipv4');
 }
@@ -48,6 +51,8 @@ for (const [net, bits] of [
   ['ff00::', 8],
   ['2002::', 16], // 6to4: embeds an IPv4 address
   ['2001::', 32], // Teredo
+  ['2001:db8::', 32], // documentation
+  ['100::', 64], // discard-only
 ] as const) {
   BLOCKED.addSubnet(net, bits, 'ipv6');
 }
@@ -129,10 +134,10 @@ export async function planSource(source: string, o: PlanOptions): Promise<Source
   if (!(o.allowedPorts ?? [443]).includes(port)) {
     throw new IngestInputError('source port is not allowed');
   }
-  const host = url.hostname
-    .toLowerCase()
-    .replace(/^\[|\]$/g, '')
-    .replace(/\.+$/, '');
+  // A trailing dot names the same host, but curl would not apply the address pin to it, so the
+  // name would be resolved again at connect time. Refuse it rather than rewrite it.
+  if (url.hostname.endsWith('.')) throw new IngestInputError('source host must not end with a dot');
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
   if (host === '') throw new IngestInputError('source host is empty');
   if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) {
     throw new IngestInputError('source host is not allowed');

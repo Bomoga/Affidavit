@@ -8,6 +8,8 @@ export interface GitleaksFinding {
   file: string;
   region: Region;
   origin: ToolReport['origin'];
+  /** Set when `file` has a `!`: the path before it, the archive if no file named `file` exists. */
+  outer?: string | undefined;
 }
 
 interface SarifDoc {
@@ -26,6 +28,22 @@ interface SarifDoc {
 
 /** `/src/a/b.js`, `file:///src/a/b.js` or `src/a/b.js` to `a/b.js`. Undefined if it escapes. */
 export function relFromUri(uri: string): string | undefined {
+  return splitUri(uri)?.file;
+}
+
+/**
+ * `/src/a.zip!inner.js` names a member inside an archive. `file` is the whole path as reported (a real
+ * file may have a `!` in its name); `outer` is the part before the first `!`, set only when there
+ * is one, for the caller to fall back to when no file of the whole name exists.
+ */
+export function splitUri(uri: string): { file: string; outer?: string } | undefined {
+  const file = plainRel(uri);
+  if (file === undefined) return undefined;
+  const bang = file.indexOf('!');
+  return bang > 0 ? { file, outer: file.slice(0, bang) } : { file };
+}
+
+function plainRel(uri: string): string | undefined {
   const rel = uri.replace(/^file:\/\//, '').replace(/^\/?src\//, '');
   if (rel === '' || rel.startsWith('/') || /^[A-Za-z]:/.test(rel)) return undefined;
   if (rel.split('/').some((s) => s === '..' || s === '.' || s === '')) return undefined;
@@ -62,7 +80,8 @@ export async function readGitleaksFindings(
         for (const loc of locations) {
           const pl = loc.physicalLocation;
           const uri = pl?.artifactLocation?.uri;
-          const rel = typeof uri === 'string' ? relFromUri(uri) : undefined;
+          const parts = typeof uri === 'string' ? splitUri(uri) : undefined;
+          const rel = parts?.file;
           const r = pl?.region;
           const startLine = posInt(r?.['startLine']);
           const endLine = posInt(r?.['endLine']) ?? startLine;
@@ -87,6 +106,7 @@ export async function readGitleaksFindings(
             file: rel,
             region: { startLine, startColumn, endLine, endColumn },
             origin: report.origin,
+            outer: parts?.outer,
           });
         }
       }

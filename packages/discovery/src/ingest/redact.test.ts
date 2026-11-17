@@ -4,7 +4,13 @@ import { inspect } from 'node:util';
 import { afterAll, describe, expect, it } from 'vitest';
 import type { GitleaksFinding } from './findings.js';
 import { buildRedactionMap } from './map.js';
-import { extractLines, extractRegion, redactBuffer, SecretRedactor } from './redactor.js';
+import {
+  entriesOf,
+  extractLines,
+  extractRegion,
+  redactBuffer,
+  SecretRedactor,
+} from './redactor.js';
 import { cleanup, fakeKey, tmpDir } from './testkit.js';
 import { buildWorkspace, findLeaks, isEnvName } from './workspace.js';
 import { mkdirSync, readFileSync } from 'node:fs';
@@ -170,13 +176,13 @@ describe('buildRedactionMap', () => {
       ],
       1 << 26,
     );
-    const values = m.redactor.all().map((e) => [e.value.toString(), e.exact]);
+    const values = entriesOf(m.redactor).map((e) => [e.value.toString(), e.exact]);
     expect(values).toEqual([
       [key, true],
       [`y = "${key}";`, false],
     ]);
     // both are replaced, so the key is gone from the big file too
-    const out = redactBuffer('big.js', Buffer.from(big), m.redactor.all());
+    const out = redactBuffer('big.js', Buffer.from(big), entriesOf(m.redactor));
     expect(out.buf.includes(key)).toBe(false);
   });
 
@@ -223,6 +229,10 @@ describe('workspace', () => {
       'production.env',
       'my.ENV',
       'prod.env.local',
+      '.env~',
+      '.env1',
+      '.envlocal',
+      '.ENVBackup',
     ])
       expect(isEnvName(n), n).toBe(true);
     for (const n of ['env', 'env.js', '.environment', '.envelope', 'environment.js', 'dotenv.js']) {

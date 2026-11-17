@@ -1,11 +1,17 @@
-import { execFile } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:net';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { cleanGitError, GIT_CONFIG, gitEnv, killTree, pinConfig } from './git.js';
 import { ingestRepo, IngestInputError } from './index.js';
-import { isBlockedAddress, planSource, unmapV4, type HostResolver } from './source.js';
+import {
+  isBlockedAddress,
+  planSource,
+  unmapV4,
+  type HostResolver,
+  type SourcePlan,
+} from './source.js';
 import { cleanup, fakeGitleaks, request, tmpDir } from './testkit.js';
 
 vi.setConfig({ testTimeout: 60_000 });
@@ -41,6 +47,12 @@ describe('SSRF guard: literal hosts', () => {
     'https://[2002:7f00:1::]/',
     'https://[ff02::1]/',
     'https://198.18.0.1/',
+    'https://192.0.2.1/',
+    'https://198.51.100.7/',
+    'https://203.0.113.5/',
+    'https://[2001:db8::1]/',
+    'https://[100::1]/',
+    'https://[::ffff:0:1]/',
     'https://198.19.255.255/',
     'https://127.0.0.1/',
     'https://127.1/',
@@ -99,14 +111,30 @@ describe('SSRF guard: names, ports, schemes', () => {
     ).rejects.toBeInstanceOf(IngestInputError);
   });
 
-  it('pins the checked address and strips the trailing dot', async () => {
-    const p = await plan('https://Git.Example.com./a.git', {
+  it('pins the checked address, and the URL git gets names the same host', async () => {
+    const p = await plan('https://Git.Example.COM/a.git', {
       resolve: resolveTo(PUBLIC, '8.8.8.8'),
     });
     expect(p).toMatchObject({ host: 'git.example.com', port: 443, ip: PUBLIC });
+    expect(new URL((p as { url: string }).url).hostname).toBe('git.example.com');
     expect(pinConfig(p)).toEqual([`http.curloptResolve=git.example.com:443:${PUBLIC}`]);
     const v6 = await plan('https://git.example.com/a.git', { resolve: resolveTo('2606:4700::1') });
     expect(pinConfig(v6)).toEqual(['http.curloptResolve=git.example.com:443:[2606:4700::1]']);
+    // a plan whose URL and host disagree is refused, so the pin can never silently not apply
+    expect(() =>
+      pinConfig({ ...(p as Extract<SourcePlan, { kind: 'https' }>), host: 'other.example.com' }),
+    ).toThrow(IngestInputError);
+  });
+
+  it('refuses a trailing dot, which curl would not pin', async () => {
+    for (const url of [
+      'https://a.com./x',
+      'https://a.com../x',
+      'https://Example.COM../x',
+      'https://Git.Example.com./a.git',
+    ]) {
+      await expect(plan(url), url).rejects.toBeInstanceOf(IngestInputError);
+    }
   });
 
   it('allows port 443 only unless the caller allows more', async () => {
@@ -227,6 +255,21 @@ describe('SSRF guard end to end: nothing connects', () => {
   });
 });
 
+/** Alive means running: a zombie nobody has reaped yet (no init in a container) is dead. */
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return false;
+  }
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return stat.slice(stat.lastIndexOf(')') + 2).charAt(0) !== 'Z';
+  } catch {
+    return true; // no /proc (Windows, macOS): kill(0) is the answer
+  }
+}
+
 describe('process control', () => {
   it('killTree kills the child and what it started', async () => {
     const dir = tmpDir();
@@ -239,22 +282,20 @@ const g = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio
 require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(g.pid));
 setInterval(() => {}, 1000);`,
     );
-    const child = execFile(process.execPath, [script], {
+    // Spawned the way runGit spawns git: detached, so it leads a process group on POSIX.
+    const child = spawn(process.execPath, [script], {
       detached: process.platform !== 'win32',
-    } as object);
+      stdio: 'ignore',
+    });
     for (let i = 0; i < 100 && !existsSync(pidFile); i++)
       await new Promise((r) => setTimeout(r, 50));
     const grandchild = Number(readFileSync(pidFile, 'utf8'));
-    expect(() => process.kill(grandchild, 0)).not.toThrow();
+    expect(isAlive(grandchild)).toBe(true);
     killTree(child);
     let alive = true;
     for (let i = 0; i < 100 && alive; i++) {
       await new Promise((r) => setTimeout(r, 100));
-      try {
-        process.kill(grandchild, 0);
-      } catch {
-        alive = false;
-      }
+      alive = isAlive(grandchild);
     }
     expect(alive).toBe(false);
   });

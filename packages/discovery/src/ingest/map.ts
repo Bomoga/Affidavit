@@ -104,6 +104,17 @@ export async function buildRedactionMap(
 
   for (const f of findings) {
     const buf = await load(f.file);
+    if (buf === 'missing' && f.outer !== undefined) {
+      // `data/a.zip!inner.js`: a finding inside an archive member. The member cannot be read or
+      // rewritten, so the archive stays out of the workspace. Member names never go in a message.
+      const outer = await load(f.outer);
+      if (outer !== 'missing') {
+        excluded.set(f.outer, outer === 'too-large' ? 'too-large' : 'secret-in-non-text-file');
+        continue;
+      }
+      unresolved.push(`${f.outer}:${f.region.startLine}`);
+      continue;
+    }
     if (buf === 'missing') {
       unresolved.push(`${f.file}:${f.region.startLine}`);
       continue;

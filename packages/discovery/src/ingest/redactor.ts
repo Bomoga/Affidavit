@@ -22,6 +22,17 @@ export function placeholderFor(ruleId: string, n: number): string {
   return `[REDACTED:${ruleId.replace(SAFE_RULE, '_').slice(0, 64) || 'secret'}:${n}]`;
 }
 
+const INTERNAL = new WeakMap<SecretRedactor, readonly MapEntry[]>();
+
+/**
+ * The raw entries (values included) of a redactor, for the workspace build and the leak check.
+ * Exported from this module only: index.ts does not re-export it, so nothing reachable from
+ * IngestOk exposes a value.
+ */
+export function entriesOf(r: SecretRedactor): readonly MapEntry[] {
+  return INTERNAL.get(r) ?? [];
+}
+
 /**
  * The redaction map: every secret value ingestion found, in memory only. It never serialises its
  * values: JSON.stringify gives a count, and util.inspect (console.log) prints a stub, so a result
@@ -34,6 +45,7 @@ export class SecretRedactor {
 
   constructor(entries: readonly MapEntry[]) {
     this.#entries = entries;
+    INTERNAL.set(this, entries);
     // longest first, so a secret that contains another is replaced as a whole
     this.#globals = entries
       .filter((e) => e.scope === 'global')
@@ -42,11 +54,6 @@ export class SecretRedactor {
 
   get size(): number {
     return this.#entries.length;
-  }
-
-  /** For ingestion internals (workspace build, leak check). */
-  all(): readonly MapEntry[] {
-    return this.#entries;
   }
 
   /**

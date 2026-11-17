@@ -6,9 +6,10 @@ import { detectRepo } from './detect.js';
 import { readGitleaksFindings } from './findings.js';
 import { assertFullSha, checkoutPinned } from './git.js';
 import { buildRedactionMap } from './map.js';
-import type { SecretRedactor } from './redactor.js';
+import { entriesOf, type SecretRedactor } from './redactor.js';
 import { planSource } from './source.js';
 import {
+  CleanupFailedError,
   IngestInputError,
   RedactionIncompleteError,
   RedactionLeakError,
@@ -30,6 +31,31 @@ function redactDetection(d: Detection, r: SecretRedactor): Detection {
       evidence: f.evidence.map((p) => r.applyPath(p)),
     })),
   };
+}
+
+const REMOVE = { recursive: true, force: true, maxRetries: 5, retryDelay: 200 } as const;
+
+/**
+ * Replaces known values in every string an error carries: message, stack, path, dest, and the
+ * same on `cause` and on the members of an AggregateError.
+ */
+export function redactError(e: unknown, r: SecretRedactor, seen = new Set<unknown>()): void {
+  if (typeof e !== 'object' || e === null || seen.has(e)) return;
+  seen.add(e);
+  const o = e as Record<string, unknown>;
+  for (const k of ['message', 'stack', 'path', 'dest']) {
+    const v = o[k];
+    if (typeof v === 'string') {
+      try {
+        o[k] = r.apply(v);
+      } catch {
+        // a read-only property: leave it
+      }
+    }
+  }
+  redactError(o['cause'], r, seen);
+  const members = o['errors'];
+  if (Array.isArray(members)) for (const m of members) redactError(m, r, seen);
 }
 
 const DEFAULT_MAX_FILE_BYTES = 64 * 1024 * 1024;
@@ -68,109 +94,115 @@ export async function ingestRepo(deps: IngestDeps, req: IngestRequest): Promise<
   if (!(caseDir + sep).startsWith(workRoot + sep)) throw new IngestInputError('bad caseId');
   await mkdir(caseDir, { recursive: false }); // fails if it exists: never reuse or clear old state
   const wsDir = join(caseDir, 'workspace');
-  let ok = false;
-  try {
-    let redactor: SecretRedactor | undefined;
+  let redactor: SecretRedactor | undefined;
+  const work = async (): Promise<IngestResult> => {
     const priv = await mkdtemp(join(caseDir, 'private-'));
-    try {
-      const repoDir = join(priv, 'repo');
-      const home = join(priv, 'home');
-      await mkdir(repoDir);
-      await mkdir(home);
-      await checkoutPinned({
-        dir: repoDir,
-        home,
-        plan,
-        commit,
-        gitExecutable: deps.gitExecutable,
-        timeoutMs: deps.gitTimeoutMs,
-        maxRepoBytes: deps.maxRepoBytes,
-        passProxyEnv: deps.passProxyEnv,
-      });
+    const repoDir = join(priv, 'repo');
+    const home = join(priv, 'home');
+    await mkdir(repoDir);
+    await mkdir(home);
+    await checkoutPinned({
+      dir: repoDir,
+      home,
+      plan,
+      commit,
+      gitExecutable: deps.gitExecutable,
+      timeoutMs: deps.gitTimeoutMs,
+      maxRepoBytes: deps.maxRepoBytes,
+      maxRepoFiles: deps.maxRepoFiles,
+      passProxyEnv: deps.passProxyEnv,
+      gitVersionProbe: deps.gitVersionProbe,
+    });
 
-      const detected = await detectRepo(repoDir);
-      if (!detected.supported) {
-        return { status: 'unsupported', commit, ...detected.unsupported };
-      }
+    const detected = await detectRepo(repoDir);
+    // Not ok: the case directory (and the checkout in it) is removed below.
+    if (!detected.supported) return { status: 'unsupported', commit, ...detected.unsupported };
 
-      // A private scan copy (without .git): quarantine moves files out of it.
-      const scanDir = join(priv, 'scan');
-      await cp(repoDir, scanDir, {
-        recursive: true,
-        verbatimSymlinks: true,
-        filter: (src) => src !== join(repoDir, '.git'),
-      });
-      const snapshot = await quarantineSnapshot(scanDir);
-      const run = await runTool(deps.runner, manifest, 'gitleaks', {
-        snapshot,
-        outputDir: join(priv, 'out'),
-        scratchDir: join(priv, 'scratch'),
-        configDir: deps.tools?.configDir,
-        gitleaksConfigFile: deps.tools?.gitleaksConfigFile,
-        maxWindowBytes: deps.tools?.maxWindowBytes,
-        maxReportBytes: deps.tools?.maxReportBytes,
-      });
+    // A private scan copy (without .git): quarantine moves files out of it.
+    const scanDir = join(priv, 'scan');
+    await cp(repoDir, scanDir, {
+      recursive: true,
+      verbatimSymlinks: true,
+      filter: (src) => src !== join(repoDir, '.git'),
+    });
+    const snapshot = await quarantineSnapshot(scanDir);
+    const run = await runTool(deps.runner, manifest, 'gitleaks', {
+      snapshot,
+      outputDir: join(priv, 'out'),
+      scratchDir: join(priv, 'scratch'),
+      configDir: deps.tools?.configDir,
+      gitleaksConfigFile: deps.tools?.gitleaksConfigFile,
+      maxWindowBytes: deps.tools?.maxWindowBytes,
+      maxReportBytes: deps.tools?.maxReportBytes,
+    });
 
-      const { findings, malformed } = await readGitleaksFindings(run.reports, run.windowedFiles);
-      if (malformed > 0) {
-        throw new RedactionIncompleteError(Array(malformed).fill('<unreadable gitleaks result>'));
-      }
-      const map = await buildRedactionMap(repoDir, findings, maxFileBytes);
-      redactor = map.redactor;
-      const built = await buildWorkspace(repoDir, wsDir, map.redactor, map.excluded, maxFileBytes);
-      const leaks = await findLeaks(wsDir, map.redactor);
-      if (leaks.length > 0)
-        throw new RedactionLeakError(leaks.map((p) => map.redactor.applyPath(p)));
-
-      redactor = map.redactor;
-      const r = redactor;
-      const result: IngestOk = {
-        status: 'ok',
-        tenantId: req.tenantId,
-        caseId: req.caseId,
-        repo: req.repo,
-        commit,
-        workspacePath: wsDir,
-        detection: redactDetection(detected.detection, r),
-        redactions: built.redactions,
-        redactor: r,
-        excluded: built.excluded,
-        scan: {
-          partial: run.partial,
-          // messages hold repo paths, and a path can carry a secret
-          notifications: run.notifications.map((n) => ({
-            ...n,
-            message: r.apply(n.message),
-          })),
-          binaryMediaFiles: run.binaryMediaFiles.map((p) => r.applyPath(p)),
-          windowedFiles: run.windowedFiles.map((p) => r.applyPath(p)),
-          quarantined: run.quarantined.map((p) => r.applyPath(p)),
-          findings: map.findings,
-          redactedValues: r.size,
-          shortValues: r.all().filter((e) => e.scope === 'located').length,
-          lineFallbacks: r.all().filter((e) => !e.exact).length,
-        },
-      };
-      // Last check, over everything this function returns and not only the workspace.
-      const serialised = JSON.stringify(result) + inspect(result, { depth: 20 });
-      if (
-        r.all().some((e) => e.scope === 'global' && serialised.includes(e.value.toString('utf8')))
-      ) {
-        throw new RedactionLeakError(['<ingestion result>']);
-      }
-      ok = true;
-      return result;
-    } catch (e) {
-      // Error text can quote repo paths, which can carry a secret.
-      if (redactor !== undefined && e instanceof Error) {
-        e.message = redactor.apply(e.message);
-        if (e.stack !== undefined) e.stack = redactor.apply(e.stack);
-      }
-      throw e;
-    } finally {
-      await rm(priv, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    const { findings, malformed } = await readGitleaksFindings(run.reports, run.windowedFiles);
+    if (malformed > 0) {
+      throw new RedactionIncompleteError(Array(malformed).fill('<unreadable gitleaks result>'));
     }
-  } finally {
-    if (!ok) await rm(caseDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    const map = await buildRedactionMap(repoDir, findings, maxFileBytes);
+    const r = map.redactor;
+    redactor = r; // from here on, errors are scrubbed of known values before they leave
+    const built = await buildWorkspace(repoDir, wsDir, r, map.excluded, maxFileBytes);
+    const leaks = await findLeaks(wsDir, r);
+    if (leaks.length > 0) throw new RedactionLeakError(leaks.map((p) => r.applyPath(p)));
+
+    const result: IngestOk = {
+      status: 'ok',
+      tenantId: req.tenantId,
+      caseId: req.caseId,
+      repo: req.repo,
+      commit,
+      workspacePath: wsDir,
+      detection: redactDetection(detected.detection, r),
+      redactions: built.redactions,
+      redactor: r,
+      excluded: built.excluded,
+      scan: {
+        partial: run.partial,
+        // messages hold repo paths, and a path can carry a secret
+        notifications: run.notifications.map((n) => ({ ...n, message: r.apply(n.message) })),
+        binaryMediaFiles: run.binaryMediaFiles.map((p) => r.applyPath(p)),
+        windowedFiles: run.windowedFiles.map((p) => r.applyPath(p)),
+        quarantined: run.quarantined.map((p) => r.applyPath(p)),
+        findings: map.findings,
+        redactedValues: r.size,
+        shortValues: entriesOf(r).filter((e) => e.scope === 'located').length,
+        lineFallbacks: entriesOf(r).filter((e) => !e.exact).length,
+      },
+    };
+    // Last check, over everything this function returns and not only the workspace.
+    const serialised = JSON.stringify(result) + inspect(result, { depth: 20 });
+    if (
+      entriesOf(r).some(
+        (e) => e.scope === 'global' && serialised.includes(e.value.toString('utf8')),
+      )
+    ) {
+      throw new RedactionLeakError(['<ingestion result>']);
+    }
+    // The raw checkout goes before success is reported. If it cannot be removed, nothing is
+    // returned and the whole case directory is removed instead.
+    await rm(priv, REMOVE);
+    return result;
+  };
+  const cleanup = async (): Promise<void> => {
+    try {
+      await rm(caseDir, REMOVE);
+    } catch {
+      throw new CleanupFailedError(caseDir);
+    }
+  };
+
+  let result: IngestResult;
+  try {
+    result = await work();
+  } catch (e) {
+    // Error text can quote repo paths, which can carry a secret.
+    if (redactor !== undefined) redactError(e, redactor);
+    await cleanup();
+    throw e;
   }
+  // Unsupported: nothing is kept, so the case directory and its checkout go too.
+  if (result.status !== 'ok') await cleanup();
+  return result;
 }

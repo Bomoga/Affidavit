@@ -12,7 +12,7 @@ import { randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { gzipSync } from 'node:zlib';
+import { crc32, gzipSync } from 'node:zlib';
 import type { ToolRunnerPort } from '@affidavit/contracts';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { repoRoot } from '../tools/index.js';
@@ -71,6 +71,55 @@ const runner: ToolRunnerPort = {
 };
 
 afterAll(cleanup);
+
+/** A one-entry stored (uncompressed) zip. */
+function storedZip(name: string, data: Buffer): Buffer {
+  const n = Buffer.from(name);
+  const crc = crc32(data);
+  const local = Buffer.alloc(30);
+  local.writeUInt32LE(0x04034b50, 0);
+  local.writeUInt16LE(20, 4);
+  local.writeUInt32LE(crc, 14);
+  local.writeUInt32LE(data.length, 18);
+  local.writeUInt32LE(data.length, 22);
+  local.writeUInt16LE(n.length, 26);
+  const central = Buffer.alloc(46);
+  central.writeUInt32LE(0x02014b50, 0);
+  central.writeUInt16LE(20, 4);
+  central.writeUInt16LE(20, 6);
+  central.writeUInt32LE(crc, 16);
+  central.writeUInt32LE(data.length, 20);
+  central.writeUInt32LE(data.length, 24);
+  central.writeUInt16LE(n.length, 28);
+  const body = Buffer.concat([local, n, data]);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(1, 8);
+  end.writeUInt16LE(1, 10);
+  end.writeUInt32LE(46 + n.length, 12);
+  end.writeUInt32LE(body.length, 16);
+  return Buffer.concat([body, central, n, end]);
+}
+
+/** A one-entry ustar archive. */
+function tarOf(name: string, data: Buffer): Buffer {
+  const h = Buffer.alloc(512);
+  h.write(name, 0, 100);
+  h.write('0000644\0', 100);
+  h.write('0000000\0', 108);
+  h.write('0000000\0', 116);
+  h.write(data.length.toString(8).padStart(11, '0') + '\0', 124);
+  h.write('00000000000\0', 136);
+  h.write('        ', 148);
+  h.write('0', 156);
+  h.write('ustar\0', 257);
+  h.write('00', 263);
+  let sum = 0;
+  for (const b of h) sum += b;
+  h.write(sum.toString(8).padStart(6, '0') + '\0 ', 148);
+  const pad = Buffer.alloc(((512 - (data.length % 512)) % 512) + 1024);
+  return Buffer.concat([h, data, pad]);
+}
 
 describe.skipIf(!enabled)('ingest with the real gitleaks image', () => {
   let configDir: string;
@@ -162,6 +211,32 @@ describe.skipIf(!enabled)('ingest with the real gitleaks image', () => {
     expect(r.scan.partial).toBe(true);
     expect(r.scan.notifications.some((n) => n.message.includes('data/utf16.txt'))).toBe(true);
     expect(r.scan.windowedFiles).toContain('/src/src/big.js');
+  });
+
+  it('a secret inside a zip or tar member keeps the archive out and does not fail the ingestion', async () => {
+    const key = fakeKey();
+    const text = Buffer.from(`const k = "${key}";\n`);
+    const { dir, shas } = makeRepo([
+      {
+        'package.json': EXPRESS_PKG,
+        'src/app.js': "require('express')();\n",
+        'data/a.zip': storedZip('inner.js', text),
+        'data/b.tar': tarOf('inner.js', text),
+      },
+    ]);
+    const workRoot = tmpDir();
+    const r = (await ingestRepo(
+      { runner, workRoot, allowLocalSource: true, tools: { configDir } },
+      request({ source: dir, commit: shas[0] as string }),
+    )) as IngestOk;
+    expect(r.status).toBe('ok');
+    expect(r.excluded.map((e) => [e.path, e.reason]).sort()).toEqual([
+      ['data/a.zip', 'secret-in-non-text-file'],
+      ['data/b.tar', 'secret-in-non-text-file'],
+    ]);
+    expect(everything(r.workspacePath)).not.toContain(key);
+    expect(JSON.stringify(r)).not.toContain(key);
+    expect(JSON.stringify(r)).not.toContain('inner.js'); // member names stay out of the result
   });
 
   it('a repo with no secrets ingests clean and not partial', async () => {

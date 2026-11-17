@@ -2,8 +2,10 @@ export { ingestRepo } from './ingest.js';
 export { SecretRedactor } from './redactor.js';
 export { isEnvName } from './workspace.js';
 export {
+  CleanupFailedError,
   CloneFailedError,
   CommitMismatchError,
+  GitTooOldError,
   IngestInputError,
   RedactionIncompleteError,
   RedactionLeakError,
