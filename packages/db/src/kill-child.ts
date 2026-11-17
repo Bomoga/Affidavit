@@ -3,7 +3,7 @@
  * SIGKILL it and let a real lease expire. It has its own app and worker pools. Configured by
  * environment (CHILD_*) and reports on stdout, one line per event.
  *
- * Modes: `hang` (start the attempt, then never return), `work-then-hang` (move the case on with
+ * Modes: `print-env` (report the names of the inherited environment variables and exit), `hang` (start the attempt, then never return), `work-then-hang` (move the case on with
  * PgCaseStore, then hang), `hang-claim` (die before the claim can answer), `complete` (finish the
  * attempt in its own transaction).
  */
@@ -20,6 +20,11 @@ function env(name: string): string {
 
 async function main(): Promise<void> {
   const mode = env('CHILD_MODE');
+  if (mode === 'print-env') {
+    // For the test that checks what the child inherits.
+    console.log(`ENV ${JSON.stringify(Object.keys(process.env).sort())}`);
+    return;
+  }
   const caseId = env('CHILD_CASE');
   const tenant = env('CHILD_TENANT');
   const leaseSeconds = Number(env('CHILD_LEASE'));

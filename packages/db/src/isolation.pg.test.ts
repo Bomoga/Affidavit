@@ -51,7 +51,7 @@ async function seed(
   const run = { tenantId: tenant, caseId: caseFile.id, stage: 'map' as const, attempt: 1 };
   await enqueueStage(pool, run);
   await claimStageRun(workerPool, run, 'seed-worker', 60);
-  await flagForReview(pool, run, 'attempts-exhausted', 'seed');
+  await flagForReview(pool, { ...run, visit: 2 }, 'attempts-exhausted', 'seed');
   // Event seqs 0 and 1 are handed out by the store, as the trial does.
   await store.nextSeq(caseFile.id);
   await store.nextSeq(caseFile.id);
@@ -288,8 +288,8 @@ describePg('cross-tenant isolation (tenant A against tenant B data)', () => {
       params: () => [B, caseB.id],
     },
     review_flags: {
-      text: `insert into review_flags (tenant_id, case_id, stage, attempt, reason, detail)
-        values ($1, $2, 'map', 9, 'attempts-exhausted', 'd')`,
+      text: `insert into review_flags (tenant_id, case_id, stage, attempt, visit, reason, detail)
+        values ($1, $2, 'map', 9, 1, 'attempts-exhausted', 'd')`,
       params: () => [B, caseB.id],
     },
   };

@@ -555,7 +555,12 @@ describePg('stage queue (Graphile Worker)', () => {
         () => false,
       );
       expect(ran).toEqual([]);
-      const failed = await listFailedStageJobs(db().worker);
+      // The refusal is recorded on the job. Recovery has nothing left to do for it (the case left
+      // the stage and no run is open), so the default list skips it; `includeHandled` shows it.
+      expect((await listFailedStageJobs(db().worker)).some((j) => j.key === stageJobKey(w))).toBe(
+        false,
+      );
+      const failed = await listFailedStageJobs(db().worker, undefined, { includeHandled: true });
       expect(failed.find((j) => j.key === stageJobKey(w))?.lastError).toMatch(/is at stage map/);
       // An unclaimed queued job is never adopted while it can still run; once it has failed the
       // case having left the stage means adopt-complete (nothing left to do).
@@ -681,7 +686,8 @@ describePg('stage queue (Graphile Worker)', () => {
     await expireLease(p);
     // Expired lease, but the case never left intake: adopting would hide an unfinished stage.
     expect(await completeStageRun(db().app, p)).toBe(false);
-    expect(await resumeDecision(pools(), p)).toBe('next-attempt');
+    // No margin: the job was never run, so nothing can be winding down.
+    expect(await resumeDecision(pools(), p, { staleLockSeconds: 0 })).toBe('next-attempt');
     await storeA.transition(file.id, 'map');
     expect(await completeStageRun(db().app, p)).toBe(true);
   });
