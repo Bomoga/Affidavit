@@ -59,24 +59,6 @@ Semgrep SARIF carries only a rule's `metadata.cwe` (as tags) in `properties.tags
 - Whether OSV injection or IDOR advisories become trial candidates before CR-5 is answered.
 - Where the merged rule ids live: the normalizer returns them in a Lane 1 side record (`NormalizeResult.merged`, with the OSV package per member) because `Candidate` has one rule id and one range.
 
-## CR-7: the map's answer is richer than `Candidate.reachability` and `RouteInfo` (raised by L1-05)
-
-**Problem.** The map returns, per candidate, a three-valued reachability that fits `Candidate.reachability`, and a route that fits `RouteInfo` (`CaseFile.route`). Four facts it also produces have no home in contracts:
-
-- The reason for `unknown` (`route-not-mounted`, `external-entry`, `referenced-unresolved`, `repo-incomplete`, `file-incomplete`, `file-not-analyzed`, `no-enclosing-function`, `dynamic-require`). An `unknown` on a high-score candidate must go to trial or review (F3); the reviewer, and the audit trail, need to see why it is not a clean `reachable` or `unreachable`.
-- The function path from the route entry to the sink (up to 5 paths, shortest first). Slice assembly (L1-07) and Defense could use it to show the call chain.
-- Map coverage: files skipped or only partly parsed, limits hit (steps, time, files), and leaks (dynamic require, dynamic dispatch, `eval`, routes on receivers it could not tie to Express). A partial map is the same kind of signal as CR-4's partial secret scan.
-- Two meanings of `RouteInfo.middleware` and `RouteInfo.path` the contract does not state. The map's `middleware` is the chain in front of the handler without application-wide `app.use(fn)` middleware (listed separately as `appMiddleware`); a path part it cannot reduce to a string is written `${name}`; a reachability entry that is a `use` registration (an error handler) has method `USE`.
-
-**Request.** Either add optional fields (for example `Candidate.reachabilityReason: string`, `CaseFile.callPath`, and a coverage object next to CR-4's `ingest`), or state that these stay Lane 1 internal and are recorded as events. State the `RouteInfo.middleware` convention above, and whether `method: 'USE'` and `${...}` path parts are allowed in `CaseFile.route`.
-
-**Interim.** `@affidavit/discovery` exports `CandidateReachability` (value, reason, detail, function, paths), `MapCoverage` and `MapRoute` (with `appMiddleware`, `chain`, `mounted`, `pathDynamic`). `routeInfoOf(path)` returns a contract-valid `RouteInfo` and L1-07 should prefer a `reachable` path whose method is not `USE`. L1-06 treats `unknown` as "not dismissed".
-
-- The CWE set: injection is 74, 77, 78, 89, 90, 91, 94, 95, 564, 643, 917, 943 and idor is 284, 285, 566, 639, 862, 863. Whether 284 and 285 belong in idor, and whether 1336 belongs in injection.
-- An unsafe path on one finding is now a `skipped` entry (reason `unsafe-path`), not a report failure; say if that should escalate.
-- Whether different CWEs in one class on the same range should stay separate candidates (today they merge into one).
-- Whether one bad result (for example a bad line number) should reject a whole report, as now, or be skipped and recorded.
-
 ## CR-7: Lane 3 needs a single-stage entry point for the worker (raised by L1-10)
 
 **Problem.** The queue runs one job per case stage, so a killed worker resumes at stage granularity. `Orchestrator.run(caseId)` in `@affidavit/trial` loops from the current stage to a terminal stage, builds its stage context privately, and emits `stage-entered` for the next stage before it checks the kill switch. The worker cannot drive one stage at a time through it without duplicating `stage-entered` events (a halted run emits one, and the next run emits it again). The trial handlers (`createDefenseHandler` and the others) take a context only the orchestrator can build, and there is no jury handler yet.
@@ -98,3 +80,23 @@ Semgrep SARIF carries only a rule's `metadata.cwe` (as tags) in `properties.tags
 **Problem.** `affidavit scan` has to stream a case's events to the terminal. The only read path is `PgEventSink.events(caseId, afterSeq)` (a Lane 1 method beyond the `EventSink` port, which has `emit` only). There is no subscribe, `LISTEN/NOTIFY` or push API, so the CLI polls it every 500 ms by default (`--poll-ms`) until a terminal event (`verdict-written`, `escalated`, `budget-exhausted`) or a timeout (`--timeout`, default 120 s).
 
 **Request.** None blocking. When L1-12 adds the SSE endpoint, decide whether the CLI should read that stream instead, and whether the `events` read belongs on a port in `packages/contracts` (for example an `EventLog` port with `events(caseId, afterSeq)` and an optional subscribe). Until then the CLI depends on `@affidavit/db` directly, an approved Lane 1 dependency (L1-11 brief).
+
+## CR-10: the map's answer is richer than `Candidate.reachability` and `RouteInfo` (raised by L1-05)
+
+**Problem.** The map returns, per candidate, a three-valued reachability that fits `Candidate.reachability`, and a route that fits `RouteInfo` (`CaseFile.route`). Four facts it also produces have no home in contracts:
+
+- The reason for `unknown` (`route-not-mounted`, `external-entry`, `referenced-unresolved`, `repo-incomplete`, `file-incomplete`, `file-not-analyzed`, `no-enclosing-function`, `dynamic-require`). An `unknown` on a high-score candidate must go to trial or review (F3); the reviewer, and the audit trail, need to see why it is not a clean `reachable` or `unreachable`.
+- The function path from the route entry to the sink (up to 5 paths, shortest first). Slice assembly (L1-07) and Defense could use it to show the call chain.
+- Map coverage: files skipped or only partly parsed, limits hit (steps, time, files), and leaks (dynamic require, dynamic dispatch, `eval`, routes on receivers it could not tie to Express). A partial map is the same kind of signal as CR-4's partial secret scan.
+- Two meanings of `RouteInfo.middleware` and `RouteInfo.path` the contract does not state. The map's `middleware` is the chain in front of the handler without application-wide `app.use(fn)` middleware (listed separately as `appMiddleware`); a path part it cannot reduce to a string is written `${name}`; a reachability entry that is a `use` registration (an error handler) has method `USE`.
+
+**Request.** Either add optional fields (for example `Candidate.reachabilityReason: string`, `CaseFile.callPath`, and a coverage object next to CR-4's `ingest`), or state that these stay Lane 1 internal and are recorded as events. State the `RouteInfo.middleware` convention above, and whether `method: 'USE'` and `${...}` path parts are allowed in `CaseFile.route`.
+
+**Interim.** `@affidavit/discovery` exports `CandidateReachability` (value, reason, detail, function, paths), `MapCoverage` and `MapRoute` (with `appMiddleware`, `chain`, `mounted`, `pathDynamic`). `routeInfoOf(path)` returns a contract-valid `RouteInfo` and L1-07 should prefer a `reachable` path whose method is not `USE`. L1-06 treats `unknown` as "not dismissed".
+
+- The CWE set: injection is 74, 77, 78, 89, 90, 91, 94, 95, 564, 643, 917, 943 and idor is 284, 285, 566, 639, 862, 863. Whether 284 and 285 belong in idor, and whether 1336 belongs in injection.
+- An unsafe path on one finding is now a `skipped` entry (reason `unsafe-path`), not a report failure; say if that should escalate.
+- Whether different CWEs in one class on the same range should stay separate candidates (today they merge into one).
+- Whether one bad result (for example a bad line number) should reject a whole report, as now, or be skipped and recorded.
+
+`RouteInfo.authRequired` is a heuristic from the middleware chain only: it cannot see an ownership or login check written inside a handler, and `true` means "a guard was proven by name (package) or by body (repo code)", never more. `'unknown'` is used whenever the guard is optional, conditional, scoped to a path the map cannot pin down, or the chain has an item it could not resolve.

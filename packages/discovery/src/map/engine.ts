@@ -40,6 +40,8 @@ export interface HandlerRef {
   unresolved: boolean;
   /** At least one value is a third-party package member. */
   external: boolean;
+  /** The argument has options that make a check optional (`credentialsRequired`, `.unless`). */
+  optional: boolean;
 }
 
 export type RouterEvent =
@@ -165,6 +167,8 @@ const SQL_METHODS = new Set([
   '$queryRawUnsafe',
   '$executeRawUnsafe',
 ]);
+/** Callees that take an Express app and add no routes of their own. */
+const BENIGN_ROUTER_SINKS = new Set(['http', 'https', 'http2', 'supertest', 'serverless-http']);
 const COMMAND_FNS = new Set(['exec', 'execSync', 'execFile', 'execFileSync', 'spawn', 'spawnSync']);
 const COLL_NAME = /(col|coll|collection|collections|model|models)$/i;
 const SQL_RECEIVER = /^(db|pool|client|conn|connection|knex|sequelize|database|sql|mysql|pg|cnx)$/i;
@@ -218,6 +222,30 @@ export function labelOf(n: AstNode | undefined, depth = 0): string {
       s = '<expr>';
   }
   return safeIdent(s);
+}
+
+const OPTIONAL_KEYS = new Set([
+  'credentialsRequired',
+  'required',
+  'optional',
+  'passthrough',
+  'unless',
+  'skip',
+  'ignore',
+  'exclude',
+]);
+
+/** True when a middleware argument carries options that can switch its check off. */
+function looksOptional(n: AstNode | undefined): boolean {
+  let budget = 400;
+  const walk = (x: AstNode, depth: number): boolean => {
+    if (budget-- <= 0) return true;
+    if (depth > 12) return true;
+    if (x.t === 'pair' && OPTIONAL_KEYS.has(keyName(x.f['key']) ?? '')) return true;
+    if (x.t === 'property_identifier' && x.x === 'unless') return true;
+    return x.c.some((c) => walk(c, depth + 1));
+  };
+  return n !== undefined && walk(n, 0);
 }
 
 export interface InterpOutput {
@@ -510,9 +538,13 @@ export class Interpreter {
    * data access and route registrations are seen. Repeats until nothing new was created.
    */
   private sweep(): void {
-    for (let guard = 0; guard < 64; guard++) {
+    for (let guard = 0; ; guard++) {
       const todo = this.created.filter((c) => !this.ran.has(c.id) && c.fn.kind !== 'class');
       if (todo.length === 0) return;
+      if (guard >= 64) {
+        this.limitsHit.add('sweep');
+        return;
+      }
       for (const c of todo) {
         this.ran.add(c.id);
         try {
@@ -558,9 +590,9 @@ export class Interpreter {
     this.executed.add(c.fn.id);
     this.ran.add(c.id);
     this.memo.set(key, []);
-    this.active.set(c.fn.id, (this.active.get(c.fn.id) ?? 0) + 1);
     const mod = this.modules.get(c.fn.file);
     if (!mod) return [];
+    this.active.set(c.fn.id, (this.active.get(c.fn.id) ?? 0) + 1);
     const fr: Frame = {
       facts,
       fn: c.fn,
@@ -570,15 +602,15 @@ export class Interpreter {
       mod,
       depth,
     };
-    const params = c.fn.node.f['parameters'];
-    if (params) {
-      params.c.forEach((p, i) => this.bind(fr, p, args[i] ?? [], true));
-    } else {
-      const single = c.fn.node.f['parameter'];
-      if (single) this.bind(fr, single, args[0] ?? [], true);
-    }
     const body = c.fn.node.f['body'];
     try {
+      const params = c.fn.node.f['parameters'];
+      if (params) {
+        params.c.forEach((p, i) => this.bind(fr, p, args[i] ?? [], true));
+      } else {
+        const single = c.fn.node.f['parameter'];
+        if (single) this.bind(fr, single, args[0] ?? [], true);
+      }
       if (body) {
         if (body.t === 'statement_block') this.execList(fr, body.c);
         else fr.returns = union(fr.returns, this.ev(fr, body));
@@ -627,6 +659,7 @@ export class Interpreter {
   }
 
   private ctorStack: FnValue | undefined;
+  private decoratedExport = false;
 
   private initFields(fr: Frame, cls: FnValue, inst: ObjValue): void {
     if (!cls.fields) return;
@@ -697,12 +730,19 @@ export class Interpreter {
     const base = heritage?.c[0];
     if (base) cls.parentClass = this.ev(fr, base);
     const body = n.f['body'];
+    const decorated = this.decoratedExport || n.c.some((d) => d.t === 'decorator');
+    this.decoratedExport = false;
     const cfr: Frame = { ...fr, scope, thisVals: [cls] };
     for (const m of body?.c ?? []) {
       if (m.t === 'method_definition') {
         const mname = keyName(m.f['name']);
         const mc = this.closureOf(cfr, m);
         if (!mname || !mc) continue;
+        // Decorated classes and methods (NestJS, TypeORM, ...) are called by a framework.
+        if (decorated || m.c.some((d) => d.t === 'decorator')) {
+          this.handoffs.push([fr.fn.id, mc.fn.id]);
+          this.schedule(mc);
+        }
         if (mname === 'constructor') cls.ctor = mc;
         else if (m.op === 'static') cls.staticProps.set(mname, [mc]);
         else cls.protoProps.set(mname, union(cls.protoProps.get(mname) ?? [], [mc]));
@@ -955,7 +995,11 @@ export class Interpreter {
       } else {
         items.push(this.ev(fr, c));
       }
-      if (items.length > 256) break;
+    }
+    if (items.length > 256) {
+      // Everything was evaluated; only what is kept is cut, and the cut is reported.
+      this.limitsHit.add('value-set-cap');
+      items.length = 256;
     }
     return { k: 'arr', items };
   }
@@ -1232,7 +1276,9 @@ export class Interpreter {
     const value = n.f['value'];
     const src = plainString(n.f['source']);
     if (decl) {
+      this.decoratedExport = n.c.some((d) => d.t === 'decorator');
       this.ev(fr, decl);
+      this.decoratedExport = false;
       if (decl.t === 'lexical_declaration' || decl.t === 'variable_declaration') {
         for (const d of decl.c) {
           const nm = d.f['name'];
@@ -1306,7 +1352,6 @@ export class Interpreter {
         nodes.push(a);
         vals.push(this.ev(fr, a));
       }
-      if (vals.length > 64) break;
     }
     return { nodes, vals };
   }
@@ -1398,6 +1443,34 @@ export class Interpreter {
 
     const { nodes, vals } = this.argValues(fr, argsNode);
 
+    // `app.get.call(app, '/x', fn)` and `.apply`: a registration through the method object.
+    if (
+      (method === 'call' || method === 'apply') &&
+      fnNode.t === 'member_expression' &&
+      fnNode.f['object']?.t === 'member_expression'
+    ) {
+      const inner = fnNode.f['object'];
+      const innerMethod = inner.f['property']?.x;
+      const innerObj = inner.f['object'];
+      const holders = innerObj ? this.ev(fr, innerObj) : [];
+      const rs = holders.filter((v): v is RouterValue => v.k === 'router');
+      if (innerMethod !== undefined && rs.length > 0) {
+        const rest =
+          method === 'call'
+            ? { nodes: nodes.slice(1), vals: vals.slice(1) }
+            : {
+                nodes: ((vals[1] ?? []).find((x): x is ArrValue => x.k === 'arr')?.items ?? []).map(
+                  () => nodes[1] ?? n,
+                ),
+                vals: (vals[1] ?? []).find((x): x is ArrValue => x.k === 'arr')?.items ?? [],
+              };
+        return this.registerRoute(fr, n, rs, [], innerMethod, rest.nodes, rest.vals);
+      }
+    }
+    if (fnNode.t === 'member_expression' && labelOf(fnNode) === 'Reflect.apply') {
+      this.leak('unresolved-router', fr.facts.path, line);
+    }
+
     // `.call`, `.apply` and `.bind` on a repo function.
     if (
       (method === 'call' || method === 'apply' || method === 'bind') &&
@@ -1445,9 +1518,7 @@ export class Interpreter {
     }
 
     if (fnNode.t === 'subscript_expression' && method === undefined && callee.length === 0) {
-      if (vals.some((a) => a.some((v) => v.k === 'fn' || v.k === 'router'))) {
-        this.leak('dynamic-dispatch', fr.facts.path, line);
-      }
+      this.leak('dynamic-dispatch', fr.facts.path, line);
     }
 
     let result: Value[] = [];
@@ -1468,17 +1539,50 @@ export class Interpreter {
     // A function passed to any call may be called by it: record the edge and analyze the body.
     // When the callee is not repo code the function is also handed to code the map cannot see.
     const opaque = !userCallee;
-    for (const a of vals) {
-      for (const v of a) {
-        if (v.k === 'fn') {
-          this.addEdge(fr.fn.id, v.fn.id);
-          if (opaque) this.handoffs.push([fr.fn.id, v.fn.id]);
-          this.schedule(v);
-        }
-      }
-    }
+    const benign =
+      callee.length > 0 && callee.every((v) => v.k === 'ext' && BENIGN_ROUTER_SINKS.has(v.pkg));
+    this.handOff(fr, vals, opaque, opaque && !benign, line);
     this.capCheck();
     return result;
+  }
+
+  /**
+   * Functions among the arguments (also inside objects and arrays, to a bounded depth and count)
+   * get a call edge and are analyzed. When the callee is not repo code they are also handed to
+   * code the map cannot see, and a router passed to such a callee may get routes the map
+   * does not see.
+   */
+  private handOff(
+    fr: Frame,
+    vals: Value[][],
+    opaque: boolean,
+    escapes: boolean,
+    line: number,
+  ): void {
+    let budget = 512;
+    const seen = new Set<Value>();
+    const visit = (v: Value, depth: number): void => {
+      if (seen.has(v)) return;
+      seen.add(v);
+      if (budget-- <= 0) {
+        this.limitsHit.add('value-set-cap');
+        return;
+      }
+      if (v.k === 'fn') {
+        this.addEdge(fr.fn.id, v.fn.id);
+        if (opaque) this.handoffs.push([fr.fn.id, v.fn.id]);
+        this.schedule(v);
+        for (const p of v.staticProps.values())
+          if (depth < 4) for (const x of p) visit(x, depth + 1);
+      } else if (v.k === 'router') {
+        if (escapes) this.leak('unresolved-router', fr.facts.path, line);
+      } else if (depth < 4) {
+        if (v.k === 'obj') for (const p of v.props.values()) for (const x of p) visit(x, depth + 1);
+        else if (v.k === 'arr')
+          for (const item of v.items) for (const x of item) visit(x, depth + 1);
+      }
+    };
+    for (const a of vals) for (const v of a) visit(v, 0);
   }
 
   /** `x.get('/p', fn)` or `x.use(fn)` where `x` is named like a router but is not tracked. */
@@ -1598,15 +1702,7 @@ export class Interpreter {
       }
     }
     const opaque = !ctors.some((c) => c.k === 'fn');
-    for (const a of vals) {
-      for (const v of a) {
-        if (v.k === 'fn') {
-          this.addEdge(fr.fn.id, v.fn.id);
-          if (opaque) this.handoffs.push([fr.fn.id, v.fn.id]);
-          this.schedule(v);
-        }
-      }
-    }
+    this.handOff(fr, vals, opaque, opaque, lineOf(n));
     return out;
   }
 
@@ -1626,6 +1722,7 @@ export class Interpreter {
       });
     }
     void fr;
+    if (out.length > 16) this.limitsHit.add('value-set-cap');
     return out.slice(0, 16);
   }
 
@@ -1653,6 +1750,7 @@ export class Interpreter {
         line: node ? lineOf(node) : 0,
         unresolved: closures.length === 0 && !ext && !router,
         external: ext && closures.length === 0,
+        optional: looksOptional(node),
       });
     };
     for (let i = from; i < nodes.length; i++) {
@@ -1711,7 +1809,11 @@ export class Interpreter {
       }));
     }
     if (method === 'use') {
-      const hasPath = this.isPathArg(nodes[0], vals[0] ?? []);
+      // An untracked first argument followed by more is a path or a middleware; either way it
+      // scopes what follows in a way the map cannot pin down.
+      const unresolvedFirst = (vals[0]?.length ?? 0) === 0 && nodes.length > 1;
+      if (unresolvedFirst) this.leak('unresolved-handler', file, line);
+      const hasPath = unresolvedFirst || this.isPathArg(nodes[0], vals[0] ?? []);
       const paths = hasPath ? this.pathsFrom(fr, nodes[0], vals[0] ?? []) : null;
       const items = this.handlerRefs(fr, nodes, vals, hasPath ? 1 : 0);
       for (const r of routers) {
@@ -1752,14 +1854,7 @@ export class Interpreter {
       return routers;
     }
     // `param`, `set`, `listen`, `engine` and the rest do not add routes.
-    for (const a of vals) {
-      for (const v of a) {
-        if (v.k === 'fn') {
-          this.handoffs.push([fr.fn.id, v.fn.id]);
-          this.schedule(v);
-        }
-      }
-    }
+    this.handOff(fr, vals, true, false, line);
     return [];
   }
 }

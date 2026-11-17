@@ -8,7 +8,8 @@
  * leave the parser; every size, depth, count and time bound is a limit that is reported when hit.
  */
 import type { RouteInfo } from '@affidavit/contracts';
-import { lstat, readdir, readFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { lstat, open, readdir } from 'node:fs/promises';
 import { join, posix } from 'node:path';
 import { Interpreter, type InterpOutput } from './engine.js';
 import { grammarFor, initParser, parseSource, type Grammar } from './parse.js';
@@ -123,22 +124,36 @@ interface SourceEntry {
   grammar: Grammar;
 }
 
+const MAX_LISTED_SKIPS = 5_000;
+
 async function collect(
   root: string,
   limits: MapLimits,
   skipped: SkippedPath[],
+  deadline: number,
 ): Promise<SourceEntry[]> {
   const out: SourceEntry[] = [];
+  let overflow = false;
   const stack: { rel: string; depth: number }[] = [{ rel: '', depth: 0 }];
+  let listed = 0;
   while (stack.length > 0) {
     const cur = stack.pop();
     if (!cur) break;
+    if (Date.now() > deadline) {
+      skipped.push({ path: cur.rel || '.', reason: 'time-budget', affectsCompleteness: true });
+      break;
+    }
     let entries;
     try {
       entries = await readdir(join(root, cur.rel), { withFileTypes: true });
     } catch {
       skipped.push({ path: cur.rel || '.', reason: 'unreadable', affectsCompleteness: true });
       continue;
+    }
+    listed += entries.length;
+    if (listed > limits.maxEntries) {
+      skipped.push({ path: cur.rel || '.', reason: 'entry-limit', affectsCompleteness: true });
+      break;
     }
     entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     const subdirs: { rel: string; depth: number }[] = [];
@@ -165,7 +180,11 @@ async function collect(
           // skipping it counts against completeness.
           skipped.push({ path: rel, reason: 'minified', affectsCompleteness: true });
         } else if (out.length >= limits.maxFiles) {
-          skipped.push({ path: rel, reason: 'too-many-files', affectsCompleteness: true });
+          // The limit is reported once through `limitsHit`; the first few are listed by name.
+          if (skipped.length < MAX_LISTED_SKIPS) {
+            skipped.push({ path: rel, reason: 'too-many-files', affectsCompleteness: true });
+          }
+          overflow = true;
         } else {
           out.push({ path: rel, abs: join(root, rel), grammar });
         }
@@ -173,6 +192,9 @@ async function collect(
     }
     // Depth-first in sorted order: push in reverse so the first directory is walked first.
     for (const s of subdirs.reverse()) stack.push(s);
+  }
+  if (overflow && !skipped.some((s) => s.reason === 'too-many-files')) {
+    skipped.push({ path: '.', reason: 'too-many-files', affectsCompleteness: true });
   }
   return out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 }
@@ -190,8 +212,10 @@ export async function buildMap(options: MapOptions): Promise<RepoMap> {
 
   const skipped: SkippedPath[] = [];
   const limitsHit = new Set<LimitHit>();
-  const entries = await collect(options.root, limits, skipped);
+  const entries = await collect(options.root, limits, skipped, deadline);
   if (skipped.some((s) => s.reason === 'too-many-files')) limitsHit.add('files');
+  if (skipped.some((s) => s.reason === 'entry-limit')) limitsHit.add('entries');
+  if (skipped.some((s) => s.reason === 'time-budget')) limitsHit.add('time');
 
   let fnCounter = 0;
   const nextFnId = (): number => fnCounter++;
@@ -206,21 +230,39 @@ export async function buildMap(options: MapOptions): Promise<RepoMap> {
     }
     let text: string;
     try {
-      const st = await lstat(e.abs);
-      if (!st.isFile()) {
+      const before = await lstat(e.abs);
+      if (!before.isFile()) {
         skipped.push({ path: e.path, reason: 'unreadable', affectsCompleteness: true });
         continue;
       }
-      if (st.size > limits.maxFileBytes) {
-        skipped.push({ path: e.path, reason: 'too-large', affectsCompleteness: true });
-        continue;
+      // Open without following a link that appeared since the walk, and size the opened file.
+      const handle = await open(e.abs, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+      let buf: Buffer;
+      try {
+        const st = await handle.stat();
+        if (!st.isFile()) {
+          skipped.push({ path: e.path, reason: 'unreadable', affectsCompleteness: true });
+          continue;
+        }
+        if (st.size > limits.maxFileBytes) {
+          skipped.push({ path: e.path, reason: 'too-large', affectsCompleteness: true });
+          continue;
+        }
+        if (totalBytes + st.size > limits.maxTotalBytes) {
+          limitsHit.add('total-bytes');
+          skipped.push({ path: e.path, reason: 'total-bytes-exceeded', affectsCompleteness: true });
+          continue;
+        }
+        buf = Buffer.alloc(Math.min(st.size, limits.maxFileBytes) + 1);
+        const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
+        if (bytesRead > limits.maxFileBytes) {
+          skipped.push({ path: e.path, reason: 'too-large', affectsCompleteness: true });
+          continue;
+        }
+        buf = buf.subarray(0, bytesRead);
+      } finally {
+        await handle.close();
       }
-      if (totalBytes + st.size > limits.maxTotalBytes) {
-        limitsHit.add('total-bytes');
-        skipped.push({ path: e.path, reason: 'total-bytes-exceeded', affectsCompleteness: true });
-        continue;
-      }
-      const buf = await readFile(e.abs);
       totalBytes += buf.length;
       if (buf.includes(0)) {
         skipped.push({ path: e.path, reason: 'binary', affectsCompleteness: true });
@@ -255,8 +297,9 @@ export async function buildMap(options: MapOptions): Promise<RepoMap> {
 
   const interp: InterpOutput = new Interpreter(facts, limits, deadline).run();
   for (const l of interp.limitsHit) limitsHit.add(l);
-  const { routes: flat, truncated } = buildRoutes(interp);
+  const { routes: flat, truncated, timedOut } = buildRoutes(interp, deadline);
   if (truncated) limitsHit.add('routes');
+  if (timedOut) limitsHit.add('time');
 
   const uses = new Map<string, number>();
   for (const f of facts.values()) for (const [k, v] of f.uses) uses.set(k, (uses.get(k) ?? 0) + v);

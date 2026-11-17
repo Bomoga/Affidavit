@@ -18,6 +18,8 @@ export interface MapLimits {
   maxAstDepth: number;
   /** Most syntax nodes kept per file. */
   maxNodesPerFile: number;
+  /** Directory entries listed while looking for source files. */
+  maxEntries: number;
   /** Directory nesting walked below the root. */
   maxDirDepth: number;
   /** Deepest chain of inlined calls while interpreting. */
@@ -41,6 +43,7 @@ export const DEFAULT_MAP_LIMITS: MapLimits = {
   maxTotalNodes: 2_500_000,
   maxAstDepth: 100,
   maxNodesPerFile: 400_000,
+  maxEntries: 200_000,
   maxDirDepth: 40,
   maxCallDepth: 12,
   maxSteps: 3_000_000,
@@ -63,7 +66,9 @@ export type MapSkipReason =
   | 'minified'
   | 'declaration-file'
   | 'excluded-directory'
-  | 'directory-too-deep';
+  | 'directory-too-deep'
+  | 'entry-limit'
+  | 'time-budget';
 
 /** A file or directory the map did not read. Reported so a gap is never silent. */
 export interface SkippedPath {
@@ -110,7 +115,9 @@ export type LimitHit =
   | 'total-bytes'
   | 'total-nodes'
   | 'value-set-cap'
-  | 'routes';
+  | 'routes'
+  | 'sweep'
+  | 'entries';
 
 export interface MapCoverage {
   /**
@@ -151,6 +158,10 @@ export interface ChainItem {
   external: boolean;
   /** True when the argument resolved to neither a function in the repo nor a known package. */
   unresolved: boolean;
+  /** True when the item may check authentication but the map cannot tell (optional or conditional
+   * options, a name that looks like a guard on code that is not one, a guard that may let the
+   * request through before it checks). */
+  authUncertain?: boolean;
   /** Why the map treats this item as an authentication guard, if it does. */
   authGuard?: 'name' | 'body';
 }

@@ -242,6 +242,21 @@ export function prepass(
     if (IDENT.has(n.t) && n.x && parent && !isDeclarationPosition(n, parent, field, grand)) {
       uses.set(n.x, (uses.get(n.x) ?? 0) + 1);
     }
+    // A string key names a member as surely as an identifier does: `o['go']()`, `{ 'go': f }`.
+    if (n.t === 'subscript_expression') {
+      const idx = n.f['index'];
+      const s = plainString(idx);
+      if (s !== undefined) uses.set(s, (uses.get(s) ?? 0) + 1);
+      else if (idx?.t === 'template_string') {
+        for (const c of idx.c) {
+          const t = c.t === 'string_fragment' ? c.x?.trim() : undefined;
+          if (t) uses.set(t, (uses.get(t) ?? 0) + 1);
+        }
+      }
+    } else if ((n.t === 'pair' || n.t === 'pair_pattern') && n.f['key']?.t === 'string') {
+      const s = plainString(n.f['key']);
+      if (s !== undefined) uses.set(s, (uses.get(s) ?? 0) + 1);
+    }
     if (n.t === 'call_expression') {
       const fnNode = n.f['function'];
       const args = n.f['arguments'];

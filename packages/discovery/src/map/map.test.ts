@@ -285,7 +285,8 @@ describe('routes: authentication guards', () => {
   it('says true for a guard by name or by body, false when every middleware is known and no guard, unknown otherwise', async () => {
     const m = await mapOf({
       'server.js': server,
-      'auth.js': 'exports.isLoggedIn = (req, res, next) => next();',
+      'auth.js':
+        "exports.isLoggedIn = (req, res, next) => { if (req.session.uid) return next(); return res.redirect('/'); };",
     });
     const a = (p: string) => m.routes.find((r) => r.route.path === p)?.route.authRequired;
     expect(a('/by-name')).toBe(true);
@@ -818,6 +819,365 @@ describe('more patterns', () => {
     expect(m.coverage.skipped.every((s) => s.affectsCompleteness)).toBe(true);
     const ok = await mapOf(files);
     expect(sigs(ok)).toEqual(['GET /bom']);
+  });
+});
+
+const notUnreachable = (m: RepoMap, c: MapCandidate): void => {
+  const r = verdict(m, c);
+  expect(r?.reachability, `${c.file}:${c.range.startLine} ${r?.reason}`).not.toBe('unreachable');
+};
+
+describe('fix round 1: never a false unreachable', () => {
+  it('evaluates every argument and array element (no silent cut at 64 or 256)', async () => {
+    const noops = Array.from({ length: 70 }, (_, i) => `(q, s, n) => n${i}`).join(', ');
+    const many = Array.from({ length: 300 }, () => '(q, s, n) => n()').join(',\n');
+    const m = await mapOf({
+      'a.js': [
+        "const app = require('express')();",
+        `app.get('/args', ${noops}, function lastHandler(req, res) {`,
+        "  res.send('x');",
+        '});',
+        `const list = [${many},`,
+        '  function lastInArray(req, res) {',
+        "    res.send('y');",
+        '  },',
+        '];',
+        "app.get('/arr', list);",
+      ].join('\n'),
+    });
+    // Line 2-4 is the handler after 70 middleware; it must be seen and reachable.
+    expect(verdict(m, at('a.js', 3))?.reachability).toBe('reachable');
+    // The array was cut at 256 and that is reported, so its tail is never "unreachable".
+    expect(m.coverage.limitsHit).toContain('value-set-cap');
+    expect(m.coverage.complete).toBe(false);
+    notUnreachable(m, at('a.js', 7));
+  });
+
+  it('treats code handed to a package from any function as an external entry', async () => {
+    const files = {
+      'a.js': [
+        "const http = require('http');",
+        'function start() {',
+        '  http.createServer(function handle(req, res) {', // 3
+        '    res.end("a");', // 4
+        '  }).listen(1);',
+        '}',
+        'start();',
+      ].join('\n'),
+      'koa.js': [
+        'module.exports = function () {',
+        "  const Koa = require('koa');",
+        '  const k = new Koa();',
+        '  k.use(async function mw(ctx) {', // 4
+        '    ctx.body = "k";', // 5
+        '  });',
+        '};',
+      ].join('\n'),
+      'app.js': "const app = require('express')();\napp.get('/ok', (req, res) => res.end());",
+    };
+    const m = await mapOf(files);
+    notUnreachable(m, at('a.js', 4));
+    notUnreachable(m, at('koa.js', 5));
+  });
+
+  it('reads a registration made through .call and .apply', async () => {
+    const m = await mapOf({
+      'app.js': [
+        "const app = require('express')();",
+        "app.get.call(app, '/c', function viaCall(req, res) {", // 2
+        '  res.end();', // 3
+        '});',
+        "app.post.apply(app, ['/p', function viaApply(req, res) {", // 5
+        '  res.end();', // 6
+        '}]);',
+      ].join('\n'),
+    });
+    expect(sigs(m).sort()).toEqual(['GET /c', 'POST /p']);
+    expect(verdict(m, at('app.js', 3))?.reachability).toBe('reachable');
+    expect(verdict(m, at('app.js', 6))?.reachability).toBe('reachable');
+  });
+
+  it('counts string and template keys as references, and unresolved computed calls as leaks', async () => {
+    const m = await mapOf({
+      'lib.js': [
+        'const base = {',
+        '  go() {', // 2
+        '    return 1;', // 3
+        '  },',
+        '};',
+        'const o = Object.create(base);',
+        "o['go']();",
+        'const t = {',
+        '  tpl() {', // 8
+        '    return 2;', // 9
+        '  },',
+        '};',
+        'const k = Object.assign({}, t);',
+        'k[`tp${"l"}`]();',
+      ].join('\n'),
+      'z.js': "const app = require('express')();\napp.get('/z', (req, res) => res.end());",
+    });
+    notUnreachable(m, at('lib.js', 3));
+    notUnreachable(m, at('lib.js', 9));
+    const leak = await mapOf({
+      'lib.js': 'function dead() {\n  return 1;\n}',
+      'z.js': 'const lib = require("lib");\nconst k = process.argv[2];\nlib[k]();',
+    });
+    expect(leak.coverage.leaks.map((l) => l.kind)).toContain('dynamic-dispatch');
+    expect(verdict(leak, at('lib.js', 2))?.reachability).toBe('unknown');
+  });
+
+  it('hands off functions inside objects and arrays given to a package', async () => {
+    const m = await mapOf({
+      'hapi.js': [
+        "const Hapi = require('@hapi/hapi');",
+        'const server = Hapi.server();',
+        'server.route([{',
+        "  method: 'GET',",
+        "  path: '/h',",
+        '  handler(request) {', // 6
+        "    return 'h';", // 7
+        '  },',
+        '}]);',
+      ].join('\n'),
+      'cron.js': [
+        "const cron = require('node-cron');",
+        "cron.schedule('* * * * *', {",
+        '  run() {', // 3
+        '    return 1;', // 4
+        '  },',
+        '});',
+      ].join('\n'),
+      'gql.js': [
+        "const { ApolloServer } = require('apollo-server');",
+        'const resolvers = { Query: { me: function me() { return 1; } } };', // 2
+        'new ApolloServer({ resolvers });',
+      ].join('\n'),
+      'z.js': "const app = require('express')();\napp.get('/z', (req, res) => res.end());",
+    });
+    notUnreachable(m, at('hapi.js', 7));
+    notUnreachable(m, at('cron.js', 4));
+    notUnreachable(m, at('gql.js', 2));
+  });
+
+  it('treats decorated classes and methods as framework entry points', async () => {
+    const m = await mapOf({
+      'c.ts': [
+        "import { Controller, Get } from '@nestjs/common';",
+        '@Controller()',
+        'export class Cats {',
+        '  @Get()',
+        '  list() {', // 5
+        "    return 'cats';", // 6
+        '  }',
+        '}',
+      ].join('\n'),
+      'z.ts':
+        "import express from 'express';\nconst app = express();\napp.get('/z', (req, res) => res.end());",
+    });
+    notUnreachable(m, at('c.ts', 6));
+  });
+
+  it('does not hang on mounts that branch at every level, and reports the cut', async () => {
+    const n = 14;
+    const lines = ["const express = require('express');", 'const app = express();'];
+    for (let i = 0; i < n; i++) lines.push(`const r${i} = express.Router();`);
+    for (let i = 0; i < n - 1; i++) {
+      for (const p of ['a', 'b', 'c', 'd']) lines.push(`r${i}.use('/${p}', r${i + 1});`);
+    }
+    // No route at the leaf: nothing stops the walk early except its own budget.
+    lines.push("app.use('/r', r0);");
+    const started = Date.now();
+    const m = await mapOf({ 'big.js': lines.join('\n') });
+    expect(Date.now() - started).toBeLessThan(20_000);
+    expect(m.coverage.limitsHit.some((l) => l === 'routes' || l === 'time')).toBe(true);
+    expect(m.coverage.complete).toBe(false);
+  }, 30_000);
+});
+
+describe('fix round 1: auth is a proven guard or unknown', () => {
+  const auth = async (mw: string, extra: Record<string, string> = {}) => {
+    const m = await mapOf({
+      'app.js': [
+        "const app = require('express')();",
+        "const jwt = require('express-jwt');",
+        'const csrfProtection = (req, res, next) => next();',
+        'const isLoggedIn = (req, res, next) => next();',
+        'const early = (req, res, next) => { next(); if (!req.user) return res.redirect("/"); };',
+        `app.get('/x', ${mw}, (req, res) => res.end());`,
+      ].join('\n'),
+      ...extra,
+    });
+    return m.routes[0]?.route.authRequired;
+  };
+
+  it('does not take protect/csrf-like names, or a repo function that always calls next, for a guard', async () => {
+    expect(await auth('csrfProtection')).not.toBe(true);
+    expect(await auth('isLoggedIn')).not.toBe(true);
+    expect(await auth('isLoggedIn')).toBe('unknown');
+  });
+
+  it('gives unknown for package middleware whose check can be switched off', async () => {
+    expect(await auth('jwt({ secret: "s" })')).toBe(true);
+    expect(await auth('jwt({ secret: "s", credentialsRequired: false })')).toBe('unknown');
+    expect(await auth('jwt({ secret: "s" }).unless({ path: ["/x"] })')).toBe('unknown');
+  });
+
+  it('gives unknown when the guard may let the request through before it checks', async () => {
+    expect(await auth('early')).toBe('unknown');
+  });
+
+  it('gives unknown, not true, for a guard scoped to a path it cannot pin down', async () => {
+    const m = await mapOf({
+      'app.js': [
+        "const app = require('express')();",
+        'const guard = (req, res, next) => { if (req.user) return next(); return res.sendStatus(401); };',
+        'app.use(process.env.SCOPE, guard);',
+        "app.get('/x', (req, res) => res.end());",
+      ].join('\n'),
+    });
+    const r = m.routes[0];
+    expect(r?.chain.map((c) => c.label)).toContain('guard');
+    expect(r?.route.authRequired).toBe('unknown');
+  });
+
+  it('gives unknown, not false, when a scope list was cut', async () => {
+    const paths = Array.from({ length: 20 }, (_, i) => `'/p${i}'`).join(', ');
+    const m = await mapOf({
+      'app.js': [
+        "const app = require('express')();",
+        'const guard = (req, res, next) => { if (req.user) return next(); return res.sendStatus(401); };',
+        `app.use([${paths}], guard);`,
+        "app.get('/p19/x', (req, res) => res.end());",
+      ].join('\n'),
+    });
+    expect(m.coverage.limitsHit).toContain('value-set-cap');
+    expect(m.routes[0]?.route.authRequired).toBe('unknown');
+  });
+});
+
+describe('fix round 1: route paths in the output', () => {
+  it('caps a joined path after mounts and marks it dynamic', async () => {
+    const seg = 'x'.repeat(150);
+    const m = await mapOf({
+      'a.js': [
+        "const express = require('express');",
+        'const app = express();',
+        'const r1 = express.Router();',
+        'const r2 = express.Router();',
+        `app.use('/${seg}', r1);`,
+        `r1.use('/${seg}', r2);`,
+        "r2.get('/end', (req, res) => res.end());",
+      ].join('\n'),
+    });
+    expect(m.routes[0]?.route.path.length).toBeLessThanOrEqual(200);
+    expect(m.routes[0]?.pathDynamic).toBe(true);
+  });
+
+  it('strips control and non-URL characters from output paths', async () => {
+    const m = await mapOf({
+      'a.js':
+        "require('express')().get('/a\\u0001\\n\\u202eb c\\\"\\x7f', (req, res) => res.end());",
+    });
+    const p = m.routes[0]?.route.path ?? '';
+    expect(p).toMatch(/^[\x21-\x7e]+$/);
+    expect(p.startsWith('/a')).toBe(true);
+  });
+});
+
+describe('fix round 1: limits and reporting', () => {
+  it('stops listing a directory tree at the entry limit and says so', async () => {
+    const files: Record<string, string> = {};
+    for (let i = 0; i < 12; i++) files[`f${i}.js`] = `exports.v = ${i};`;
+    const m = await mapOf(files, { maxEntries: 5 });
+    expect(m.coverage.limitsHit).toContain('entries');
+    expect(m.coverage.skipped.some((s) => s.reason === 'entry-limit')).toBe(true);
+    expect(m.coverage.complete).toBe(false);
+  });
+
+  it('reports a spent time budget during the file walk', async () => {
+    const m = await mapOf({ 'a.js': 'exports.a = 1;' }, { maxMillis: -1 });
+    expect(m.coverage.skipped.some((s) => s.reason === 'time-budget')).toBe(true);
+  });
+
+  it('keeps reachability details to identifier characters', async () => {
+    const m = await mapOf({
+      'a.js': [
+        "const app = require('express')();",
+        'function ｇｏ() {',
+        '  return 1;',
+        '}',
+        "app.get('/x', (req, res) => res.end(String(ｇｏ)));",
+        'exports.ｇｏ = ｇｏ;',
+      ].join('\n'),
+      'b.js': "const a = require('./a');\nsetTimeout(() => a['ｇｏ'](), 1);",
+    });
+    const r = verdict(m, at('a.js', 3));
+    expect(r?.detail ?? '').toMatch(/^[\x20-\x7e]*$/);
+  });
+});
+
+describe('fix round 1: unreachable is still the right answer for dead code', () => {
+  const app = {
+    'server.js': [
+      "const express = require('express');",
+      "const users = require('./routes/users');",
+      "const { log } = require('./lib/log');",
+      'const app = express();',
+      'app.use(express.json());',
+      "app.use('/users', users);",
+      "app.get('/health', (req, res) => { log('h'); res.end('ok'); });",
+    ].join('\n'),
+    'routes/users.js': [
+      "const router = require('express').Router();",
+      "const repo = require('../lib/repo');",
+      "router.get('/:id', (req, res) => {", // 3
+      '  repo.byId(req.params.id, (err, row) => res.json(row));', // 4
+      '});',
+      'module.exports = router;',
+    ].join('\n'),
+    'lib/repo.js': [
+      "const db = require('./db');",
+      'exports.byId = function byId(id, cb) {', // 2
+      "  db.query('select * from users where id = ' + id, cb);", // 3
+      '};',
+      'exports.legacyExport = function legacyExport(name) {', // 5
+      "  return db.query(`select * from old where n = '${name}'`);", // 6
+      '};',
+      'function neverCalledHelper(x) {', // 8
+      '  return db.query("delete from t where a = " + x);', // 9
+      '}',
+    ].join('\n'),
+    'lib/db.js': 'exports.query = (sql, cb) => cb && cb(null, [sql]);',
+    'lib/log.js': 'exports.log = (m) => console.log(m);',
+  };
+
+  it('says unreachable for an unused exported function and an unused local helper', async () => {
+    const m = await mapOf(app);
+    expect(m.coverage.complete).toBe(true);
+    expect(verdict(m, at('lib/repo.js', 3))?.reachability).toBe('reachable');
+    for (const line of [6, 9]) {
+      const r = verdict(m, at('lib/repo.js', line));
+      expect(r?.reachability, `line ${line}`).toBe('unreachable');
+      expect(r?.reason).toBe('unreferenced');
+    }
+  });
+
+  it('turns that into unknown the moment anything else could reach it', async () => {
+    const referenced = await mapOf({
+      ...app,
+      'job.js':
+        "const { legacyExport } = require('./lib/repo');\nmodule.exports = () => legacyExport('a');",
+    });
+    expect(verdict(referenced, at('lib/repo.js', 6))?.reachability).toBe('unknown');
+    const framework = await mapOf({
+      ...app,
+      'lib/more.js':
+        "const k = new (require('koa'))();\nk.use(function late(ctx) {\n  ctx.body = 1;\n});",
+    });
+    expect(verdict(framework, at('lib/more.js', 3))?.reachability).toBe('unknown');
+    const unparsed = await mapOf({ ...app, 'oops.js': 'const = = ;;; {{{' });
+    expect(verdict(unparsed, at('lib/repo.js', 6))?.reachability).toBe('unknown');
   });
 });
 

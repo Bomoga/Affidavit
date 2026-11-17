@@ -9,7 +9,7 @@
  *   unknown     everything else, with a reason. Downstream never treats this as a dismissal.
  */
 import type { InterpOutput } from './engine.js';
-import { fnRef, type FileFacts, type FnInfo } from './prepass.js';
+import { fnRef, safeIdent, type FileFacts, type FnInfo } from './prepass.js';
 import type { FlatRoute } from './routes.js';
 import type {
   CandidateReachability,
@@ -97,9 +97,27 @@ function derive(m: ReachModel): Derived {
   // another framework's route registration) may be invoked by that package at any time. Code
   // handed over from functions that nothing runs is dead and does not count; code handed over
   // from functions that start-up code runs is followed through the call edges.
-  const extStarts = m.interp.handoffs
-    .filter(([from]) => fnById.get(from)?.kind === 'module')
-    .map(([, to]) => to);
+  const startup = forward(
+    m.interp.edges,
+    [...fnById.values()].filter((f) => f.kind === 'module').map((f) => f.id),
+  );
+  const isDead = (id: number): boolean => {
+    const f = fnById.get(id);
+    if (!f || f.kind === 'module' || startup.has(id) || appReach.has(id)) return false;
+    let named = false;
+    for (let cur: FnInfo | undefined = f; cur && cur.kind !== 'module';) {
+      for (const name of cur.names) {
+        // `module.exports = function () {}` and `export default` name nothing: the function
+        // is whatever the importer calls it.
+        if (name === 'exports' || name === 'default') continue;
+        if ((m.uses.get(name) ?? 0) > 0) return false;
+        named = true;
+      }
+      cur = cur.parent === null ? undefined : fnById.get(cur.parent);
+    }
+    return named;
+  };
+  const extStarts = m.interp.handoffs.filter(([from]) => !isDead(from)).map(([, to]) => to);
   const extReach = forward(m.interp.edges, extStarts);
   const d: Derived = { fnById, rev, entryIndex, appReach, extReach };
   derivedCache.set(m, d);
@@ -332,7 +350,7 @@ function reachOne(m: ReachModel, d: Derived, c: MapCandidate): CandidateReachabi
           c,
           'unknown',
           'referenced-unresolved',
-          `no resolved route reaches this code, but the name "${name.slice(0, 60)}" is referenced somewhere the map could not follow`,
+          `no resolved route reaches this code, but the name "${safeIdent(name)}" is referenced somewhere the map could not follow`,
           { fn: ref },
         );
       }
