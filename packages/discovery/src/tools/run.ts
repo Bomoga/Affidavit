@@ -12,7 +12,12 @@ import {
   type QuarantinedSnapshot,
 } from './quarantine.js';
 import { findGitleaksUnscannable, type Unscannable } from './unscannable.js';
-import { remapWindowReport, windowPathParts, writeWindows } from './windows.js';
+import {
+  assertMaxWindowBytes,
+  remapWindowReport,
+  windowPathParts,
+  writeWindows,
+} from './windows.js';
 
 export type RunToolOptions = Omit<ToolRunOptions, 'sourceDir'> & {
   /** The quarantined scan copy. Its removed-path list is passed through on the result. */
@@ -241,6 +246,12 @@ const KIND_TEXT: Record<Exclude<Unscannable['kind'], 'binary-media'>, string> = 
 const QUARANTINED_ARCHIVE_TEXT =
   'was moved to the quarantine sidecar and has a name gitleaks reads as an archive but is not one, so gitleaks drops it and its content is NOT scanned (sidecar files are not windowed)';
 
+// An archive-named file that was not windowed (a PDF or executable or another
+// signature gitleaks skips whatever the name, or a file whose windows failed or ran out of budget)
+// gets no second scan, so the usual 'scanned in a window' wording would be wrong for it.
+const NOT_WINDOWED_ARCHIVE_TEXT =
+  'has a name gitleaks reads as an archive but is not one, so gitleaks drops it, and it was not scanned in a window either (it carries a file signature gitleaks skips whatever the name, or its windows could not be written), so its content is NOT scanned';
+
 const KIND_ORDER = [
   'binary-header-mismatch',
   'non-text-content',
@@ -251,12 +262,25 @@ const KIND_ORDER = [
   'multiline-split-risk',
 ] as const;
 
+function archiveText(
+  f: Unscannable & { quarantined?: boolean },
+  kind: string,
+  windowed: ReadonlySet<string>,
+): string | undefined {
+  if (kind !== 'archive-name-mismatch') return undefined;
+  if (f.quarantined) return QUARANTINED_ARCHIVE_TEXT;
+  return windowed.has(`/src/${f.path}`) ? undefined : NOT_WINDOWED_ARCHIVE_TEXT;
+}
+
 /**
  * Splits gitleaks coverage findings. Everything except media files (image, audio, video) is a
  * coverage loss: it becomes a notification, never truncated, listed by severity. gitleaks reads
  * media files as text (probed), so they lose nothing and are returned apart.
  */
-function coverageSplit(files: readonly (Unscannable & { quarantined?: boolean })[]): {
+function coverageSplit(
+  files: readonly (Unscannable & { quarantined?: boolean })[],
+  windowed: ReadonlySet<string>,
+): {
   notifications: ToolNotification[];
   binaryMediaFiles: string[];
 } {
@@ -267,7 +291,7 @@ function coverageSplit(files: readonly (Unscannable & { quarantined?: boolean })
         notifications.push({
           level: 'warning',
           id: kind,
-          message: `/src/${f.path} ${f.quarantined && kind === 'archive-name-mismatch' ? QUARANTINED_ARCHIVE_TEXT : KIND_TEXT[kind]}`,
+          message: `/src/${f.path} ${archiveText(f, kind, windowed) ?? KIND_TEXT[kind]}`,
         });
       }
     }
@@ -313,6 +337,17 @@ function mapSidecarUri(uri: string, mapping: ReadonlyMap<string, string>): strin
   return mapped === undefined ? uri : `/src/${mapped}`;
 }
 
+/** Replaces `q0001/...` sidecar paths inside free text with the original path. */
+function mapSidecarText(text: string, mapping: ReadonlyMap<string, string>): string {
+  return text.replace(
+    /(?<![\w.-])(q\d{4,})((?:\/[^\s"']*)?)/g,
+    (whole, q: string, rest: string) => {
+      const original = mapping.get(q);
+      return original === undefined ? whole : `${original}${rest}`;
+    },
+  );
+}
+
 async function rewriteSidecarReport(
   file: string,
   doc: unknown,
@@ -324,7 +359,11 @@ async function rewriteSidecarReport(
       const o = v as Record<string, unknown>;
       for (const [k, val] of Object.entries(o)) {
         if (k === 'uri' && typeof val === 'string') o[k] = mapSidecarUri(val, mapping);
-        else walk(val);
+        else if (k === 'message' && val !== null && typeof val === 'object') {
+          // gitleaks names the scanned path in the message text: no sidecar name may reach it
+          const m = val as { text?: unknown };
+          if (typeof m.text === 'string') m.text = mapSidecarText(m.text, mapping);
+        } else walk(val);
       }
     }
   };
@@ -391,6 +430,7 @@ export async function runTool(
   options: RunToolOptions,
 ): Promise<ToolRunResult> {
   const { snapshot, maxReportBytes, maxWindowBytes, ...rest } = options;
+  assertMaxWindowBytes(maxWindowBytes); // before anything runs, so NaN cannot mean "unlimited"
   const maxBytes = maxReportBytes ?? DEFAULT_MAX_REPORT_BYTES;
   const q = snapshot.removed;
   const outputDir = resolve(options.outputDir);
@@ -573,7 +613,10 @@ export async function runTool(
       // is the unique directory created above, never a path another run could own.
       await rm(windowsDir, { recursive: true, force: true });
     }
-    const split = coverageSplit(unscanned.sort((a, b) => a.path.localeCompare(b.path)));
+    const split = coverageSplit(
+      unscanned.sort((a, b) => a.path.localeCompare(b.path)),
+      new Set(windowedFiles),
+    );
     notifications.push(...split.notifications);
     binaryMediaFiles = split.binaryMediaFiles;
   }

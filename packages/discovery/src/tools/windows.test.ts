@@ -448,3 +448,91 @@ describe('remapWindowReport', () => {
     ).toEqual([59_999, 79_999]);
   });
 });
+
+describe('writeWindows budget and options', () => {
+  const setup = () => {
+    const root = tmp();
+    const snap = join(root, 'snap');
+    mkdirSync(snap);
+    writeFileSync(join(snap, 'a.txt'), randomText(61, 120_000, false));
+    return { snap, windowsDir: wdir(root) };
+  };
+
+  it('writes a file whose windows exactly fill the budget and skips it one byte short', async () => {
+    const full = setup();
+    const total = (await writeWindows(full.snap, full.windowsDir)).bytes;
+    expect(total).toBeGreaterThan(0);
+
+    const exact = setup();
+    const atLimit = await writeWindows(exact.snap, exact.windowsDir, { maxBytes: total });
+    expect(atLimit.skippedForBudget).toEqual([]);
+    expect(atLimit.bytes).toBe(total);
+
+    const short = setup();
+    const under = await writeWindows(short.snap, short.windowsDir, { maxBytes: total - 1 });
+    expect(under.skippedForBudget).toEqual(['a.txt']);
+    expect(under.bytes).toBeLessThanOrEqual(total - 1);
+  });
+
+  it.each([Number.NaN, -1, Number.POSITIVE_INFINITY])('refuses maxBytes %s', async (bad) => {
+    const { snap, windowsDir } = setup();
+    await expect(writeWindows(snap, windowsDir, { maxBytes: bad })).rejects.toBeInstanceOf(
+      RangeError,
+    );
+    expect(readdirSync(windowsDir)).toEqual([]);
+  });
+
+  it('accepts a budget of 0 and writes nothing', async () => {
+    const { snap, windowsDir } = setup();
+    const res = await writeWindows(snap, windowsDir, { maxBytes: 0 });
+    expect(res.entries).toEqual([]);
+    expect(res.skippedForBudget).toEqual(['a.txt']);
+  });
+});
+
+describe('remapWindowReport message text', () => {
+  const entry: WindowEntry = {
+    name: 'w0003/p0001',
+    original: 'a/b.gz.yaml',
+    startLine: 1,
+    startColumn: 0,
+  };
+  const doc = (text: string | undefined) => ({
+    runs: [
+      {
+        results: [
+          {
+            ruleId: 'rule-x',
+            ...(text === undefined ? {} : { message: { text } }),
+            locations: [
+              {
+                physicalLocation: {
+                  artifactLocation: { uri: '/src/w0003/p0001/a/b._gz.yaml' },
+                  region: { startLine: 2, endLine: 2, startColumn: 1, endColumn: 4 },
+                },
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  });
+
+  it('swaps the internal path for the original one', () => {
+    const d = doc('rule-x has detected secret for file /src/w0003/p0001/a/b._gz.yaml.');
+    remapWindowReport(d, [entry]);
+    expect((d.runs[0]?.results[0] as { message?: { text: string } }).message?.text).toBe(
+      'rule-x has detected secret for file /src/a/b.gz.yaml.',
+    );
+  });
+
+  it('replaces text that still holds an internal path after the swap', () => {
+    const d = doc('see w0003/p0001 and more');
+    remapWindowReport(d, [entry]);
+    expect(JSON.stringify(d)).not.toMatch(/w\d{4}\/p\d{4}/);
+  });
+
+  it('leaves a result without message text alone', () => {
+    expect(remapWindowReport(doc(undefined), [entry])).toBe(1);
+  });
+});

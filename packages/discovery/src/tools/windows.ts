@@ -69,6 +69,16 @@ export interface WindowEntry {
   startColumn: number;
 }
 
+/** Throws unless `value` is a finite number of at least 0 (NaN and Infinity are refused, not "unlimited"). */
+export function assertMaxWindowBytes(value: number | undefined): void {
+  if (value === undefined) return;
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    throw new RangeError(
+      `maxWindowBytes must be a finite number of at least 0, got ${String(value)}`,
+    );
+  }
+}
+
 export class WindowsDirNotFreshError extends Error {
   constructor(dir: string) {
     super(`windows directory must exist and be empty before a run: ${dir}`);
@@ -190,6 +200,7 @@ export async function writeWindows(
   windowsDir: string,
   options: WriteWindowsOptions = {},
 ): Promise<WindowsResult> {
+  assertMaxWindowBytes(options.maxBytes);
   const maxBytes = options.maxBytes ?? MAX_WINDOW_BYTES;
   if ((await readdir(windowsDir)).length > 0) throw new WindowsDirNotFreshError(windowsDir);
 
@@ -233,7 +244,9 @@ export async function writeWindows(
         const kind = classifyHead(e.name, head);
         const big = st.size > BIG_FILE && kind === undefined;
         // A name gitleaks reads as an archive: plain text or an image is worth windowing under a
-        // neutral name. A PDF or executable is skipped by gitleaks whatever it is called.
+        // neutral name. A PDF or executable (any "other" signature) is skipped by gitleaks whatever
+        // it is called, and an empty file has nothing to window; neither is windowed, and runTool
+        // words their notification as NOT scanned.
         const archiveNamed =
           kind === 'archive-name-mismatch' && st.size > 0 && signatureClass(head) !== 'other';
         if (!big && !archiveNamed) continue;
@@ -285,9 +298,15 @@ export async function writeWindows(
       } else {
         // A path that is too long, a full disk, a permission error: report this file and go on.
         // Its windows are removed, so no finding can carry a raw wNNNN path with no entry for it.
-        failed.push({ original: c.original, why: whyOf(err) });
         bytes -= mineBytes;
-        await rm(join(windowsDir, sub), { recursive: true, force: true });
+        let why = whyOf(err);
+        try {
+          await rm(join(windowsDir, sub), { recursive: true, force: true });
+        } catch (rmErr) {
+          // never let a cleanup error escape as an untyped error; say so in the reason instead
+          why += `; removing its partial windows failed (${whyOf(rmErr)})`;
+        }
+        failed.push({ original: c.original, why });
       }
     }
   }
@@ -311,7 +330,30 @@ interface SarifLocation {
 }
 interface SarifResult {
   ruleId?: string;
+  message?: { text?: string };
   locations?: SarifLocation[];
+}
+
+/** Anything that still looks like an internal window path (`w0001/p0002`). */
+const INTERNAL_WINDOW_PATH = /w\d{4,}\/p\d{4,}/;
+
+/**
+ * gitleaks puts the scanned path in `message.text`. Swap the internal `wNNNN/pNNNN/<neutral path>`
+ * for the original path so no generated name reaches report text. If anything internal is left
+ * after that, the text is replaced by a generic one.
+ */
+function rewriteMessage(
+  result: SarifResult,
+  mapped: { internal: string; original: string }[],
+): void {
+  const text = result.message?.text;
+  if (typeof text !== 'string' || result.message === undefined || mapped.length === 0) return;
+  let out = text;
+  for (const m of mapped) out = out.split(m.internal).join(m.original);
+  if (INTERNAL_WINDOW_PATH.test(out)) {
+    out = `${result.ruleId ?? 'a rule'} detected a secret in /src/${mapped[0]?.original ?? ''}`;
+  }
+  result.message.text = out;
 }
 
 /**
@@ -341,6 +383,7 @@ export function remapWindowReport(doc: unknown, entries: readonly WindowEntry[])
     const out: SarifResult[] = [];
     for (const result of run.results ?? []) {
       const keys: string[] = [];
+      const mapped: { internal: string; original: string }[] = [];
       for (const loc of result.locations ?? []) {
         const pl = loc.physicalLocation;
         const uri = pl?.artifactLocation?.uri;
@@ -348,6 +391,12 @@ export function remapWindowReport(doc: unknown, entries: readonly WindowEntry[])
         const w = parts === undefined ? undefined : byName.get(parts.name);
         if (pl === undefined || w === undefined) continue;
         if (pl.artifactLocation) pl.artifactLocation.uri = `/src/${w.original}`;
+        if (parts !== undefined) {
+          mapped.push({
+            internal: parts.rest === '' ? parts.name : `${parts.name}/${parts.rest}`,
+            original: w.original,
+          });
+        }
         const r = pl.region;
         if (r !== undefined) {
           const shiftCol = (line: number | undefined, col: number | undefined) =>
@@ -367,6 +416,7 @@ export function remapWindowReport(doc: unknown, entries: readonly WindowEntry[])
           ),
         );
       }
+      rewriteMessage(result, mapped);
       const key = keys.join('&');
       if (keys.length > 0 && seen.has(key)) continue;
       if (keys.length > 0) seen.add(key);
