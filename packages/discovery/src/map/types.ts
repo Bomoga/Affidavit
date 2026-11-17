@@ -123,6 +123,7 @@ export type LimitHit =
   | 'value-set-cap'
   | 'routes'
   | 'sweep'
+  | 'recursion-cutoff'
   | 'entries';
 
 export interface MapCoverage {

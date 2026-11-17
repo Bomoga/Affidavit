@@ -145,36 +145,53 @@ async function collect(
     const cur = stack.pop();
     if (!cur) break;
     if (Date.now() > deadline) {
-      skipped.push({ path: cur.rel || '.', reason: 'time-budget', affectsCompleteness: true });
+      skipped.push({
+        path: reduceName(cur.rel) || '.',
+        reason: 'time-budget',
+        affectsCompleteness: true,
+      });
       break;
     }
     let entries;
     try {
       entries = await readdir(join(root, cur.rel), { withFileTypes: true });
     } catch {
-      skipped.push({ path: cur.rel || '.', reason: 'unreadable', affectsCompleteness: true });
+      skipped.push({
+        path: reduceName(cur.rel) || '.',
+        reason: 'unreadable',
+        affectsCompleteness: true,
+      });
       continue;
     }
     listed += entries.length;
     if (listed > limits.maxEntries) {
-      skipped.push({ path: cur.rel || '.', reason: 'entry-limit', affectsCompleteness: true });
+      skipped.push({
+        path: reduceName(cur.rel) || '.',
+        reason: 'entry-limit',
+        affectsCompleteness: true,
+      });
       break;
     }
     entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     const subdirs: { rel: string; depth: number }[] = [];
     for (const e of entries) {
       const rel = cur.rel ? posix.join(cur.rel, e.name) : e.name;
+      const shown = reduceName(rel);
       if (UNSAFE_NAME.test(e.name) && (e.isDirectory() || grammarFor(e.name) !== undefined)) {
         // Reported under a reduced name, and never read: the name would reach the output.
         skipped.push({ path: reduceName(rel), reason: 'unsafe-name', affectsCompleteness: true });
       } else if (e.isSymbolicLink()) {
-        skipped.push({ path: rel, reason: 'symlink', affectsCompleteness: true });
+        skipped.push({ path: shown, reason: 'symlink', affectsCompleteness: true });
       } else if (e.isDirectory()) {
         const excluded = EXCLUDED_DIRS.get(e.name);
         if (excluded !== undefined) {
-          skipped.push({ path: rel, reason: 'excluded-directory', affectsCompleteness: excluded });
+          skipped.push({
+            path: shown,
+            reason: 'excluded-directory',
+            affectsCompleteness: excluded,
+          });
         } else if (cur.depth + 1 > limits.maxDirDepth) {
-          skipped.push({ path: rel, reason: 'directory-too-deep', affectsCompleteness: true });
+          skipped.push({ path: shown, reason: 'directory-too-deep', affectsCompleteness: true });
         } else {
           subdirs.push({ rel, depth: cur.depth + 1 });
         }
@@ -182,15 +199,15 @@ async function collect(
         const grammar = grammarFor(e.name);
         if (!grammar) continue;
         if (/\.d\.[cm]?ts$/.test(e.name)) {
-          skipped.push({ path: rel, reason: 'declaration-file', affectsCompleteness: false });
+          skipped.push({ path: shown, reason: 'declaration-file', affectsCompleteness: false });
         } else if (/\.min\.[cm]?js$/.test(e.name)) {
           // Not read (a bundle is not worth the budget), but it may hold first-party code, so
           // skipping it counts against completeness.
-          skipped.push({ path: rel, reason: 'minified', affectsCompleteness: true });
+          skipped.push({ path: shown, reason: 'minified', affectsCompleteness: true });
         } else if (out.length >= limits.maxFiles) {
           // The limit is reported once through `limitsHit`; the first few are listed by name.
           if (skipped.length < MAX_LISTED_SKIPS) {
-            skipped.push({ path: rel, reason: 'too-many-files', affectsCompleteness: true });
+            skipped.push({ path: shown, reason: 'too-many-files', affectsCompleteness: true });
           }
           overflow = true;
         } else {

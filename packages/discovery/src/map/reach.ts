@@ -112,7 +112,7 @@ function derive(m: ReachModel): Derived {
         // `module.exports = function () {}` and `export default` name nothing: the function
         // is whatever the importer calls it.
         if (name === 'exports' || name === 'default') continue;
-        if ((m.uses.get(name) ?? 0) > 0) return false;
+        if (alwaysReferenced(cur, name) || (m.uses.get(name) ?? 0) > 0) return false;
         named = true;
       }
       cur = cur.parent === null ? undefined : fnById.get(cur.parent);
@@ -125,6 +125,30 @@ function derive(m: ReachModel): Derived {
   derivedCache.set(m, d);
   return d;
 }
+
+/**
+ * Names the language or a library calls for you: `m + 1` runs `valueOf`, a template literal runs
+ * `toString`, `await` runs `then`, `JSON.stringify` runs `toJSON`. No reference to them exists in
+ * the source, so a missing reference proves nothing.
+ */
+const PROTOCOL_NAMES = new Set([
+  'toString',
+  'valueOf',
+  'toJSON',
+  'then',
+  'catch',
+  'finally',
+  'inspect',
+  'handleEvent',
+  'constructor',
+  'next',
+  'return',
+  'throw',
+  'toLocaleString',
+]);
+
+const alwaysReferenced = (fn: FnInfo, name: string): boolean =>
+  fn.accessor || PROTOCOL_NAMES.has(name) || name.startsWith('Symbol.');
 
 function normalizePath(file: string): string | undefined {
   const p = file.replace(/\\/g, '/').replace(/^\.\//, '');
@@ -360,7 +384,7 @@ function reachOne(m: ReachModel, d: Derived, c: MapCandidate): CandidateReachabi
     for (const name of cur.names) {
       if (name === 'exports' || name === 'default') continue;
       named = true;
-      if ((m.uses.get(name) ?? 0) > 0) {
+      if (alwaysReferenced(cur, name) || (m.uses.get(name) ?? 0) > 0) {
         return result(
           c,
           'unknown',

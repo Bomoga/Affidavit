@@ -1397,6 +1397,185 @@ describe('fix round 2: names and text in the output', () => {
   });
 });
 
+describe('fix round 3: memo, identity, protocol names, recursion', () => {
+  it('does not reuse a call after the array it was given was changed', async () => {
+    const m = await mapOf({
+      'a.js': [
+        "const app = require('express')();",
+        "function reg(l) { app.post('/x', l[0]); }",
+        'const table = [function ha(req, res) { res.end(); }];',
+        'reg(table);',
+        'table[0] = function hb(req, res) {', // 5
+        '  res.end(req.query.x);', // 6
+        '};',
+        'reg(table);',
+      ].join('\n'),
+    });
+    expect(verdict(m, at('a.js', 6))?.reachability).toBe('reachable');
+  });
+
+  it('does not reuse a call after a captured variable or a push changed what it reads', async () => {
+    const m = await mapOf({
+      'a.js': [
+        "const app = require('express')();",
+        'const hs = [function ha(req, res) { res.end(); }];',
+        "function reg() { app.post('/y', hs[hs.length - 1]); app.post('/z', hs[1]); }",
+        'reg();',
+        'hs.push(function hb(req, res) {', // 5
+        '  res.end(req.query.x);', // 6
+        '});',
+        'reg();',
+      ].join('\n'),
+    });
+    expect(verdict(m, at('a.js', 6))?.reachability).not.toBe('unreachable');
+  });
+
+  const guard = async (cond: string, pre = '') => {
+    const m = await mapOf({
+      'app.js': [
+        "const app = require('express')();",
+        `const mw = (req, res, next) => { ${pre} ${cond} };`,
+        "app.get('/x', mw, (req, res) => res.end());",
+      ].join('\n'),
+    });
+    return m.routes[0]?.route.authRequired;
+  };
+
+  it('does not take a function, a session id or the bare passport object for an identity', async () => {
+    expect(await guard("if (req.isAuthenticated) return next(); return res.redirect('/');")).toBe(
+      'unknown',
+    );
+    expect(await guard("if (req.isAuthenticated()) return next(); return res.redirect('/');")).toBe(
+      true,
+    );
+    expect(await guard("if (req.session.id) return next(); return res.redirect('/');")).toBe(
+      'unknown',
+    );
+    expect(await guard("if (req.session.passport) return next(); return res.redirect('/');")).toBe(
+      'unknown',
+    );
+    expect(
+      await guard("if (req.session.passport.user) return next(); return res.redirect('/');"),
+    ).toBe(true);
+  });
+
+  it('gives unknown when the guard rewrites what it reads', async () => {
+    expect(
+      await guard(
+        "if (req.user) return next(); return res.redirect('/');",
+        'req.user = req.user || { guest: true };',
+      ),
+    ).toBe('unknown');
+    expect(
+      await guard(
+        "if (req.session.userId) return next(); return res.redirect('/');",
+        'req.session = {};',
+      ),
+    ).toBe('unknown');
+  });
+
+  it('gives unknown for an auth package given `authRequired: false` or an unlisted package', async () => {
+    const auth = async (decl: string, call: string) => {
+      const m = await mapOf({
+        'app.js': [
+          "const app = require('express')();",
+          decl,
+          `app.get('/x', ${call}, (req, res) => res.end());`,
+        ].join('\n'),
+      });
+      return m.routes[0]?.route.authRequired;
+    };
+    const oidc = "const { auth } = require('express-openid-connect');";
+    expect(await auth(oidc, 'auth({ authRequired: false })')).toBe('unknown');
+    expect(await auth(oidc, 'auth({ authRequired: true })')).toBe(true);
+    const bearer = "const { auth } = require('express-oauth2-jwt-bearer');";
+    expect(await auth(bearer, 'auth({ authRequired: false })')).toBe('unknown');
+    const pp = "const passport = require('passport');";
+    expect(await auth(pp, "passport.authenticate('jwt', { session: false })")).toBe(true);
+    expect(await auth("const jwt = require('jsonwebtoken');", 'jwt.decode')).toBe('unknown');
+  });
+
+  it('never calls a method the language runs for you unreachable', async () => {
+    const m = await mapOf({
+      'a.js': [
+        "const app = require('express')();",
+        'const money = {',
+        '  valueOf() {', // 3
+        '    return 1;', // 4
+        '  },',
+        '};',
+        'const label = {',
+        '  toString() {', // 8
+        "    return 'x';", // 9
+        '  },',
+        '};',
+        'const later = {',
+        '  then(ok) {', // 13
+        '    ok(1);', // 14
+        '  },',
+        '};',
+        'const acc = {',
+        '  get size() {', // 18
+        '    return 2;', // 19
+        '  },',
+        '};',
+        "app.get('/p', async (req, res) => { res.end(`${label}${money + 1}${acc.size}`); await later; });",
+      ].join('\n'),
+    });
+    for (const line of [4, 9, 14, 19]) notUnreachable(m, at('a.js', line));
+  });
+
+  it('reports a recursion cut made with different arguments, and keeps same-argument recursion quiet', async () => {
+    const m = await mapOf({
+      'a.js': [
+        "const app = require('express')();",
+        'function ha(req, res) { res.end(); }',
+        'function hb(req, res) { res.end(); }',
+        'function hc(req, res) {', // 4
+        '  res.end(req.query.x);', // 5
+        '}',
+        'function reg(l) {',
+        '  app.get(l[0], l[1]);',
+        '  if (l[2]) reg(l[2]);',
+        '}',
+        "reg(['/a', ha, ['/b', hb, ['/c', hc]]]);",
+      ].join('\n'),
+    });
+    expect(m.coverage.limitsHit).toContain('recursion-cutoff');
+    expect(m.coverage.complete).toBe(false);
+    notUnreachable(m, at('a.js', 5));
+    const same = await mapOf({
+      'b.js': [
+        'function R(db) {',
+        '  if (!(this instanceof R)) return new R(db);',
+        '  this.db = db;',
+        '}',
+        'const db = {};',
+        'new R(db);',
+      ].join('\n'),
+    });
+    expect(same.coverage.limitsHit).not.toContain('recursion-cutoff');
+  });
+
+  it('reduces the name of a skipped symbolic link', async () => {
+    const { root, parent } = repo({
+      'app.js': "require('express')().get('/ok', (req, res) => res.end());",
+    });
+    writeFileSync(join(parent, 'target'), 'x');
+    let linked = true;
+    try {
+      symlinkSync(join(parent, 'target'), join(root, 'l‮k'));
+    } catch {
+      linked = false;
+    }
+    const m = await buildMap({ root });
+    if (linked) {
+      expect(m.coverage.skipped.some((s) => s.reason === 'symlink')).toBe(true);
+      expect(JSON.stringify(m)).not.toContain('‮');
+    }
+  });
+});
+
 describe('public surface', () => {
   it('rejects a map that did not come from buildMap', () => {
     const fake: RepoMap = {

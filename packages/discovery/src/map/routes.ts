@@ -51,6 +51,16 @@ const AUTH_NAME =
   /(loggedin|logged_in|isauth|authenticat|authoriz|requireslogin|requirelogin|ensurelogin|requiresauth|requireauth|ensureauth|requireuser|checkauth|verifytoken|verifyjwt|jwt|isadmin|requireadmin|ensureadmin|isowner|checkrole|requirerole|hasrole)/i;
 const AUTH_BARE = /(^|[._])auth(\(\))?$/i;
 
+/** Packages whose middleware authenticates, and which members of them do. */
+const GUARD_PACKAGES: Record<string, (path: string[]) => boolean> = {
+  'express-jwt': () => true,
+  'express-oauth2-jwt-bearer': () => true,
+  'express-basic-auth': () => true,
+  'connect-ensure-login': () => true,
+  passport: (p) => p[0] === 'authenticate',
+  'express-openid-connect': (p) => p[0] === 'requiresAuth' || p[0] === 'auth',
+};
+
 /** Name-based guess: does this middleware label look like an authentication check? */
 export function looksLikeAuthName(label: string): boolean {
   if (/^passport\.(initialize|session)\(/i.test(label)) return false;
@@ -73,12 +83,14 @@ function chainText(n: AstNode | undefined, depth = 0): string | undefined {
 
 /** Chains that say who the caller is. An Authorization header is deliberately not here: its
  * presence says nothing about whether the credential was checked. */
-const IDENTITY_CHAIN = [
-  /^(req|request)\.session\.(userid|user|id|loggedin|isloggedin|passport|uid)$/i,
+const IDENTITY_VALUE = [
+  /^(req|request)\.session\.(userid|user|loggedin|isloggedin|uid|passport\.user)$/i,
   /^(req|request)\.user$/i,
   /^ctx\.state\.user$/i,
-  /^(req|request)\.isAuthenticated$/i,
 ];
+/** Identity that only a call answers: `req.isAuthenticated` alone is a function, always truthy. */
+const IDENTITY_CALL = [/^(req|request)\.isAuthenticated$/i];
+const IDENTITY_CHAIN = [...IDENTITY_VALUE, ...IDENTITY_CALL];
 
 const unwrap = (n: AstNode | undefined): AstNode | undefined => {
   let x = n;
@@ -89,10 +101,22 @@ const unwrap = (n: AstNode | undefined): AstNode | undefined => {
 const isIdentityAtom = (n: AstNode | undefined): boolean => {
   const x = unwrap(n);
   if (!x) return false;
-  if (x.t === 'call_expression' && (x.f['arguments']?.c.length ?? 0) > 0) return false;
+  if (x.t === 'call_expression') {
+    if ((x.f['arguments']?.c.length ?? 0) > 0) return false;
+    const t = chainText(x.f['function']);
+    return t !== undefined && IDENTITY_CALL.some((re) => re.test(t));
+  }
   const t = chainText(x);
-  return t !== undefined && IDENTITY_CHAIN.some((re) => re.test(t));
+  return t !== undefined && IDENTITY_VALUE.some((re) => re.test(t));
 };
+
+/** The chain the condition reads (through `!` and parentheses). */
+function atomChain(n: AstNode | undefined): string | undefined {
+  const x = unwrap(n);
+  if (!x) return undefined;
+  if (x.t === 'unary_expression' && x.op === '!') return atomChain(x.c[0]);
+  return chainText(x.t === 'call_expression' ? x.f['function'] : x);
+}
 
 /** `pos`: the condition is true when the caller is known; `neg`: true when not. Only a single
  * identity read (optionally negated) qualifies: anything mixed with another test does not. */
@@ -192,13 +216,25 @@ export function bodyLooksLikeAuthGuard(fn: FnInfo): 'guard' | 'uncertain' | 'no'
   let denies = false;
   let passes = false;
   let hasTry = false;
+  const writes: string[] = [];
   walkAll(body, (n) => {
+    // A write to the chain the guard reads (`req.user = req.user || guest`) changes what it means.
+    if (n.t === 'assignment_expression' || n.t === 'augmented_assignment_expression') {
+      const w = chainText(n.f['left']);
+      if (w) writes.push(w);
+    } else if (n.t === 'update_expression') {
+      const w = chainText(n.c[0]);
+      if (w) writes.push(w);
+    } else if (n.t === 'unary_expression' && n.op === 'delete') {
+      const w = chainText(n.c[0]);
+      if (w) writes.push(w);
+    }
     if (n.t === 'member_expression') {
       const t = chainText(n);
       if (
         t &&
         (IDENTITY_CHAIN.some((re) => re.test(t)) ||
-          /^(req|request)\.(user|auth|headers\.authorization)/i.test(t) ||
+          /^(req|request)\.(user|auth|session|isAuthenticated|headers\.authorization)/i.test(t) ||
           /^ctx\.state\.user/i.test(t))
       ) {
         reads = true;
@@ -219,12 +255,16 @@ export function bodyLooksLikeAuthGuard(fn: FnInfo): 'guard' | 'uncertain' | 'no'
   if (nextName && refCount(body, nextName) > 0) passes = true;
   if (!reads || !denies || !passes) return 'no';
   if (!nextName || hasTry || refCount(body, nextName) !== 1) return 'uncertain';
+  const touched = (chain: string | undefined): boolean =>
+    chain === undefined ||
+    writes.some((w) => chain === w || chain.startsWith(`${w}.`) || w.startsWith(`${chain}.`));
 
   if (body.t !== 'statement_block') {
     const t = unwrap(body);
     if (t?.t === 'ternary_expression') {
       const [cond, a, b] = t.c;
       const pol = polarity(cond);
+      if (touched(atomChain(cond))) return 'uncertain';
       const ok =
         pol === 'pos'
           ? isCallTo(a, nextName) && isDenyExpr(b)
@@ -240,6 +280,7 @@ export function bodyLooksLikeAuthGuard(fn: FnInfo): 'guard' | 'uncertain' | 'no'
   const ifs = stmts[at];
   if (!ifs) return 'uncertain';
   const pol = polarity(ifs.f['condition']);
+  if (touched(atomChain(ifs.f['condition']))) return 'uncertain';
   const alt =
     ifs.f['alternative']?.t === 'else_clause' ? ifs.f['alternative'].c[0] : ifs.f['alternative'];
   const rest = stmts.slice(at + 1);
@@ -321,7 +362,7 @@ export function buildRoutes(
   /** The same registration reached twice (a function run with different arguments) counts once. */
   const seen = new Set<string>();
   const pushRoute = (r: FlatRoute): void => {
-    const key = `${r.kind}|${r.mounted}|${r.route.method}|${r.route.path}|${r.file}|${r.line}|${r.handlerLabel}`;
+    const key = `${r.kind}|${r.mounted}|${r.route.method}|${r.route.path}|${r.file}|${r.line}|${r.handlerLabel}|${r.entryFns.join(',')}`;
     if (seen.has(key)) return;
     seen.add(key);
     routes.push(r);
@@ -353,9 +394,18 @@ export function buildRoutes(
       } else if (ref.strategy === 'anonymous-only') {
         authNone = true;
       } else if (nameHit || ref.strategy !== undefined) {
-        // A package's middleware: the name is the evidence, unless its options can turn it off
-        // or cannot be read (a variable, a spread, a computed key) or it may be `anonymous`.
-        if (ref.optional || ref.strategy === 'uncertain' || /\.unless\b/.test(ref.label)) {
+        // A package's middleware: a known guard package and member is the evidence, unless its
+        // options can turn the check off or cannot be read (a variable, a spread, a computed
+        // key, a literal `false`) or it may be `anonymous`. Any other package whose name merely
+        // looks like auth (`jwt.decode`) proves nothing.
+        const ext = ref.vals.find((v): v is Extract<Value, { k: 'ext' }> => v.k === 'ext');
+        const known = ext !== undefined && (GUARD_PACKAGES[ext.pkg]?.(ext.path) ?? false);
+        if (
+          !known ||
+          ref.optional ||
+          ref.strategy === 'uncertain' ||
+          /\.unless\b/.test(ref.label)
+        ) {
           authUncertain = true;
         } else authGuard = 'name';
       }

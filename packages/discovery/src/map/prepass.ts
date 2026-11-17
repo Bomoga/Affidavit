@@ -16,6 +16,8 @@ export interface FnInfo {
   kind: FnKind;
   /** Declared or assigned names, in order of discovery. Identifier text only. */
   names: string[];
+  /** A getter or setter: the language runs it on property access. */
+  accessor: boolean;
   startLine: number;
   endLine: number;
   /** Lexically enclosing function (the module function for top-level code); null for a module. */
@@ -201,6 +203,7 @@ export function prepass(
     node: root,
     kind: 'module',
     names: [],
+    accessor: false,
     startLine: 1,
     endLine: Math.max(root.er, 1),
     parent: null,
@@ -231,6 +234,7 @@ export function prepass(
         node: n,
         kind,
         names: nameFromContext(n, parent, field),
+        accessor: n.acc === true,
         startLine: n.r,
         endLine: n.er,
         parent: enclosing.id,

@@ -19,6 +19,8 @@ export interface AstNode {
   x?: string;
   /** Operator token, for nodes that have an `operator` field (binary, for-in, assignment). */
   op?: string;
+  /** `method_definition` with a `get` or `set` keyword. */
+  acc?: boolean;
   /** Named children in source order. Comments are not kept. */
   c: AstNode[];
   /** Named children by field name. */
@@ -213,6 +215,7 @@ function copyTree(cursor: CursorLike, limits: ParseLimits): ParseResult {
           }
         } else if (parent && !cursor.nodeIsNamed) {
           if (cursor.currentFieldName === 'operator') parent.op = cursor.nodeType;
+          else if (cursor.nodeType === 'get' || cursor.nodeType === 'set') parent.acc = true;
           else if (cursor.nodeType === 'static' || cursor.nodeType === 'default') {
             parent.op ??= cursor.nodeType;
           }

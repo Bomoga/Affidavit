@@ -6,6 +6,13 @@ import { createHash } from 'node:crypto';
 import type { AstNode } from './parse.js';
 import type { FnInfo } from './prepass.js';
 
+/**
+ * Counts writes to anything a memoized call could have read: object, array and function
+ * properties, variables that exist already, and module-level declarations. A call is only reused
+ * while this has not moved, so a mutation between two identical-looking calls is never missed.
+ */
+export const mutation = { epoch: 0 };
+
 export class Scope {
   readonly vars = new Map<string, Value[]>();
   constructor(readonly parent: Scope | null) {}
@@ -15,6 +22,7 @@ export class Scope {
   }
 
   declare(name: string, vals: Value[]): void {
+    if (this.parent === null) mutation.epoch++;
     this.vars.set(name, vals);
   }
 
@@ -28,6 +36,7 @@ export class Scope {
 
   /** Weak update in the scope that declares `name`, else a new binding in the outermost scope. */
   assign(name: string, vals: Value[]): void {
+    mutation.epoch++;
     const o = this.owner(name);
     if (o) o.vars.set(name, union(o.vars.get(name) ?? [], vals));
     else this.outermost().vars.set(name, vals);

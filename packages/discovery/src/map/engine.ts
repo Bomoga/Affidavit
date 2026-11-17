@@ -16,6 +16,7 @@ import { keyName, plainString, safeIdent, type FileFacts, type FnInfo } from './
 import type { DataAccessCall, Leak, LimitHit, MapLimits } from './types.js';
 import {
   capHit,
+  mutation,
   Scope,
   sig,
   union,
@@ -259,6 +260,11 @@ function looksOptional(n: AstNode | undefined): boolean {
     if (budget-- <= 0 || depth > 12) return true;
     if (x.t === 'spread_element' || x.t === 'computed_property_name') return true;
     if (x.t === 'pair' && OPTIONAL_KEYS.has(keyName(x.f['key']) ?? '')) return true;
+    // Any literal `false` option on an auth package may switch the check off
+    // (`authRequired: false`); passport's `session: false` does not.
+    if (x.t === 'pair' && x.f['value']?.t === 'false' && keyName(x.f['key']) !== 'session') {
+      return true;
+    }
     if (x.t === 'shorthand_property_identifier' && OPTIONAL_KEYS.has(x.x ?? '')) return true;
     if (x.t === 'property_identifier' && x.x === 'unless') return true;
     if (x.t === 'template_string' && x.c.some((c) => c.t === 'template_substitution')) return true;
@@ -354,6 +360,7 @@ export class Interpreter {
   private readonly execs = new Map<number, number>();
   private readonly executed = new Set<number>();
   private readonly active = new Map<number, number>();
+  private readonly activeArgs = new Map<number, string[]>();
   private readonly created: FnValue[] = [];
   private readonly ran = new Set<number>();
   private readonly handoffs: [number, number][] = [];
@@ -637,13 +644,23 @@ export class Interpreter {
       this.limitsHit.add('call-depth');
       return [];
     }
-    const key = `${c.id}|${args.map((a) => sig(a)).join(';')}|${sig(thisVals)}`;
+    const argSig = args.map((a) => sig(a)).join(';');
+    // The epoch is part of the key: a heap or variable write since the last identical call may
+    // change what the function does, so the call is run again.
+    const key = `${c.id}|${mutation.epoch}|${argSig}|${sig(thisVals)}`;
+    const startEpoch = mutation.epoch;
     const cached = this.memo.get(key);
     if (cached) return cached;
-    // A function that is already running twice up the stack adds nothing by running again
-    // (`new X()` inside X's own constructor builds a fresh instance every time, so the memo
-    // key never repeats).
-    if ((this.active.get(c.fn.id) ?? 0) >= 2) return [];
+    // A function already running twice up the stack is not run a third time. When the new run
+    // has arguments the running ones do not (`reg(l[2])` inside `reg(l)`), it could have seen
+    // something new, so the cut is reported. `new X(db)` inside X's own constructor repeats the
+    // same arguments and adds nothing.
+    if ((this.active.get(c.fn.id) ?? 0) >= 2) {
+      if (!(this.activeArgs.get(c.fn.id) ?? []).includes(argSig)) {
+        this.limitsHit.add('recursion-cutoff');
+      }
+      return [];
+    }
     const n = (this.execs.get(c.fn.id) ?? 0) + 1;
     if (n > this.limits.maxExecutionsPerFunction) {
       this.limitsHit.add('executions-per-function');
@@ -656,6 +673,9 @@ export class Interpreter {
     const mod = this.modules.get(c.fn.file);
     if (!mod) return [];
     this.active.set(c.fn.id, (this.active.get(c.fn.id) ?? 0) + 1);
+    const running = this.activeArgs.get(c.fn.id) ?? [];
+    running.push(argSig);
+    this.activeArgs.set(c.fn.id, running);
     const fr: Frame = {
       facts,
       fn: c.fn,
@@ -680,9 +700,12 @@ export class Interpreter {
       }
     } finally {
       this.active.set(c.fn.id, (this.active.get(c.fn.id) ?? 1) - 1);
+      running.pop();
     }
     this.capCheck();
-    this.memo.set(key, fr.returns);
+    // Reusable only if the run changed nothing a later identical call could read.
+    if (mutation.epoch === startEpoch) this.memo.set(key, fr.returns);
+    else this.memo.delete(key);
     return fr.returns;
   }
 
@@ -1288,13 +1311,28 @@ export class Interpreter {
   private assignTo(fr: Frame, target: AstNode, vals: Value[]): void {
     const objNode = target.f['object'];
     if (!objNode) return;
+    const idxNode = target.f['index'];
     const name =
       target.t === 'member_expression'
         ? target.f['property']?.x
-        : this.constString(fr, target.f['index']);
+        : idxNode?.t === 'number'
+          ? idxNode.x
+          : this.constString(fr, idxNode);
     if (name === undefined) return;
     const holders = this.ev(fr, objNode);
+    mutation.epoch++;
     for (const h of holders) {
+      if (h.k === 'arr') {
+        // `table[0] = fn`: a weak update of that element.
+        const i = /^\d+$/.test(name) ? Number(name) : -1;
+        if (i >= 0 && i < 256) {
+          while (h.items.length <= i) h.items.push([]);
+          h.items[i] = union(h.items[i] ?? [], vals);
+        } else if (i >= 256) {
+          this.limitsHit.add('value-set-cap');
+        }
+        continue;
+      }
       if (h.k === 'obj') {
         // `module.exports = x` replaces; every other property write is a weak update.
         const isModuleObj = this.moduleObjs.has(h);
@@ -1508,6 +1546,22 @@ export class Interpreter {
     }
 
     const { nodes, vals } = this.argValues(fr, argsNode);
+
+    // `arr.push(fn)` and `arr.unshift(fn)` add elements.
+    if ((method === 'push' || method === 'unshift') && recv.some((v) => v.k === 'arr')) {
+      mutation.epoch++;
+      for (const v of recv) {
+        if (v.k !== 'arr') continue;
+        for (const a of vals) {
+          if (v.items.length >= 256) {
+            this.limitsHit.add('value-set-cap');
+            break;
+          }
+          if (method === 'push') v.items.push(a);
+          else v.items.unshift(a);
+        }
+      }
+    }
 
     // `app.get.call(app, '/x', fn)` and `.apply`: a registration through the method object.
     if (
