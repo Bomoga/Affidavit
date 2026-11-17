@@ -36,9 +36,38 @@ Semgrep, OSV-Scanner and gitleaks run as pinned Docker images (`docker/tools/too
 
 An `archive-name-mismatch` message says the file is scanned in a window only when it really was windowed. Otherwise (a PDF, executable or other skipped signature, a window write failure, a quarantined sidecar file) it says the content is NOT scanned. Image, audio and video files are not coverage losses and are listed in `binaryMediaFiles` only.
 
+## The map (`src/map/`, L1-05)
+
+`buildMap({ root })` reads the redacted workspace with `web-tree-sitter` (grammars load from the installed `tree-sitter-javascript` and `tree-sitter-typescript` wasm files; no network) and returns `{ routes, dataAccess, coverage }`. `reachabilityFor(map, candidates)` then answers per candidate. `routeInfoOf(path)` makes the contract `RouteInfo` for a reaching path. Entry points are exported from the package index.
+
+Files: `parse.ts` (tree-sitter to plain objects; comments dropped; depth and node caps), `prepass.ts` (functions, name uses, module specifiers), `values.ts` and `engine.ts` (the abstract interpreter), `routes.ts` (router events to a route table; auth guards), `reach.ts` (reachability), `index.ts` (file walk, limits, public API).
+
+What it does: runs the repo's modules in an abstract interpreter (never real code: `require` resolves only to files already in the analysis set, and nothing is evaluated). Values are sets of strings, objects, closures, Express routers and package members. It follows `require` and `import` between files, `module.exports`, `exports.x`, destructuring, classes and `extends`, `this.x = ...` constructors, `new`, and `.call/.apply/.bind`. Express: `app.get/post/put/delete/patch/options/head/all`, `router.*`, `app.route(p).get(...)`, `app.use` (with or without a path), mounted routers with prefixes, middleware in registration order. `RouteInfo.middleware` is the chain in front of the handler without application-wide `app.use(fn)` middleware (that is `MapRoute.appMiddleware`); labels are identifier characters only (`isLoggedIn`, `bodyParser.json()`), never free text.
+
+What it approximates (all documented here on purpose):
+
+- Branches: both are taken. Loops run once, except `for...of` over an array literal of strings (up to 64 elements), which runs once per element so a route in the loop gets its real path. A path part it cannot reduce to a string is rendered as `${name}` and `pathDynamic` is true; `x || 'a'` with an untracked `x` also counts as dynamic.
+- Calls: repo functions are inlined with the argument values (memoized by argument shape, bounded depth, at most 256 runs per function, a function already running twice up the stack is not run again). A function value passed to any call gets a call edge from the caller and is analyzed later with untracked parameters. Functions never entered are run once at the end with untracked parameters (a "sweep"), so their calls and data access are seen. Callbacks run after the code that created them, not at the call.
+- Property access on unknown values gives nothing; there is no flow through object spreads of unknown values, getters, `Proxy`, prototype chains other than `F.prototype.x = ...` and classes, or computed keys that are not literal strings.
+- A route registration on a receiver it cannot tie to `express()` or `Router()` is kept only when the receiver is named like a router (`app`, `router`, `routes`, `api`, `server`, ...) and the call shape matches; it is listed with `mounted: 'orphan'` and recorded as a `unresolved-router` leak.
+- Auth: a middleware counts as an auth guard by name (`isLoggedIn`, `requireAuth`, `jwt`, ...) or by body (reads `req.session.userId`, `req.user`, `ctx.state.user` or an Authorization header, can deny with a redirect, 401, 403 or throw, and can call `next()`). The final handler is never judged. `authRequired` is `true` when a guard is on the chain, `false` when every middleware is resolved or a known benign package and none is a guard, `'unknown'` otherwise. A check inside the handler is not seen.
+- Data access: Mongo collection methods on `db.collection('x')` values and Mongoose models, SQL `query/execute/raw/exec/run/all/get/prepare` on known SQL packages or receivers named like a database handle, `eval` and `new Function`, and `child_process` calls with a non-literal command. Only code the interpreter entered is listed.
+
+Reachability answers (three-valued, matching `Candidate.reachability`):
+
+- `reachable`: a route mounted under an `express()` application reaches the innermost function that holds the candidate's lines. The result carries the route, the middleware and the function path (shortest first, up to 5).
+- `unreachable`: only when the whole analysis is complete (no skipped or partly parsed file, no limit hit, no `dynamic-dispatch`, `unresolved-handler`, `unresolved-router` or `code-eval` leak), no dynamic require could have loaded the file, no code handed to a package from start-up code reaches it, and neither the function nor any named function around it is referenced by name anywhere. In practice that means dead code.
+- `unknown` for everything else, always with a `reason` (`route-not-mounted`, `external-entry`, `referenced-unresolved`, `repo-incomplete`, `file-incomplete`, `file-not-analyzed`, `no-enclosing-function`, `dynamic-require`, `invalid-location`). `unknown` is not `unreachable`: L1-06 must route a high-score `unknown` candidate to trial or review, never to a dismissal. Module-level lines are `unknown` (they run at load, not per request).
+- A `use` registration (an error handler, a catch-all middleware) is a reachability entry with method `USE`; it is not listed in `routes`.
+
+Untrusted input: comments never leave the parser; string contents appear only as route paths (capped at 200 characters) and the dynamic-path marker; every label and name is restricted to identifier characters; `f` maps are prototype-free and user-controlled names only key `Map`s. Bounds (all in `MapLimits`, reported in `coverage` when hit): files, bytes, syntax nodes, tree depth, directory depth, call depth, interpreter steps, runs per function, wall-clock time, parse time. Symbolic links, `node_modules`, `.git`, `vendor`, `dist` and similar directories are not read and are listed in `coverage.skipped`.
+
+Tests: `src/map/map.test.ts` (patterns and hostile inputs, offline). `src/map/map.nodegoat.test.ts` runs the map on the pinned NodeGoat checkout and compares it with `fixtures/corpus/map/nodegoat-routes.json.fixture` and the corpus labels. It is skipped unless `AFFIDAVIT_CORPUS_NETWORK=1` (fetches and verifies the pinned commit with git, like the corpus network tests and the L1-04 regression) or `AFFIDAVIT_MAP_NODEGOAT_DIR=<checkout>`. Bash: `AFFIDAVIT_CORPUS_NETWORK=1 pnpm --filter @affidavit/discovery exec vitest run map.nodegoat`. PowerShell: `$env:AFFIDAVIT_CORPUS_NETWORK = '1'`, then the same command.
+
+Not covered yet: Koa, Fastify and Next route registration (code handed to those packages is `external-entry`, so it is `unknown`, never `unreachable`), dead code that only other dead code refers to, request-time reachability of module-level code, and IDOR-specific path facts beyond the auth flag.
+
 Root CLAUDE.md rules apply here. Do not add dependencies without asking.
 
 ## Libraries still to come (notes, not installed)
 
-- tree-sitter
 - A SARIF parser (TBD)
