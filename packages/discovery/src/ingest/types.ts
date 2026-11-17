@@ -50,6 +50,8 @@ export type ExclusionReason =
   /** A finding in this file could not be located, so the file is not trusted. */
   | 'unresolvable-finding'
   | 'too-large'
+  /** Two files would be written to the same name; the second is left out. */
+  | 'name-collision'
   | 'not-regular-file';
 
 export interface ExcludedFile {
@@ -181,8 +183,13 @@ export class CloneFailedError extends Error {
 
 /** The case directory could not be removed after a failure. It may hold a raw checkout. */
 export class CleanupFailedError extends Error {
-  constructor(readonly dir: string) {
-    super(`could not remove ${dir}; remove it by hand, it may hold an unredacted checkout`);
+  constructor(
+    readonly dir: string,
+    cause?: unknown,
+  ) {
+    super(`could not remove ${dir}; remove it by hand, it may hold an unredacted checkout`, {
+      cause,
+    });
     this.name = 'CleanupFailedError';
   }
 }
@@ -201,7 +208,7 @@ export class GitTooOldError extends Error {
 /** A fetch or checkout grew past the byte cap and was killed. */
 export class RepoTooLargeError extends Error {
   constructor(
-    readonly phase: 'fetch' | 'tree' | 'checkout',
+    readonly phase: 'fetch' | 'refs' | 'tree' | 'checkout',
     readonly limit: number,
     readonly what: 'bytes' | 'files' = 'bytes',
   ) {

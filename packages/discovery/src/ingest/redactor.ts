@@ -215,14 +215,18 @@ export function redactBuffer(
   return { buf, hits };
 }
 
-/** True if the bytes hold a UTF-16LE encoding of an ASCII-or-BMP value in any entry. */
+/**
+ * True if the bytes hold a UTF-16 (little or big endian) encoding of a global value, whether the
+ * value is the exact secret or the whole-line fallback. gitleaks does not read UTF-16 files, and
+ * the redactor does not rewrite them, so such a file must stay out.
+ */
 export function holdsUtf16(buf: Buffer, entries: readonly MapEntry[]): boolean {
   for (const e of entries) {
-    if (e.scope !== 'global' || !e.exact) continue;
+    if (e.scope !== 'global') continue;
     const text = e.value.toString('utf8');
-    if (Buffer.from(text, 'utf8').equals(e.value) && buf.includes(Buffer.from(text, 'utf16le'))) {
-      return true;
-    }
+    if (!Buffer.from(text, 'utf8').equals(e.value)) continue;
+    const le = Buffer.from(text, 'utf16le');
+    if (buf.includes(le) || buf.includes(Buffer.from(le).swap16())) return true;
   }
   return false;
 }

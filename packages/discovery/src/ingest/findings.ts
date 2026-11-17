@@ -56,15 +56,16 @@ const posInt = (v: unknown): number | undefined =>
 /**
  * Reads gitleaks SARIF reports (snapshot, quarantine and windows passes) into one list. A result
  * whose location cannot be read is reported in `malformed`, never skipped: the caller fails
- * closed. `windowedFiles` (`/src/<path>`) are files the windows pass scanned whole; their
+ * closed. `windowedFiles` (`/src/<path>`) must be only files whose windows cover them whole and
+ * clean (ToolRunResult.fullyWindowedFiles): their
  * snapshot-pass findings are dropped because gitleaks columns after its first 100 KB chunk are
  * unreliable (the windows columns are remapped and are not).
  */
 export async function readGitleaksFindings(
   reports: readonly ToolReport[],
-  windowedFiles: readonly string[],
+  fullyWindowedFiles: readonly string[],
 ): Promise<{ findings: GitleaksFinding[]; malformed: number }> {
-  const windowed = new Set(windowedFiles.map((f) => f.replace(/^\/src\//, '')));
+  const windowed = new Set(fullyWindowedFiles.map((f) => f.replace(/^\/src\//, '')));
   const hasWindows = reports.some((r) => r.origin === 'windows');
   const seen = new Set<string>();
   const findings: GitleaksFinding[] = [];

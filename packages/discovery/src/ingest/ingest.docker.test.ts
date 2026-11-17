@@ -239,6 +239,27 @@ describe.skipIf(!enabled)('ingest with the real gitleaks image', () => {
     expect(JSON.stringify(r)).not.toContain('inner.js'); // member names stay out of the result
   });
 
+  it('a window budget that runs out does not drop the finding', async () => {
+    const key = fakeKey();
+    const big = `${'// padding line\n'.repeat(12_000)}const late = "${key}";\n${'// tail\n'.repeat(500)}`;
+    const { dir, shas } = makeRepo([
+      { 'package.json': EXPRESS_PKG, 'src/app.js': "require('express')();\n", 'src/big.js': big },
+    ]);
+    const r = (await ingestRepo(
+      {
+        runner,
+        workRoot: tmpDir(),
+        allowLocalSource: true,
+        tools: { configDir, maxWindowBytes: 100_000 },
+      },
+      request({ source: dir, commit: shas[0] as string }),
+    )) as IngestOk;
+    expect(r.status).toBe('ok');
+    expect(r.scan.findings).toBeGreaterThan(0);
+    expect(everything(r.workspacePath)).not.toContain(key);
+    expect(r.scan.partial).toBe(true);
+  });
+
   it('a repo with no secrets ingests clean and not partial', async () => {
     const { dir, shas } = makeRepo([
       { 'package.json': EXPRESS_PKG, 'src/app.js': 'require("express")();\n' },

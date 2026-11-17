@@ -47,6 +47,10 @@ describe('SSRF guard: literal hosts', () => {
     'https://[2002:7f00:1::]/',
     'https://[ff02::1]/',
     'https://198.18.0.1/',
+    'https://192.88.99.1/',
+    'https://[fec0::1]/',
+    'https://[::ffff:0:1:2]/',
+    'https://[3fff::1]/',
     'https://192.0.2.1/',
     'https://198.51.100.7/',
     'https://203.0.113.5/',
@@ -287,9 +291,16 @@ setInterval(() => {}, 1000);`,
       detached: process.platform !== 'win32',
       stdio: 'ignore',
     });
-    for (let i = 0; i < 100 && !existsSync(pidFile); i++)
+    // The file may exist before its content does: wait for a whole positive integer.
+    let grandchild = 0;
+    for (let i = 0; i < 200 && !(grandchild > 0); i++) {
       await new Promise((r) => setTimeout(r, 50));
-    const grandchild = Number(readFileSync(pidFile, 'utf8'));
+      if (existsSync(pidFile)) {
+        const text = readFileSync(pidFile, 'utf8');
+        if (/^\d+$/.test(text)) grandchild = Number(text);
+      }
+    }
+    expect(grandchild).toBeGreaterThan(0);
     expect(isAlive(grandchild)).toBe(true);
     killTree(child);
     let alive = true;

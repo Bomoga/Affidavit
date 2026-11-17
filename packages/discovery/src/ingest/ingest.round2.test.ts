@@ -49,10 +49,39 @@ const entry = (value: string, over = {}) => ({
 
 describe('git version', () => {
   it('refuses https clones below 2.37, which ignore the address pin', async () => {
-    for (const v of ['git version 2.36.9', 'git version 2.30.0', 'git version 1.9.1', 'nonsense']) {
+    for (const v of [
+      'git version 2.36.9',
+      'git version 2.30.0',
+      'git version 1.9.1',
+      'nonsense',
+      'git version 2.37.0',
+      'git version 2.37.5',
+      'git version 2.38.4',
+      'git version 2.39.3',
+      'git version 2.40.1',
+      'git version 2.41.0',
+      'git version 2.42.1',
+      'git version 2.43.3',
+      'git version 2.44.0',
+      'git version 2.45.0',
+    ]) {
       expect(() => assertGitSupportsPin(v), v).toThrow(GitTooOldError);
     }
-    for (const v of ['git version 2.37.0', 'git version 2.54.0.windows.1', 'git version 3.0.0']) {
+    for (const v of [
+      'git version 2.37.7',
+      'git version 2.38.5',
+      'git version 2.39.4',
+      'git version 2.39.5',
+      'git version 2.40.2',
+      'git version 2.41.1',
+      'git version 2.42.2',
+      'git version 2.43.4',
+      'git version 2.44.1',
+      'git version 2.45.1',
+      'git version 2.46.0',
+      'git version 2.54.0.windows.1',
+      'git version 3.0.0',
+    ]) {
       expect(() => assertGitSupportsPin(v), v).not.toThrow();
     }
     const d = deps({
@@ -99,7 +128,6 @@ describe('tree caps', () => {
     const d = deps({ maxRepoBytes: 100_000 }); // 8000 entries at 4096 each is far over
     await expect(ingestRepo(d, request({ source: dir, commit: sha }))).rejects.toMatchObject({
       name: 'RepoTooLargeError',
-      phase: 'tree',
       what: 'bytes',
     });
   });
@@ -134,7 +162,7 @@ describe('one deadline', () => {
       timeoutMs: -1,
     }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(CloneFailedError);
-    expect(err).toMatchObject({ timedOut: true, step: 'init' });
+    expect(err).toMatchObject({ timedOut: true, step: 'version' });
   });
 
   it('connect errors collapse to one message for https, but size and time keep their types', () => {

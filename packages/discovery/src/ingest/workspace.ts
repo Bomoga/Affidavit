@@ -15,6 +15,9 @@ export function isEnvName(name: string): boolean {
   if (n === '.envs' || n === '.envrc') return true;
   // `.env~`, `.env1`, `.envlocal` and the like; `.environment` and `.envelope` are not env files.
   if (/^\.env[a-z0-9~]*$/.test(n) && !/^\.(?:environ|envelope)/.test(n)) return true;
+  // Editor and file-manager copies: `.env copy`, `.env - Copy`, `.env (1)`, `.env `, `.env+old`,
+  // `.env@prod`: `.env` followed by anything that is not a letter. `#.env#` is an editor backup.
+  if (/^\.env(?![a-z])/.test(n) || /^#\.env.*#$/.test(n)) return true;
   return /\.env(?:[-_.]|$)/.test(n);
 }
 
@@ -83,8 +86,19 @@ export async function buildWorkspace(
       }
       const { buf, hits } = redactBuffer(childRel, input, entries);
       const outRel = safePath(childRel);
-      await writeFile(join(dst, safePath(e.name)), buf);
-      await chmod(join(dst, safePath(e.name)), st.mode & 0o777).catch(() => undefined);
+      const target = join(dst, safePath(e.name));
+      try {
+        // wx: never overwrite. Two names that end up the same file (redaction, or a case-insensitive
+        // file system) keep the first and leave the second out.
+        await writeFile(target, buf, { flag: 'wx' });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+          skip(childRel, 'name-collision');
+          continue;
+        }
+        throw err;
+      }
+      await chmod(target, st.mode & 0o777).catch(() => undefined);
       for (const h of hits) {
         const key = `${outRel}|${h.startLine}|${h.endLine}|${h.entry.placeholder}`;
         if (seen.has(key)) continue;

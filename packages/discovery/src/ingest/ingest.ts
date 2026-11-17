@@ -6,7 +6,7 @@ import { detectRepo } from './detect.js';
 import { readGitleaksFindings } from './findings.js';
 import { assertFullSha, checkoutPinned } from './git.js';
 import { buildRedactionMap } from './map.js';
-import { entriesOf, type SecretRedactor } from './redactor.js';
+import { entriesOf, SecretRedactor } from './redactor.js';
 import { planSource } from './source.js';
 import {
   CleanupFailedError,
@@ -36,26 +36,40 @@ function redactDetection(d: Detection, r: SecretRedactor): Detection {
 const REMOVE = { recursive: true, force: true, maxRetries: 5, retryDelay: 200 } as const;
 
 /**
- * Replaces known values in every string an error carries: message, stack, path, dest, and the
- * same on `cause` and on the members of an AggregateError.
+ * Replaces known values in every own string and string-array field of an error (message, stack,
+ * path, dest, and custom ones such as NonUtf8NameError.dir), and recurses into `cause` and the
+ * members of an AggregateError.
  */
 export function redactError(e: unknown, r: SecretRedactor, seen = new Set<unknown>()): void {
   if (typeof e !== 'object' || e === null || seen.has(e)) return;
   seen.add(e);
   const o = e as Record<string, unknown>;
-  for (const k of ['message', 'stack', 'path', 'dest']) {
+  for (const k of Object.getOwnPropertyNames(e)) {
     const v = o[k];
-    if (typeof v === 'string') {
-      try {
-        o[k] = r.apply(v);
-      } catch {
-        // a read-only property: leave it
+    try {
+      if (typeof v === 'string') o[k] = r.apply(v);
+      else if (Array.isArray(v) && v.every((x) => typeof x === 'string')) {
+        o[k] = v.map((x) => r.apply(x));
       }
+    } catch {
+      // a read-only property: leave it
     }
   }
   redactError(o['cause'], r, seen);
   const members = o['errors'];
   if (Array.isArray(members)) for (const m of members) redactError(m, r, seen);
+}
+
+/** Every string (and key) reachable from a value, skipping the redactor itself. */
+function* stringsIn(v: unknown, seen = new Set<unknown>()): Generator<string> {
+  if (typeof v === 'string') yield v;
+  else if (typeof v === 'object' && v !== null && !(v instanceof SecretRedactor) && !seen.has(v)) {
+    seen.add(v);
+    for (const [k, x] of Object.entries(v)) {
+      yield k;
+      yield* stringsIn(x, seen);
+    }
+  }
 }
 
 const DEFAULT_MAX_FILE_BYTES = 64 * 1024 * 1024;
@@ -136,7 +150,7 @@ export async function ingestRepo(deps: IngestDeps, req: IngestRequest): Promise<
       maxReportBytes: deps.tools?.maxReportBytes,
     });
 
-    const { findings, malformed } = await readGitleaksFindings(run.reports, run.windowedFiles);
+    const { findings, malformed } = await readGitleaksFindings(run.reports, run.fullyWindowedFiles);
     if (malformed > 0) {
       throw new RedactionIncompleteError(Array(malformed).fill('<unreadable gitleaks result>'));
     }
@@ -172,12 +186,15 @@ export async function ingestRepo(deps: IngestDeps, req: IngestRequest): Promise<
       },
     };
     // Last check, over everything this function returns and not only the workspace.
-    const serialised = JSON.stringify(result) + inspect(result, { depth: 20 });
-    if (
-      entriesOf(r).some(
-        (e) => e.scope === 'global' && serialised.includes(e.value.toString('utf8')),
-      )
-    ) {
+    // Walks the strings themselves: JSON would hide a value behind escaping.
+    const globals = entriesOf(r)
+      .filter((e) => e.scope === 'global')
+      .map((e) => e.value.toString('utf8'));
+    for (const str of stringsIn(result)) {
+      if (globals.some((g) => str.includes(g)))
+        throw new RedactionLeakError(['<ingestion result>']);
+    }
+    if (globals.some((g) => inspect(result, { depth: 20 }).includes(g))) {
       throw new RedactionLeakError(['<ingestion result>']);
     }
     // The raw checkout goes before success is reported. If it cannot be removed, nothing is
@@ -185,11 +202,11 @@ export async function ingestRepo(deps: IngestDeps, req: IngestRequest): Promise<
     await rm(priv, REMOVE);
     return result;
   };
-  const cleanup = async (): Promise<void> => {
+  const cleanup = async (cause?: unknown): Promise<void> => {
     try {
       await rm(caseDir, REMOVE);
     } catch {
-      throw new CleanupFailedError(caseDir);
+      throw new CleanupFailedError(caseDir, cause);
     }
   };
 
@@ -199,7 +216,7 @@ export async function ingestRepo(deps: IngestDeps, req: IngestRequest): Promise<
   } catch (e) {
     // Error text can quote repo paths, which can carry a secret.
     if (redactor !== undefined) redactError(e, redactor);
-    await cleanup();
+    await cleanup(e);
     throw e;
   }
   // Unsupported: nothing is kept, so the case directory and its checkout go too.

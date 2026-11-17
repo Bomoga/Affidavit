@@ -34,6 +34,7 @@ for (const [net, bits] of [
   ['192.0.0.0', 24],
   ['192.168.0.0', 16],
   ['198.18.0.0', 15],
+  ['192.88.99.0', 24], // deprecated 6to4 relay anycast
   ['224.0.0.0', 4],
   ['240.0.0.0', 4],
   ['192.0.2.0', 24],
@@ -50,6 +51,9 @@ for (const [net, bits] of [
   ['fc00::', 7],
   ['ff00::', 8],
   ['2002::', 16], // 6to4: embeds an IPv4 address
+  ['fec0::', 10], // deprecated site-local
+  ['::ffff:0:0:0', 96], // SIIT IPv4-translated
+  ['3fff::', 20], // documentation
   ['2001::', 32], // Teredo
   ['2001:db8::', 32], // documentation
   ['100::', 64], // discard-only
@@ -109,7 +113,7 @@ export interface PlanOptions {
  * Validates a clone source and, for https, resolves the host and checks EVERY address it
  * returns. The checked address travels in the plan so git can be pinned to it: a name that
  * resolves to a public address now cannot resolve to a loopback address when git connects. The
- * clone runs on the host through execFile (not in a jail), so this check is the SSRF defence.
+ * clone runs on the host through a spawned git process (not in a jail), so this check is the SSRF defence.
  * A URL with credentials is refused so a token can never reach a log line or an error message.
  */
 export async function planSource(source: string, o: PlanOptions): Promise<SourcePlan> {
