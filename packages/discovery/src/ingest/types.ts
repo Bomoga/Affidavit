@@ -52,7 +52,13 @@ export type ExclusionReason =
   | 'too-large'
   /** Two files would be written to the same name; the second is left out. */
   | 'name-collision'
-  | 'not-regular-file';
+  | 'not-regular-file'
+  /**
+   * An image, audio or video file (judged by its leading bytes, whatever its name). The scanner
+   * reads these as text, but UTF-16 text or text past a chunk cut inside them can be missed and a
+   * binary cannot be rewritten, so they are left out whole rather than shipped unscanned.
+   */
+  | 'media-file';
 
 export interface ExcludedFile {
   /** Repo-relative path. Already passed through the redactor. */

@@ -37,6 +37,7 @@ import {
   evaluate,
   formatEvaluation,
   handlerEndLine,
+  handlerEndProblems,
   type CorpusLite,
   listRuleIds,
   parseSemgrepSarif,
@@ -266,6 +267,7 @@ describe.skipIf(!enabled)('own Semgrep rules, Docker and corpus', { timeout: 900
               handlerEndLine: handlerEndLine(
                 readFileSync(join(vulnerableDir, l.source.file), 'utf8'),
                 l.source.range.startLine,
+                l.source.range.endLine,
               ),
             }
           : l,
@@ -302,7 +304,8 @@ describe.skipIf(!enabled)('own Semgrep rules, Docker and corpus', { timeout: 900
         .join('\n');
       writeFileSync(out, `${table}\n\n${detail}\n`);
     }
-    expect(evaluation.problems).toEqual([]);
+    const pinProblems = handlerEndProblems(corpusWithExtents.labels, expectations);
+    expect([...pinProblems, ...evaluation.problems]).toEqual([]);
 
     if (process.env['AFFIDAVIT_RULES_STAMP'] === 'write') {
       writeStamp({

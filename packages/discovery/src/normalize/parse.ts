@@ -13,6 +13,12 @@ export interface RawFinding {
   endLine: number;
   /** OSV only: the package the advisory applies to. */
   pkg?: { name: string; version: string };
+  /**
+   * OSV only: the advisory ids this package actually reported for the advisory, when they are not
+   * just `[ruleId]` (`ruleId` is the lowest id of the alias group, which this package may not
+   * have reported at all). Sorted, bytewise.
+   */
+  osvIds?: string[];
 }
 
 export type SkipReason = 'unmapped-class' | 'no-location' | 'no-region' | 'unsafe-path';
@@ -338,6 +344,10 @@ export function parseOsv(doc: unknown): Parsed {
         seen.add(root);
         const ruleId = names.get(root) as string;
         const cwe = [...new Set(cwes.get(root))].sort((a, b) => a - b);
+        const reported = [
+          ...new Set(items.filter((x) => find(x.id) === root).map((x) => x.id)),
+        ].sort(cmp);
+        const osvIds = reported.length === 1 && reported[0] === ruleId ? undefined : reported;
         const cls = classOf(cwe);
         if (!path.ok) {
           skipped.push({ tool: 'osv', ruleId, reason: 'unsafe-path', cwe });
@@ -352,6 +362,7 @@ export function parseOsv(doc: unknown): Parsed {
             startLine: 1,
             endLine: 1,
             pkg,
+            ...(osvIds ? { osvIds } : {}),
           });
         }
       }
