@@ -170,10 +170,8 @@ const SNIFF_BYTES = 100_000;
  * - `binary-media`: an image, audio or video signature on a file whose extension agrees. gitleaks
  *   reads these as text, so a plaintext secret inside is found. Informational only. The text and
  *   chunk checks are NOT run on these files (a real image has NUL bytes, so the text check would
- *   flag every one), so a UTF-16 secret or a chunk-cut secret inside a real media file is not
- *   detected here. The tools layer does not close that gap; ingestion does, by failing closed:
- *   it leaves every media file out of the workspace (exclusion reason `media-file`, see
- *   ingest/workspace.ts), so no unscanned media content is ever handed on. The same signature on a file with another extension (`GIF89a` at the top of `app.env`)
+ *   flag every one): a UTF-16 secret or a chunk-cut secret inside a real media file is an accepted
+ *   gap. The same signature on a file with another extension (`GIF89a` at the top of `app.env`)
  *   is a `binary-header-mismatch`.
  * - `skipped-file-type`: a file type gitleaks skips (archives, PDF, SQLite, executables and the
  *   other "application" types) whose extension agrees with the signature. Archives it can unpack
