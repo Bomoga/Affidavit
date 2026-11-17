@@ -12,6 +12,9 @@ function cases(db, req, userId, cache) {
   // ruleid: affidavit.injection.sql-concat
   db.raw(`DELETE FROM t WHERE id = ${userId}`);
 
+  // ruleid: affidavit.injection.sql-concat
+  knex('t').whereRaw('name = ' + userId);
+
   // Semgrep's constant propagation sees that this variable is a string literal.
   const fixed = 'constant';
   // ok: affidavit.injection.sql-concat

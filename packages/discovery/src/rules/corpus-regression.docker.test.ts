@@ -38,7 +38,8 @@ import {
   formatEvaluation,
   listRuleIds,
   parseSemgrepSarif,
-  rulesDigest,
+  regressionInputsDigest,
+  runOutputDigest,
   type TreeRun,
   type TreeVariant,
 } from './corpus-regression.js';
@@ -284,7 +285,8 @@ describe.skipIf(!enabled)('own Semgrep rules, Docker and corpus', { timeout: 900
 
     if (process.env['AFFIDAVIT_RULES_STAMP'] === 'write') {
       writeStamp({
-        rulesSha256: rulesDigest(rulesRoot()),
+        inputsSha256: regressionInputsDigest(repoRoot()),
+        runOutputSha256: runOutputDigest(runs, evaluation),
         semgrepImage: image,
         nodegoatCommit: pin.commit,
         ranOn: new Date().toISOString().slice(0, 10),

@@ -13,7 +13,10 @@ rules:
       cls: injection
       cwe: CWE-89
       confidence: medium
-      note: Does not follow data across files; the arraignment stage decides reachability.
+      note: >-
+        Does not follow data across files or through variables (the taint rule does); the
+        arraignment stage decides reachability. Known false positives: a constant table or column
+        name interpolated from a non-literal variable, and a value validated elsewhere.
     patterns:
       - pattern-either:
           - pattern: $DB.$M(`...${$X}...`, ...)
@@ -22,7 +25,7 @@ rules:
           - pattern: $DB.$M("..." + $X + "...", ...)
       - metavariable-regex:
           metavariable: $M
-          regex: ^(query|execute|raw|queryRaw|\$queryRawUnsafe|\$executeRawUnsafe|unsafe)$
+          regex: ^(query|execute|raw|queryRaw|\$queryRawUnsafe|\$executeRawUnsafe|unsafe|whereRaw|orderByRaw|havingRaw|joinRaw)$
       - metavariable-pattern:
           metavariable: $X
           patterns:

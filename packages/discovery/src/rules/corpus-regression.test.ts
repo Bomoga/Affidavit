@@ -1,20 +1,21 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { loadToolManifest, repoRoot } from '../tools/index.js';
 import {
   countAnnotations,
   evaluate,
   listRuleIds,
-  notificationPath,
+  parseNotification,
   parseSemgrepSarif,
-  rulesDigest,
+  regressionInputsDigest,
   type CorpusLite,
   type Expectations,
   type RuleFinding,
   type TreeRun,
   type TreeVariant,
 } from './corpus-regression.js';
-import { loadCorpusLite, loadExpectations, readStamp, rulesRoot } from './load.js';
+import { corpusDataDir, loadCorpusLite, loadExpectations, readStamp, rulesRoot } from './load.js';
 
 const NOSQL = 'affidavit.injection.nosql-where-template';
 const IDOR_P = 'affidavit.idor.route-param-to-data-access';
@@ -58,7 +59,10 @@ const expectations: Expectations = {
   },
   notTargeted: { eval: 'not an MVP class' },
   unlabeledFindings: [],
-  allowedNotificationPathPrefixes: ['app/assets/vendor/'],
+  allowedNotifications: [
+    { file: 'app/assets/vendor/jquery.min.js', rule: 'x' },
+    { file: 'app/assets/vendor/m.min.js', rule: null },
+  ],
 };
 
 const f = (ruleId: string, file: string, startLine: number, endLine = startLine): RuleFinding => ({
@@ -157,12 +161,27 @@ describe('evaluate', () => {
     expect(p2).toContain(`expectations name rule ${IDOR_P}, which does not exist`);
   });
 
-  it('allows a Semgrep notification only for the named vendored paths', () => {
+  it('allows a Semgrep notification only for an exact (file, rule) pair', () => {
     const runs = good();
     runs.vulnerable.notifications = [
       'Timeout when running x on /src/app/assets/vendor/jquery.min.js:',
+      'Syntax error at line /src/app/assets/vendor/m.min.js:1:\n `?.8`',
     ];
     expect(evaluate(corpus, expectations, ids, runs).problems).toEqual([]);
+    // Same file, a different rule: not allowed.
+    runs.vulnerable.notifications = [
+      'Timeout when running y on /src/app/assets/vendor/jquery.min.js:',
+    ];
+    expect(evaluate(corpus, expectations, ids, runs).problems.join('\n')).toContain(
+      'unexplained Semgrep notification',
+    );
+    // A path that climbs out is never allowed, even if its text starts like an allowed one.
+    runs.vulnerable.notifications = [
+      'Timeout when running x on /src/app/assets/vendor/../../routes/session.js:',
+    ];
+    expect(evaluate(corpus, expectations, ids, runs).problems.join('\n')).toContain(
+      'unexplained Semgrep notification',
+    );
     runs.vulnerable.notifications = ['Timeout when running x on /src/app/routes/session.js:'];
     expect(evaluate(corpus, expectations, ids, runs).problems.join('\n')).toContain(
       'unexplained Semgrep notification',
@@ -205,10 +224,21 @@ describe('parseSemgrepSarif', () => {
   });
 });
 
-describe('notificationPath', () => {
-  it('extracts the path named in a notification', () => {
-    expect(notificationPath('Timeout when running r on /src/app/x/y.js:')).toBe('app/x/y.js');
-    expect(notificationPath('nothing here')).toBeUndefined();
+describe('parseNotification', () => {
+  it('reads timeouts and syntax errors, and refuses everything else', () => {
+    expect(parseNotification('Timeout when running r on /src/app/x/y.js:\n ')).toEqual({
+      kind: 'timeout',
+      rule: 'r',
+      file: 'app/x/y.js',
+    });
+    expect(parseNotification('Syntax error at line /src/app/m.min.js:1:\n `?.8`')).toEqual({
+      kind: 'syntax-error',
+      rule: null,
+      file: 'app/m.min.js',
+    });
+    expect(parseNotification('nothing here')).toBeUndefined();
+    expect(parseNotification('Timeout when running r on /src/../etc/passwd:')).toBeUndefined();
+    expect(parseNotification('Timeout when running r on /src//abs/y.js:')).toBeUndefined();
   });
 });
 
@@ -225,9 +255,13 @@ describe('the rule files', () => {
     for (const c of corpus.negativeControls) {
       for (const id of c.expectedRuleIds) expect(ruleIds).toContain(id);
     }
-    for (const name of ['injection-sql-concat.yaml', 'idor-route-param.yaml']) {
+    const files = readdirSync(join(root, 'semgrep')).filter((n) => /\.ya?ml$/.test(n));
+    expect(files.length).toBe(ruleIds.length);
+    for (const name of files) {
       const text = readFileSync(join(root, 'semgrep', name), 'utf8');
-      expect(text).not.toMatch(/semgrep\.dev|r2c-|returntocorp/i);
+      expect(text, name).not.toMatch(/semgrep\.dev|r2c-|returntocorp/i);
+      // No registry or auto config reference of any kind.
+      expect(text, name).not.toMatch(/^\s*(extends|include):|config:\s*(auto|p\/)/m);
     }
   });
 
@@ -245,14 +279,25 @@ describe('the rule files', () => {
 });
 
 describe('every rule change runs the corpus regression', () => {
-  it('the regression stamp matches the current rules, tests and expectations', () => {
+  it('the regression stamp matches the current rules, tests, expectations, corpus pin, harness and wrapper', () => {
     const stamp = readStamp();
-    const now = rulesDigest(rulesRoot());
+    const now = regressionInputsDigest(repoRoot());
     expect(
-      stamp.rulesSha256,
-      'rules, rule tests or corpus expectations changed since the last passing corpus regression. Run: ' +
+      stamp.inputsSha256,
+      'rules, rule tests, corpus expectations, the NodeGoat pin or labels, the harness or the Semgrep wrapper changed since the last passing corpus regression. Run: ' +
         'AFFIDAVIT_DOCKER_TESTS=1 AFFIDAVIT_RULES_STAMP=write pnpm --filter @affidavit/discovery exec vitest run corpus-regression.docker ' +
         '(needs Docker and network), then commit packages/discovery/rules/regression-stamp.json and update docs/lanes/lane1/rules-report.md',
     ).toBe(now);
+  });
+
+  it('the stamp names the pinned Semgrep image and the pinned NodeGoat commit', () => {
+    const stamp = readStamp();
+    const semgrep = loadToolManifest().tools.find((t) => t.name === 'semgrep');
+    expect(stamp.semgrepImage).toBe(semgrep?.reference);
+    const pin = JSON.parse(readFileSync(join(corpusDataDir(), 'pin.json'), 'utf8')) as {
+      commit: string;
+    };
+    expect(stamp.nodegoatCommit).toBe(pin.commit);
+    expect(stamp.runOutputSha256).toMatch(/^[0-9a-f]{64}$/);
   });
 });

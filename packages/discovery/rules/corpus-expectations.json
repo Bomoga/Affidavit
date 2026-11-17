@@ -22,5 +22,19 @@
     "nodegoat-loginj-login-username": "Log injection (CWE-117). Not an SQL, NoSQL or IDOR class, so no rule targets it."
   },
   "unlabeledFindings": [],
-  "allowedNotificationPathPrefixes": ["app/assets/vendor/"]
+  "allowedNotifications": [
+    { "file": "app/assets/vendor/chart/morris-0.4.3.min.js", "rule": null },
+    {
+      "file": "app/assets/vendor/jquery.min.js",
+      "rule": "affidavit.idor.request-id-to-data-access"
+    },
+    {
+      "file": "app/assets/vendor/jquery.min.js",
+      "rule": "affidavit.injection.nosql-operator-request"
+    },
+    {
+      "file": "app/assets/vendor/jquery.min.js",
+      "rule": "affidavit.injection.sql-request-taint"
+    }
+  ]
 }

@@ -1,7 +1,7 @@
 // Test file for rules/semgrep/injection-nosql-where-template.yaml. Not executed; only parsed by Semgrep.
 const HIGH = 50;
 
-function cases(col, userId, threshold, name) {
+function cases(col, Model, userId, threshold, name) {
   const parsedUserId = parseInt(userId);
 
   // ruleid: affidavit.injection.nosql-where-template
@@ -29,6 +29,15 @@ function cases(col, userId, threshold, name) {
   col.find({
     $where: `this.userId == ${parsedUserId} && this.stocks > ${parseInt(threshold, 10)}`,
   });
+
+  // ruleid: affidavit.injection.nosql-where-template
+  Model.find().$where(`this.name == '${name}'`);
+
+  // ruleid: affidavit.injection.nosql-where-template
+  Model.find().$where("this.name == '" + name + "'");
+
+  // ok: affidavit.injection.nosql-where-template
+  Model.find().$where(`this.stocks > ${Number(threshold)}`);
 
   // ok: affidavit.injection.nosql-where-template
   col.find({ $where: `this.stocks > ${Number(threshold)}` });

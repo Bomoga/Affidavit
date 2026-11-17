@@ -24,9 +24,18 @@ rules:
       - pattern: Number(...)
       - pattern: Boolean(...)
     pattern-sinks:
+      # The filter (first argument).
       - patterns:
           - pattern: $COL.$M($Q, ...)
           - focus-metavariable: $Q
           - metavariable-regex:
               metavariable: $M
-              regex: ^(find|findOne|findOneAndUpdate|findOneAndDelete|updateOne|updateMany|deleteOne|deleteMany|countDocuments|remove)$
+              regex: ^(find|findOne|findById|findOneAndUpdate|findOneAndDelete|findOneAndReplace|updateOne|updateMany|replaceOne|deleteOne|deleteMany|countDocuments|aggregate|remove)$
+      # The update document, the replacement, or distinct's filter (second argument), where a body
+      # can carry operators.
+      - patterns:
+          - pattern: $COL.$M($F, $U, ...)
+          - focus-metavariable: $U
+          - metavariable-regex:
+              metavariable: $M
+              regex: ^(updateOne|updateMany|replaceOne|findOneAndUpdate|findOneAndReplace|findByIdAndUpdate|distinct)$

@@ -5,12 +5,15 @@ rules:
     severity: ERROR
     message: >-
       A request value (req.body, req.query, req.params, req.headers or req.cookies) flows into the
-      text of a SQL statement in this file without a numeric coercion. Use bound parameters.
+      first argument of a query call (query, execute, raw, whereRaw and similar) in this file,
+      directly or through variables, without a numeric coercion. Use bound parameters.
     metadata:
       cls: injection
       cwe: CWE-89
       confidence: high
-      note: Intra-file only. A value that crosses a file boundary before the query is not seen.
+      note: >-
+        Intra-file only. A value that crosses a file boundary before the query is not seen. A
+        request value passed whole as the statement is also reported.
     mode: taint
     pattern-sources:
       - pattern: $REQ.body
@@ -28,9 +31,4 @@ rules:
           - focus-metavariable: $Q
           - metavariable-regex:
               metavariable: $M
-              regex: ^(query|execute|raw|queryRaw|\$queryRawUnsafe|\$executeRawUnsafe|unsafe)$
-          - metavariable-pattern:
-              metavariable: $Q
-              pattern-either:
-                - pattern: '`...${...}...`'
-                - pattern: '... + ...'
+              regex: ^(query|execute|raw|queryRaw|\$queryRawUnsafe|\$executeRawUnsafe|unsafe|whereRaw|orderByRaw|havingRaw|joinRaw)$

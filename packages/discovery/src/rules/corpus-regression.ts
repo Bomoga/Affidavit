@@ -61,7 +61,8 @@ export interface Expectations {
   rules: Record<string, { catches: string[]; flagsControls: string[] }>;
   notTargeted: Record<string, string>;
   unlabeledFindings: { ruleId: string; file: string; startLine: number }[];
-  allowedNotificationPathPrefixes: string[];
+  /** Exact (file, rule) pairs of tolerated Semgrep notifications. */
+  allowedNotifications: { file: string; rule: string | null }[];
 }
 
 export interface RuleRow {
@@ -115,10 +116,30 @@ const sameSet = (a: readonly string[], b: readonly string[]): boolean =>
 
 const showSet = (xs: readonly string[]): string => (xs.length === 0 ? 'none' : xs.join(', '));
 
-/** Path of a repo file named in a Semgrep notification, or undefined if none is named. */
-export function notificationPath(message: string): string | undefined {
-  const m = /\/src\/([^\s:]+)/.exec(message);
-  return m?.[1];
+export interface ParsedNotification {
+  kind: 'timeout' | 'syntax-error';
+  /** Repo-relative path. */
+  file: string;
+  /** Rule that timed out; null for a parse error, which is not tied to a rule. */
+  rule: string | null;
+}
+
+/**
+ * Reads the two Semgrep notification shapes the regression tolerates. Anything else, including a
+ * path that is absolute or climbs out with `..`, is undefined and so never allowed.
+ */
+export function parseNotification(message: string): ParsedNotification | undefined {
+  const first = message.split('\n')[0] ?? '';
+  const timeout = /^Timeout when running (\S+) on \/src\/(\S+?):$/.exec(first);
+  const syntax = /^Syntax error at line \/src\/(\S+?):\d+:$/.exec(first);
+  const parsed: ParsedNotification | undefined = timeout
+    ? { kind: 'timeout', rule: timeout[1] ?? '', file: timeout[2] ?? '' }
+    : syntax
+      ? { kind: 'syntax-error', rule: null, file: syntax[1] ?? '' }
+      : undefined;
+  if (!parsed) return undefined;
+  if (parsed.file.startsWith('/') || parsed.file.split('/').includes('..')) return undefined;
+  return parsed;
 }
 
 /**
@@ -261,13 +282,14 @@ export function evaluate(
     if (!labelIds.has(id)) problems.push(`notTargeted names unknown label ${id}`);
   }
 
-  // A timeout or parse failure may hide findings. It is allowed only in named vendored paths.
+  // A timeout or parse failure may hide findings. Each one must be an exact (file, rule) pair the
+  // expectations name. A path with `..` or a leading slash is never accepted.
   for (const variant of ['vulnerable', 'safe', 'negative-control'] as const) {
     for (const message of runs[variant].notifications) {
-      const p = notificationPath(message);
+      const n = parseNotification(message);
       const allowed =
-        p !== undefined &&
-        expectations.allowedNotificationPathPrefixes.some((prefix) => p.startsWith(prefix));
+        n !== undefined &&
+        expectations.allowedNotifications.some((a) => a.file === n.file && a.rule === n.rule);
       if (!allowed) {
         problems.push(`${variant}: unexplained Semgrep notification: ${message.slice(0, 200)}`);
       }
@@ -309,21 +331,80 @@ export function countAnnotations(testsDir: string): Record<string, { ruleid: num
 }
 
 /**
- * Digest over everything a rule change can touch: rule files, Semgrep test files, and the
- * expectations file, with line endings normalised so a Windows checkout hashes the same.
+ * Digest over everything that decides what the regression result means, with line endings
+ * normalised so a Windows checkout hashes the same:
+ *  - our rule files, their Semgrep test files, the IDOR generator and the expectations file;
+ *  - the Semgrep entry of docker/tools/tools.json (image reference and exit-code policy);
+ *  - the NodeGoat pin (commit, tree, archive and patch hashes), the patch files and the corpus
+ *    labels (app.json);
+ *  - the harness (this file, load.ts, the Docker test, the corpus fetch script) and the wrapper
+ *    that builds the Semgrep command line (invocations.ts, run.ts, quarantine.ts).
+ * A change to any of them needs a new real run before `pnpm test` passes again.
  */
-export function rulesDigest(rulesRoot: string): string {
+export function regressionInputsDigest(repo: string): string {
   const h = createHash('sha256');
+  const add = (name: string, text: string): void => {
+    h.update(`${name}\n${text.length}\n${text}\n`);
+  };
+  const readText = (rel: string): string =>
+    readFileSync(join(repo, rel), 'utf8').replace(/\r\n/g, '\n');
+
+  const rules = 'packages/discovery/rules';
   const files: string[] = [];
   for (const sub of ['semgrep', 'tests']) {
-    for (const name of readdirSync(join(rulesRoot, sub)).sort()) files.push(`${sub}/${name}`);
+    for (const name of readdirSync(join(repo, rules, sub)).sort()) {
+      files.push(`${rules}/${sub}/${name}`);
+    }
   }
-  files.push('corpus-expectations.json');
-  for (const rel of files) {
-    const text = readFileSync(join(rulesRoot, rel), 'utf8').replace(/\r\n/g, '\n');
-    h.update(`${rel}\n${text.length}\n${text}\n`);
+  files.push(`${rules}/corpus-expectations.json`, `${rules}/generate-idor-rules.mjs`);
+
+  const nodegoat = 'packages/corpus/data/nodegoat';
+  files.push(`${nodegoat}/pin.json`, `${nodegoat}/app.json`);
+  for (const name of readdirSync(join(repo, nodegoat, 'patches')).sort()) {
+    files.push(`${nodegoat}/patches/${name}`);
   }
+  files.push('packages/corpus/scripts/fetch-pinned.mjs');
+
+  const src = 'packages/discovery/src';
+  files.push(
+    `${src}/rules/corpus-regression.ts`,
+    `${src}/rules/load.ts`,
+    `${src}/rules/corpus-regression.docker.test.ts`,
+    `${src}/tools/invocations.ts`,
+    `${src}/tools/run.ts`,
+    `${src}/tools/quarantine.ts`,
+  );
+  for (const rel of files) add(rel, readText(rel));
+
+  const tools = JSON.parse(readText('docker/tools/tools.json')) as {
+    tools: { name: string }[];
+  };
+  add(
+    'docker/tools/tools.json#semgrep',
+    JSON.stringify(tools.tools.find((t) => t.name === 'semgrep')),
+  );
   return h.digest('hex');
+}
+
+/**
+ * Digest of the normalised run output: every finding on every tree, sorted, plus the per-rule
+ * table. Notifications are left out because timeouts depend on machine speed.
+ */
+export function runOutputDigest(
+  runs: Readonly<Record<TreeVariant, TreeRun>>,
+  evaluation: Evaluation,
+): string {
+  const lines: string[] = [];
+  for (const variant of ['vulnerable', 'safe', 'negative-control'] as const) {
+    for (const f of runs[variant].findings) {
+      lines.push(`${variant}|${f.ruleId}|${f.file}|${String(f.startLine)}-${String(f.endLine)}`);
+    }
+  }
+  lines.sort();
+  for (const r of evaluation.rows) {
+    lines.push(`row|${r.ruleId}|${r.caught.join(',')}|${r.controlsFlagged.join(',')}`);
+  }
+  return createHash('sha256').update(lines.join('\n')).digest('hex');
 }
 
 /** Findings from a Semgrep SARIF document. Anything malformed is skipped, never trusted. */

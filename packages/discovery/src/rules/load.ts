@@ -30,7 +30,10 @@ export function loadExpectations(): Expectations {
  * without a new run. Scalars only, so Prettier leaves the file as written.
  */
 export interface RegressionStamp {
-  rulesSha256: string;
+  /** regressionInputsDigest: rules, rule tests, expectations, corpus pin and labels, harness, wrapper. */
+  inputsSha256: string;
+  /** runOutputDigest of the run that wrote the stamp (findings and per-rule table). */
+  runOutputSha256: string;
   semgrepImage: string;
   nodegoatCommit: string;
   ranOn: string;

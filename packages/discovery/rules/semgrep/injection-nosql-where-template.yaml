@@ -13,7 +13,10 @@ rules:
       cls: injection
       cwe: CWE-943
       confidence: medium
-      note: Does not follow data across files; the arraignment stage decides reachability.
+      note: >-
+        Does not follow data across files; the arraignment stage decides reachability. Known false
+        positive: a constant held in a variable is flagged, because the rule cannot tell it from
+        request data (the corpus negative control relies on this).
     patterns:
       - pattern-either:
           - pattern: '{ $where: `...${$X}...`, ... }'
@@ -24,6 +27,11 @@ rules:
           - pattern: '{ "$where": $X + "...", ... }'
           - pattern: '{ $where: "..." + $X + "...", ... }'
           - pattern: '{ "$where": "..." + $X + "...", ... }'
+          # Mongoose query builder: Model.find().$where(...)
+          - pattern: '$Q.$where(`...${$X}...`)'
+          - pattern: '$Q.$where("..." + $X)'
+          - pattern: '$Q.$where($X + "...")'
+          - pattern: '$Q.$where("..." + $X + "...")'
       # A value coerced to a number cannot carry a quote or code, so it is not reported.
       - metavariable-pattern:
           metavariable: $X
