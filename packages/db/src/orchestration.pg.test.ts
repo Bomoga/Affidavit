@@ -80,12 +80,14 @@ describePg('stage attempts, review flags, open-case sweep and recovery', () => {
   it('review flags are one per attempt, durable, insert-only and tenant scoped', async () => {
     const file = sampleCase(A);
     await storeA.open(file, BUDGET);
-    const p = { tenantId: A, caseId: file.id, stage: 'intake' as const, attempt: 1 };
-    expect(await isFlaggedForReview(db().app, A, file.id, 'intake')).toBe(false);
+    const p = { tenantId: A, caseId: file.id, stage: 'intake' as const, attempt: 1, visit: 1 };
+    expect(await isFlaggedForReview(db().app, A, file.id, 'intake', 1)).toBe(false);
     expect(await flagForReview(db().app, p, 'attempts-exhausted', 'first')).toBe(true);
     expect(await flagForReview(db().app, p, 'budget-exhausted', 'again')).toBe(false);
-    expect(await isFlaggedForReview(db().app, A, file.id, 'intake')).toBe(true);
-    expect(await isFlaggedForReview(db().app, B, file.id, 'intake')).toBe(false);
+    expect(await isFlaggedForReview(db().app, A, file.id, 'intake', 1)).toBe(true);
+    // A flag is for its own visit only.
+    expect(await isFlaggedForReview(db().app, A, file.id, 'intake', 2)).toBe(false);
+    expect(await isFlaggedForReview(db().app, B, file.id, 'intake', 1)).toBe(false);
     for (const stmt of [sql`update review_flags set detail = 'x'`, sql`delete from review_flags`]) {
       await expect(withTenant(db().app, A, (tx) => tx.execute(stmt))).rejects.toThrow();
     }

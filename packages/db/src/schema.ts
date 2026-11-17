@@ -82,6 +82,11 @@ export const cases = pgTable(
         and (${t.caseFile}->'candidate'->>'score')::double precision is not distinct from ${t.candidateScore}
         and (${t.caseFile}->>'escalationFloor')::double precision is not distinct from ${t.escalationFloor}`,
     ),
+    // The repo column (the foreign key target) must be the repo the case file says it targets.
+    check(
+      'cases_repo_matches',
+      sql`${t.caseFile}->'target'->>'repo' is not distinct from ${t.repoId}`,
+    ),
     check('cases_budget_finite', sql`${t.remainingUsd} <> 'NaN'::numeric`),
   ],
 ).enableRLS();
@@ -98,6 +103,12 @@ export const stages = pgTable(
     ordinal: integer('ordinal').notNull(),
     stage: text('stage').notNull(),
     enteredAt: timestamp('entered_at', { withTimezone: true }).notNull().defaultNow(),
+    /**
+     * The case's event counter when the stage was entered (written by the trigger on cases). Events
+     * of this visit have a seq at or above it; recordOnce compares only those. 0 on rows written
+     * before this column existed, which means "every event".
+     */
+    entrySeq: integer('entry_seq').notNull().default(0),
   },
   (t) => [
     primaryKey({ columns: [t.tenantId, t.caseId, t.ordinal] }),
@@ -235,6 +246,10 @@ export const escalations = pgTable(
         and ${t.escalation}->>'caseId' is not distinct from ${t.caseId}
         and ${t.escalation}->>'reason' is not distinct from ${t.reason}`,
     ),
+    check(
+      'escalations_detail_matches',
+      sql`${t.escalation}->>'detail' is not distinct from ${t.detail}`,
+    ),
   ],
 ).enableRLS();
 
@@ -259,6 +274,12 @@ export const events = pgTable(
         and ${t.event}->>'type' is not distinct from ${t.type}
         and ${t.event}->>'caseId' is not distinct from ${t.caseId}
         and (${t.event}->>'seq')::int is not distinct from ${t.seq}`,
+    ),
+    // The verdict inside a verdict-written event must be this case's (the sink checks it too).
+    check(
+      'events_verdict_case_matches',
+      sql`${t.type} <> 'verdict-written'
+        or ${t.event}->'payload'->'verdict'->>'caseId' is not distinct from ${t.caseId}`,
     ),
   ],
 ).enableRLS();
@@ -341,6 +362,12 @@ export const reviewFlags = pgTable(
     caseId: text('case_id').notNull(),
     stage: text('stage').notNull(),
     attempt: integer('attempt').notNull(),
+    /**
+     * The stage visit (stage-history ordinal) the flag is for. A flag blocks retries only for its
+     * own visit, so an appeal that returns to the stage starts afresh. 0 marks a row written
+     * before visits were stored: it matches every visit of its stage.
+     */
+    visit: integer('visit').notNull(),
     reason: text('reason').notNull(),
     detail: text('detail').notNull(),
     createdAt: createdAt(),
@@ -349,6 +376,7 @@ export const reviewFlags = pgTable(
     primaryKey({ columns: [t.tenantId, t.caseId, t.stage, t.attempt] }),
     caseRef(t),
     check('review_flags_stage_valid', sql`${t.stage} in (${stageList})`),
+    check('review_flags_visit_valid', sql`${t.visit} >= 0`),
     check(
       'review_flags_reason_valid',
       sql`${t.reason} in ('attempts-exhausted', 'budget-exhausted')`,

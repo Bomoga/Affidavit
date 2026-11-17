@@ -89,6 +89,8 @@ export async function enqueueStage(pool: AppPool, p: StagePayload): Promise<bool
 export const DEFAULT_STALE_LOCK_SECONDS = 600;
 
 export interface FailedStageJob {
+  /** The Graphile job id (a bigint, as text): the keyset cursor for `afterId`. */
+  id: string;
   key: string;
   attempts: number;
   lastError: string | null;
@@ -96,37 +98,67 @@ export interface FailedStageJob {
   reason: 'failed' | 'stale-lock';
 }
 
+export interface ListFailedOptions {
+  /** Most jobs returned. Default and ceiling: `MAX_FAILED_JOBS_PER_PAGE`. */
+  limit?: number;
+  /** Keyset paging: only jobs with a larger Graphile id than this (a `FailedStageJob.id`). */
+  afterId?: string | null;
+  /**
+   * Also list failures recovery has nothing left to do for (superseded by a later attempt, the
+   * case left the visit, a person was already asked to look). Default false: they are skipped, so
+   * a pass does not re-read every failure it already handled.
+   */
+  includeHandled?: boolean;
+}
+
+export const MAX_FAILED_JOBS_PER_PAGE = 500;
+
 /**
  * Queue jobs that will never run again: those that exhausted their single attempt with an error
  * (including failures before claiming, such as a forged payload, a refused claim or a database
  * outage), and those still locked by a worker that died (locked longer than `staleLockSeconds`
- * with the attempt used up, no error ever recorded, and no live stage-run lease). Read as the
- * worker role. Surface these; such a job keeps its key, so the same attempt cannot be enqueued
+ * with the attempt used up, no error ever recorded, and no live stage-run lease). A job whose
+ * attempt holds a live lease or completed is never listed, locked or not (Graphile clears the
+ * lock of a job locked for over 4 hours without recording an error, so an unlocked job with a
+ * live lease is a long-running handler, not a failure). Failures that are already handled (see
+ * `includeHandled`) are left out. A job with no stage_jobs record is never "handled", so a forged
+ * job stays visible. Read as the worker role, oldest first, one page at a time (`limit`,
+ * `afterId`). Surface these; such a job keeps its key, so the same attempt cannot be enqueued
  * again and the orchestrator must use the next one.
  */
 export async function listFailedStageJobs(
   workerPool: WorkerPool,
   staleLockSeconds = DEFAULT_STALE_LOCK_SECONDS,
+  options: ListFailedOptions = {},
 ): Promise<FailedStageJob[]> {
+  const limit = Math.min(
+    Math.max(options.limit ?? MAX_FAILED_JOBS_PER_PAGE, 1),
+    MAX_FAILED_JOBS_PER_PAGE,
+  );
   const { rows } = await workerPool.query<{
+    id: string;
     key: string;
     attempts: number;
     last_error: string | null;
     stale: boolean;
   }>(
-    `select key, attempts, last_error, (locked_at is not null) as stale
+    `select j.id::text as id, j.key, j.attempts, j.last_error, (j.locked_at is not null) as stale
      from graphile_worker._private_jobs j
-     where attempts >= max_attempts
-       and ((locked_at is null)
-         or (locked_at is not null and locked_at < now() - make_interval(secs => $1)
-             and not coalesce(public.stage_run_job_alive(
-               j.payload->>'tenantId', j.payload->>'caseId', j.payload->>'stage',
-               case when (j.payload->>'attempt') ~ '^[0-9]{1,9}$'
-                    then (j.payload->>'attempt')::int end), false)))
-     order by id`,
-    [staleLockSeconds],
+     cross join lateral (select case when (j.payload->>'attempt') ~ '^[0-9]{1,9}$'
+                                     then (j.payload->>'attempt')::int end as attempt) a
+     where j.attempts >= j.max_attempts
+       and (j.locked_at is null or j.locked_at < now() - make_interval(secs => $1))
+       and not coalesce(public.stage_run_job_alive(
+         j.payload->>'tenantId', j.payload->>'caseId', j.payload->>'stage', a.attempt), false)
+       and ($3::bigint is null or j.id > $3::bigint)
+       and ($4::boolean or not coalesce(public.stage_attempt_handled(
+         j.payload->>'tenantId', j.payload->>'caseId', j.payload->>'stage', a.attempt), false))
+     order by j.id
+     limit $2`,
+    [staleLockSeconds, limit, options.afterId ?? null, options.includeHandled ?? false],
   );
   return rows.map((r) => ({
+    id: r.id,
     key: r.key,
     attempts: r.attempts,
     lastError: r.last_error,
@@ -138,10 +170,11 @@ export type StageJobState = 'none' | 'queued' | 'running' | 'failed' | 'stale';
 
 /**
  * The queue job for a stage attempt's key, as the worker role sees it. `none`: no job (never
- * enqueued, or finished and deleted). `failed`: errored with its attempt used up. `stale`: locked
- * with the attempt used up for longer than `staleLockSeconds`, and no live stage-run lease (the
- * worker died, possibly before claiming). `running`: locked recently, or its attempt still holds
- * a live lease. `queued`: waiting.
+ * enqueued, or finished and deleted). `failed`: errored with its attempt used up and no live
+ * lease or completed run behind it. `stale`: locked with the attempt used up for longer than
+ * `staleLockSeconds`, and no live stage-run lease (the worker died, possibly before claiming).
+ * `running`: locked recently, or its attempt still holds a live lease (also when Graphile cleared
+ * the lock of a long-running job). `queued`: waiting.
  */
 export async function stageJobState(
   workerPool: WorkerPool,
@@ -165,7 +198,7 @@ export async function stageJobState(
   const r = rows[0];
   if (!r) return 'none';
   if (r.locked) return r.stale && r.attempts >= r.max_attempts && !r.live ? 'stale' : 'running';
-  if (r.attempts >= r.max_attempts) return 'failed';
+  if (r.attempts >= r.max_attempts) return r.live ? 'running' : 'failed';
   return 'queued';
 }
 
@@ -189,6 +222,18 @@ export interface StageContext {
   complete(tx: Tx): Promise<void>;
   /** Extend the lease now (the task wrapper also does this on a timer). */
   heartbeat(): Promise<boolean>;
+}
+
+/**
+ * Per task signal: has the lease (as far as the holder can tell) run out? Registered by
+ * `stageTaskList`, read by the lease guard, so a holder that was paused (no timer ran) still
+ * refuses port writes after its confirmed expiry. Reading it aborts the signal if it just ran out.
+ */
+const leaseWatch = new WeakMap<AbortSignal, () => boolean>();
+
+/** True when the signal aborted, or the lease it belongs to has run out by the clock. */
+export function leaseLost(signal: AbortSignal): boolean {
+  return signal.aborted || (leaseWatch.get(signal)?.() ?? false);
 }
 
 export type StageHandler = (job: StagePayload, ctx: StageContext) => Promise<void>;
@@ -248,20 +293,38 @@ export function stageTaskList(
       const abort = new AbortController();
       // The lease expiry we last KNOW about (measured conservatively from when the request that
       // confirmed it started). If we cannot confirm a heartbeat before it, the lease may be gone,
-      // so the signal aborts: once that expiry has passed, or after three failures in a row,
-      // whether the database answered no, errored, or did not answer at all.
+      // so the signal aborts: at that moment (a timer set to it), or after three failures in a
+      // row, whether the database answered no, errored, or did not answer at all. A holder whose
+      // process was paused (so no timer ran) is still refused: `leaseExpired` compares the clock
+      // with the deadline, and the lease guard calls it before every port write.
       let confirmedUntil = claimStartedAt + leaseSeconds * 1000;
       let failures = 0;
+      let deadlineTimer: NodeJS.Timeout | undefined;
       const lose = (why: string) => {
         if (!abort.signal.aborted) abort.abort(new Error(why));
       };
-      const beat = async (): Promise<boolean> => {
+      const armDeadline = () => {
+        clearTimeout(deadlineTimer);
+        deadlineTimer = setTimeout(
+          () => lose('lease expiry passed without a confirmed heartbeat'),
+          Math.max(0, confirmedUntil - Date.now()),
+        );
+      };
+      armDeadline();
+      leaseWatch.set(abort.signal, () => {
+        if (abort.signal.aborted) return true;
+        if (Date.now() < confirmedUntil) return false;
+        lose('lease expiry passed without a confirmed heartbeat');
+        return true;
+      });
+      const heartbeatOnce = async (): Promise<boolean> => {
         const startedAt = Date.now();
         try {
           const ok = await heartbeatStageRun(options.appPool, job, token, leaseSeconds);
           if (ok) {
             confirmedUntil = Math.max(confirmedUntil, startedAt + leaseSeconds * 1000);
             failures = 0;
+            armDeadline();
           } else {
             lose('lease lost');
           }
@@ -272,6 +335,15 @@ export function stageTaskList(
           if (failures >= 3 || Date.now() >= confirmedUntil) lose('heartbeat failed');
           return false;
         }
+      };
+      // One heartbeat at a time: a database that is slow or hung must not collect a queue of
+      // them (each would hold a pool connection). A caller during a flight shares its result.
+      let inFlight: Promise<boolean> | null = null;
+      const beat = (): Promise<boolean> => {
+        inFlight ??= heartbeatOnce().finally(() => {
+          inFlight = null;
+        });
+        return inFlight;
       };
       const timer = setInterval(
         () => {
@@ -314,6 +386,7 @@ export function stageTaskList(
         }
       } finally {
         clearInterval(timer);
+        clearTimeout(deadlineTimer);
       }
     };
   }

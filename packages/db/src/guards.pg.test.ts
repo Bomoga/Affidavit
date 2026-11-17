@@ -6,11 +6,14 @@ import {
   samples,
   type CaseStage,
 } from '@affidavit/contracts';
+import pg from 'pg';
 import { describe, expect, it } from 'vitest';
 import { PgCaseStore } from './case-store.js';
 import { provisionTenant } from './migrate.js';
 import { enqueueStage } from './queue.js';
 import { claimStageRun } from './stage-runs.js';
+import { flagForReview } from './stage-attempts.js';
+import { openPool } from './tenant.js';
 import { BUDGET, describePg, sampleCase, useTestDatabase } from './test-support.js';
 
 const T = 'tenant-g';
@@ -54,6 +57,155 @@ describePg('database guards behind the store', () => {
     await provisionTenant(db().ownerUrl, 'tenant-unprovisioned');
     await expect(store.open(sampleCase('tenant-unprovisioned'), BUDGET)).resolves.toBeUndefined();
   });
+
+  /**
+   * Every `*_blob_matches` CHECK (and its siblings), one key at a time: a blob that is valid
+   * except that one key is missing must be rejected, and the untouched blob must be accepted, so
+   * the rejection is the missing key's doing. Triggers that would object first are disabled.
+   */
+  async function blobMatrix(file: ReturnType<typeof sampleCase>): Promise<void> {
+    const id = file.id;
+    const exhibitId = Exhibit.parse(samples.Exhibit).id;
+    const attempt = async (text: string, params: unknown[]): Promise<string> => {
+      const c = await db().admin.connect();
+      try {
+        await c.query('begin');
+        await c.query('alter table ballots disable trigger user');
+        await c.query('alter table escalations disable trigger user');
+        try {
+          await c.query(text, params);
+          return 'ok';
+        } catch (err) {
+          return (err as Error).message;
+        }
+      } finally {
+        await c.query('rollback');
+        c.release();
+      }
+    };
+    type Blob = Record<string, unknown>;
+    const caseInsert = `insert into cases (tenant_id, id, repo_id, case_file, candidate_score, escalation_floor,
+                 remaining_input_tokens, remaining_output_tokens, remaining_usd)
+               values ($1, 'cm-ok', $2, $3::jsonb, 0.5, 0.1, 1, 1, 1)`;
+    const caseBlob = {
+      id: 'cm-ok',
+      tenantId: T,
+      target: { repo: file.target.repo },
+      candidate: { score: 0.5 },
+      escalationFloor: 0.1,
+    };
+    const escalationInsert = `insert into escalations (tenant_id, case_id, seq, reason, detail, escalation) values ($1, $2, 0, 'split-jury', 'd', $3::jsonb)`;
+    const entries: {
+      check: string;
+      text: string;
+      params: (blob: string) => unknown[];
+      blob: Blob;
+      keys: string[];
+      extra?: Blob[];
+    }[] = [
+      {
+        check: 'events_blob_matches',
+        text: `insert into events (tenant_id, case_id, seq, type, event) values ($1, $2, 0, 'stage-entered', $3::jsonb)`,
+        params: (b) => [T, id, b],
+        blob: { type: 'stage-entered', caseId: id, seq: 0 },
+        keys: ['type', 'caseId', 'seq'],
+      },
+      {
+        check: 'events_verdict_case_matches',
+        text: `insert into events (tenant_id, case_id, seq, type, event) values ($1, $2, 0, 'verdict-written', $3::jsonb)`,
+        params: (b) => [T, id, b],
+        blob: { type: 'verdict-written', caseId: id, seq: 0, payload: { verdict: { caseId: id } } },
+        keys: ['payload'],
+        // The verdict inside the event must be this case's, whatever else the blob says.
+        extra: [
+          {
+            type: 'verdict-written',
+            caseId: id,
+            seq: 0,
+            payload: { verdict: { caseId: 'other' } },
+          },
+          { type: 'verdict-written', caseId: id, seq: 0, payload: { verdict: {} } },
+        ],
+      },
+      {
+        check: 'verdicts_blob_matches',
+        text: `insert into verdicts (tenant_id, case_id, outcome, verdict) values ($1, $2, 'proven-fixed', $3::jsonb)`,
+        params: (b) => [T, id, b],
+        blob: { caseId: id, outcome: 'proven-fixed' },
+        keys: ['caseId', 'outcome'],
+      },
+      {
+        check: 'ballots_blob_matches',
+        text: `insert into ballots (tenant_id, case_id, seq, juror_id, question, ballot) values ($1, $2, 0, 'j', 'severity', $3::jsonb)`,
+        params: (b) => [T, id, b],
+        blob: { jurorId: 'j', question: 'severity' },
+        keys: ['jurorId', 'question'],
+      },
+      {
+        check: 'escalations_blob_matches',
+        text: escalationInsert,
+        params: (b) => [T, id, b],
+        blob: { caseId: id, reason: 'split-jury', detail: 'd' },
+        keys: ['caseId', 'reason'],
+      },
+      {
+        check: 'escalations_detail_matches',
+        text: escalationInsert,
+        params: (b) => [T, id, b],
+        blob: { caseId: id, reason: 'split-jury', detail: 'd' },
+        keys: ['detail'],
+        extra: [{ caseId: id, reason: 'split-jury', detail: 'a different detail' }],
+      },
+      {
+        check: 'exhibits_blob_matches',
+        text: `insert into exhibits (tenant_id, case_id, id, kind, author, sha256, exhibit) values ($1, $2, 'ex-m', 'witness', 'defense', 'a', $3::jsonb)`,
+        params: (b) => [T, id, b],
+        blob: { id: 'ex-m', caseId: id, kind: 'witness', author: 'defense', sha256: 'a' },
+        keys: ['id', 'caseId', 'kind', 'author', 'sha256'],
+      },
+      {
+        check: 'exhibits_result_valid',
+        text: `update exhibits set result = $2::jsonb where case_id = $1`,
+        params: (b) => [id, b],
+        blob: { exhibitId },
+        keys: ['exhibitId'],
+      },
+      {
+        check: 'cases_file_matches',
+        text: caseInsert,
+        params: (b) => [T, file.target.repo, b],
+        blob: caseBlob,
+        keys: ['id', 'tenantId', 'candidate', 'escalationFloor'],
+        extra: [{ ...caseBlob, candidate: {} }],
+      },
+      {
+        check: 'cases_repo_matches',
+        text: caseInsert,
+        params: (b) => [T, file.target.repo, b],
+        blob: caseBlob,
+        keys: ['target'],
+        extra: [{ ...caseBlob, target: {} }],
+      },
+    ];
+    for (const e of entries) {
+      expect(await attempt(e.text, e.params(JSON.stringify(e.blob))), `${e.check} baseline`).toBe(
+        'ok',
+      );
+      const mutants: [string, Blob][] = [
+        ...e.keys.map((k): [string, Blob] => {
+          const rest = { ...e.blob };
+          delete rest[k];
+          return [`without ${k}`, rest];
+        }),
+        ...(e.extra ?? []).map((b, i): [string, Blob] => [`variant ${i}`, b]),
+      ];
+      for (const [what, blob] of mutants) {
+        expect(await attempt(e.text, e.params(JSON.stringify(blob))), `${e.check} ${what}`).toMatch(
+          new RegExp(e.check),
+        );
+      }
+    }
+  }
 
   describe('cases', () => {
     it('case file, score, floor and identity are not updatable by the application role', async () => {
@@ -176,6 +328,7 @@ describePg('database guards behind the store', () => {
           JSON.stringify({
             id,
             tenantId: T,
+            target: { repo },
             candidate: { score: Number(v.score) },
             escalationFloor: 0.1,
           }),
@@ -279,7 +432,13 @@ describePg('database guards behind the store', () => {
       const text = `insert into cases (tenant_id, id, repo_id, case_file, candidate_score, escalation_floor,
         remaining_input_tokens, remaining_output_tokens, remaining_usd)
         values ($1, $2, $3, $4::jsonb, $5, $6, 1, 1, 1)`;
-      const good = { id: 'cf-ok', tenantId: T, candidate: { score: 0.9 }, escalationFloor: 0.7 };
+      const good = {
+        id: 'cf-ok',
+        tenantId: T,
+        target: { repo: file.target.repo },
+        candidate: { score: 0.9 },
+        escalationFloor: 0.7,
+      };
       const attempt = (id: string, over: object, score = 0.9, floor = 0.7) =>
         asApp(text, [
           T,
@@ -294,6 +453,11 @@ describePg('database guards behind the store', () => {
       expect(await attempt('cf-2', {}, 0.1)).toMatch(/cases_file_matches/); // score column lowered
       expect(await attempt('cf-3', {}, 0.9, 0.99)).toMatch(/cases_file_matches/); // floor raised
       expect(await attempt('cf-4', { id: 'different' })).toMatch(/cases_file_matches/);
+      // The repo column (the foreign key) must be the repo the case file targets.
+      expect(await attempt('cf-5', { target: { repo: 'another-repo' } })).toMatch(
+        /cases_repo_matches/,
+      );
+      expect(await attempt('cf-6', { target: undefined })).toMatch(/cases_repo_matches/);
     });
 
     it('the budget must be a number and seq advances by one', async () => {
@@ -435,9 +599,10 @@ describePg('database guards behind the store', () => {
         [T, file.target.repo],
         /cases_file_matches/,
       );
+      await blobMatrix(file);
     });
 
-    it('functions are not executable by PUBLIC, and the app role cannot ALTER ROLE its own settings', async () => {
+    it('functions are not executable by PUBLIC, and the app role cannot set app.tenant_id as a role default', async () => {
       const { rows } = await db().admin.query<{ proname: string }>(`
         select p.proname from pg_proc p join pg_namespace n on n.oid = p.pronamespace
         where n.nspname = 'public'
@@ -447,6 +612,25 @@ describePg('database guards behind the store', () => {
       expect(await asApp(`alter role affidavit_app set app.tenant_id = 'tenant-evil'`)).toMatch(
         /permission denied|must have/,
       );
+    });
+
+    it('documented behaviour: the app role CAN change its own search_path default; openPool then fails closed', async () => {
+      // PostgreSQL lets an ordinary role set its own session defaults, except for custom
+      // settings such as app.tenant_id (denied above). A search_path change cannot be prevented,
+      // but the next openPool refuses the role, so a service would not start with it.
+      const c = new pg.Client({ connectionString: db().appUrl });
+      await c.connect();
+      try {
+        await c.query(`alter role affidavit_app in database ${db().name} set search_path = public`);
+        await expect(openPool(db().appUrl, 'affidavit_app')).rejects.toThrow(/search_path/);
+      } finally {
+        await c.end();
+        await db().admin.query(
+          `alter role affidavit_app in database ${db().name} set search_path = pg_catalog, public, pg_temp`,
+        );
+      }
+      const pool = await openPool(db().appUrl, 'affidavit_app');
+      await pool.end();
     });
 
     it('case exhaustion never clears', async () => {
@@ -539,7 +723,13 @@ describePg('database guards behind the store', () => {
       wallMs: 1,
       attempt: 1,
     });
-    for (const t of ['stages', 'cost_rows']) {
+    await flagForReview(
+      db().app,
+      { tenantId: T, caseId: file.id, stage: 'map', attempt: 1, visit: 2 },
+      'attempts-exhausted',
+      'seed',
+    );
+    for (const t of ['stages', 'cost_rows', 'review_flags']) {
       await expect(db().admin.query(`update ${t} set tenant_id = tenant_id`)).rejects.toThrow(
         /append-only/,
       );
@@ -549,5 +739,28 @@ describePg('database guards behind the store', () => {
     for (const t of ['ballots', 'escalations']) {
       await expect(db().admin.query(`truncate ${t}`)).rejects.toThrow(/append-only/);
     }
+  });
+
+  it('the application role may only SELECT and INSERT on review_flags, at table and column level', async () => {
+    const grants = await db().admin.query<{ privilege_type: string }>(
+      `select p.privilege_type from pg_class c
+       cross join lateral aclexplode(c.relacl) p
+       join pg_roles r on r.oid = p.grantee
+       where c.relname = 'review_flags' and c.relnamespace = 'public'::regnamespace
+         and r.rolname = 'affidavit_app'
+       order by 1`,
+    );
+    expect(grants.rows.map((r) => r.privilege_type)).toEqual(['INSERT', 'SELECT']);
+    const cols = await db().admin.query(
+      `select attname from pg_attribute
+       where attrelid = 'public.review_flags'::regclass and attnum > 0 and attacl is not null`,
+    );
+    expect(cols.rows).toEqual([]);
+    const worker = await db().admin.query(
+      `select 1 from pg_class c cross join lateral aclexplode(c.relacl) p
+       join pg_roles r on r.oid = p.grantee
+       where c.relname = 'review_flags' and r.rolname = 'affidavit_worker'`,
+    );
+    expect(worker.rows).toEqual([]);
   });
 });
