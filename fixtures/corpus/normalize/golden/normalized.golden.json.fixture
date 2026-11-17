@@ -1,0 +1,316 @@
+{
+  "candidates": [
+    {
+      "schemaVersion": 1,
+      "id": "cand-0194ff9b922d3e68",
+      "tool": "osv",
+      "ruleId": "AFFIDAVIT-NORM-0001",
+      "cls": "injection",
+      "file": "package-lock.json",
+      "range": {
+        "startLine": 1,
+        "endLine": 1
+      },
+      "reachability": "unknown",
+      "score": 0,
+      "scoreInputs": {},
+      "toolAgreement": 1
+    },
+    {
+      "schemaVersion": 1,
+      "id": "cand-e86aa811af64f1ac",
+      "tool": "semgrep",
+      "ruleId": "affidavit.normalize.query-from-request",
+      "cls": "injection",
+      "file": "src/100%.js",
+      "range": {
+        "startLine": 2,
+        "endLine": 2
+      },
+      "reachability": "unknown",
+      "score": 0,
+      "scoreInputs": {},
+      "toolAgreement": 1
+    },
+    {
+      "schemaVersion": 1,
+      "id": "cand-f03b979be994a22d",
+      "tool": "semgrep",
+      "ruleId": "affidavit.normalize.query-from-request",
+      "cls": "injection",
+      "file": "src/a#b.js",
+      "range": {
+        "startLine": 2,
+        "endLine": 2
+      },
+      "reachability": "unknown",
+      "score": 0,
+      "scoreInputs": {},
+      "toolAgreement": 1
+    },
+    {
+      "schemaVersion": 1,
+      "id": "cand-d618873b127263a0",
+      "tool": "semgrep",
+      "ruleId": "affidavit.normalize.query-from-request",
+      "cls": "injection",
+      "file": "src/a%20b.js",
+      "range": {
+        "startLine": 2,
+        "endLine": 2
+      },
+      "reachability": "unknown",
+      "score": 0,
+      "scoreInputs": {},
+      "toolAgreement": 1
+    },
+    {
+      "schemaVersion": 1,
+      "id": "cand-b3361b19af2e6803",
+      "tool": "codeql",
+      "ruleId": "js/command-line-injection",
+      "cls": "injection",
+      "file": "src/admin.js",
+      "range": {
+        "startLine": 3,
+        "endLine": 4
+      },
+      "reachability": "unknown",
+      "score": 0,
+      "scoreInputs": {},
+      "toolAgreement": 1
+    },
+    {
+      "schemaVersion": 1,
+      "id": "cand-3daeed9494f9bdf4",
+      "tool": "semgrep",
+      "ruleId": "affidavit.normalize.query-from-request",
+      "cls": "injection",
+      "file": "src/routes.js",
+      "range": {
+        "startLine": 9,
+        "endLine": 9
+      },
+      "reachability": "unknown",
+      "score": 0,
+      "scoreInputs": {},
+      "toolAgreement": 2
+    },
+    {
+      "schemaVersion": 1,
+      "id": "cand-ff79f6a56e4ed6e2",
+      "tool": "semgrep",
+      "ruleId": "affidavit.normalize.nosql-where",
+      "cls": "injection",
+      "file": "src/routes.js",
+      "range": {
+        "startLine": 15,
+        "endLine": 15
+      },
+      "reachability": "unknown",
+      "score": 0,
+      "scoreInputs": {},
+      "toolAgreement": 2
+    },
+    {
+      "schemaVersion": 1,
+      "id": "cand-54dbfe17a03fb204",
+      "tool": "semgrep",
+      "ruleId": "affidavit.normalize.idor-find-by-id",
+      "cls": "idor",
+      "file": "src/routes.js",
+      "range": {
+        "startLine": 21,
+        "endLine": 21
+      },
+      "reachability": "unknown",
+      "score": 0,
+      "scoreInputs": {},
+      "toolAgreement": 1
+    },
+    {
+      "schemaVersion": 1,
+      "id": "cand-029cc22160aa4fc0",
+      "tool": "semgrep",
+      "ruleId": "affidavit.normalize.query-from-request",
+      "cls": "injection",
+      "file": "src/é.js",
+      "range": {
+        "startLine": 2,
+        "endLine": 2
+      },
+      "reachability": "unknown",
+      "score": 0,
+      "scoreInputs": {},
+      "toolAgreement": 1
+    }
+  ],
+  "merged": [
+    {
+      "candidateId": "cand-0194ff9b922d3e68",
+      "members": [
+        {
+          "tool": "osv",
+          "ruleId": "AFFIDAVIT-NORM-0001",
+          "startLine": 1,
+          "endLine": 1,
+          "package": {
+            "name": "sqlish",
+            "version": "1.0.0"
+          }
+        }
+      ]
+    },
+    {
+      "candidateId": "cand-e86aa811af64f1ac",
+      "members": [
+        {
+          "tool": "semgrep",
+          "ruleId": "affidavit.normalize.query-from-request",
+          "startLine": 2,
+          "endLine": 2
+        },
+        {
+          "tool": "semgrep",
+          "ruleId": "affidavit.normalize.sql-concat",
+          "startLine": 2,
+          "endLine": 2
+        }
+      ]
+    },
+    {
+      "candidateId": "cand-f03b979be994a22d",
+      "members": [
+        {
+          "tool": "semgrep",
+          "ruleId": "affidavit.normalize.query-from-request",
+          "startLine": 2,
+          "endLine": 2
+        },
+        {
+          "tool": "semgrep",
+          "ruleId": "affidavit.normalize.sql-concat",
+          "startLine": 2,
+          "endLine": 2
+        }
+      ]
+    },
+    {
+      "candidateId": "cand-d618873b127263a0",
+      "members": [
+        {
+          "tool": "semgrep",
+          "ruleId": "affidavit.normalize.query-from-request",
+          "startLine": 2,
+          "endLine": 2
+        },
+        {
+          "tool": "semgrep",
+          "ruleId": "affidavit.normalize.sql-concat",
+          "startLine": 2,
+          "endLine": 2
+        }
+      ]
+    },
+    {
+      "candidateId": "cand-b3361b19af2e6803",
+      "members": [
+        {
+          "tool": "codeql",
+          "ruleId": "js/command-line-injection",
+          "startLine": 3,
+          "endLine": 4
+        }
+      ]
+    },
+    {
+      "candidateId": "cand-3daeed9494f9bdf4",
+      "members": [
+        {
+          "tool": "semgrep",
+          "ruleId": "affidavit.normalize.query-from-request",
+          "startLine": 9,
+          "endLine": 9
+        },
+        {
+          "tool": "semgrep",
+          "ruleId": "affidavit.normalize.sql-concat",
+          "startLine": 9,
+          "endLine": 9
+        },
+        {
+          "tool": "codeql",
+          "ruleId": "js/sql-injection",
+          "startLine": 9,
+          "endLine": 9
+        }
+      ]
+    },
+    {
+      "candidateId": "cand-ff79f6a56e4ed6e2",
+      "members": [
+        {
+          "tool": "semgrep",
+          "ruleId": "affidavit.normalize.nosql-where",
+          "startLine": 15,
+          "endLine": 15
+        },
+        {
+          "tool": "codeql",
+          "ruleId": "js/nosql-injection",
+          "startLine": 15,
+          "endLine": 15
+        }
+      ]
+    },
+    {
+      "candidateId": "cand-54dbfe17a03fb204",
+      "members": [
+        {
+          "tool": "semgrep",
+          "ruleId": "affidavit.normalize.idor-find-by-id",
+          "startLine": 21,
+          "endLine": 21
+        }
+      ]
+    },
+    {
+      "candidateId": "cand-029cc22160aa4fc0",
+      "members": [
+        {
+          "tool": "semgrep",
+          "ruleId": "affidavit.normalize.query-from-request",
+          "startLine": 2,
+          "endLine": 2
+        },
+        {
+          "tool": "semgrep",
+          "ruleId": "affidavit.normalize.sql-concat",
+          "startLine": 2,
+          "endLine": 2
+        }
+      ]
+    }
+  ],
+  "skipped": [
+    {
+      "tool": "codeql",
+      "ruleId": "js/reflected-xss",
+      "reason": "unmapped-class",
+      "file": "src/routes.js",
+      "startLine": 30,
+      "endLine": 30,
+      "cwe": [
+        79
+      ]
+    },
+    {
+      "tool": "osv",
+      "ruleId": "AFFIDAVIT-NORM-0002",
+      "reason": "unmapped-class",
+      "file": "package-lock.json",
+      "cwe": []
+    }
+  ],
+  "partialTools": []
+}

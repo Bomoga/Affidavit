@@ -1,0 +1,74 @@
+{
+  "results": [
+    {
+      "source": {
+        "path": "/src/package-lock.json",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "plainlib",
+            "version": "2.0.0",
+            "ecosystem": "npm",
+            "purl": "pkg:npm/plainlib@2.0.0?source=PUBLIC_REGISTRY"
+          },
+          "groups": [
+            {
+              "ids": [
+                "AFFIDAVIT-NORM-0002"
+              ],
+              "aliases": [
+                "AFFIDAVIT-NORM-0002"
+              ],
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "affected": [
+                {
+                  "package": {
+                    "ecosystem": "npm",
+                    "name": "plainlib"
+                  },
+                  "ranges": [
+                    {
+                      "events": [
+                        {
+                          "introduced": "0"
+                        },
+                        {
+                          "fixed": "2.0.1"
+                        }
+                      ],
+                      "type": "SEMVER"
+                    }
+                  ]
+                }
+              ],
+              "id": "AFFIDAVIT-NORM-0002",
+              "modified": "2026-01-01T00:00:00Z",
+              "published": "2026-01-01T00:00:00Z",
+              "summary": "Synthetic advisory with no CWE class for normalizer tests. Not a real vulnerability record."
+            }
+          ]
+        },
+        {
+          "package": {
+            "name": "sqlish",
+            "version": "1.0.0",
+            "ecosystem": "npm",
+            "purl": "pkg:npm/sqlish@1.0.0?source=PUBLIC_REGISTRY"
+          }
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
