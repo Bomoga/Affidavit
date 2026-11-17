@@ -41,6 +41,7 @@ const describePg = PASSWORD
 
 const exec = promisify(execFile);
 const TENANT = 'tenant-cli-e2e';
+const OTHER_TENANT = 'tenant-cli-e2e-other';
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function until(cond: () => Promise<boolean>, ms = 30_000): Promise<void> {
@@ -54,6 +55,38 @@ function composeImage(): string {
   if (!m?.[1]) throw new Error('no pinned postgres image in docker/compose.yaml');
   return m[1];
 }
+
+/**
+ * Known divergence between fixtures/trials/nodegoat-sqli-001.events.json and what the fake worker
+ * emits (a question for the lead, not changed here): the fake has no cost-charged and no remedy
+ * exhibit-submitted, adds a jury stage, writes the verdict at stage jury (seq 17), and every stage
+ * transition event has actor stenographer.
+ */
+const FIXTURE_ONLY = [
+  '6 stage-entered defense defense',
+  '9 cost-charged defense defense',
+  '10 stage-exited defense defense',
+  '11 stage-entered prosecution prosecution',
+  '12 stage-exited prosecution prosecution',
+  '13 stage-entered remedy remedy',
+  '14 exhibit-submitted remedy remedy',
+  '15 stage-exited remedy remedy',
+  '16 stage-entered verify judge',
+  '17 stage-exited verify judge',
+  '18 verdict-written verdict stenographer',
+];
+const FAKE_ONLY = [
+  '6 stage-entered defense stenographer',
+  '9 stage-exited defense stenographer',
+  '10 stage-entered prosecution stenographer',
+  '11 stage-exited prosecution stenographer',
+  '12 stage-entered remedy stenographer',
+  '13 stage-exited remedy stenographer',
+  '14 stage-entered verify stenographer',
+  '15 stage-exited verify stenographer',
+  '16 stage-entered jury stenographer',
+  '17 verdict-written jury stenographer',
+];
 
 const fixture = JSON.parse(
   readFileSync(
@@ -71,6 +104,7 @@ describePg('affidavit CLI against a worker with all fakes and real Postgres', ()
   let workerUrl = '';
   let appPool: AppPool;
   let worker: RunningWorker;
+  let scannedCaseId = '';
 
   beforeAll(async () => {
     container = `affidavit-l1-11-${randomBytes(4).toString('hex')}`;
@@ -122,6 +156,7 @@ describePg('affidavit CLI against a worker with all fakes and real Postgres', ()
     await setRolePassword(adminUrl, OWNER_ROLE, ownerPw);
     await applyMigrations(url(OWNER_ROLE, ownerPw));
     await provisionTenant(url(OWNER_ROLE, ownerPw), TENANT);
+    await provisionTenant(url(OWNER_ROLE, ownerPw), OTHER_TENANT);
     await setRolePassword(adminUrl, APP_ROLE, appPw);
     await setRolePassword(adminUrl, WORKER_ROLE, workerPw);
     appUrl = url(APP_ROLE, appPw);
@@ -172,6 +207,7 @@ describePg('affidavit CLI against a worker with all fakes and real Postgres', ()
     const idLine = c.out.find((l) => l.startsWith('case '));
     const caseId = /^case (\S+) enqueued/.exec(idLine ?? '')?.[1];
     expect(caseId).toMatch(/^case-cli-/);
+    scannedCaseId = caseId ?? '';
 
     // What the fake worker emitted for this case, straight from the store. The CLI stops at the
     // first terminal event, so it prints the stream up to and including verdict-written; the fake
@@ -208,6 +244,13 @@ describePg('affidavit CLI against a worker with all fakes and real Postgres', ()
       [16, 'stage-entered', 'jury', T],
       [17, 'verdict-written', 'jury', T],
     ]);
+    // The exact divergence from the recorded fixture, pinned so any drift fails loudly.
+    const key = (e: { seq: number; type: string; stage: string; actor: string }) =>
+      `${e.seq} ${e.type} ${e.stage} ${e.actor}`;
+    const fake = stored.slice(0, end + 1).map(key);
+    const fix = fixtureEvents.map(key);
+    expect(fix.filter((k) => !fake.includes(k))).toEqual(FIXTURE_ONLY);
+    expect(fake.filter((k) => !fix.includes(k))).toEqual(FAKE_ONLY);
     const verdict = stored[end];
     expect(verdict?.type === 'verdict-written' && verdict.payload.verdict.summary).toContain(
       '[fake]',
@@ -232,9 +275,17 @@ describePg('affidavit CLI against a worker with all fakes and real Postgres', ()
     const c = capture();
     expect(await run(['status', 'case-does-not-exist'], c.deps)).toBe(ExitCode.NOT_FOUND);
     expect(c.err.join('\n')).not.toContain(appUrl);
+  });
+
+  it('another provisioned tenant cannot read a scanned case: exit 6 and no event lines', async () => {
+    expect(scannedCaseId).toMatch(/^case-cli-/);
+    const own = capture();
+    expect(await run(['status', scannedCaseId], own.deps)).toBe(ExitCode.OK);
     const other = capture();
-    other.deps.env = { ...env(), AFFIDAVIT_TENANT_ID: 'tenant-someone-else' };
-    expect(await run(['status', 'case-does-not-exist'], other.deps)).not.toBe(ExitCode.OK);
+    other.deps.env = { ...env(), AFFIDAVIT_TENANT_ID: OTHER_TENANT };
+    expect(await run(['status', scannedCaseId], other.deps)).toBe(ExitCode.NOT_FOUND);
+    expect([...other.out, ...other.err].some((l) => l.includes('#0'))).toBe(false);
+    expect(other.out).toEqual([]);
   });
 
   it('the process entry point works: scan exits 0 with plain output and no URL', async () => {

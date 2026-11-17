@@ -17,6 +17,7 @@ import {
   type AppPool,
 } from '@affidavit/db';
 import { CliError, ExitCode } from './exit.js';
+import { RaceStop } from './guard.js';
 
 type Env = Readonly<Record<string, string | undefined>>;
 
@@ -138,6 +139,12 @@ export function secretsOf(databaseUrl: string): string[] {
 /** Maps a thrown error to a CliError with a message that cannot hold a connection string. */
 export function toCliError(err: unknown, secrets: readonly string[] = []): CliError {
   if (err instanceof CliError) return err;
+  if (err instanceof RaceStop) {
+    return new CliError(
+      err.kind === 'aborted' ? ExitCode.INTERRUPTED : ExitCode.TIMEOUT,
+      err.message,
+    );
+  }
   const raw = err instanceof Error ? err.message : 'unknown error';
   let msg = raw.replace(/postgres(?:ql)?:\/\/\S+/gi, '[redacted-url]');
   for (const s of secrets) if (s.length > 0) msg = msg.split(s).join('[redacted]');

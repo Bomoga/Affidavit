@@ -92,6 +92,21 @@ describe('sanitize and renderEvent', () => {
     expect(/[\u200b\ufeff]/u.test(s)).toBe(false);
   });
 
+  it('strips Unicode tag characters and filler characters, replaces lone surrogates', () => {
+    const tag = String.fromCodePoint(0xe0041, 0xe0042, 0xe007f);
+    expect(sanitize(`a${tag}b`)).toBe('a b');
+    for (const cp of [0x3164, 0x115f, 0xffa0]) {
+      expect(sanitize(`x${String.fromCodePoint(cp)}y`)).toBe('x y');
+    }
+    const high = String.fromCharCode(0xd83d);
+    const low = String.fromCharCode(0xde00);
+    const fffd = String.fromCharCode(0xfffd);
+    expect(sanitize(`a${high}b`)).toBe(`a${fffd}b`);
+    expect(sanitize(`a${low}b`)).toBe(`a${fffd}b`);
+    // A valid pair is kept.
+    expect(sanitize(`a${high}${low}b`)).toBe(`a${high}${low}b`);
+  });
+
   it('caps length, on code points', () => {
     const s = sanitize('\u{1F600}'.repeat(500), 50);
     expect(Array.from(s)).toHaveLength(50);
@@ -196,7 +211,16 @@ describe('argument parsing and exit codes', () => {
     const h = harness({});
     expect(await run(['scan', 'github.com/example/app'], h.deps)).toBe(ExitCode.OK);
     expect(h.out[0]).toContain('FAKE INTAKE');
-    expect(h.out.filter((l) => l.startsWith('#'))).toHaveLength(events.length);
+    // The fixture stream, event for event: exact rendered lines, and seq, type, stage and actor.
+    const printed = h.out.filter((l) => l.startsWith('#'));
+    expect(printed).toEqual(events.map((e) => renderEvent(e)));
+    expect(
+      printed.map((l) => {
+        const [seq, stage, actor, type] = l.slice(1).split(/\s+/);
+        return [Number(seq), type, stage, actor];
+      }),
+    ).toEqual(events.map((e) => [e.seq, e.type, e.stage, e.actor]));
+    expect(events).toHaveLength(19);
     expect(h.started).toHaveLength(1);
     expect(h.started[0]?.target.repo).toBe('github.com/example/app');
     expect(h.started[0]?.tenantId).toBe('tenant-cli');
@@ -279,6 +303,86 @@ describe('argument parsing and exit codes', () => {
     });
     expect(await run(['replay', 'bundle.tar'], ok.deps)).toBe(ExitCode.OK);
     expect(seen).toEqual(['bundle.tar']);
+  });
+});
+
+describe('robustness: usage errors, unexpected errors, hung queries, SIGINT', () => {
+  const hungPort = (): CasePort => ({
+    startCase: () => Promise.resolve(),
+    stage: () => new Promise(() => undefined),
+    events: () => new Promise(() => undefined),
+    close: () => Promise.resolve(),
+  });
+
+  it('usage errors are sanitized before they reach the terminal', async () => {
+    const h = harness({});
+    expect(await run([`--bad${ESC}[31m${ESC}]0;pwned${BEL}`], h.deps)).toBe(ExitCode.USAGE);
+    const text = h.err.join('\n');
+    expect(text).toContain('unknown option');
+    expect(text).not.toContain(ESC);
+    expect(text).not.toContain(BEL);
+    expect(text).not.toContain('pwned');
+  });
+
+  it('an unexpected error is exit 1 with a scrubbed message', async () => {
+    const st = harness({ stage: new Error(`boom ${SECRET_URL}`) });
+    expect(await run(['status', 'case-1'], st.deps)).toBe(ExitCode.INTERNAL);
+    expect(st.err.join('\n')).toContain('unexpected error');
+    expect(st.err.join('\n')).not.toContain('hunter2secret');
+    const sc = harness({
+      feed: () => {
+        throw new Error('bad row');
+      },
+    });
+    expect(await run(['scan', 'r'], sc.deps)).toBe(ExitCode.INTERNAL);
+  });
+
+  it('SIGINT during the poll sleep stops scan with 130 after printing what it had', async () => {
+    const h = harness({ feed: () => events.slice(0, 2) });
+    const c = new AbortController();
+    const code = await run(['scan', 'r'], {
+      ...h.deps,
+      signal: c.signal,
+      sleep: () => {
+        c.abort();
+        return Promise.resolve();
+      },
+    });
+    expect(code).toBe(ExitCode.INTERRUPTED);
+    expect(h.out.filter((l) => l.startsWith('#'))).toHaveLength(2);
+    expect(h.err.join('\n')).toContain('keeps running');
+  });
+
+  it('SIGINT while a database query hangs still stops scan and status', async () => {
+    const h = harness({});
+    const c = new AbortController();
+    const scan = run(['scan', 'r'], {
+      ...h.deps,
+      openPort: () => Promise.resolve(hungPort()),
+      signal: c.signal,
+    });
+    setTimeout(() => c.abort(), 20);
+    expect(await scan).toBe(ExitCode.INTERRUPTED);
+    const c2 = new AbortController();
+    const status = run(['status', 'case-1'], {
+      ...h.deps,
+      openPort: () => Promise.resolve(hungPort()),
+      signal: c2.signal,
+    });
+    setTimeout(() => c2.abort(), 20);
+    expect(await status).toBe(ExitCode.INTERRUPTED);
+  });
+
+  it('a hung events query does not outlive the scan timeout', async () => {
+    const h = harness({});
+    const started = Date.now();
+    const code = await run(['scan', 'r', '--timeout', '1'], {
+      ...h.deps,
+      openPort: () => Promise.resolve({ ...hungPort(), startCase: () => Promise.resolve() }),
+      now: Date.now,
+    });
+    expect(code).toBe(ExitCode.TIMEOUT);
+    expect(Date.now() - started).toBeLessThan(5000);
   });
 });
 

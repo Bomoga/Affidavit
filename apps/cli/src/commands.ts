@@ -15,6 +15,11 @@ import {
   type CliConfig,
 } from './runtime.js';
 
+import { guard, RaceStop } from './guard.js';
+
+/** Longest `status` waits for one database call. */
+const STATUS_TIMEOUT_MS = 30_000;
+
 export type Env = Readonly<Record<string, string | undefined>>;
 
 export interface CliDeps {
@@ -100,7 +105,14 @@ export async function watchCase(
   let lastSeq = -1;
   for (;;) {
     if (o.signal?.aborted) return { kind: 'aborted' };
-    const batch = await port.events(caseId, lastSeq);
+    let batch: TrialEvent[];
+    try {
+      const remaining = Math.max(deadline - o.now(), 1000);
+      batch = await guard(port.events(caseId, lastSeq), o.signal, remaining);
+    } catch (err) {
+      if (err instanceof RaceStop) return { kind: err.kind === 'aborted' ? 'aborted' : 'timeout' };
+      throw err;
+    }
     for (const event of batch) {
       if (event.seq <= lastSeq || event.caseId !== caseId) continue;
       lastSeq = event.seq;
@@ -146,7 +158,7 @@ async function runScan(
       'FAKE INTAKE (v0): the case file is the recorded NodeGoat fixture, not an analysis of your target.',
     );
     deps.out(`target ${sanitize(repo)}`);
-    await port.startCase(file, DEFAULT_BUDGET);
+    await guard(port.startCase(file, DEFAULT_BUDGET), deps.signal, opts.timeout * 1000);
     deps.out(`case ${file.id} enqueued, waiting for a worker (timeout ${opts.timeout}s)`);
     const result = await watchCase(port, file.id, {
       pollMs: opts.pollMs,
@@ -186,8 +198,8 @@ async function runStatus(
     throw new CliError(ExitCode.USAGE, 'the case id must be printable text without spaces');
   }
   return withPort(deps, async (port) => {
-    const stage = await port.stage(id);
-    const events = await port.events(id, -1);
+    const stage = await guard(port.stage(id), deps.signal, STATUS_TIMEOUT_MS);
+    const events = await guard(port.events(id, -1), deps.signal, STATUS_TIMEOUT_MS);
     const last = events.at(-1);
     const terminal = events.find((e) => TERMINAL.has(e.type));
     deps.out(`case ${sanitize(id)}`);
@@ -240,7 +252,10 @@ export function buildProgram(deps: CliDeps, result: { code: ExitCode }): Command
     .exitOverride()
     .configureOutput({
       writeOut: (s) => deps.out(s.replace(/\n$/, '')),
-      writeErr: (s) => deps.err(s.replace(/\n$/, '')),
+      // Usage errors echo what the user typed (an unknown option, a bad value): sanitize them.
+      writeErr: (s) => {
+        for (const line of s.replace(/\n$/, '').split('\n')) deps.err(renderMessage(line));
+      },
     })
     .addHelpText(
       'after',

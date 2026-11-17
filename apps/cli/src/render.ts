@@ -33,11 +33,40 @@ const CONTROL = new RegExp(
       [0x2060, 0x206f],
       [0xfeff, 0xfeff],
       [0xfff9, 0xfffb],
+      // Hangul and halfwidth fillers render as blanks; tag characters are invisible.
+      [0x115f, 0x115f],
+      [0x3164, 0x3164],
+      [0xffa0, 0xffa0],
+      [0xe0000, 0xe007f],
     ]
       .map(([lo, hi]) => String.fromCodePoint(lo!) + '-' + String.fromCodePoint(hi!))
       .join('') +
     ']',
   'gu',
+);
+
+const LONE_SURROGATE = new RegExp(
+  '[' +
+    String.fromCharCode(0xd800) +
+    '-' +
+    String.fromCharCode(0xdbff) +
+    ']' +
+    '(?![' +
+    String.fromCharCode(0xdc00) +
+    '-' +
+    String.fromCharCode(0xdfff) +
+    '])' +
+    '|(?<![' +
+    String.fromCharCode(0xd800) +
+    '-' +
+    String.fromCharCode(0xdbff) +
+    '])' +
+    '[' +
+    String.fromCharCode(0xdc00) +
+    '-' +
+    String.fromCharCode(0xdfff) +
+    ']',
+  'g',
 );
 
 /** Strips escape sequences and control characters, then caps the length. Never throws. */
@@ -48,6 +77,7 @@ export function sanitize(input: unknown, max: number = MAX_FIELD): string {
       : typeof input === 'number' || typeof input === 'boolean'
         ? String(input)
         : '';
+  s = s.replace(LONE_SURROGATE, String.fromCharCode(0xfffd));
   s = s.replace(OSC, '').replace(STRING, '').replace(CSI, '').replace(ESC_OTHER, '');
   s = s.replace(CONTROL, ' ').replace(/ {2,}/g, ' ').trim();
   // Surrogate-safe cut: Array.from splits on code points, not UTF-16 units.
