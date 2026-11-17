@@ -47,15 +47,15 @@ Known false positives:
 
 ## Run
 
-| Item               | Value                                                                                               |
-| ------------------ | --------------------------------------------------------------------------------------------------- |
-| Date               | 2026-11-17                                                                                          |
-| Repo commit        | `eb3356af0cb2e0c671a7aeb2afb0815ada9bb3f1` plus the uncommitted L1-04b changes (matcher, pins, stamp)                         |
-| Inputs digest      | `2dc5a77cc802d08e0bcbb9c5466e6f4110edd682ed24d53e7cb691186902c990`                                  |
-| Run output digest  | `ad656d2f2eb0a83b32366ee5c23c608b03a2888b53d38e6a5ac121d26da1c86b`                                  |
-| NodeGoat commit    | `c5cb68a7084e4ae7dcc60e6a98768720a81841e8`                                                          |
-| Semgrep image      | `docker.io/semgrep/semgrep@sha256:cc1b68266f267878b39739373ea9985b9a78e5d64497dd875c8de100b22695ed` |
-| Result of the test | 3 of 3 tests passed (102 seconds, vitest duration); the comparison reported no problems                               |
+| Item               | Value                                                                                                 |
+| ------------------ | ----------------------------------------------------------------------------------------------------- |
+| Date               | 2026-11-17                                                                                            |
+| Repo commit        | `68920fc98ebecd162dac345e604a18556a9e5db2` (the L1-04b commit that holds the matcher, pins and stamp) |
+| Inputs digest      | `2dc5a77cc802d08e0bcbb9c5466e6f4110edd682ed24d53e7cb691186902c990`                                    |
+| Run output digest  | `ad656d2f2eb0a83b32366ee5c23c608b03a2888b53d38e6a5ac121d26da1c86b`                                    |
+| NodeGoat commit    | `c5cb68a7084e4ae7dcc60e6a98768720a81841e8`                                                            |
+| Semgrep image      | `docker.io/semgrep/semgrep@sha256:cc1b68266f267878b39739373ea9985b9a78e5d64497dd875c8de100b22695ed`   |
+| Result of the test | 3 of 3 tests passed (102 seconds, vitest duration); the comparison reported no problems               |
 
 Run history, so the timeout flakiness is visible: with the round 1 inputs the test passed 4 times and failed once (output not captured); with the round 2 rules it failed once on a timeout pair not yet in the tolerated list (`route-param-to-data-access` on `chart/morris-0.4.3.min.js`) and then passed. The tolerated list was widened after each failure (see below). With the round 3 rules, the first Docker run (before the last unit-test fix, same rules) and the final run both passed. Run time varies.
 
