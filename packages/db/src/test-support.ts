@@ -124,6 +124,39 @@ export function useTestDatabase(tenants: readonly string[] = []): () => TestData
   };
 }
 
+/** The only variables a spawned test child inherits (what node and tsx need), besides CHILD_*. */
+const CHILD_ENV_ALLOWLIST = new Set(
+  [
+    'PATH',
+    'PATHEXT',
+    'SYSTEMROOT',
+    'WINDIR',
+    'COMSPEC',
+    'TEMP',
+    'TMP',
+    'TMPDIR',
+    'HOME',
+    'USERPROFILE',
+    'APPDATA',
+    'LOCALAPPDATA',
+    'LANG',
+    'TERM',
+  ].map((k) => k.toUpperCase()),
+);
+
+/**
+ * A minimal environment for a child process: an allowlist of what node needs plus `extra` (the
+ * CHILD_* settings). The parent's other variables, the superuser database URL among them, are not
+ * passed on.
+ */
+export function childEnv(extra: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v !== undefined && CHILD_ENV_ALLOWLIST.has(k.toUpperCase())) out[k] = v;
+  }
+  return { ...out, ...extra };
+}
+
 let counter = 0;
 export function uniqueId(prefix: string): string {
   counter += 1;

@@ -29,6 +29,20 @@
       "when": 1794891427190,
       "tag": "0003_review_flags_security",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1794894013829,
+      "tag": "0004_followups_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1794894029599,
+      "tag": "0005_followups_security",
+      "breakpoints": true
     }
   ]
 }
