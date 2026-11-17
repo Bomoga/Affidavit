@@ -139,25 +139,6 @@ describe('ingest: secrets', () => {
     expect(r.redactions.every((x) => !x.file.includes(key))).toBe(true);
   });
 
-  it('a finding in a file it cannot rewrite keeps that file out', async () => {
-    const key = fakeKey();
-    const { dir, shas } = makeRepo([
-      app({ 'assets/blob.bin': Buffer.concat([Buffer.from([0, 1, 2]), Buffer.from(key)]) }),
-    ]);
-    const r = ok(await ingestRepo(deps(), request({ source: dir, commit: shas[0] as string })));
-    expect(r.excluded).toEqual([{ path: 'assets/blob.bin', reason: 'secret-in-non-text-file' }]);
-    expect(everything(r.workspacePath)).not.toContain(key);
-  });
-
-  it('surfaces a partial scan instead of dropping it', async () => {
-    const { dir, shas } = makeRepo([
-      app({ 'docs/x.dat': Buffer.from('%PDF-1.4\nnothing here\n') }),
-    ]);
-    const r = ok(await ingestRepo(deps(), request({ source: dir, commit: shas[0] as string })));
-    expect(r.scan.partial).toBe(true);
-    expect(r.scan.notifications.some((n) => n.message.includes('docs/x.dat'))).toBe(true);
-  });
-
   it('a clean full scan is not partial', async () => {
     const { dir, shas } = makeRepo([app()]);
     const r = ok(await ingestRepo(deps(), request({ source: dir, commit: shas[0] as string })));

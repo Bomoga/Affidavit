@@ -760,7 +760,6 @@ describe('readToolRunReports', () => {
     notifications: [],
     binaryMediaFiles: [],
     windowedFiles: [],
-    fullyWindowedFiles: [],
     outputPath: '',
     outputFile: '',
     reports: [],

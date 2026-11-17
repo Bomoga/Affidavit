@@ -75,6 +75,41 @@ export function makeRepo(commits: Files[]): { dir: string; shas: string[] } {
   return { dir, shas };
 }
 
+/**
+ * Like makeRepo for a single commit, built with plumbing and no filters, so a .gitattributes in
+ * the files cannot change the stored bytes (git add would apply it).
+ */
+export function plumbingRepo(commits: Files[]): { dir: string; shas: string[] } {
+  const dir = tmpDir();
+  git(dir, 'init', '--quiet', '--initial-branch=main');
+  const run = (input: string | Buffer, ...args: string[]): string =>
+    execFileSync(
+      'git',
+      ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', ...args],
+      { cwd: dir, input, env: GIT_ENV, encoding: 'utf8' },
+    ).trim();
+  const shas: string[] = [];
+  let parent: string | undefined;
+  for (const files of commits) {
+    for (const [rel, body] of Object.entries(files)) {
+      const blob = run(
+        typeof body === 'string' ? Buffer.from(body) : body,
+        'hash-object',
+        '-w',
+        '--no-filters',
+        '--stdin',
+      );
+      run('', 'update-index', '--add', '--cacheinfo', `100644,${blob},${rel}`);
+    }
+    const tree = run('', 'write-tree');
+    const sha = run('', 'commit-tree', tree, ...(parent ? ['-p', parent] : []), '-m', 'c');
+    git(dir, 'update-ref', 'refs/heads/main', sha);
+    shas.push(sha);
+    parent = sha;
+  }
+  return { dir, shas };
+}
+
 export const EXPRESS_PKG = JSON.stringify({
   name: 'app',
   version: '1.0.0',

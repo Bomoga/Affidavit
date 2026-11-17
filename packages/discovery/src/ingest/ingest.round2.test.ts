@@ -51,6 +51,8 @@ describe('git version', () => {
   it('refuses https clones below 2.37, which ignore the address pin', async () => {
     for (const v of [
       'git version 2.36.9',
+      'git version 2.37.7',
+      'git version 2.38.5',
       'git version 2.30.0',
       'git version 1.9.1',
       'nonsense',
@@ -68,8 +70,6 @@ describe('git version', () => {
       expect(() => assertGitSupportsPin(v), v).toThrow(GitTooOldError);
     }
     for (const v of [
-      'git version 2.37.7',
-      'git version 2.38.5',
       'git version 2.39.4',
       'git version 2.39.5',
       'git version 2.40.2',

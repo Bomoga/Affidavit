@@ -9,16 +9,13 @@ import {
   ingestRepo,
   RepoTooLargeError,
   type IngestDeps,
-  type IngestOk,
 } from './index.js';
 import { redactError } from './ingest.js';
 import { holdsUtf16, SecretRedactor } from './redactor.js';
 import {
   cleanup,
   EXPRESS_PKG,
-  everything,
   fakeGitleaks,
-  fakeKey,
   git,
   listFiles,
   makeRepo,
@@ -46,31 +43,6 @@ const entry = (value: string, over = {}) => ({
   placeholder: '[P]',
   locations: [],
   ...over,
-});
-
-describe('a finding is not dropped unless its file was fully windowed', () => {
-  it('a window budget that runs out keeps the snapshot finding, and the key does not ship', async () => {
-    const key = fakeKey();
-    const big = `${'// padding line\n'.repeat(12_000)}const late = "${key}";\n${'// tail\n'.repeat(500)}`;
-    const { dir, shas } = makeRepo([
-      { 'package.json': EXPRESS_PKG, 'src/app.js': "require('express')();\n", 'src/big.js': big },
-    ]);
-    const d = deps({ tools: { maxWindowBytes: 100_000 } });
-    const r = (await ingestRepo(
-      d,
-      request({ source: dir, commit: shas[0] as string }),
-    )) as IngestOk;
-    expect(r.status).toBe('ok');
-    expect(r.scan.findings).toBeGreaterThan(0);
-    expect(everything(r.workspacePath)).not.toContain(key);
-    expect(JSON.stringify(r)).not.toContain(key);
-    // the run says so, and the key was found through the whole-line fallback
-    expect(r.scan.partial).toBe(true);
-    expect(r.scan.notifications.some((n) => n.id === 'windows-budget-exceeded')).toBe(true);
-    expect(r.scan.lineFallbacks).toBeGreaterThan(0);
-    const lines = readFileSync(join(r.workspacePath, 'src', 'big.js'), 'utf8').split('\n');
-    expect(lines[12_000]).toMatch(/REDACTED/);
-  });
 });
 
 describe('fallback fetch', () => {
@@ -118,6 +90,8 @@ describe('fallback fetch', () => {
     expect(readFileSync(join(o.dir, 'f'), 'utf8')).toBe('2');
     // no loose refs at all: the ref names the server advertises never become files
     expect(files(join(o.dir, '.git', 'refs'))).toEqual([]);
+    // and it went through the ref, not the commit hash: FETCH_HEAD names a branch
+    expect(readFileSync(join(o.dir, '.git', 'FETCH_HEAD'), 'utf8')).toMatch(/branch 'd\/d\//);
   });
 
   it('a commit no ref points at cannot be fetched this way, with a typed error', async () => {

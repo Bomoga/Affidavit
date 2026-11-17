@@ -15,6 +15,7 @@ import {
   RedactionLeakError,
   type Detection,
   type IngestDeps,
+  type IngestIncomplete,
   type IngestOk,
   type IngestRequest,
   type IngestResult,
@@ -150,13 +151,30 @@ export async function ingestRepo(deps: IngestDeps, req: IngestRequest): Promise<
       maxReportBytes: deps.tools?.maxReportBytes,
     });
 
-    const { findings, malformed } = await readGitleaksFindings(run.reports, run.fullyWindowedFiles);
+    const { findings, malformed } = await readGitleaksFindings(run.reports);
     if (malformed > 0) {
       throw new RedactionIncompleteError(Array(malformed).fill('<unreadable gitleaks result>'));
     }
     const map = await buildRedactionMap(repoDir, findings, maxFileBytes);
     const r = map.redactor;
     redactor = r; // from here on, errors are scrubbed of known values before they leave
+    // Fail closed: a scan that did not cover everything is not an ok result. The coverage detail
+    // goes back to the caller; no workspace is written and the case directory is removed.
+    if (run.partial) {
+      const incomplete: IngestIncomplete = {
+        status: 'incomplete',
+        reason: 'partial-secret-scan',
+        commit,
+        coverage: {
+          notifications: run.notifications.map((n) => ({
+            level: n.level,
+            ...(n.id === undefined ? {} : { id: n.id }),
+            message: r.apply(n.message),
+          })),
+        },
+      };
+      return incomplete;
+    }
     const built = await buildWorkspace(repoDir, wsDir, r, map.excluded, maxFileBytes);
     const leaks = await findLeaks(wsDir, r);
     if (leaks.length > 0) throw new RedactionLeakError(leaks.map((p) => r.applyPath(p)));

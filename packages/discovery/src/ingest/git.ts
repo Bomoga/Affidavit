@@ -1,5 +1,5 @@
 import { execFile, spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { lstat, readdir } from 'node:fs/promises';
+import { lstat, mkdir, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { SourcePlan } from './source.js';
 import {
@@ -86,6 +86,7 @@ export function gitEnv(home: string, local: boolean, proxy: boolean): NodeJS.Pro
     HOME: home,
     USERPROFILE: home,
     GIT_CONFIG_NOSYSTEM: '1',
+    GIT_ATTR_NOSYSTEM: '1',
     GIT_CONFIG_GLOBAL: NULL_PATH,
     GIT_TERMINAL_PROMPT: '0',
     GIT_LFS_SKIP_SMUDGE: '1',
@@ -110,7 +111,10 @@ export function killTree(child: ChildProcess, sync = false): void {
       return;
     }
     execFile('taskkill', args, { windowsHide: true }, (err) => {
-      if (err !== null) process.emitWarning(`taskkill failed for git pid ${pid}: ${err.message}`);
+      // taskkill reports an error for a process that has already gone, which is not news
+      if (err !== null && LIVE.has(child)) {
+        process.emitWarning(`taskkill failed for git pid ${pid}: ${err.message}`);
+      }
     });
     return;
   }
@@ -123,10 +127,11 @@ export function killTree(child: ChildProcess, sync = false): void {
   }
 }
 
-// Every git child that is running. They are killed (with their children) when this process exits
-// or is told to stop, so a worker that is shut down does not leave git-remote-https behind. The
-// worker image still needs an init (tini, or `docker run --init`) to reap them, and the container
-// a cgroup-wide kill as the backstop.
+// Every git child that is running. They are killed (with their children) when this process
+// exits. Signals are NOT handled here: a library that re-raises SIGTERM would kill the worker
+// before it can stop gracefully. The worker's shutdown must call `killAllGit()` (exported), and
+// the worker image still needs an init (tini, or `docker run --init`) to reap them, with a
+// cgroup-wide kill as the backstop.
 const LIVE = new Set<ChildProcess>();
 let hooked = false;
 
@@ -146,14 +151,6 @@ export function trackChild(child: ChildProcess): void {
   if (hooked) return;
   hooked = true;
   process.on('exit', killAllGit);
-  for (const sig of ['SIGINT', 'SIGTERM'] as const) {
-    const handler = (): void => {
-      killAllGit();
-      process.removeListener(sig, handler);
-      process.kill(process.pid, sig); // carry on with the default action
-    };
-    process.on(sig, handler);
-  }
 }
 
 /** Charge per file or directory in a checked-out tree, so empty files still count. */
@@ -312,16 +309,14 @@ function runGit(o: GitOptions, args: readonly string[]): Promise<string> {
 }
 
 /**
- * Oldest acceptable git, per release line. 2.37 is the first with http.curloptResolve, which the
- * address pin needs. Within a line the floor is the first release that has the fixes for
- * CVE-2022-23521 (checkout-time .gitattributes overflow, fixed in 2.37.5 and 2.38.3) and the 2024
- * set CVE-2024-32002, -32004, -32020, -32021 and -32465 (clone and upload-pack on crafted
- * repositories, including local ones): 2.37.7, 2.38.5, 2.39.4, 2.40.2, 2.41.1, 2.42.2, 2.43.4,
- * 2.44.1, 2.45.1. Every line from 2.46 on has them. The probe runs for local sources too.
+ * Oldest acceptable git, per release line: the first release of each line that has the fixes for
+ * CVE-2024-32002, -32004 (upload-pack on crafted local repositories), -32020, -32021 and -32465
+ * (May 2024). Lines before 2.39 are refused outright: they have no patched release with those
+ * fixes in the supported series, and 2.37 is the first with http.curloptResolve, which the
+ * address pin needs. Every line from 2.46 on has the fixes. The probe runs for local sources too.
+ * MIN_GIT_DESCRIPTION is built from this table so the message cannot drift from it.
  */
 export const MIN_PATCH_BY_LINE: Readonly<Record<number, number>> = {
-  37: 7,
-  38: 5,
   39: 4,
   40: 2,
   41: 1,
@@ -330,8 +325,9 @@ export const MIN_PATCH_BY_LINE: Readonly<Record<number, number>> = {
   44: 1,
   45: 1,
 };
-export const MIN_GIT_DESCRIPTION =
-  '2.39.4, 2.40.2, 2.41.1, 2.42.2, 2.43.4, 2.44.1, 2.45.1 or 2.46+';
+export const MIN_GIT_DESCRIPTION = `${Object.entries(MIN_PATCH_BY_LINE)
+  .map(([minor, patch]) => `2.${minor}.${patch}`)
+  .join(', ')} or 2.46 and later`;
 
 export function assertGitSupportsPin(versionText: string): void {
   const m = /git version (\d+)\.(\d+)(?:\.(\d+))?/.exec(versionText);
@@ -360,7 +356,10 @@ export interface CheckoutOptions {
   maxRepoFiles?: number | undefined;
   /** Pass HTTPS_PROXY and friends to git. Off: a proxy bypasses the address pin. */
   passProxyEnv?: boolean | undefined;
-  /** Cap on refs a server may advertise to the fallback fetch. Default 10,000. */
+  /**
+   * Cap on the refs a server may advertise to the fallback fetch, counted as lines stream in.
+   * Default 10,000. It does not bound the memory git itself uses to hold the advertisement.
+   */
   maxRefs?: number | undefined;
   /** Tests only: skip the fetch by hash and use the fallback. */
   forceFallback?: boolean | undefined;
@@ -398,6 +397,9 @@ export function treeCounter(maxBytes: number, maxFiles: number): (line: string) 
     if (bytes > maxBytes) throw new RepoTooLargeError('tree', maxBytes, 'bytes');
   };
 }
+
+export const NEUTRAL_ATTRIBUTES =
+  '* -text -eol -ident -filter -diff -merge -working-tree-encoding\n';
 
 export const DEFAULT_MAX_REFS = 10_000;
 
@@ -481,6 +483,11 @@ export async function checkoutPinned(o: CheckoutOptions): Promise<void> {
     watch: { dir: join(o.dir, '.git'), maxBytes: max, entryCharge: ENTRY_CHARGE },
   };
   await runGit(base, ['init', '--quiet', '--initial-branch=affidavit']);
+  // Attributes from the repo change the bytes a checkout writes (eol, working-tree-encoding,
+  // filters, ident). `info/attributes` outranks every in-tree .gitattributes, so this turns all of
+  // them off and the files on disk are the blobs, byte for byte.
+  await mkdir(join(o.dir, '.git', 'info'), { recursive: true });
+  await writeFile(join(o.dir, '.git', 'info', 'attributes'), NEUTRAL_ATTRIBUTES);
   const noTags = ['fetch', '--quiet', '--no-tags', '--no-recurse-submodules', '--depth=1'];
   try {
     if (o.forceFallback === true) throw new CloneFailedError('fetch', 'forced fallback');

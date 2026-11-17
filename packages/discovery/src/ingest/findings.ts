@@ -56,17 +56,14 @@ const posInt = (v: unknown): number | undefined =>
 /**
  * Reads gitleaks SARIF reports (snapshot, quarantine and windows passes) into one list. A result
  * whose location cannot be read is reported in `malformed`, never skipped: the caller fails
- * closed. `windowedFiles` (`/src/<path>`) must be only files whose windows cover them whole and
- * clean (ToolRunResult.fullyWindowedFiles): their
- * snapshot-pass findings are dropped because gitleaks columns after its first 100 KB chunk are
- * unreliable (the windows columns are remapped and are not).
+ * closed. Nothing is dropped in favour of another pass: the windows pass only guarantees that a
+ * stretch of about 16,000 bytes lands in one window, so a longer secret (a big private key) can be
+ * found by the snapshot pass alone. A finding in a file over 100 KB has columns that cannot be
+ * trusted, and the map then falls back to whole lines.
  */
 export async function readGitleaksFindings(
   reports: readonly ToolReport[],
-  fullyWindowedFiles: readonly string[],
 ): Promise<{ findings: GitleaksFinding[]; malformed: number }> {
-  const windowed = new Set(fullyWindowedFiles.map((f) => f.replace(/^\/src\//, '')));
-  const hasWindows = reports.some((r) => r.origin === 'windows');
   const seen = new Set<string>();
   const findings: GitleaksFinding[] = [];
   let malformed = 0;
@@ -98,7 +95,6 @@ export async function readGitleaksFindings(
             malformed++;
             continue;
           }
-          if (report.origin === 'snapshot' && hasWindows && windowed.has(rel)) continue;
           const key = [ruleId, rel, startLine, startColumn, endLine, endColumn].join('|');
           if (seen.has(key)) continue;
           seen.add(key);

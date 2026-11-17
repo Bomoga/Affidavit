@@ -9,7 +9,7 @@
  */
 import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { crc32, gzipSync } from 'node:zlib';
@@ -151,7 +151,7 @@ describe.skipIf(!enabled)('ingest with the real gitleaks image', () => {
       .toString('base64')
       .replace(/(.{64})/g, '$1\n');
     const pem = `-----BEGIN RSA PRIVATE KEY-----\n${pemBody}\n-----END RSA PRIVATE KEY-----\n`;
-    const bigLf = `${'// padding line\n'.repeat(12_000)}const late = "${key}";\n${'// tail\n'.repeat(500)}`;
+    const bigLf = `${'// padding line\n\n'.repeat(12_000)}const late = "${key}";\n${'// tail\n'.repeat(500)}`;
     const files = {
       'package.json': EXPRESS_PKG,
       'src/app.js': "require('express')();\n",
@@ -162,8 +162,6 @@ describe.skipIf(!enabled)('ingest with the real gitleaks image', () => {
       'keys/server.pem': pem,
       '.env': `API_KEY=${envKey}\nOTHER=${key}\n`,
       'sub/.Env.local': `API_KEY=${envKey}\n`,
-      'data/archive.txt.gz': gzipSync(`const k = "${key}";\n`),
-      'data/utf16.txt': Buffer.from(`token=${key}\n`, 'utf16le'),
     };
     const { dir, shas } = makeRepo([files]);
     const workRoot = tmpDir();
@@ -188,64 +186,83 @@ describe.skipIf(!enabled)('ingest with the real gitleaks image', () => {
     ]);
     expect(at('src/crlf.js')).toMatchObject([{ startLine: 2 }]);
     expect(at('src/multibyte.js')).toMatchObject([{ startLine: 2 }]);
-    expect(at('src/big.js')).toMatchObject([{ startLine: 12_001 }]);
+    expect(at('src/big.js')).toMatchObject([{ startLine: 24_001 }]);
     expect(at('keys/server.pem')).toMatchObject([{ kind: 'private-key', startLine: 1 }]);
     expect(readFileSync(join(r.workspacePath, 'keys', 'server.pem'), 'utf8')).toMatch(
       /^\[REDACTED:private-key:\d+\]\n+$/,
     );
     // line numbers did not move in the big file
     const big = readFileSync(join(r.workspacePath, 'src', 'big.js'), 'utf8').split('\n');
-    expect(big[12_000]).toMatch(/^const late = "\[REDACTED:/);
+    expect(big[24_000]).toMatch(/REDACTED/);
     expect(big.length).toBe(bigLf.split('\n').length);
 
     // .env files and files that cannot be rewritten stayed behind
     expect(listFiles(r.workspacePath).filter((f) => /\.env/i.test(f))).toEqual([]);
     expect(r.excluded.map((e) => [e.path, e.reason]).sort()).toEqual([
       ['.env', 'env-file'],
-      ['data/archive.txt.gz', 'secret-in-non-text-file'],
-      ['data/utf16.txt', 'secret-in-other-encoding'],
       ['sub/.Env.local', 'env-file'],
     ]);
 
-    // gitleaks cannot read the UTF-16 file, so the run is partial and says so
-    expect(r.scan.partial).toBe(true);
-    expect(r.scan.notifications.some((n) => n.message.includes('data/utf16.txt'))).toBe(true);
+    // the scan covered everything, so the result is ok and not partial
+    expect(r.scan.partial).toBe(false);
     expect(r.scan.windowedFiles).toContain('/src/src/big.js');
   });
 
-  it('a secret inside a zip or tar member keeps the archive out and does not fail the ingestion', async () => {
+  /** Runs the real image over a repo and expects the fail-closed result. */
+  async function incompleteFor(files: Record<string, string | Buffer>, secrets: string[]) {
+    const { dir, shas } = makeRepo([{ 'package.json': EXPRESS_PKG, ...files }]);
+    const workRoot = tmpDir();
+    const req = request({ source: dir, commit: shas[0] as string });
+    const r = await ingestRepo(
+      { runner, workRoot, allowLocalSource: true, tools: { configDir } },
+      req,
+    );
+    expect(r.status).toBe('incomplete');
+    if (r.status !== 'incomplete') throw new Error('unreachable');
+    for (const secret of secrets) expect(JSON.stringify(r)).not.toContain(secret);
+    expect(existsSync(join(workRoot, String(req.caseId)))).toBe(false); // nothing is kept
+    return r;
+  }
+
+  it('a secret inside a zip or tar member fails closed, with the archives named', async () => {
     const key = fakeKey();
     const text = Buffer.from(`const k = "${key}";\n`);
-    const { dir, shas } = makeRepo([
+    const r = await incompleteFor(
       {
-        'package.json': EXPRESS_PKG,
         'src/app.js': "require('express')();\n",
         'data/a.zip': storedZip('inner.js', text),
         'data/b.tar': tarOf('inner.js', text),
       },
-    ]);
-    const workRoot = tmpDir();
-    const r = (await ingestRepo(
-      { runner, workRoot, allowLocalSource: true, tools: { configDir } },
-      request({ source: dir, commit: shas[0] as string }),
-    )) as IngestOk;
-    expect(r.status).toBe('ok');
-    expect(r.excluded.map((e) => [e.path, e.reason]).sort()).toEqual([
-      ['data/a.zip', 'secret-in-non-text-file'],
-      ['data/b.tar', 'secret-in-non-text-file'],
-    ]);
-    expect(everything(r.workspacePath)).not.toContain(key);
-    expect(JSON.stringify(r)).not.toContain(key);
-    expect(JSON.stringify(r)).not.toContain('inner.js'); // member names stay out of the result
+      [key, 'inner.js'],
+    );
+    const text2 = r.coverage.notifications.map((n) => n.message).join('\n');
+    expect(text2).toContain('data/a.zip');
+    expect(text2).toContain('data/b.tar');
   });
 
-  it('a window budget that runs out does not drop the finding', async () => {
+  it('UTF-16 text, archives and a PDF fail closed, each with its own kind', async () => {
+    const key = fakeKey();
+    const r = await incompleteFor(
+      {
+        'src/app.js': "require('express')();\n",
+        'data/utf16.txt': Buffer.from(`token=${key}\n`, 'utf16le'),
+        'data/archive.txt.gz': gzipSync(`const k = "${key}";\n`),
+        'docs/x.dat': Buffer.from('%PDF-1.4\nnothing here\n'),
+      },
+      [key],
+    );
+    const ids = new Set(r.coverage.notifications.map((n) => n.id));
+    expect(ids.has('non-text-content')).toBe(true);
+    expect(ids.has('binary-header-mismatch')).toBe(true);
+  });
+
+  it('a window budget that runs out fails closed', async () => {
     const key = fakeKey();
     const big = `${'// padding line\n'.repeat(12_000)}const late = "${key}";\n${'// tail\n'.repeat(500)}`;
     const { dir, shas } = makeRepo([
       { 'package.json': EXPRESS_PKG, 'src/app.js': "require('express')();\n", 'src/big.js': big },
     ]);
-    const r = (await ingestRepo(
+    const r = await ingestRepo(
       {
         runner,
         workRoot: tmpDir(),
@@ -253,11 +270,25 @@ describe.skipIf(!enabled)('ingest with the real gitleaks image', () => {
         tools: { configDir, maxWindowBytes: 100_000 },
       },
       request({ source: dir, commit: shas[0] as string }),
-    )) as IngestOk;
-    expect(r.status).toBe('ok');
-    expect(r.scan.findings).toBeGreaterThan(0);
-    expect(everything(r.workspacePath)).not.toContain(key);
-    expect(r.scan.partial).toBe(true);
+    );
+    expect(r.status).toBe('incomplete');
+    expect(JSON.stringify(r)).not.toContain(key);
+  });
+
+  it('a 24 KB private key block in a 175 KB file is never shipped', async () => {
+    // The reviewer's repro: a stretch longer than one window holds, with no blank line in it.
+    const body = randomBytes(18_000)
+      .toString('base64')
+      .replace(/(.{64})/g, '$1\n');
+    const pem = `-----BEGIN PRIVATE KEY-----\n${body}\n-----END PRIVATE KEY-----\n`;
+    const file = `${'// pad\n'.repeat(10_000)}${pem}${'// pad\n'.repeat(15_000)}`;
+    const marker = body.split('\n')[100] as string;
+    const r = await incompleteFor({ 'src/big.js': file }, [marker]);
+    expect(
+      r.coverage.notifications.some((n) =>
+        /chunk-split-risk|multiline-split-risk/.test(n.id ?? ''),
+      ),
+    ).toBe(true);
   });
 
   it('a repo with no secrets ingests clean and not partial', async () => {

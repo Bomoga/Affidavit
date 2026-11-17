@@ -16,6 +16,7 @@ export {
   type Framework,
   type FrameworkEvidence,
   type IngestDeps,
+  type IngestIncomplete,
   type IngestOk,
   type IngestRequest,
   type IngestResult,

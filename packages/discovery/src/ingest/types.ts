@@ -61,11 +61,7 @@ export interface ExcludedFile {
 }
 
 export interface IngestScan {
-  /**
-   * True when gitleaks may have missed something (see ToolRunResult.partial). Findings are then
-   * incomplete and the redaction map may be too. Never silently dropped: callers decide whether
-   * to escalate.
-   */
+  /** Always false on an ok result: a partial scan returns IngestIncomplete instead. */
   partial: boolean;
   notifications: ToolNotification[];
   binaryMediaFiles: string[];
@@ -110,7 +106,23 @@ export interface IngestOk {
   scan: IngestScan;
 }
 
-export type IngestResult = IngestOk | IngestUnsupported;
+/**
+ * The secret scan did not cover everything (a file gitleaks may have skipped or cut, a window
+ * budget that ran out, content it cannot decode). Fail closed: no workspace is kept and nothing
+ * is handed on, because a secret in the uncovered part would otherwise ship. `coverage` says
+ * which files and why, with paths already passed through the redactor.
+ */
+export interface IngestIncomplete {
+  status: 'incomplete';
+  reason: 'partial-secret-scan';
+  commit: string;
+  coverage: {
+    /** One per coverage loss: `id` is the kind (for example non-text-content), `message` names the file. */
+    notifications: { level: string; id?: string; message: string }[];
+  };
+}
+
+export type IngestResult = IngestOk | IngestUnsupported | IngestIncomplete;
 
 export interface IngestRequest {
   tenantId: TenantId;

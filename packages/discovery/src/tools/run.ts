@@ -75,14 +75,6 @@ export interface ToolRunResult {
    * rule, path and region.
    */
   windowedFiles: string[];
-  /**
-   * The subset of `windowedFiles` whose windows are known to cover the WHOLE file: no window was
-   * dropped for the byte budget, no write failed, and no window was a skip candidate. Only for
-   * these is the windows pass a full substitute for the snapshot pass (whose columns are
-   * unreliable after the first 100 KB chunk). For any other windowed file, keep the snapshot
-   * findings too.
-   */
-  fullyWindowedFiles: string[];
   /** The output directory the run wrote into (the one passed in options). */
   outputPath: string;
   /** Name of the main report file. When `empty`, no file was written under this name. */
@@ -477,7 +469,6 @@ export async function runTool(
       notifications: [],
       binaryMediaFiles: [],
       windowedFiles: [],
-      fullyWindowedFiles: [],
       reports: [],
     };
   }
@@ -488,7 +479,6 @@ export async function runTool(
   const notifications: ToolNotification[] = [];
   let binaryMediaFiles: string[] = [];
   let windowedFiles: string[] = [];
-  let fullyWindowedFiles: string[] = [];
 
   if (name === 'semgrep') notifications.push(...semgrepNotifications(doc));
 
@@ -590,23 +580,12 @@ export async function runTool(
           message: `/src/${f} was not scanned in windows because the window byte budget ran out, so a secret across a gitleaks chunk cut in it may be missed`,
         });
       }
-      // Files whose windows may not cover them whole, by original path. `unmapped` is set when a
-      // skipped window cannot be tied to a file, which makes every file doubtful.
-      const incomplete = new Set<string>([
-        ...win.failed.map((f) => f.original),
-        ...win.skippedForBudget,
-      ]);
-      let unmapped = false;
       if (win.entries.length > 0) {
         // A window can still be skipped as binary by an offset signature (for example `ustar` at
         // byte 257). Check every window with the same table and report hits against the original.
         const byName = new Map(win.entries.map((e) => [e.name, e]));
         for (const hit of await findGitleaksUnscannable(windowsDir)) {
           notifications.push(windowHitNotification(hit, byName));
-          const parts = windowPathParts(hit.path);
-          const w = parts === undefined ? undefined : byName.get(parts.name);
-          if (w === undefined) unmapped = true;
-          else incomplete.add(w.original);
         }
         const winOut = `${outputDir}-windows`;
         await execute(
@@ -628,9 +607,6 @@ export async function runTool(
         await writeFile(winFile, JSON.stringify(winDoc));
         reports.push({ file: winFile, origin: 'windows' });
         windowedFiles = [...new Set(win.entries.map((e) => `/src/${e.original}`))];
-        fullyWindowedFiles = unmapped
-          ? []
-          : windowedFiles.filter((f) => !incomplete.has(f.replace(/^\/src\//, '')));
       }
     } finally {
       // The windows are scratch data and can be large. Remove them, on success or failure. This
@@ -652,7 +628,6 @@ export async function runTool(
     notifications,
     binaryMediaFiles,
     windowedFiles,
-    fullyWindowedFiles,
     reports,
   };
 }

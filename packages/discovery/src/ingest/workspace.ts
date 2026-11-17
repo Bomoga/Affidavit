@@ -12,13 +12,15 @@ import type { ExcludedFile, ExclusionReason } from './types.js';
  */
 export function isEnvName(name: string): boolean {
   const n = name.toLowerCase();
-  if (n === '.envs' || n === '.envrc') return true;
+  if (n === '.envs' || n === '.envrc' || n === '.flaskenv') return true;
   // `.env~`, `.env1`, `.envlocal` and the like; `.environment` and `.envelope` are not env files.
   if (/^\.env[a-z0-9~]*$/.test(n) && !/^\.(?:environ|envelope)/.test(n)) return true;
   // Editor and file-manager copies: `.env copy`, `.env - Copy`, `.env (1)`, `.env `, `.env+old`,
   // `.env@prod`: `.env` followed by anything that is not a letter. `#.env#` is an editor backup.
   if (/^\.env(?![a-z])/.test(n) || /^#\.env.*#$/.test(n)) return true;
-  return /\.env(?:[-_.]|$)/.test(n);
+  // `prod.env`, `prod.env~`, `prod.env copy`, `a.env.local`: `.env` anywhere, not followed by a
+  // letter (`.environment`).
+  return /\.env(?![a-z])/.test(n);
 }
 
 export interface BuiltWorkspace {
