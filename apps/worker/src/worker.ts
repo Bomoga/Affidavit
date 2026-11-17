@@ -44,6 +44,10 @@ export async function startWorker(
   const onPoolError = (err: Error) => log('database pool error', err);
   // A `real` setting that is not wired fails here, before any connection is opened.
   selectCores(config);
+  // The app pool serves the handlers (up to `concurrency`, plus a heartbeat each) and the
+  // reconcile pass, which holds one connection in its per-case lock while it takes another from
+  // this same pool. pg's default size of 10 covers the defaults (concurrency 4 plus one
+  // reconciler); raise it if concurrency is raised (see withReconcileLock in @affidavit/db).
   const appPool = await openPool(config.appDatabaseUrl, 'affidavit_app', onPoolError);
   let workerPool: WorkerPool | undefined;
   try {

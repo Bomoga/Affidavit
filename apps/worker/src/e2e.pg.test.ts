@@ -52,6 +52,34 @@ const STAGES = [
 ];
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** The only variables of this process a spawned worker inherits (what node and tsx need). */
+const CHILD_ENV_ALLOWLIST = new Set(
+  [
+    'PATH',
+    'PATHEXT',
+    'SYSTEMROOT',
+    'WINDIR',
+    'COMSPEC',
+    'TEMP',
+    'TMP',
+    'TMPDIR',
+    'HOME',
+    'USERPROFILE',
+    'APPDATA',
+    'LOCALAPPDATA',
+    'LANG',
+    'TERM',
+  ].map((k) => k.toUpperCase()),
+);
+
+function childBaseEnv(): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v !== undefined && CHILD_ENV_ALLOWLIST.has(k.toUpperCase())) out[k] = v;
+  }
+  return out;
+}
+
 function composeImage(): string {
   const file = fileURLToPath(new URL('../../../docker/compose.yaml', import.meta.url));
   const m = /image:\s*(postgres:16@sha256:[0-9a-f]{64})/.exec(readFileSync(file, 'utf8'));
@@ -232,14 +260,9 @@ describePg('worker composition root, fakes, real Postgres and Graphile Worker', 
     const cwd = fileURLToPath(new URL('..', import.meta.url));
     const child = spawn(process.execPath, ['--import', 'tsx', 'src/test-child.ts'], {
       cwd,
-      env: {
-        // Only the role URLs, never the admin password.
-        ...Object.fromEntries(
-          Object.entries(process.env).filter(([k]) => k !== 'AFFIDAVIT_TEST_POSTGRES_PASSWORD'),
-        ),
-        ...env(),
-        ...extra,
-      },
+      // An allowlist, not the parent's environment: only what node and tsx need, the worker
+      // settings (the two role URLs, never the admin password) and the CHILD_* switches.
+      env: { ...childBaseEnv(), ...env(), ...extra },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     const lines: string[] = [];

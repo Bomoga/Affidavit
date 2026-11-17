@@ -152,7 +152,7 @@ export async function listFailedStageJobs(
          j.payload->>'tenantId', j.payload->>'caseId', j.payload->>'stage', a.attempt), false)
        and ($3::bigint is null or j.id > $3::bigint)
        and ($4::boolean or not coalesce(public.stage_attempt_handled(
-         j.payload->>'tenantId', j.payload->>'caseId', j.payload->>'stage', a.attempt), false))
+         j.payload->>'tenantId', j.payload->>'caseId', j.payload->>'stage', a.attempt, j.key), false))
      order by j.id
      limit $2`,
     [staleLockSeconds, limit, options.afterId ?? null, options.includeHandled ?? false],
@@ -231,7 +231,14 @@ export interface StageContext {
  */
 const leaseWatch = new WeakMap<AbortSignal, () => boolean>();
 
-/** True when the signal aborted, or the lease it belongs to has run out by the clock. */
+/**
+ * True when the signal aborted, or the lease it belongs to has run out by the clock. This compares
+ * the LOCAL clock with the holder's last CONFIRMED expiry (the time a heartbeat started plus the
+ * lease length), which is never later than the database's expiry, so it errs toward "lost". It
+ * reads only process state: a signal that was never registered by `stageTaskList` is lost only
+ * once aborted. It is a guard for a paused or slow holder, not a fence: a write that passed the
+ * check can still land after the lease expires, and the stores do not verify the token.
+ */
 export function leaseLost(signal: AbortSignal): boolean {
   return signal.aborted || (leaseWatch.get(signal)?.() ?? false);
 }

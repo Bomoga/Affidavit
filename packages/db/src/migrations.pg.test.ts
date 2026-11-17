@@ -1,10 +1,15 @@
 import { expect, it } from 'vitest';
 import pg from 'pg';
 import { applyMigrations, APP_ROLE, OWNER_ROLE, WORKER_ROLE, bootstrapRoles } from './migrate.js';
-import { describePg, useTestDatabase } from './test-support.js';
+import { sql } from 'drizzle-orm';
+import { PgCaseStore } from './case-store.js';
+import { withTenant } from './tenant.js';
+import { BUDGET, describePg, sampleCase, useTestDatabase } from './test-support.js';
+
+const TENANT = 'tenant-mg';
 
 describePg('migrations on a fresh Postgres', () => {
-  const db = useTestDatabase();
+  const db = useTestDatabase([TENANT]);
 
   it('creates every table with tenant_id, row-level security enabled and forced', async () => {
     const { rows } = await db().admin.query<{
@@ -142,6 +147,80 @@ describePg('migrations on a fresh Postgres', () => {
     } finally {
       await asOwner.end();
     }
+  });
+
+  it('EXECUTE on every SECURITY DEFINER function and key helper goes to exactly the intended roles', async () => {
+    const { rows } = await db().admin.query<{ proname: string; grantees: string[] }>(
+      `select p.proname,
+              coalesce(array_agg(distinct case when a.grantee = 0 then 'PUBLIC'
+                                               else (select rolname from pg_roles where oid = a.grantee)::text end)
+                       filter (where a.privilege_type = 'EXECUTE'), '{}'::text[]) as grantees
+       from pg_proc p
+       join pg_namespace n on n.oid = p.pronamespace
+       left join lateral aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a on true
+       where n.nspname = 'public'
+         and (p.prosecdef or p.proname in ('stage_lock_key', 'stage_job_key'))
+       group by p.oid, p.proname order by p.proname`,
+    );
+    const o = OWNER_ROLE;
+    const byName = Object.fromEntries(rows.map((r) => [r.proname, [...r.grantees].sort()]));
+    expect(byName).toEqual({
+      claim_stage_run: [o, WORKER_ROLE].sort(),
+      enqueue_stage: [o, APP_ROLE].sort(),
+      list_open_cases: [o, WORKER_ROLE].sort(),
+      record_stage_entry: [o],
+      stage_attempt_handled: [o, WORKER_ROLE].sort(),
+      stage_job_key: [o],
+      stage_lock_key: [o],
+      stage_run_complete: [o, APP_ROLE].sort(),
+      stage_run_fail: [o, APP_ROLE].sort(),
+      stage_run_heartbeat: [o, APP_ROLE].sort(),
+      stage_run_job_alive: [o, WORKER_ROLE].sort(),
+    });
+    // PUBLIC is never among them (a NULL proacl would mean EXECUTE for everyone).
+    for (const r of rows) expect(r.grantees, r.proname).not.toContain('PUBLIC');
+  });
+
+  it('every SECURITY DEFINER function pins search_path with pg_temp last (live catalog)', async () => {
+    const { rows } = await db().admin.query<{ proname: string; proconfig: string[] | null }>(
+      `select p.proname, p.proconfig from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+       where n.nspname = 'public' and p.prosecdef order by p.proname`,
+    );
+    expect(rows.length).toBeGreaterThan(0);
+    for (const r of rows) {
+      const sp = (r.proconfig ?? []).filter((c) => c.startsWith('search_path='));
+      expect(sp, `${r.proname} has one search_path setting`).toHaveLength(1);
+      const parts = sp[0]!
+        .slice('search_path='.length)
+        .split(',')
+        .map((x) => x.trim());
+      expect(parts.at(-1), `${r.proname} search_path ends with pg_temp`).toBe('pg_temp');
+      expect(parts[0], `${r.proname} search_path starts with pg_catalog`).toBe('pg_catalog');
+    }
+  });
+
+  it('new review_flags rows cannot use the legacy visit 0 (NOT VALID check), visit 1 is fine', async () => {
+    const file = sampleCase(TENANT);
+    await new PgCaseStore(db().app, TENANT).open(file, BUDGET);
+    const insert = (visit: number, attempt: number) =>
+      withTenant(db().app, TENANT, (tx) =>
+        tx.execute(sql`insert into public.review_flags
+          (tenant_id, case_id, stage, attempt, visit, reason, detail)
+          values (${TENANT}, ${file.id}, 'intake', ${attempt}, ${visit}, 'attempts-exhausted', 'd')`),
+      );
+    const err = await insert(0, 1).then(
+      () => null,
+      (e: unknown) =>
+        e as { cause?: { code?: string; constraint?: string }; code?: string; constraint?: string },
+    );
+    const pgErr = err?.cause ?? err;
+    expect(pgErr).toMatchObject({ code: '23514', constraint: 'review_flags_visit_positive' });
+    await expect(insert(1, 2)).resolves.toBeDefined();
+    const c = await db().admin.query<{ convalidated: boolean }>(
+      `select convalidated from pg_constraint where conname = 'review_flags_visit_positive'`,
+    );
+    // NOT VALID by design: rows written before visits were stored are not scanned or rewritten.
+    expect(c.rows).toEqual([{ convalidated: false }]);
   });
 
   it('bootstrapRoles is idempotent', async () => {
