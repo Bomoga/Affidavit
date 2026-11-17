@@ -21,6 +21,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { namesFileContent, probeExitCode } from './lib.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repo = join(here, '..', '..', '..');
@@ -84,7 +85,7 @@ try {
     add(`f.${e}`);
     add(`f.${e}.txt`);
   }
-  writeFileSync(join(work, 'names.txt'), names.join('\n'));
+  writeFileSync(join(work, 'names.txt'), namesFileContent(names));
   mkdirSync(join(work, 'out'));
   writeFileSync(
     join(work, 'gitleaks.toml'),
@@ -101,7 +102,7 @@ try {
 
   const script = [
     'mkdir -p /scan',
-    'while IFS= read -r n; do printf \'k = "AFFIDAVIT_FAKE_KEY_0123456789ABCDEF"\\n\' > "/scan/$n"; done < /probe/names.txt',
+    'while IFS= read -r n || [ -n "$n" ]; do printf \'k = "AFFIDAVIT_FAKE_KEY_0123456789ABCDEF"\\n\' > "/scan/$n"; done < /probe/names.txt',
     'gitleaks dir /scan --no-banner --no-color --redact --exit-code 0 --config /probe/gitleaks.toml --max-archive-depth 3 --report-format json --report-path /probe/out/r.json >/dev/null 2>&1',
   ].join('\n');
 
@@ -150,7 +151,7 @@ try {
   const all = [...new Set([...names, ...upper])];
   names.length = 0;
   names.push(...all);
-  writeFileSync(join(work, 'names.txt'), names.join('\n'));
+  writeFileSync(join(work, 'names.txt'), namesFileContent(names));
   run();
   dropped = droppedOf();
 
@@ -177,7 +178,8 @@ try {
     `gitleaks dropped but ARCHIVE_NAME does not match: ${shouldScan.length}; extensions: ${group(shouldScan).join(' ')}`,
   );
   for (const n of shouldScan.slice(0, 20)) console.log(`  MISSED: ${n}`);
-  process.exitCode = shouldScan.length > 0 ? 1 : 0;
+  for (const n of shouldDrop.slice(0, 20)) console.log(`  OVER-MATCH: ${n}`);
+  process.exitCode = probeExitCode(shouldDrop, shouldScan);
 } finally {
   rmSync(work, { recursive: true, force: true });
 }

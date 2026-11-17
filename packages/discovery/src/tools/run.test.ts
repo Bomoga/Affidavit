@@ -573,6 +573,142 @@ describe('runTool', () => {
       ).rejects.toBeInstanceOf(ToolOutputMissingError);
       expect(existsSync(`${snap.dir}.windows`)).toBe(false);
     });
+
+    it('says NOT scanned for archive-named files that are not windowed (other signatures)', async () => {
+      const snap = await snapshot({
+        'src/app.js': 'x',
+        'src/doc.tar.pdf': '%PDF-1.4 secret',
+        'src/data.zip.db': 'SQLite format 3\0 more',
+        'src/config.gz.yaml': 'key: value\n',
+      });
+      const { runner } = fakeRunner((out) => writeFileSync(join(out, 'gitleaks.sarif'), sarif()));
+      const res = await runTool(runner, manifest, 'gitleaks', await options(snap));
+      const note = (p: string) =>
+        res.notifications.find((n) => n.id === 'archive-name-mismatch' && n.message.includes(p));
+      for (const p of ['/src/src/doc.tar.pdf', '/src/src/data.zip.db']) {
+        expect(note(p)?.message, p).toContain('NOT scanned');
+        expect(note(p)?.message, p).not.toContain('scanned in a window under');
+      }
+      // a windowed one keeps the window wording
+      expect(note('/src/src/config.gz.yaml')?.message).toContain('scanned in a window');
+      expect(note('/src/src/config.gz.yaml')?.message).not.toContain('NOT scanned');
+      expect(res.windowedFiles).toEqual(['/src/src/config.gz.yaml']);
+    });
+
+    it('gives a risk-flagged file the window budget over an earlier-walked, smaller one', async () => {
+      // a-plain.txt is walked first and is smaller, but has blank lines, so it carries no flag.
+      // z-flagged.txt has 25 KB with no blank line (chunk-split-risk), so it must win the budget.
+      const plain = `${`${'a'.repeat(79)}\n`.repeat(9)}\n`.repeat(140);
+      const snap = await snapshot({ 'src/app.js': 'x' });
+      writeFileSync(join(snap.dir, 'src', 'a-plain.txt'), plain);
+      writeFileSync(join(snap.dir, 'src', 'z-flagged.txt'), bigText());
+      const { runner } = fakeRunner((out) => writeFileSync(join(out, 'gitleaks.sarif'), sarif()));
+      const res = await runTool(runner, manifest, 'gitleaks', {
+        ...(await options(snap)),
+        maxWindowBytes: 160_000,
+      });
+      expect(res.notifications.some((n) => n.id === 'chunk-split-risk')).toBe(true);
+      expect(res.windowedFiles).toEqual(['/src/src/z-flagged.txt']);
+      const over = res.notifications.filter((n) => n.id === 'windows-budget-exceeded');
+      expect(over.map((n) => n.message.split(' ')[0])).toEqual(['/src/src/a-plain.txt']);
+    });
+
+    it.each([Number.NaN, -1, Number.POSITIVE_INFINITY])(
+      'refuses maxWindowBytes %s before running anything',
+      async (bad) => {
+        const { runner, calls } = fakeRunner();
+        await expect(
+          runTool(runner, manifest, 'gitleaks', { ...(await options()), maxWindowBytes: bad }),
+        ).rejects.toBeInstanceOf(RangeError);
+        expect(calls).toHaveLength(0);
+      },
+    );
+
+    it('accepts maxWindowBytes of 0 and reports every windowed file as over budget', async () => {
+      const snap = await snapshot({ 'src/app.js': 'x' });
+      writeFileSync(join(snap.dir, 'src', 'big.txt'), bigText());
+      const { runner } = fakeRunner((out) => writeFileSync(join(out, 'gitleaks.sarif'), sarif()));
+      const res = await runTool(runner, manifest, 'gitleaks', {
+        ...(await options(snap)),
+        maxWindowBytes: 0,
+      });
+      expect(res.notifications.some((n) => n.id === 'windows-budget-exceeded')).toBe(true);
+    });
+
+    it('never lets an internal window path into the message text of a windows finding', async () => {
+      const snap = await snapshot({ 'src/app.js': 'x' });
+      writeFileSync(join(snap.dir, 'src', 'big.txt'), bigText());
+      let n = 0;
+      const winFinding = {
+        runs: [
+          {
+            results: [
+              {
+                ruleId: 'r',
+                message: { text: 'r has detected secret for file /src/w0001/p0001/src/big.txt.' },
+                locations: [
+                  {
+                    physicalLocation: {
+                      artifactLocation: { uri: '/src/w0001/p0001/src/big.txt' },
+                      region: { startLine: 3, endLine: 3, startColumn: 1, endColumn: 5 },
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+      let winOut = '';
+      const { runner } = fakeRunner((out) => {
+        const isWindows = n++ === 1;
+        if (isWindows) winOut = out;
+        writeFileSync(
+          join(out, 'gitleaks.sarif'),
+          isWindows ? JSON.stringify(winFinding) : sarif(),
+        );
+      });
+      await runTool(runner, manifest, 'gitleaks', await options(snap));
+      const text = readFileSync(join(winOut, 'gitleaks.sarif'), 'utf8');
+      expect(text).not.toMatch(/w\d{4}\/p\d{4}/);
+      expect(text).toContain('for file /src/src/big.txt.');
+    });
+
+    it('never lets a sidecar name into the message text of a quarantine finding', async () => {
+      const snap = await snapshot({ 'src/app.js': 'x', '.git/config': '[core]' });
+      const neutral = [...snap.mapping.keys()][0]!;
+      let n = 0;
+      let sideOut = '';
+      const { runner } = fakeRunner((out) => {
+        const isSide = n++ === 1;
+        if (isSide) sideOut = out;
+        const doc = {
+          runs: [
+            {
+              results: [
+                {
+                  ruleId: 'r',
+                  message: { text: `r has detected secret for file /src/${neutral}.` },
+                  locations: [
+                    {
+                      physicalLocation: {
+                        artifactLocation: { uri: `/src/${neutral}` },
+                        region: { startLine: 1 },
+                      },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        };
+        writeFileSync(join(out, 'gitleaks.sarif'), isSide ? JSON.stringify(doc) : sarif());
+      });
+      await runTool(runner, manifest, 'gitleaks', await options(snap));
+      const text = readFileSync(join(sideOut, 'gitleaks.sarif'), 'utf8');
+      expect(text).not.toContain(neutral);
+      expect(text).toContain(`for file /src/${snap.mapping.get(neutral)}.`);
+    });
   });
 
   it('never truncates coverage notifications, however many files', async () => {
