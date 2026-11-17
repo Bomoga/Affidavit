@@ -1,0 +1,9 @@
+# osv-scanner reads this file from the directory of the scanned lockfile.
+# Same entry as the repo root osv-scanner.toml; see the reason there.
+
+# GHSA-fc5q-39xc-vjpf: picomatch <= 4.0.7, ReDoS through single-branch repeated extglobs (high).
+# No patched release exists (4.0.7 is the latest). Time-boxed: remove this entry when a fix ships.
+[[IgnoredVulns]]
+id = "GHSA-fc5q-39xc-vjpf"
+ignoreUntil = 2026-12-17
+reason = "No patched picomatch release exists; development tooling only. Re-check by 2026-12-17."
