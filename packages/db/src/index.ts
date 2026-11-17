@@ -5,4 +5,6 @@ export * from './case-store.js';
 export * from './event-sink.js';
 export * from './queue.js';
 export * from './stage-runs.js';
+export * from './stage-attempts.js';
+export * from './orchestration.js';
 export * from './transition-rules.js';

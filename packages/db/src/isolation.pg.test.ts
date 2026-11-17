@@ -4,6 +4,7 @@ import { beforeAll, expect, it } from 'vitest';
 import { PgCaseStore } from './case-store.js';
 import { PgEventSink } from './event-sink.js';
 import { enqueueStage } from './queue.js';
+import { flagForReview } from './stage-attempts.js';
 import { claimStageRun } from './stage-runs.js';
 import { withTenant, type AppPool, type WorkerPool } from './tenant.js';
 import { BUDGET, describePg, sampleCase, useTestDatabase } from './test-support.js';
@@ -24,6 +25,7 @@ const TABLES = [
   'cost_rows',
   'escalations',
   'events',
+  'review_flags',
 ] as const;
 
 async function seed(
@@ -49,6 +51,7 @@ async function seed(
   const run = { tenantId: tenant, caseId: caseFile.id, stage: 'map' as const, attempt: 1 };
   await enqueueStage(pool, run);
   await claimStageRun(workerPool, run, 'seed-worker', 60);
+  await flagForReview(pool, run, 'attempts-exhausted', 'seed');
   // Event seqs 0 and 1 are handed out by the store, as the trial does.
   await store.nextSeq(caseFile.id);
   await store.nextSeq(caseFile.id);
@@ -282,6 +285,11 @@ describePg('cross-tenant isolation (tenant A against tenant B data)', () => {
     },
     events: {
       text: `insert into events (tenant_id, case_id, seq, type, event) values ($1, $2, 99, 'stage-entered', '{}')`,
+      params: () => [B, caseB.id],
+    },
+    review_flags: {
+      text: `insert into review_flags (tenant_id, case_id, stage, attempt, reason, detail)
+        values ($1, $2, 'map', 9, 'attempts-exhausted', 'd')`,
       params: () => [B, caseB.id],
     },
   };

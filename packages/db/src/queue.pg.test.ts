@@ -291,7 +291,14 @@ describePg('stage queue (Graphile Worker)', () => {
     expect(failed.map((j) => j.key)).toEqual(
       expect.arrayContaining(['forged-1', stageJobKey(real)]),
     );
-    expect(failed.find((j) => j.key === 'forged-1')?.lastError).toMatch(/no enqueued stage job/);
+    // Refused before the claim now: the queue key does not name the payload's tenant and case.
+    // The claim itself still refuses the same payload (asserted directly below).
+    expect(failed.find((j) => j.key === 'forged-1')?.lastError).toMatch(
+      /queue job key does not match its payload/,
+    );
+    expect(failed.find((j) => j.key === stageJobKey(real))?.lastError).toMatch(
+      /queue job key does not match its payload/,
+    );
     expect(await stageRunState(db().app, pay(B, caseB.id, 'map'))).toBe('unclaimed');
     await expect(claimStageRun(db().worker, pay(B, caseB.id, 'map', 9), 'w', 60)).rejects.toThrow(
       /no enqueued stage job/,

@@ -235,9 +235,13 @@ export function stageTaskList(
   for (const stage of CaseStage.options) {
     const handler = handlers[stage];
     if (!handler) continue;
-    list[stageTaskIdentifier(stage)] = async (raw) => {
+    list[stageTaskIdentifier(stage)] = async (raw, helpers) => {
       const job = parseStagePayload(raw);
       if (job.stage !== stage) throw new Error(`payload stage ${job.stage} on task for ${stage}`);
+      // The queue key must name the same tenant, case, stage and attempt as the payload.
+      if (helpers.job.key !== stageJobKey(job)) {
+        throw new Error(`queue job key does not match its payload for ${stageJobKey(job)}`);
+      }
       const claimStartedAt = Date.now();
       const token = await claimStageRun(options.workerPool, job, workerId, leaseSeconds);
       if (token === null) return;
