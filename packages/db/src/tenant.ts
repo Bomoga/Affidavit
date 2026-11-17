@@ -29,8 +29,9 @@ function createPool(
   onError: (err: Error) => void = (err) => {
     console.error(`[@affidavit/db] idle pool client error: ${err.message}`);
   },
+  max?: number,
 ): pg.Pool {
-  const pool = new pg.Pool({ connectionString });
+  const pool = new pg.Pool({ connectionString, ...(max === undefined ? {} : { max }) });
   pool.on('error', onError);
   return pool;
 }
@@ -119,13 +120,19 @@ export async function assertSafeRole(pool: pg.Pool, expected: LoginRole): Promis
   if (reasons.length > 0) throw new UnsafeRoleError(reasons);
 }
 
-/** Creates a pool and refuses it unless the role is safe. Use this at process startup. */
+/**
+ * Creates a pool and refuses it unless the role is safe. Use this at process startup.
+ * `options.max` is the pool size (default: pg's, 10). An app pool shared with reconcile passes
+ * must stay larger than the number of concurrent reconcilers: each holds one connection (its
+ * advisory-lock transaction) while its work takes others from the same pool (`withReconcileLock`).
+ */
 export async function openPool<R extends LoginRole>(
   connectionString: string,
   expected: R,
   onError?: (err: Error) => void,
+  options: { max?: number } = {},
 ): Promise<CheckedPool<R>> {
-  const pool = createPool(connectionString, onError);
+  const pool = createPool(connectionString, onError, options.max);
   try {
     await assertSafeRole(pool, expected);
   } catch (err) {

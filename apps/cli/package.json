@@ -12,11 +12,17 @@
     "lint": "eslint src",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:pg": "vitest run --config vitest.pg.config.ts",
+    "affidavit": "node --import tsx src/main.ts"
   },
   "dependencies": {
     "@affidavit/contracts": "workspace:*",
+    "@affidavit/db": "workspace:*",
     "@affidavit/evidence": "workspace:*",
     "commander": "15.0.0"
+  },
+  "devDependencies": {
+    "@affidavit/worker": "workspace:*"
   }
 }

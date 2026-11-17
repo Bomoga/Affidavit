@@ -11,11 +11,14 @@ import {
   type Role,
   type StageCost,
 } from '@affidavit/contracts';
+import { sql } from 'drizzle-orm';
 import { PgCaseStore } from './case-store.js';
 import { PgEventSink } from './event-sink.js';
 import {
   enqueueStage,
+  leaseLost,
   listFailedStageJobs,
+  MAX_FAILED_JOBS_PER_PAGE,
   parseStagePayload,
   type StageHandler,
   type StagePayload,
@@ -27,9 +30,10 @@ import {
   isFlaggedForReview,
   listOpenCases,
   stageAttemptState,
+  type OpenCaseCursor,
   type ReviewReason,
 } from './stage-attempts.js';
-import type { AppPool, WorkerPool } from './tenant.js';
+import { withTenant, type AppPool, type WorkerPool } from './tenant.js';
 
 /*
  * The stage orchestration: how a stage job is run (work, transition, next job, completion last),
@@ -48,8 +52,9 @@ export class LeaseLostError extends Error {
   }
 }
 
+/** Refuses once the signal aborted or the lease's confirmed expiry has passed by the clock. */
 function check(signal: AbortSignal): void {
-  if (signal.aborted) throw new LeaseLostError();
+  if (leaseLost(signal)) throw new LeaseLostError();
 }
 
 /** A CaseStore whose writes are refused once the job's signal aborted. Reads pass through. */
@@ -107,7 +112,10 @@ export interface StageEnv {
   sink: EventSink;
   caseFiles: CaseFileSource;
   signal: AbortSignal;
-  /** Events already recorded for a case (a read), for idempotent emission. */
+  /**
+   * Events already recorded for a case during its CURRENT stage visit (seq at or after the visit's
+   * entry), for idempotent emission: an event of an earlier visit does not count.
+   */
   events(caseId: CaseId): Promise<TrialEvent[]>;
   /** A named point inside the work; a no-op unless a test hook is installed. */
   checkpoint(name: string): Promise<void>;
@@ -151,9 +159,10 @@ export async function record(
 }
 
 /**
- * `record`, unless an event of the same type, stage and payload is already stored. Stage work
- * that emits events BEFORE its transition uses this, so a retry after a kill emits nothing twice
- * and a kill after the transition has nothing left to emit.
+ * `record`, unless an event of the same type, stage and payload is already stored for the current
+ * visit (`env.events` only returns events at or after the visit's entry seq, so a revisit of a
+ * stage emits its events again). Stage work that emits events BEFORE its transition uses this, so
+ * a retry after a kill emits nothing twice and a kill after the transition has nothing left to emit.
  */
 export async function recordOnce(
   env: Pick<StageEnv, 'store' | 'sink' | 'events'>,
@@ -196,9 +205,20 @@ export async function ensureStageJob(
 ): Promise<StagePayload | null> {
   const s = await stageAttemptState(appPool, tenantId, caseId);
   if (TERMINAL_STAGES.includes(s.stage) || s.latestAttempt !== null) return null;
-  if (await isFlaggedForReview(appPool, tenantId, caseId, s.stage)) return null;
+  if (await isFlaggedForReview(appPool, tenantId, caseId, s.stage, s.visit)) return null;
   const p = parseStagePayload({ tenantId, caseId, stage: s.stage, attempt: s.nextAttempt });
   return (await enqueueStage(appPool, p)) ? p : null;
+}
+
+/** A case's events from the entry of its current stage visit on (a read). */
+export async function visitEvents(
+  appPool: AppPool,
+  sink: PgEventSink,
+  tenantId: string,
+  caseId: string,
+): Promise<TrialEvent[]> {
+  const s = await stageAttemptState(appPool, tenantId, caseId);
+  return sink.events(caseId as CaseId, s.entrySeq - 1);
 }
 
 export interface StageHandlerOptions {
@@ -227,7 +247,7 @@ export function stageHandler(core: StageCore, options: StageHandlerOptions): Sta
       sink: new GuardedEventSink(pgSink, ctx.signal),
       caseFiles: new PgCaseFileSource(appPool, job.tenantId),
       signal: ctx.signal,
-      events: (caseId) => pgSink.events(caseId),
+      events: (caseId) => visitEvents(appPool, pgSink, job.tenantId, caseId),
       checkpoint: async (name) => {
         check(ctx.signal);
         await hooks?.checkpoint?.(job, name);
@@ -253,8 +273,13 @@ export interface ReconcileOptions {
   /** Total attempts of one stage, the first included. Beyond it a person has to look. */
   maxStageAttempts: number;
   juryEnabled?: boolean;
-  /** Most open cases examined per pass. */
+  /** Most open cases (and most failed jobs) examined per pass. */
   sweepLimit?: number;
+  /**
+   * Where the previous pass stopped, so the next one continues after it instead of starting at
+   * the oldest again. Default: kept per worker pool for the life of the process.
+   */
+  cursors?: ReconcileCursors;
   log?: (message: string) => void;
 }
 
@@ -264,6 +289,24 @@ export type ReconcileAction =
   | { kind: 'enqueued'; payload: StagePayload }
   /** Durable (review_flags). The case stays where it is; it is never dismissed. */
   | { kind: 'needs-review'; payload: StagePayload; reason: ReviewReason; why: string };
+
+/** Keyset positions of the two scans. A scan that returns a short page starts over next pass. */
+export interface ReconcileCursors {
+  failedAfterId: string | null;
+  openAfter: OpenCaseCursor | null;
+}
+
+const defaultCursors = new WeakMap<WorkerPool, ReconcileCursors>();
+
+function cursorsFor(o: ReconcileOptions): ReconcileCursors {
+  if (o.cursors) return o.cursors;
+  let c = defaultCursors.get(o.workerPool);
+  if (!c) {
+    c = { failedAfterId: null, openAfter: null };
+    defaultCursors.set(o.workerPool, c);
+  }
+  return c;
+}
 
 function parseKey(key: string): StagePayload | null {
   try {
@@ -295,7 +338,16 @@ export async function reconcileOnce(o: ReconcileOptions): Promise<ReconcileActio
       );
     }
   };
-  for (const job of await listFailedStageJobs(o.workerPool, o.staleLockSeconds)) {
+  const limit = o.sweepLimit ?? 500;
+  const cursors = cursorsFor(o);
+  const failed = await listFailedStageJobs(o.workerPool, o.staleLockSeconds, {
+    limit,
+    afterId: cursors.failedAfterId,
+  });
+  const lastFailed = failed[failed.length - 1];
+  cursors.failedAfterId =
+    lastFailed && failed.length >= Math.min(limit, MAX_FAILED_JOBS_PER_PAGE) ? lastFailed.id : null;
+  for (const job of failed) {
     const p = parseKey(job.key);
     if (!p) {
       o.log?.('ignoring a queue job with an unreadable key');
@@ -303,7 +355,16 @@ export async function reconcileOnce(o: ReconcileOptions): Promise<ReconcileActio
     }
     await guard(job.key, () => reconcileAttempt(o, p, actions));
   }
-  for (const c of await listOpenCases(o.workerPool, o.sweepLimit ?? 500)) {
+  const open = await listOpenCases(o.workerPool, limit, {
+    after: cursors.openAfter,
+    staleLockSeconds: o.staleLockSeconds,
+  });
+  const lastOpen = open[open.length - 1];
+  cursors.openAfter =
+    lastOpen && open.length >= Math.min(limit, 1000)
+      ? { tenantId: lastOpen.tenantId, caseId: lastOpen.caseId }
+      : null;
+  for (const c of open) {
     await guard(`case ${c.caseId}`, () => reconcileCase(o, c.tenantId, c.caseId, actions));
   }
   return actions;
@@ -350,46 +411,77 @@ async function reconcileAttempt(
   }
 }
 
+/**
+ * Runs `fn` while holding a Postgres advisory lock for this case and stage (its own key space, not
+ * the one enqueue_stage and claim_stage_run use, which would deadlock with the enqueue inside
+ * `fn`). Concurrent reconcilers queue up here; each re-reads the state under the lock, so only the
+ * first one retries, charges and enqueues.
+ *
+ * Pool requirement: this holds one app-pool connection, idle in a transaction, for as long as `fn`
+ * runs, and `fn` takes further connections from the SAME pool (each store and queue call checks
+ * one out). With R reconcilers at once the pool needs more than R connections, or all of them can
+ * be held by lock holders waiting for another one and nothing proceeds. `reconcileOnce` handles
+ * one case at a time and the worker runs one pass at a time, so reconcile alone needs 2; handlers
+ * on the same pool need theirs on top (concurrency plus heartbeats). Passing the held client into
+ * `fn` would remove the requirement but means threading a transaction through every store and
+ * queue call; not done. A test pins that a pool of 2 is enough for one reconciler.
+ */
+async function withReconcileLock<T>(
+  appPool: AppPool,
+  p: StagePayload,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const key = JSON.stringify(['reconcile', p.tenantId, p.caseId, p.stage]);
+  return withTenant(appPool, p.tenantId, async (tx) => {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${key}, 0))`);
+    return fn();
+  });
+}
+
 async function retry(
   o: ReconcileOptions,
   p: StagePayload,
   actions: ReconcileAction[],
 ): Promise<void> {
-  const s = await stageAttemptState(o.appPool, p.tenantId, p.caseId);
-  // Superseded: the case moved on, or a later attempt of this visit exists.
-  if (s.stage !== p.stage || s.latestAttempt !== p.attempt) return;
-  if (await isFlaggedForReview(o.appPool, p.tenantId, p.caseId, p.stage)) return;
-  const review = async (reason: ReviewReason, why: string) => {
-    if (await flagForReview(o.appPool, p, reason, why)) {
-      actions.push({ kind: 'needs-review', payload: p, reason, why });
+  await withReconcileLock(o.appPool, p, async () => {
+    const s = await stageAttemptState(o.appPool, p.tenantId, p.caseId);
+    // Superseded: the case moved on, or a later attempt of this visit exists (another reconciler
+    // that held the lock before us, say).
+    if (s.stage !== p.stage || s.latestAttempt !== p.attempt) return;
+    if (await isFlaggedForReview(o.appPool, p.tenantId, p.caseId, p.stage, s.visit)) return;
+    const review = async (reason: ReviewReason, why: string) => {
+      if (await flagForReview(o.appPool, { ...p, visit: s.visit }, reason, why)) {
+        actions.push({ kind: 'needs-review', payload: p, reason, why });
+      }
+    };
+    // Attempts of THIS visit only: an appeal that returns to the stage starts a fresh budget.
+    if (s.visitAttempts >= o.maxStageAttempts) {
+      await review(
+        'attempts-exhausted',
+        `stage ${p.stage} used ${s.visitAttempts} of ${o.maxStageAttempts} attempts in this visit`,
+      );
+      return;
     }
-  };
-  if (p.attempt >= o.maxStageAttempts) {
-    await review(
-      'attempts-exhausted',
-      `stage ${p.stage} used ${p.attempt} of ${o.maxStageAttempts} attempts`,
-    );
-    return;
-  }
-  // The dead attempt must be abandoned BEFORE the next one is enqueued, or the claim refuses it.
-  await failStageRun(o.appPool, p, 'abandoned by reconcile: lease expired or job failed');
-  const next = { ...p, attempt: s.nextAttempt };
-  const store = new PgCaseStore(o.appPool, p.tenantId, { juryEnabled: o.juryEnabled });
-  const charge: StageCost = {
-    stage: p.stage,
-    inputTokens: 0,
-    outputTokens: 0,
-    usd: 0,
-    wallMs: 0,
-    attempt: next.attempt,
-  };
-  if ((await store.chargeBudget(p.caseId, charge)).exhausted) {
-    await review('budget-exhausted', 'case budget is exhausted');
-    return;
-  }
-  if (await enqueueStage(o.appPool, next)) {
-    actions.push({ kind: 'retried', payload: p, nextAttempt: next.attempt });
-  }
+    // The dead attempt must be abandoned BEFORE the next one is enqueued, or the claim refuses it.
+    await failStageRun(o.appPool, p, 'abandoned by reconcile: lease expired or job failed');
+    const next = { ...p, attempt: s.nextAttempt };
+    const store = new PgCaseStore(o.appPool, p.tenantId, { juryEnabled: o.juryEnabled });
+    const charge: StageCost = {
+      stage: p.stage,
+      inputTokens: 0,
+      outputTokens: 0,
+      usd: 0,
+      wallMs: 0,
+      attempt: next.attempt,
+    };
+    if ((await store.chargeBudget(p.caseId, charge)).exhausted) {
+      await review('budget-exhausted', 'case budget is exhausted');
+      return;
+    }
+    if (await enqueueStage(o.appPool, next)) {
+      actions.push({ kind: 'retried', payload: p, nextAttempt: next.attempt });
+    }
+  });
 }
 
 /**
@@ -408,7 +500,7 @@ export async function startCase(
   await options.afterOpen?.();
   const sink = new PgEventSink(appPool, caseFile.tenantId);
   await recordOnce(
-    { store, sink, events: (id) => sink.events(id) },
+    { store, sink, events: (id) => visitEvents(appPool, sink, caseFile.tenantId, id) },
     caseFile.id,
     'intake',
     'stenographer',

@@ -78,3 +78,9 @@ Semgrep SARIF carries only a rule's `metadata.cwe` (as tags) in `properties.tags
 **Interim.** `@affidavit/db` writes an insert-only `review_flags` row (tenant, case, stage, attempt, reason `attempts-exhausted` or `budget-exhausted`, detail). The case stays at its stage and is excluded from the recovery sweep until a person acts. Nothing reads the flags yet (API, CLI and the courtroom do not show them).
 
 **Request.** Decide the shape: an `Escalation.reason` member for attempts exhausted, whether `escalated` should be reachable from `intake`, `map` and `arraign` (with a Lane 1 written Verdict), and how a person clears a flag. Then `review_flags` can be replaced by the real escalation.
+
+## CR-9: no push or subscribe API for case events, so the CLI polls (raised by L1-11)
+
+**Problem.** `affidavit scan` has to stream a case's events to the terminal. The only read path is `PgEventSink.events(caseId, afterSeq)` (a Lane 1 method beyond the `EventSink` port, which has `emit` only). There is no subscribe, `LISTEN/NOTIFY` or push API, so the CLI polls it every 500 ms by default (`--poll-ms`) until a terminal event (`verdict-written`, `escalated`, `budget-exhausted`) or a timeout (`--timeout`, default 120 s).
+
+**Request.** None blocking. When L1-12 adds the SSE endpoint, decide whether the CLI should read that stream instead, and whether the `events` read belongs on a port in `packages/contracts` (for example an `EventLog` port with `events(caseId, afterSeq)` and an optional subscribe). Until then the CLI depends on `@affidavit/db` directly, an approved Lane 1 dependency (L1-11 brief).

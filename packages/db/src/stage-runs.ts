@@ -1,6 +1,11 @@
 import { TERMINAL_STAGES } from '@affidavit/contracts';
 import { and, eq, sql } from 'drizzle-orm';
-import { stageJobState, type StageJobState, type StagePayload } from './queue.js';
+import {
+  DEFAULT_STALE_LOCK_SECONDS,
+  stageJobState,
+  type StageJobState,
+  type StagePayload,
+} from './queue.js';
 import * as t from './schema.js';
 import { withTenant, type AppPool, type Tx, type WorkerPool } from './tenant.js';
 
@@ -179,8 +184,9 @@ export type ResumeAction =
    */
   | 'adopt-complete'
   /**
-   * The attempt failed, its lease expired with the case still at this visit, or its queue job
-   * failed or went stale before claiming. Abandon it with failStageRun(pool, p, 'lease expired')
+   * The attempt failed, its lease expired with the case still at this visit (and its queue job is
+   * stale, failed or gone, or the lease expired more than the stale-lock margin ago), or its queue
+   * job failed or went stale before claiming. Abandon it with failStageRun(pool, p, 'lease expired')
    * if still open, charge the budget, and enqueue attempt + 1.
    */
   | 'next-attempt';
@@ -196,6 +202,12 @@ export interface ResumeInput {
   jobStage: string;
   jobVisit: number;
   now: Date;
+  /**
+   * How long past its expiry an open attempt's lease must be before it is retried while its queue
+   * job is still queued or running (the holder may be winding down, or paused). A job that is
+   * stale, failed or gone is retried as soon as the lease has expired. Default 0 (no margin).
+   */
+  leaseMarginMs?: number;
 }
 
 /**
@@ -220,7 +232,14 @@ export function decideResume(i: ResumeInput): ResumeAction {
   }
   if (i.run.state === 'failed') return left ? 'done' : 'next-attempt';
   if (i.run.leaseExpiresAt.getTime() > i.now.getTime()) return 'wait';
-  return left ? 'adopt-complete' : 'next-attempt';
+  if (left) return 'adopt-complete';
+  // Expired lease, case still at the visit. The job state says whether the holder can still be
+  // alive: a queued or running job gets the margin before its attempt is abandoned.
+  if (i.job === 'queued' || i.job === 'running') {
+    const margin = i.leaseMarginMs ?? 0;
+    return i.run.leaseExpiresAt.getTime() + margin < i.now.getTime() ? 'next-attempt' : 'wait';
+  }
+  return 'next-attempt';
 }
 
 export interface ResumePools {
@@ -269,5 +288,6 @@ export async function resumeDecision(
     jobStage: p.stage,
     jobVisit: rows.jobVisit ?? rows.caseVisit,
     now: options.now ?? new Date(),
+    leaseMarginMs: (options.staleLockSeconds ?? DEFAULT_STALE_LOCK_SECONDS) * 1000,
   });
 }
