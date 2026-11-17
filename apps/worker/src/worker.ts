@@ -1,19 +1,17 @@
 import { randomUUID } from 'node:crypto';
-import type { Budget, CaseFile } from '@affidavit/contracts';
 import {
-  PgCaseStore,
-  PgEventSink,
-  enqueueStage,
   openPool,
+  reconcileOnce,
   stageTaskList,
   type AppPool,
+  type StageHooks,
   type WorkerPool,
 } from '@affidavit/db';
 import { run } from 'graphile-worker';
 import type { WorkerConfig } from './config.js';
-import { buildHandlers, type HandlerHooks } from './handlers.js';
-import { reconcileOnce } from './reconcile.js';
-import { record } from './stage.js';
+import { buildHandlers, selectCores } from './handlers.js';
+
+export { startCase } from '@affidavit/db';
 
 export interface RunningWorker {
   appPool: AppPool;
@@ -25,12 +23,13 @@ export interface RunningWorker {
 export interface StartOptions {
   log?: (message: string, err?: unknown) => void;
   workerId?: string;
-  hooks?: HandlerHooks;
+  hooks?: StageHooks;
 }
 
 /**
  * Opens the two role pools, registers the stage handlers on Graphile Worker, and starts the
- * recovery loop (once now, then every reconcileIntervalMs).
+ * recovery loop (once now, then every reconcileIntervalMs). Wiring only: the handler ordering and
+ * the recovery policy live in @affidavit/db.
  */
 export async function startWorker(
   config: WorkerConfig,
@@ -43,7 +42,8 @@ export async function startWorker(
     });
   const workerId = options.workerId ?? randomUUID();
   const onPoolError = (err: Error) => log('database pool error', err);
-  // Handlers are built first so a `real` setting that is not wired fails before any connection.
+  // A `real` setting that is not wired fails here, before any connection is opened.
+  selectCores(config);
   const appPool = await openPool(config.appDatabaseUrl, 'affidavit_app', onPoolError);
   let workerPool: WorkerPool | undefined;
   try {
@@ -103,30 +103,4 @@ export async function startWorker(
     await workerPool?.end().catch(() => undefined);
     throw err;
   }
-}
-
-/**
- * Registers a case at `intake`, records the first event and enqueues the first stage job. The
- * entry point the API and CLI will call. Not atomic: a crash after `open` leaves a case at
- * intake with no job, which a later retry of this call repairs only if the caller re-enqueues.
- */
-export async function startCase(
-  appPool: AppPool,
-  caseFile: CaseFile,
-  budget: Budget,
-  options: { juryEnabled?: boolean } = {},
-): Promise<void> {
-  const store = new PgCaseStore(appPool, caseFile.tenantId, options);
-  await store.open(caseFile, budget);
-  const sink = new PgEventSink(appPool, caseFile.tenantId);
-  await record({ store, sink }, caseFile.id, 'intake', 'stenographer', {
-    type: 'stage-entered',
-    payload: {},
-  });
-  await enqueueStage(appPool, {
-    tenantId: caseFile.tenantId,
-    caseId: caseFile.id,
-    stage: 'intake',
-    attempt: 1,
-  });
 }

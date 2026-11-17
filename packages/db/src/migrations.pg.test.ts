@@ -28,6 +28,7 @@ describePg('migrations on a fresh Postgres', () => {
       'events',
       'exhibits',
       'repos',
+      'review_flags',
       'stage_jobs',
       'stage_runs',
       'stages',
@@ -109,6 +110,7 @@ describePg('migrations on a fresh Postgres', () => {
     expect(fns.rows).toEqual([
       { proname: 'claim_stage_run', owner: OWNER_ROLE },
       { proname: 'enqueue_stage', owner: OWNER_ROLE },
+      { proname: 'list_open_cases', owner: OWNER_ROLE },
       { proname: 'record_stage_entry', owner: OWNER_ROLE },
       { proname: 'stage_run_complete', owner: OWNER_ROLE },
       { proname: 'stage_run_fail', owner: OWNER_ROLE },
@@ -121,6 +123,7 @@ describePg('migrations on a fresh Postgres', () => {
     );
     expect(pol.rows.map((p) => p.tablename)).toEqual([
       'cases',
+      'review_flags',
       'stage_jobs',
       'stage_runs',
       'stages',

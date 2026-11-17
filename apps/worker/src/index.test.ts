@@ -1,9 +1,7 @@
 import { CaseStage } from '@affidavit/contracts';
-import { FakeCaseStore, FakeEventSink } from '@affidavit/testing';
 import { describe, expect, it } from 'vitest';
 import { ConfigError, describeConfig, loadConfig } from './config.js';
 import { selectCores, NotWiredError } from './handlers.js';
-import { GuardedCaseStore, GuardedEventSink, LeaseLostError } from './guard.js';
 
 const SECRET = 'hunter2-not-a-real-password';
 const base = {
@@ -17,6 +15,8 @@ describe('config', () => {
     expect([c.intake, c.trial, c.judge]).toEqual(['fake', 'fake', 'fake']);
     expect(c.leaseSeconds).toBe(300);
     expect(c.juryEnabled).toBe(true);
+    expect(c.staleLockSeconds).toBe(360);
+    expect(loadConfig({ ...base, AFFIDAVIT_LEASE_SECONDS: '30' }).staleLockSeconds).toBe(90);
   });
 
   it('lists every problem and never echoes a connection string', () => {
@@ -61,26 +61,4 @@ describe('handler selection', () => {
       expect(() => selectCores(loadConfig({ ...base, [name]: 'real' }))).toThrow(NotWiredError);
     },
   );
-});
-
-describe('lease guard', () => {
-  it('refuses port writes once the signal aborted, but still reads', async () => {
-    const abort = new AbortController();
-    const store = new GuardedCaseStore(new FakeCaseStore(), abort.signal);
-    const sink = new GuardedEventSink(new FakeEventSink(), abort.signal);
-    abort.abort();
-    await expect(Promise.resolve().then(() => store.nextSeq('c' as never))).rejects.toBeInstanceOf(
-      LeaseLostError,
-    );
-    await expect(
-      Promise.resolve().then(() => store.transition('c' as never, 'map')),
-    ).rejects.toBeInstanceOf(LeaseLostError);
-    await expect(Promise.resolve().then(() => sink.emit({} as never))).rejects.toBeInstanceOf(
-      LeaseLostError,
-    );
-    // A read reaches the inner store (which does not know the case), not the guard.
-    await expect(Promise.resolve().then(() => store.stage('c' as never))).rejects.toThrow(
-      /unknown case/,
-    );
-  });
 });

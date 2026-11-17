@@ -7,10 +7,13 @@
  * - defense, prosecution, remedy, verify, jury: stand-ins for Lane 3's trial handlers.
  * - the Judge: `FakeJudge` from @affidavit/testing, scripted with the contracts sample result.
  *
- * Events are emitted by the stage that EXITS (exited, then entered for the next stage) and only
- * after the case transition, so an attempt killed before its transition leaves no event behind
- * and a retry cannot duplicate one.
+ * Crash safety: events are emitted idempotently (`recordOnce`) BEFORE the case transition, and
+ * the transition is the last write. A retry after a kill therefore re-emits nothing, and a kill
+ * after the transition has nothing left to emit. (The fake flow never revisits a stage, so an
+ * event is identified by type, stage and payload; real handlers that can revisit a stage need an
+ * identity that includes the visit.)
  */
+import { recordOnce, type StageCore, type StageEnv } from '@affidavit/db';
 import {
   ExhibitResult,
   Verdict,
@@ -20,7 +23,6 @@ import {
   type JudgePort,
 } from '@affidavit/contracts';
 import { FakeJudge } from '@affidavit/testing';
-import { record, type StageCore, type StageEnv } from '../stage.js';
 
 export function fakeJudge(): JudgePort {
   const witness = Witness.parse(samples.Witness);
@@ -29,17 +31,19 @@ export function fakeJudge(): JudgePort {
   });
 }
 
+/** Exit event, entry event, then the transition last. */
 async function moveTo(env: StageEnv, to: CaseStage): Promise<void> {
   const { job } = env;
-  await env.store.transition(job.caseId, to);
-  await record(env, job.caseId, job.stage, 'stenographer', {
+  await recordOnce(env, job.caseId, job.stage, 'stenographer', {
     type: 'stage-exited',
     payload: { to },
   });
-  await record(env, job.caseId, to, 'stenographer', {
+  await recordOnce(env, job.caseId, to, 'stenographer', {
     type: 'stage-entered',
     payload: { from: job.stage },
   });
+  await env.checkpoint('after-events');
+  await env.store.transition(job.caseId, to);
 }
 
 function passThrough(to: CaseStage): StageCore {
@@ -47,7 +51,14 @@ function passThrough(to: CaseStage): StageCore {
 }
 
 export const fakeIntakeCores: Partial<Record<CaseStage, StageCore>> = {
-  intake: passThrough('map'),
+  intake: async (env) => {
+    // Repairs a case that was opened but crashed before its first event was written.
+    await recordOnce(env, env.job.caseId, 'intake', 'stenographer', {
+      type: 'stage-entered',
+      payload: {},
+    });
+    await moveTo(env, 'map');
+  },
   map: passThrough('arraign'),
   arraign: passThrough('defense'),
 };
@@ -55,18 +66,20 @@ export const fakeIntakeCores: Partial<Record<CaseStage, StageCore>> = {
 async function finishWithVerdict(env: StageEnv): Promise<void> {
   const { job } = env;
   // Idempotent: a retry after a kill must not trip the append-only verdict.
-  if ((await env.store.getVerdict(job.caseId)) === null) {
-    const verdict = Verdict.parse({
+  let verdict = await env.store.getVerdict(job.caseId);
+  if (verdict === null) {
+    verdict = Verdict.parse({
       ...(samples.Verdict as object),
       caseId: job.caseId,
       summary: '[fake] scripted verdict from the worker composition root',
     });
     await env.store.appendVerdict(verdict);
-    await record(env, job.caseId, job.stage, 'stenographer', {
-      type: 'verdict-written',
-      payload: { verdict },
-    });
   }
+  await env.checkpoint('after-verdict');
+  await recordOnce(env, job.caseId, job.stage, 'stenographer', {
+    type: 'verdict-written',
+    payload: { verdict },
+  });
   await moveTo(env, 'verdict');
 }
 
@@ -80,12 +93,12 @@ export function fakeTrialCores(options: {
       if (!caseFile) throw new Error(`no case file for ${env.job.caseId}`);
       const witness = Witness.parse({ ...(samples.Witness as object), caseId: caseFile.id });
       const result = await options.judge.runWitness(caseFile, witness, ['vulnerable', 'safe']);
-      if (env.signal.aborted) throw new Error('lease lost');
-      await record(env, caseFile.id, 'defense', 'defense', {
+      await env.checkpoint('after-judge');
+      await recordOnce(env, caseFile.id, 'defense', 'defense', {
         type: 'exhibit-submitted',
         payload: { exhibitId: result.exhibitId, kind: 'witness' },
       });
-      await record(env, caseFile.id, 'defense', 'judge', {
+      await recordOnce(env, caseFile.id, 'defense', 'judge', {
         type: 'exhibit-result',
         payload: { result },
       });

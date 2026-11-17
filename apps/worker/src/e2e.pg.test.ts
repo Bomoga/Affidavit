@@ -10,6 +10,8 @@ import {
   WORKER_ROLE,
   applyMigrations,
   bootstrapRoles,
+  PgCaseStore,
+  enqueueStage,
   openPool,
   provisionTenant,
   setRolePassword,
@@ -362,5 +364,79 @@ describePg('worker composition root, fakes, real Postgres and Graphile Worker', 
       (await psql(`select count(*) from stage_runs where case_id='${id}' and attempt > 1`))[0]?.[0],
     ).toBe('0');
     await expectNoDuplicateStage(id);
+  });
+
+  const open = async (id: string) =>
+    (
+      await psql(
+        `select count(*) from stage_runs where case_id='${id}' and completed_at is null and failed_at is null`,
+      )
+    )[0]?.[0] === '0';
+
+  it.each([
+    // Defense has emitted its events but not moved the case: the retry must emit nothing twice.
+    ['defense:1:after-events', 'defense'],
+    // Defense has run the Judge but emitted nothing yet.
+    ['defense:1:after-judge', 'defense'],
+    // The verdict is written but its event is not: the retry must not trip the append-only verdict.
+    ['jury:1:after-verdict', 'jury'],
+  ])('SIGKILL at %s: the retry repeats no event and no stage', async (point, stage) => {
+    const id = await newCase();
+    const first = spawnChild({ CHILD_HANG_AT: point });
+    await until(() => first.lines.some((l) => l.startsWith('HUNG')));
+    expect(
+      first.lines.some((l) => l.startsWith('HUNG')),
+      first.stderr(),
+    ).toBe(true);
+    await first.kill();
+    const second = spawnChild({});
+    await until(async () => (await stageOf(id)) === 'verdict');
+    expect(await stageOf(id), second.stderr()).toBe('verdict');
+    await until(() => open(id), 20_000);
+    expect(second.lines).toContain(`STARTED ${stage} 2`);
+    await expectNoDuplicateStage(id, [stage]);
+  });
+
+  it('SIGKILL inside startCase (after open, before the first job): recovery enqueues intake once and the first event is not lost', async () => {
+    const id = `case-e2e-${randomBytes(4).toString('hex')}`;
+    const file = CaseFile.parse({ ...CaseFile.parse(samples.CaseFile), id, tenantId: TENANT });
+    const crashed = spawnChild({ CHILD_START_CASE: JSON.stringify(file) });
+    await until(() => crashed.lines.includes('HUNG startCase'));
+    expect(crashed.lines, crashed.stderr()).toContain('HUNG startCase');
+    await crashed.kill();
+    expect(await stageOf(id)).toBe('intake');
+    expect((await psql(`select count(*) from stage_jobs where case_id='${id}'`))[0]?.[0]).toBe('0');
+    const second = spawnChild({});
+    await until(async () => (await stageOf(id)) === 'verdict');
+    expect(await stageOf(id), second.stderr()).toBe('verdict');
+    await until(() => open(id), 20_000);
+    await expectNoDuplicateStage(id);
+  });
+
+  it('a revisited stage runs under a new attempt number instead of failing to enqueue', async () => {
+    const file = CaseFile.parse({
+      ...CaseFile.parse(samples.CaseFile),
+      id: `case-e2e-${randomBytes(4).toString('hex')}`,
+      tenantId: TENANT,
+    });
+    const store = new PgCaseStore(appPool, TENANT);
+    await store.open(file, { maxInputTokens: 1_000_000, maxOutputTokens: 200_000, maxUsd: 5 });
+    for (const s of ['map', 'arraign', 'defense', 'prosecution', 'remedy'] as const) {
+      await store.transition(file.id, s);
+    }
+    // The first visit to remedy was enqueued but never ran; then verify appealed back to remedy.
+    await enqueueStage(appPool, { tenantId: TENANT, caseId: file.id, stage: 'remedy', attempt: 1 });
+    await store.transition(file.id, 'verify');
+    await store.transition(file.id, 'remedy');
+    const w = await startWorker(config(), { log: () => undefined });
+    running.push(w);
+    await until(async () => (await stageOf(file.id)) === 'verdict');
+    expect(await stageOf(file.id)).toBe('verdict');
+    await until(() => open(file.id), 20_000);
+    const runs = await psql(
+      `select stage, attempt, (completed_at is not null) from stage_runs where case_id='${file.id}' and stage='remedy' order by attempt`,
+    );
+    // The stale attempt 1 never ran (the claim refuses it); the new visit ran as attempt 2.
+    expect(runs).toEqual([['remedy', '2', 't']]);
   });
 });

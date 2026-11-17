@@ -95,14 +95,23 @@ function urlVar(env: Env, name: string, problems: string[]): string {
 /** Validates the environment. Throws ConfigError listing every problem, none of them a secret. */
 export function loadConfig(env: Env = process.env): WorkerConfig {
   const problems: string[] = [];
+  const leaseSeconds = intVar(env, 'AFFIDAVIT_LEASE_SECONDS', 300, 1, 3600, problems);
   const config: WorkerConfig = {
     appDatabaseUrl: urlVar(env, 'AFFIDAVIT_APP_DATABASE_URL', problems),
     workerDatabaseUrl: urlVar(env, 'AFFIDAVIT_WORKER_DATABASE_URL', problems),
     intake: implVar(env, 'AFFIDAVIT_INTAKE_IMPL', problems),
     trial: implVar(env, 'AFFIDAVIT_TRIAL_IMPL', problems),
     judge: implVar(env, 'AFFIDAVIT_JUDGE_IMPL', problems),
-    leaseSeconds: intVar(env, 'AFFIDAVIT_LEASE_SECONDS', 300, 1, 3600, problems),
-    staleLockSeconds: intVar(env, 'AFFIDAVIT_STALE_LOCK_SECONDS', 600, 1, 86_400, problems),
+    leaseSeconds,
+    // Default: the lease plus a margin, so a live attempt is never called dead.
+    staleLockSeconds: intVar(
+      env,
+      'AFFIDAVIT_STALE_LOCK_SECONDS',
+      leaseSeconds + 60,
+      1,
+      86_400,
+      problems,
+    ),
     reconcileIntervalMs: intVar(
       env,
       'AFFIDAVIT_RECONCILE_INTERVAL_MS',
