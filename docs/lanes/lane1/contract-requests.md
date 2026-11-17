@@ -31,7 +31,7 @@ The gate issue in NodeGoat at the pinned commit is MongoDB `$where` (NoSQL) inje
 
 **Request.** Say which of the two paths is intended, and whether the jury-enabled setting belongs on the case (so a database can enforce it) or stays store configuration.
 
-## CR-4: dependency findings have no class or location in `Candidate` (raised by L1-03)
+## CR-5: dependency findings have no class or location in `Candidate` (raised by L1-03)
 
 **Problem.** `Candidate.cls` is `injection | idor`, and `range` is a line range. An OSV-Scanner finding is a vulnerable package in a lockfile: it has no line, and most advisories are neither injection nor IDOR. The normalizer therefore (a) places an OSV candidate at line 1 of its lockfile, and (b) emits it only when the advisory's `database_specific.cwe_ids` maps to a MVP class. Every other advisory is returned in `skipped` with reason `unmapped-class`, so L1-06 can record it but cannot give it an `osv-no-path` dismissal (a `Dismissal` needs a `candidateId`).
 
@@ -39,6 +39,14 @@ The gate issue in NodeGoat at the pinned commit is MongoDB `$where` (NoSQL) inje
 
 **Interim.** The normalizer follows the first reading's constraints: no new fields, the `skipped` list carries tool, rule id, file and CWE numbers.
 
-## CR-5: how a Semgrep rule declares its class (raised by L1-03)
+## CR-6: how a Semgrep rule declares its class (raised by L1-03)
 
 Semgrep SARIF carries only a rule's `metadata.cwe` (as tags) in `properties.tags`; other metadata keys such as a custom `affidavit-class` are not emitted (checked on the pinned 1.184.0 image). The normalizer therefore derives `cls` from CWE numbers (injection: 74, 77, 78, 89, 90, 91, 94, 95, 564, 643, 917, 943; idor: 284, 285, 566, 639, 862, 863). Rules written for L1-04 must set `metadata.cwe` to one of these, or their findings are `skipped`. No contract change needed; recorded here so Lane 3 and L1-04 know the convention.
+
+**Open questions for the lead (L1-03 review), not decided here.**
+
+- Whether a `MalformedReportError` escalates the case or fails it.
+- Whether OSV injection or IDOR advisories become trial candidates before CR-5 is answered.
+- Where the merged rule ids live: the normalizer returns them in a Lane 1 side record (`NormalizeResult.merged`, with the OSV package per member) because `Candidate` has one rule id and one range.
+- The CWE set: injection is 74, 77, 78, 89, 90, 91, 94, 95, 564, 643, 917, 943 and idor is 284, 285, 566, 639, 862, 863. Whether 284 and 285 belong in idor, and whether 1336 belongs in injection.
+- An unsafe path on one finding is now a `skipped` entry (reason `unsafe-path`), not a report failure; say if that should escalate.

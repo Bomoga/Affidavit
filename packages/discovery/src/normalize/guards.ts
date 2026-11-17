@@ -13,7 +13,6 @@ export type MalformedCode =
   | 'bad-string'
   | 'bad-region'
   | 'bad-rule'
-  | 'unsafe-uri'
   | 'unreadable'
   | 'invalid-candidate'
   | 'unsupported-tool'
@@ -95,6 +94,12 @@ export class Guard {
     return v;
   }
 
+  /** A string whose content is checked later (a path): only the type is checked here. */
+  raw(v: unknown, pointer: string): string {
+    if (typeof v !== 'string') this.fail('wrong-type', pointer, 'expected a string');
+    return v;
+  }
+
   line(v: unknown, pointer: string): number {
     if (typeof v !== 'number' || !Number.isSafeInteger(v) || v < 1 || v > LIMITS.line) {
       this.fail('bad-region', pointer, 'expected a line number from 1 to 100000000');
@@ -110,32 +115,47 @@ export function own(o: Obj, key: string): unknown {
 
 const SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/;
 
+export type PathResult = { ok: true; path: string } | { ok: false; why: string };
+
 /**
- * Maps a report path to a repo-relative path. The tools run with the repo mounted at `/src`, so an
- * absolute path must start with `/src/`; a relative one (CodeQL's `%SRCROOT%` form) is taken as
- * repo-relative. Anything else (another absolute path, a scheme such as `file:`, a drive letter, a
- * backslash, an empty or `.` or `..` segment, a control character) throws `unsafe-uri`.
+ * Maps a report path to a repo-relative path, or says why it is unsafe. The tools run with the
+ * repo mounted at `/src`, so an absolute path must start with `/src/`; a relative one (CodeQL's
+ * `%SRCROOT%` form) is taken as repo-relative.
+ *
+ * `decode` is true only for CodeQL, whose SARIF writes real URIs. Semgrep writes the raw file name
+ * with no URI encoding (`/src/100%.js`, `/src/a%20b.js` are real names), so its paths are never
+ * decoded. A path is decoded at most once, here: the segments checked below are the final names
+ * and must never be decoded again by any caller.
+ *
+ * Unsafe means: another absolute path, a scheme or drive letter on a relative path, an empty, `.`
+ * or `..` segment, a control character, or an over-long path. A backslash is an ordinary file name
+ * character on the Linux target, so it is allowed. The caller records an unsafe path as a skipped
+ * finding; it is not a structural error.
  */
-export function repoRelativePath(g: Guard, raw: unknown, pointer: string): string {
-  const uri = g.str(raw, pointer);
-  let path: string;
-  try {
-    path = decodeURIComponent(uri);
-  } catch {
-    return g.fail('unsafe-uri', pointer, 'invalid percent-encoding');
-  }
-  // eslint-disable-next-line no-control-regex
-  if (/[\u0000-\u001f\u007f\\]/.test(path)) g.fail('unsafe-uri', pointer, 'control or backslash');
-  if (SCHEME.test(path)) g.fail('unsafe-uri', pointer, 'has a scheme or drive letter');
-  if (path.startsWith('/')) {
-    if (!path.startsWith('/src/')) g.fail('unsafe-uri', pointer, 'absolute path outside /src');
-    path = path.slice('/src/'.length);
-  }
-  if (path.length === 0) g.fail('unsafe-uri', pointer, 'empty path');
-  for (const seg of path.split('/')) {
-    if (seg === '' || seg === '.' || seg === '..') {
-      g.fail('unsafe-uri', pointer, 'empty, "." or ".." path segment');
+export function safeRepoPath(uri: string, decode: boolean): PathResult {
+  if (uri.length === 0 || uri.length > LIMITS.string)
+    return { ok: false, why: 'empty or too long' };
+  let path = uri;
+  if (decode) {
+    try {
+      path = decodeURIComponent(uri);
+    } catch {
+      return { ok: false, why: 'invalid percent-encoding' };
     }
   }
-  return path;
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f]/.test(path)) return { ok: false, why: 'control character' };
+  if (path.startsWith('/')) {
+    if (!path.startsWith('/src/')) return { ok: false, why: 'absolute path outside /src' };
+    path = path.slice('/src/'.length);
+  } else if (SCHEME.test(path)) {
+    return { ok: false, why: 'has a scheme or drive letter' };
+  }
+  if (path.length === 0) return { ok: false, why: 'empty path' };
+  for (const seg of path.split('/')) {
+    if (seg === '' || seg === '.' || seg === '..') {
+      return { ok: false, why: 'empty, "." or ".." path segment' };
+    }
+  }
+  return { ok: true, path };
 }

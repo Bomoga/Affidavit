@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { Candidate } from '@affidavit/contracts';
-import { LIMITS, MalformedReportError, type SourceTool } from './guards.js';
+import { MalformedReportError, type SourceTool } from './guards.js';
 import type { RawFinding } from './parse.js';
 
 // Lower is preferred when several tools report the same issue: the Candidate carries the
@@ -15,8 +15,29 @@ function byPreference(a: RawFinding, b: RawFinding): number {
     PRIORITY[a.tool] - PRIORITY[b.tool] ||
     cmp(a.ruleId, b.ruleId) ||
     a.startLine - b.startLine ||
-    a.endLine - b.endLine
+    a.endLine - b.endLine ||
+    cmp(a.pkg?.name ?? '', b.pkg?.name ?? '') ||
+    cmp(a.pkg?.version ?? '', b.pkg?.version ?? '')
   );
+}
+
+/** One input finding that ended up inside a candidate. */
+export interface MergedMember {
+  tool: SourceTool;
+  ruleId: string;
+  startLine: number;
+  endLine: number;
+  /** OSV only. */
+  package?: { name: string; version: string };
+}
+
+/**
+ * Lane 1 side record: every finding that fed a candidate, the primary included. `Candidate` has
+ * only one rule id and range, so this is where the rest stays on record (the lead decides where it finally lives).
+ */
+export interface MergedRecord {
+  candidateId: string;
+  members: MergedMember[];
 }
 
 /** A stable id: the same issue at the same place gets the same id on every run. */
@@ -27,8 +48,9 @@ export function candidateId(f: RawFinding): string {
   return `cand-${createHash('sha256').update(key).digest('hex').slice(0, 16)}`;
 }
 
-function build(cluster: RawFinding[]): Candidate {
-  const primary = [...cluster].sort(byPreference)[0] as RawFinding;
+function build(cluster: RawFinding[]): { candidate: Candidate; record: MergedRecord } {
+  const sorted = [...cluster].sort(byPreference);
+  const primary = sorted[0] as RawFinding;
   const candidate = {
     schemaVersion: 1,
     id: candidateId(primary),
@@ -53,21 +75,100 @@ function build(cluster: RawFinding[]): Candidate {
       { cause: parsed.error },
     );
   }
-  return parsed.data;
+  return {
+    candidate: parsed.data,
+    record: {
+      candidateId: parsed.data.id,
+      members: sorted.map((f) => ({
+        tool: f.tool,
+        ruleId: f.ruleId,
+        startLine: f.startLine,
+        endLine: f.endLine,
+        ...(f.pkg ? { package: f.pkg } : {}),
+      })),
+    },
+  };
+}
+
+/**
+ * Splits one file-and-class group into clusters. The preferred unassigned finding is a primary;
+ * the unassigned findings whose lines overlap the PRIMARY's range join it. Overlap is never
+ * chained (a wide range does not bridge two separate issues), and each finding lands in exactly
+ * one cluster. A segment tree over the start-sorted findings holds the largest end line still
+ * unassigned, so a primary finds its members without scanning the whole group.
+ */
+function clusterByPrimary(group: RawFinding[]): RawFinding[][] {
+  const byPref = [...group].sort(byPreference);
+  const byStart = [...group].sort((a, b) => a.startLine - b.startLine || byPreference(a, b));
+  const n = byStart.length;
+  let size = 1;
+  while (size < n) size *= 2;
+  const tree = new Int32Array(2 * size).fill(-1);
+  const pos = new Map<RawFinding, number>();
+  byStart.forEach((f, i) => {
+    pos.set(f, i);
+    tree[size + i] = f.endLine;
+  });
+  for (let i = size - 1; i >= 1; i--)
+    tree[i] = Math.max(tree[2 * i] as number, tree[2 * i + 1] as number);
+  const remove = (i: number): void => {
+    let k = size + i;
+    tree[k] = -1;
+    for (k >>= 1; k >= 1; k >>= 1)
+      tree[k] = Math.max(tree[2 * k] as number, tree[2 * k + 1] as number);
+  };
+  const collect = (node: number, lo: number, hi: number, ub: number, s: number, out: number[]) => {
+    if (lo >= ub || (tree[node] as number) < s) return;
+    if (hi - lo === 1) {
+      out.push(lo);
+      return;
+    }
+    const mid = (lo + hi) >> 1;
+    collect(2 * node, lo, mid, ub, s, out);
+    collect(2 * node + 1, mid, hi, ub, s, out);
+  };
+
+  const clusters: RawFinding[][] = [];
+  for (const primary of byPref) {
+    const at = pos.get(primary) as number;
+    if ((tree[size + at] as number) === -1) continue; // already in an earlier cluster
+    remove(at);
+    // Start-sorted findings whose start is within the primary's range.
+    let lo = 0;
+    let hi = n;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if ((byStart[mid] as RawFinding).startLine <= primary.endLine) lo = mid + 1;
+      else hi = mid;
+    }
+    const found: number[] = [];
+    collect(1, 0, size, lo, primary.startLine, found);
+    const cluster = [primary];
+    for (const i of found) {
+      cluster.push(byStart[i] as RawFinding);
+      remove(i);
+    }
+    clusters.push(cluster);
+  }
+  return clusters;
 }
 
 /**
  * Deduplicates findings and computes `toolAgreement`.
  *
- * Findings are grouped by file and class. Within a group, line ranges that overlap (sharing at
- * least one line, directly or through a chain of overlapping ranges) are one issue, whichever tool
- * or rule reported them. `toolAgreement` is the number of distinct tools in that issue, so two
- * Semgrep rules on one line count once. OSV findings have no real range, so they merge only with
- * an identical advisory id in the same lockfile.
+ * Findings are grouped by file and class. Within a group the preferred finding is a primary and
+ * every unassigned finding whose lines overlap the primary's range is merged into it, whichever
+ * tool or rule reported it (no chaining, see clusterByPrimary). `toolAgreement` is the number of
+ * distinct tools in the cluster, so two Semgrep rules on one line count once. OSV findings have no
+ * real range, so they merge only with the same advisory id in the same lockfile.
  *
- * The result is sorted by file, start line, end line, class, then id, with bytewise comparison.
+ * `merged` records every member of every candidate, so nothing is dropped unrecorded. Both lists
+ * are sorted by file, start line, end line, class, then id, with bytewise comparison.
  */
-export function mergeFindings(findings: readonly RawFinding[]): Candidate[] {
+export function mergeFindings(findings: readonly RawFinding[]): {
+  candidates: Candidate[];
+  merged: MergedRecord[];
+} {
   const groups = new Map<string, RawFinding[]>();
   for (const f of findings) {
     const key = [f.file, f.cls, f.tool === 'osv' ? `osv:${f.ruleId}` : 'range'].join('\0');
@@ -76,36 +177,18 @@ export function mergeFindings(findings: readonly RawFinding[]): Candidate[] {
     else groups.set(key, [f]);
   }
 
-  const out: Candidate[] = [];
-  for (const [key, group] of [...groups].sort((a, b) => cmp(a[0], b[0]))) {
-    if (!key.endsWith('\0range')) {
-      out.push(build(group));
-      continue;
-    }
-    const sorted = [...group].sort(
-      (a, b) => a.startLine - b.startLine || a.endLine - b.endLine || byPreference(a, b),
-    );
-    let cluster: RawFinding[] = [];
-    let end = 0;
-    for (const f of sorted) {
-      if (cluster.length > 0 && f.startLine > end) {
-        out.push(build(cluster));
-        cluster = [];
-      }
-      cluster.push(f);
-      end = Math.max(end, f.endLine);
-    }
-    if (cluster.length > 0) out.push(build(cluster));
+  const built: { candidate: Candidate; record: MergedRecord }[] = [];
+  for (const [key, group] of groups) {
+    const clusters = key.endsWith('\0range') ? clusterByPrimary(group) : [group];
+    for (const c of clusters) built.push(build(c));
   }
-  if (out.length > LIMITS.candidates) {
-    throw new MalformedReportError('semgrep', 'too-many', '', 'too many candidates');
-  }
-  return out.sort(
+  built.sort(
     (a, b) =>
-      cmp(a.file, b.file) ||
-      a.range.startLine - b.range.startLine ||
-      a.range.endLine - b.range.endLine ||
-      cmp(a.cls, b.cls) ||
-      cmp(a.id, b.id),
+      cmp(a.candidate.file, b.candidate.file) ||
+      a.candidate.range.startLine - b.candidate.range.startLine ||
+      a.candidate.range.endLine - b.candidate.range.endLine ||
+      cmp(a.candidate.cls, b.candidate.cls) ||
+      cmp(a.candidate.id, b.candidate.id),
   );
+  return { candidates: built.map((b) => b.candidate), merged: built.map((b) => b.record) };
 }

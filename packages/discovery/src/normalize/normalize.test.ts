@@ -169,7 +169,37 @@ describe('golden output over recorded tool runs', () => {
     expect(normalizeReports([{ tool: 'semgrep', doc }]).candidates).toHaveLength(1);
   });
 
-  it('merges chained overlaps and keeps disjoint ranges apart', () => {
+  it('does not chain overlaps: a wide range cannot bridge two separate issues', () => {
+    // Semgrep A at line 10, Semgrep B at line 40, CodeQL C over 10-40, one class, one file.
+    const rules = [{ id: 'A', properties: { tags: ['CWE-89'] } }];
+    const result = (ruleId: string, region: unknown) => ({
+      ...sqlResult('/src/x.js', region),
+      ruleId,
+    });
+    const semgrepDoc = sarif(
+      [result('A', { startLine: 10 }), result('B', { startLine: 40 })],
+      [...rules, { id: 'B', properties: { tags: ['CWE-89'] } }],
+    );
+    const codeqlDoc = sarif(
+      [result('C', { startLine: 10, endLine: 40 })],
+      [{ id: 'C', properties: { tags: ['CWE-89'] } }],
+    );
+    const out = normalizeReports([
+      { tool: 'semgrep', doc: semgrepDoc },
+      { tool: 'codeql', doc: codeqlDoc },
+    ]);
+    expect(
+      out.candidates.map((c) => `${c.ruleId}:${c.range.startLine}:${c.toolAgreement}`),
+    ).toEqual(['A:10:2', 'B:40:1']);
+    // Every input finding is on record in exactly one candidate.
+    expect(out.merged.flatMap((m) => m.members.map((x) => x.ruleId)).sort()).toEqual([
+      'A',
+      'B',
+      'C',
+    ]);
+  });
+
+  it('keeps disjoint ranges and files apart, and merges direct overlaps', () => {
     const doc = sarif(
       [
         sqlResult('/src/a.js', { startLine: 1, endLine: 3 }),
@@ -185,6 +215,56 @@ describe('golden output over recorded tool runs', () => {
       'a.js:7',
       'b.js:1',
     ]);
+  });
+
+  it('records the rules and packages that were merged into a candidate', () => {
+    const out = normalizeReports(all);
+    const sql = out.merged.find((m) => m.members.some((x) => x.ruleId === 'js/sql-injection'));
+    expect(sql?.members.map((x) => `${x.tool}:${x.ruleId}`)).toEqual([
+      'semgrep:affidavit.normalize.query-from-request',
+      'semgrep:affidavit.normalize.sql-concat',
+      'codeql:js/sql-injection',
+    ]);
+    expect(out.merged.map((m) => m.candidateId)).toEqual(out.candidates.map((c) => c.id));
+  });
+
+  it('puts every input finding in exactly one candidate or in skipped (randomised)', () => {
+    let seed = 12345;
+    const rand = (n: number): number => {
+      seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff;
+      return seed % n;
+    };
+    const files = ['/src/a.js', '/src/b.js', '/etc/x.js'];
+    const tags = [['CWE-89'], ['CWE-639'], ['CWE-79'], []];
+    for (let round = 0; round < 200; round++) {
+      const docs: ReportInput[] = [];
+      let expected = 0;
+      for (const tool of ['semgrep', 'codeql'] as const) {
+        const rules = tags.map((t, i) => ({ id: `r${i}`, properties: { tags: t } }));
+        const results = Array.from({ length: rand(25) }, () => {
+          const start = 1 + rand(30);
+          return {
+            ruleId: `r${rand(4)}`,
+            locations: [
+              {
+                physicalLocation: {
+                  artifactLocation: { uri: files[rand(3)] },
+                  region: { startLine: start, endLine: start + rand(12) },
+                },
+              },
+            ],
+          };
+        });
+        expected += results.length;
+        docs.push({ tool, doc: sarif(results, rules) });
+      }
+      const out = normalizeReports(docs);
+      const members = out.merged.reduce((n, m) => n + m.members.length, 0);
+      expect(members + out.skipped.length).toBe(expected);
+      for (const m of out.merged) expect(m.members.length).toBeGreaterThan(0);
+      // The same findings in the other order give the same answer.
+      expect(normalizeReports([...docs].reverse())).toEqual(out);
+    }
   });
 
   it('resolves the rule through ruleIndex and rule.id', () => {
@@ -337,55 +417,217 @@ describe('malformed reports are rejected with a typed error', () => {
 });
 
 describe('paths', () => {
-  const run = (uri: unknown) =>
-    normalizeReports([{ tool: 'semgrep', doc: sarif([sqlResult(uri)], sqlRule) }]).candidates;
+  const sg = (uri: unknown) =>
+    normalizeReports([{ tool: 'semgrep', doc: sarif([sqlResult(uri)], sqlRule) }]);
+  const cq = (uri: unknown) =>
+    normalizeReports([{ tool: 'codeql', doc: sarif([sqlResult(uri)], sqlRule) }]);
 
   it('strips /src/ and accepts repo-relative paths', () => {
-    expect(run('/src/app/db.js')[0]?.file).toBe('app/db.js');
-    expect(run('app/db.js')[0]?.file).toBe('app/db.js');
-    expect(run('/src/my%20dir/a.js')[0]?.file).toBe('my dir/a.js');
+    expect(sg('/src/app/db.js').candidates[0]?.file).toBe('app/db.js');
+    expect(sg('app/db.js').candidates[0]?.file).toBe('app/db.js');
   });
 
-  it.each([
-    '/etc/passwd',
-    '/srcx/a.js',
-    '/src',
-    '/src/',
-    '/src/../etc/passwd',
-    '../a.js',
-    'a/../../b.js',
-    './a.js',
-    'a//b.js',
-    'a/./b.js',
-    '%2e%2e/a.js',
-    'a/%2E%2e/b.js',
-    '%2fetc/passwd',
-    'file:///src/a.js',
-    'https://example.com/a.js',
-    'C:/src/a.js',
-    'a\\b.js',
-    '/src/a\\..\\b.js',
-    '%5c..%5cb.js',
-    'bad%zz.js',
-    'a%00b.js',
-  ])('rejects %j', (uri) => {
-    expectMalformed([{ tool: 'semgrep', doc: sarif([sqlResult(uri)], sqlRule) }], 'unsafe-uri');
+  it('keeps Semgrep file names exactly as written, never URI-decoding them', () => {
+    for (const name of ['100%.js', 'a%20b.js', 'a#b?.js', 'a\\b.js', 'é.js', '%2e%2e/x.js']) {
+      const out = sg(`/src/${name}`);
+      expect(out.skipped).toEqual([]);
+      expect(out.candidates[0]?.file).toBe(name);
+    }
   });
 
-  it('rejects a raw control character and a non-string uri', () => {
-    expectMalformed(
-      [{ tool: 'semgrep', doc: sarif([sqlResult('/src/a.js\n')], sqlRule) }],
-      'bad-string',
-    );
+  it('decodes CodeQL URIs once', () => {
+    expect(cq('src/my%20dir/a.js').candidates[0]?.file).toBe('src/my dir/a.js');
+    // %2541 decodes to %41, and the result is not decoded again.
+    expect(cq('src/%2541.js').candidates[0]?.file).toBe('src/%41.js');
+  });
+
+  const unsafe: [string, string][] = [
+    ['semgrep', '/etc/passwd'],
+    ['semgrep', '/srcx/a.js'],
+    ['semgrep', '/src'],
+    ['semgrep', '/src/'],
+    ['semgrep', '/src/../etc/passwd'],
+    ['semgrep', '../a.js'],
+    ['semgrep', 'a/../../b.js'],
+    ['semgrep', './a.js'],
+    ['semgrep', 'a//b.js'],
+    ['semgrep', 'a/./b.js'],
+    ['semgrep', 'file:///src/a.js'],
+    ['semgrep', 'https://example.com/a.js'],
+    ['semgrep', 'C:/src/a.js'],
+    ['semgrep', '/src/a\nb.js'],
+    ['codeql', '%2e%2e/a.js'],
+    ['codeql', 'a/%2E%2e/b.js'],
+    ['codeql', '%2fetc/passwd'],
+    ['codeql', 'bad%zz.js'],
+    ['codeql', 'a%00b.js'],
+    ['codeql', '%2e/a.js'],
+  ];
+  it.each(unsafe)('skips an unsafe %s path %j without failing the report', (tool, uri) => {
+    const doc = sarif([sqlResult('/src/ok.js'), sqlResult(uri)], sqlRule);
+    const out = normalizeReports([{ tool: tool as 'semgrep' | 'codeql', doc }]);
+    expect(out.candidates.map((c) => c.file)).toEqual(['ok.js']);
+    expect(out.skipped).toEqual([{ tool, ruleId: 'r.sql', reason: 'unsafe-path', cwe: [89] }]);
+  });
+
+  it('still fails the report for a non-string uri', () => {
     expectMalformed([{ tool: 'semgrep', doc: sarif([sqlResult(5)], sqlRule) }], 'wrong-type');
   });
 
-  it('rejects an unsafe lockfile path in OSV output', () => {
-    const doc = { results: [{ source: { path: '/etc/shadow' }, packages: [] }] };
-    expectMalformed([{ tool: 'osv', doc }], 'unsafe-uri');
+  it('skips an unsafe lockfile path in OSV output', () => {
+    const doc = {
+      results: [
+        {
+          source: { path: '/etc/shadow' },
+          packages: [
+            {
+              package: { name: 'p', version: '1' },
+              vulnerabilities: [{ id: 'A', database_specific: { cwe_ids: ['CWE-89'] } }],
+            },
+          ],
+        },
+      ],
+    };
+    const out = normalizeReports([{ tool: 'osv', doc }]);
+    expect(out.candidates).toEqual([]);
+    expect(out.skipped).toEqual([{ tool: 'osv', ruleId: 'A', reason: 'unsafe-path', cwe: [89] }]);
+  });
+
+  it('uses a later location when the first has no uri', () => {
+    const doc = sarif(
+      [
+        {
+          ruleId: 'r.sql',
+          locations: [
+            { message: { text: 'x' } },
+            {
+              physicalLocation: {
+                artifactLocation: { uri: '/src/b.js' },
+                region: { startLine: 2 },
+              },
+            },
+          ],
+        },
+      ],
+      sqlRule,
+    );
+    expect(normalizeReports([{ tool: 'semgrep', doc }]).candidates[0]?.file).toBe('b.js');
   });
 });
 
+describe('recorded odd file names from the pinned Semgrep image', () => {
+  it('yields a candidate for every odd name, with the exact file name', () => {
+    const files = normalizeReports([semgrep]).candidates.map((c) => c.file);
+    for (const name of ['src/100%.js', 'src/a%20b.js', 'src/a#b.js', 'src/é.js']) {
+      expect(files).toContain(name);
+    }
+  });
+});
+
+describe('CodeQL rule references', () => {
+  const ext = (rules: unknown[]) => ({
+    version: '2.1.0',
+    runs: [
+      {
+        tool: {
+          driver: { name: 'CodeQL' },
+          extensions: [
+            { name: 'q1', rules: [] },
+            { name: 'q2', rules },
+          ],
+        },
+        results: [
+          {
+            rule: { id: 'js/sql-injection', index: 0, toolComponent: { name: 'q2', index: 1 } },
+            locations: sqlResult('src/a.js').locations,
+          },
+        ],
+      },
+    ],
+  });
+
+  it('resolves rules in tool.extensions by toolComponent', () => {
+    const out = normalizeReports([
+      {
+        tool: 'codeql',
+        doc: ext([{ id: 'js/sql-injection', properties: { tags: ['external/cwe/cwe-089'] } }]),
+      },
+    ]);
+    expect(out.candidates.map((c) => c.ruleId)).toEqual(['js/sql-injection']);
+  });
+
+  it('rejects a toolComponent index with no such extension', () => {
+    const doc = ext([]);
+    (
+      doc.runs[0]?.results[0] as { rule: { toolComponent: { index: number } } }
+    ).rule.toolComponent.index = 9;
+    expectMalformed([{ tool: 'codeql', doc }], 'bad-rule');
+  });
+});
+
+describe('OSV aliases and packages', () => {
+  const pkg = (name: string, ids: string[], groups: string[][], cwe = ['CWE-89']) => ({
+    package: { name, version: '1.0.0', ecosystem: 'npm' },
+    vulnerabilities: ids.map((id) => ({ id, database_specific: { cwe_ids: cwe } })),
+    groups: groups.map((g) => ({ ids: g, aliases: g })),
+  });
+  const lock = (packages: unknown[]) => ({
+    results: [{ source: { path: '/src/package-lock.json', type: 'lockfile' }, packages }],
+  });
+
+  it('collapses a GHSA id and its CVE alias on one package into one candidate', () => {
+    const out = normalizeReports([
+      { tool: 'osv', doc: lock([pkg('p', ['GHSA-1', 'CVE-1'], [['CVE-1', 'GHSA-1']])]) },
+    ]);
+    expect(out.candidates.map((c) => c.ruleId)).toEqual(['CVE-1']);
+    expect(out.merged[0]?.members).toHaveLength(1);
+  });
+
+  it('takes the CWEs of every id in the group', () => {
+    const doc = lock([
+      {
+        package: { name: 'p', version: '1' },
+        vulnerabilities: [
+          { id: 'A', database_specific: { cwe_ids: [] } },
+          { id: 'B', database_specific: { cwe_ids: ['CWE-639'] } },
+        ],
+        groups: [{ ids: ['A', 'B'] }],
+      },
+    ]);
+    const out = normalizeReports([{ tool: 'osv', doc }]);
+    expect(out.candidates.map((c) => [c.ruleId, c.cls])).toEqual([['A', 'idor']]);
+  });
+
+  it('keeps ungrouped vulnerabilities apart', () => {
+    const out = normalizeReports([{ tool: 'osv', doc: lock([pkg('p', ['A', 'B'], [])]) }]);
+    expect(out.candidates.map((c) => c.ruleId).sort()).toEqual(['A', 'B']);
+  });
+
+  it('records both packages when one advisory hits two packages in one lockfile', () => {
+    const out = normalizeReports([
+      { tool: 'osv', doc: lock([pkg('p', ['A'], [['A']]), pkg('q', ['A'], [['A']])]) },
+    ]);
+    expect(out.candidates).toHaveLength(1);
+    expect(out.merged[0]?.members.map((m) => m.package?.name)).toEqual(['p', 'q']);
+  });
+});
+
+describe('limits and error attribution', () => {
+  it('keeps a long tag instead of dropping it', () => {
+    const rules = [{ id: 'r.sql', properties: { tags: [`CWE-89: ${'x'.repeat(3_000)}`] } }];
+    expect(
+      normalizeReports([{ tool: 'semgrep', doc: sarif([sqlResult('/src/a.js')], rules) }])
+        .candidates,
+    ).toHaveLength(1);
+  });
+
+  it('attributes a failure to the report that caused it', () => {
+    const e = expectMalformed([semgrep, { tool: 'codeql', doc: { version: '2.1.0' } }]);
+    expect(e.tool).toBe('codeql');
+    const o = expectMalformed([semgrep, codeql, { tool: 'osv', doc: [] }]);
+    expect(o.tool).toBe('osv');
+  });
+});
 describe('class mapping', () => {
   it('reads CWE numbers from the tag spellings the tools use', () => {
     expect(cweNumber('CWE-89: Improper Neutralization')).toBe(89);
@@ -461,6 +703,23 @@ describe('readToolRunReports', () => {
     );
     expect(one?.tool).toBe('osv');
     expect(await readToolRunReports(run({ name: 'osv-scanner', empty: true }))).toEqual([]);
+  });
+
+  it('maps codeql to its own format and rejects unknown tool names', async () => {
+    const dir = tmp();
+    put(dir, 'c.sarif', JSON.stringify(sarif([])));
+    const [one] = await readToolRunReports(
+      run({ name: 'codeql', reports: [{ file: join(dir, 'c.sarif'), origin: 'snapshot' }] }),
+    );
+    expect(one?.tool).toBe('codeql');
+    const err: unknown = await readToolRunReports(
+      run({ name: 'mystery' as ToolRunResult['name'] }),
+    ).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(MalformedReportError);
+    expect((err as MalformedReportError).code).toBe('unsupported-tool');
   });
 
   it('rejects gitleaks, bad JSON, missing, oversize and non-regular files', async () => {
