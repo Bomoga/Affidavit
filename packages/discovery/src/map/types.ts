@@ -68,7 +68,8 @@ export type MapSkipReason =
   | 'excluded-directory'
   | 'directory-too-deep'
   | 'entry-limit'
-  | 'time-budget';
+  | 'time-budget'
+  | 'unsafe-name';
 
 /** A file or directory the map did not read. Reported so a gap is never silent. */
 export interface SkippedPath {
@@ -80,7 +81,12 @@ export interface SkippedPath {
 }
 
 export type IncompleteReason =
-  'syntax-error' | 'depth-limit' | 'node-limit' | 'interpreter-aborted' | 'stack-overflow';
+  | 'syntax-error'
+  | 'depth-limit'
+  | 'node-limit'
+  | 'text-limit'
+  | 'interpreter-aborted'
+  | 'stack-overflow';
 
 export interface IncompleteFile {
   file: string;
@@ -162,6 +168,9 @@ export interface ChainItem {
    * options, a name that looks like a guard on code that is not one, a guard that may let the
    * request through before it checks). */
   authUncertain?: boolean;
+  /** A package's authentication middleware that deliberately authenticates nobody
+   * (`passport.authenticate('anonymous')`). */
+  authNone?: boolean;
   /** Why the map treats this item as an authentication guard, if it does. */
   authGuard?: 'name' | 'body';
 }
@@ -224,6 +233,8 @@ export type ReachReason =
   | 'no-enclosing-function'
   /** Reached only from code handed to a package (another framework, a scheduler, an event). */
   | 'external-entry'
+  /** Run by start-up code and not reached from a route. */
+  | 'startup-code'
   /** Referred to somewhere, but no resolved route reaches it. */
   | 'referenced-unresolved'
   | 'invalid-location';

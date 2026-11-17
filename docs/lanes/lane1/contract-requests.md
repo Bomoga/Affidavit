@@ -58,6 +58,10 @@ Semgrep SARIF carries only a rule's `metadata.cwe` (as tags) in `properties.tags
 - Whether a `MalformedReportError` escalates the case or fails it.
 - Whether OSV injection or IDOR advisories become trial candidates before CR-5 is answered.
 - Where the merged rule ids live: the normalizer returns them in a Lane 1 side record (`NormalizeResult.merged`, with the OSV package per member) because `Candidate` has one rule id and one range.
+- The CWE set: injection is 74, 77, 78, 89, 90, 91, 94, 95, 564, 643, 917, 943 and idor is 284, 285, 566, 639, 862, 863. Whether 284 and 285 belong in idor, and whether 1336 belongs in injection.
+- An unsafe path on one finding is now a `skipped` entry (reason `unsafe-path`), not a report failure; say if that should escalate.
+- Whether different CWEs in one class on the same range should stay separate candidates (today they merge into one).
+- Whether one bad result (for example a bad line number) should reject a whole report, as now, or be skipped and recorded.
 
 ## CR-7: Lane 3 needs a single-stage entry point for the worker (raised by L1-10)
 
@@ -93,10 +97,5 @@ Semgrep SARIF carries only a rule's `metadata.cwe` (as tags) in `properties.tags
 **Request.** Either add optional fields (for example `Candidate.reachabilityReason: string`, `CaseFile.callPath`, and a coverage object next to CR-4's `ingest`), or state that these stay Lane 1 internal and are recorded as events. State the `RouteInfo.middleware` convention above, and whether `method: 'USE'` and `${...}` path parts are allowed in `CaseFile.route`.
 
 **Interim.** `@affidavit/discovery` exports `CandidateReachability` (value, reason, detail, function, paths), `MapCoverage` and `MapRoute` (with `appMiddleware`, `chain`, `mounted`, `pathDynamic`). `routeInfoOf(path)` returns a contract-valid `RouteInfo` and L1-07 should prefer a `reachable` path whose method is not `USE`. L1-06 treats `unknown` as "not dismissed".
-
-- The CWE set: injection is 74, 77, 78, 89, 90, 91, 94, 95, 564, 643, 917, 943 and idor is 284, 285, 566, 639, 862, 863. Whether 284 and 285 belong in idor, and whether 1336 belongs in injection.
-- An unsafe path on one finding is now a `skipped` entry (reason `unsafe-path`), not a report failure; say if that should escalate.
-- Whether different CWEs in one class on the same range should stay separate candidates (today they merge into one).
-- Whether one bad result (for example a bad line number) should reject a whole report, as now, or be skipped and recorded.
 
 `RouteInfo.authRequired` is a heuristic from the middleware chain only: it cannot see an ownership or login check written inside a handler, and `true` means "a guard was proven by name (package) or by body (repo code)", never more. `'unknown'` is used whenever the guard is optional, conditional, scoped to a path the map cannot pin down, or the chain has an item it could not resolve.

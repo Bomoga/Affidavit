@@ -46,6 +46,8 @@ interface Derived {
   appReach: Set<number>;
   /** Functions reachable from code handed to a package from outside any request. */
   extReach: Set<number>;
+  /** Functions run by module-level code (start-up). */
+  startup: Set<number>;
 }
 
 const derivedCache = new WeakMap<ReachModel, Derived>();
@@ -119,7 +121,7 @@ function derive(m: ReachModel): Derived {
   };
   const extStarts = m.interp.handoffs.filter(([from]) => !isDead(from)).map(([, to]) => to);
   const extReach = forward(m.interp.edges, extStarts);
-  const d: Derived = { fnById, rev, entryIndex, appReach, extReach };
+  const d: Derived = { fnById, rev, entryIndex, appReach, extReach, startup };
   derivedCache.set(m, d);
   return d;
 }
@@ -338,13 +340,26 @@ function reachOne(m: ReachModel, d: Derived, c: MapCandidate): CandidateReachabi
       { fn: ref },
     );
   }
-  // Name rule: the function and every named function around it must be unreferenced.
+  if (d.startup.has(target.id)) {
+    return result(
+      c,
+      'unknown',
+      'startup-code',
+      'run by start-up code and not reached from a route; start-up code can register handlers the map does not follow',
+      { fn: ref },
+    );
+  }
+  // Name rule: the function and every named function around it must be unreferenced, and at
+  // least one of them must have a name (an unnamed function is whatever its caller makes it).
+  let named = false;
   for (
     let cur: FnInfo | undefined = target;
     cur && cur.kind !== 'module';
     cur = cur.parent === null ? undefined : d.fnById.get(cur.parent)
   ) {
     for (const name of cur.names) {
+      if (name === 'exports' || name === 'default') continue;
+      named = true;
       if ((m.uses.get(name) ?? 0) > 0) {
         return result(
           c,
@@ -355,6 +370,15 @@ function reachOne(m: ReachModel, d: Derived, c: MapCandidate): CandidateReachabi
         );
       }
     }
+  }
+  if (!named) {
+    return result(
+      c,
+      'unknown',
+      'referenced-unresolved',
+      'no route reaches this code and no function around it has a name to check references for',
+      { fn: ref },
+    );
   }
   return result(
     c,

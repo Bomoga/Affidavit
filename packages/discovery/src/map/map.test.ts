@@ -1181,6 +1181,222 @@ describe('fix round 1: unreachable is still the right answer for dead code', () 
   });
 });
 
+describe('fix round 2: memo keys are lossless and cheap', () => {
+  it('keeps two calls that differ only after the 60th character apart', async () => {
+    const ka = `${'x'.repeat(70)}A`;
+    const kb = `${'x'.repeat(70)}B`;
+    const m = await mapOf({
+      'a.js': [
+        "const app = require('express')();",
+        'const table = {};',
+        `table['${ka}'] = function fa() {`, // 3
+        '  return 1;', // 4
+        '};',
+        `table['${kb}'] = function fb() {`, // 6
+        '  return 2;', // 7
+        '};',
+        'function pick(k) {',
+        '  return table[k];',
+        '}',
+        `pick('${ka}');`,
+        `app.get('/t', (req, res) => { pick('${kb}')(); res.end(); });`,
+      ].join('\n'),
+    });
+    expect(verdict(m, at('a.js', 7))?.reachability).toBe('reachable');
+  });
+
+  it('does not build exponential signatures for shared nested arrays', async () => {
+    const row = Array.from({ length: 64 }, (_, i) => i).join(',');
+    const started = Date.now();
+    const m = await mapOf(
+      {
+        'a.js': [
+          `const a0 = [${row}];`,
+          `const a1 = [${Array(64).fill('a0').join(',')}];`,
+          `const a2 = [${Array(64).fill('a1').join(',')}];`,
+          `const a3 = [${Array(64).fill('a2').join(',')}];`,
+          `const a4 = [${Array(64).fill('a3').join(',')}];`,
+          'function f(x) { return x; }',
+          'f(a4);',
+        ].join('\n'),
+      },
+      { maxMillis: 3000 },
+    );
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(m.coverage.filesAnalyzed).toBe(1);
+  }, 60_000);
+});
+
+describe('fix round 2: a guard is a proven guard', () => {
+  const guard = async (body: string) => {
+    const m = await mapOf({
+      'app.js': [
+        "const app = require('express')();",
+        `const mw = (req, res, next) => {${body}};`,
+        "app.get('/x', mw, (req, res) => res.end());",
+      ].join('\n'),
+    });
+    return m.routes[0]?.route.authRequired;
+  };
+
+  it('accepts the plain shapes', async () => {
+    expect(await guard("if (req.user) return next(); return res.redirect('/');")).toBe(true);
+    expect(await guard("if (!req.user) return res.redirect('/'); return next();")).toBe(true);
+    expect(await guard('if (!req.session.userId) { return res.sendStatus(401); } next();')).toBe(
+      true,
+    );
+    expect(
+      await guard(
+        "if (req.isAuthenticated()) { return next(); } else { return res.redirect('/'); }",
+      ),
+    ).toBe(true);
+  });
+
+  it('gives unknown for every shape that is not a clean guard', async () => {
+    const shapes: Record<string, string> = {
+      'deny on another path':
+        "if (req.path === '/admin' && !req.user) return res.redirect('/'); return next();",
+      'identity read unrelated to the deny':
+        'const u = req.user; if (req.query.x) return res.sendStatus(403); next();',
+      'deny mixed with another test':
+        'if (req.user && req.user.banned) return res.sendStatus(403); next();',
+      'no return after the deny': "if (!req.user) { res.redirect('/login'); } next();",
+      'throw caught inside': "try { if (!req.user) throw new Error('x'); } catch (e) {} next();",
+      'next aliased': "const n = next; if (!req.user) return res.redirect('/'); return n();",
+      'next passed on': "if (!req.user) return res.redirect('/'); return helper(req, res, next);",
+      'authorization header present only':
+        'if (!req.headers.authorization) return res.sendStatus(401); next();',
+      'next first': "next(); if (!req.user) return res.redirect('/');",
+    };
+    for (const [name, body] of Object.entries(shapes)) {
+      expect(await guard(body), name).toBe('unknown');
+    }
+  });
+
+  it('gives unknown when a package guard has options it cannot read', async () => {
+    const cases: Record<string, [string, string]> = {
+      'options in a variable': ['const opts = { credentialsRequired: false };', 'jwt(opts)'],
+      'options from a call': ['', 'jwt(loadOpts())'],
+      'spread options': ['const base = { secret: "s" };', 'jwt({ ...base })'],
+      'computed key': ['const k = "credentialsRequired";', 'jwt({ [k]: false })'],
+    };
+    for (const [name, [decl, call]] of Object.entries(cases)) {
+      const m = await mapOf({
+        'app.js': [
+          "const app = require('express')();",
+          "const jwt = require('express-jwt');",
+          decl,
+          `app.get('/x', ${call}, (req, res) => res.end());`,
+        ].join('\n'),
+      });
+      expect(m.routes[0]?.route.authRequired, name).toBe('unknown');
+    }
+  });
+
+  it('reads passport strategies: anonymous alone is no guard, a list with it is unknown', async () => {
+    const auth = async (call: string) => {
+      const m = await mapOf({
+        'app.js': [
+          "const app = require('express')();",
+          "const passport = require('passport');",
+          `app.get('/x', ${call}, (req, res) => res.end());`,
+        ].join('\n'),
+      });
+      return m.routes[0]?.route.authRequired;
+    };
+    expect(await auth("passport.authenticate('jwt', { session: false })")).toBe(true);
+    expect(await auth("passport.authenticate('anonymous')")).toBe(false);
+    expect(await auth("passport.authenticate(['jwt', 'anonymous'])")).toBe('unknown');
+    expect(await auth('passport.authenticate(strategyName)')).toBe('unknown');
+  });
+});
+
+describe('fix round 2: reachability is only ever said for provably dead code', () => {
+  it('counts an assigned property as a use, so a setter it triggers is not dead', async () => {
+    const m = await mapOf({
+      'a.js': [
+        "const app = require('express')();",
+        "const { exec } = require('child_process');",
+        'const o = {',
+        '  set v(q) {', // 4
+        '    exec(q);', // 5
+        '  },',
+        '};',
+        "app.get('/x', (req, res) => { o.v = req.query.x; res.end(); });",
+      ].join('\n'),
+    });
+    expect(verdict(m, at('a.js', 5))?.reachability).not.toBe('unreachable');
+  });
+
+  it('answers unknown when no function around the code has a name', async () => {
+    const m = await mapOf({
+      'x.js': 'module.exports = [\n  function () {\n    return 1;\n  },\n];',
+      'z.js': "require('express')().get('/z', (req, res) => res.end());",
+    });
+    const r = verdict(m, at('x.js', 3));
+    expect(r?.reachability).toBe('unknown');
+  });
+
+  it('answers unknown for an IIFE that start-up code runs', async () => {
+    const m = await mapOf({
+      'x.js': '(function () {\n  const a = 1;\n  return a;\n})();',
+      'z.js': "require('express')().get('/z', (req, res) => res.end());",
+    });
+    const r = verdict(m, at('x.js', 3));
+    expect(r?.reachability).toBe('unknown');
+    expect(r?.reason).toBe('startup-code');
+  });
+});
+
+describe('fix round 2: names and text in the output', () => {
+  it('skips a file whose name has a bidi character, reports it reduced, and leaves it out', async () => {
+    const { root } = repo({ 'ok.js': "require('express')().get('/ok', (req, res) => res.end());" });
+    let made = true;
+    try {
+      writeFileSync(
+        join(root, 'evil‮gnp.js'),
+        "require('express')().get('/evil', (req, res) => res.end());",
+      );
+    } catch {
+      made = false;
+    }
+    const m = await buildMap({ root });
+    expect(sigs(m)).toEqual(['GET /ok']);
+    if (made) {
+      expect(m.coverage.skipped.map((s) => s.reason)).toContain('unsafe-name');
+      expect(JSON.stringify(m)).not.toContain('‮');
+      expect(m.coverage.complete).toBe(false);
+    }
+  });
+
+  it('marks a file with text cut at the leaf cap as incomplete', async () => {
+    const m = await mapOf({
+      'a.js': `require('express')().get('/${'q'.repeat(700)}', (req, res) => res.end());`,
+    });
+    expect(m.coverage.incomplete[0]?.reasons).toContain('text-limit');
+    expect(m.coverage.complete).toBe(false);
+  });
+
+  it('marks a template that grew past the string cap as dynamic', async () => {
+    const part = 'a'.repeat(300);
+    const m = await mapOf({
+      'a.js': [
+        "const app = require('express')();",
+        `const p = '${part}';`,
+        'app.get(`/${p}/${p}`, (req, res) => res.end());',
+      ].join('\n'),
+    });
+    expect(m.routes[0]?.pathDynamic).toBe(true);
+  });
+
+  it('reduces output paths to URL path characters', async () => {
+    const m = await mapOf({
+      'a.js': "require('express')().get(\"/a<b>'c\\\\d|e^f\", (req, res) => res.end());",
+    });
+    expect(m.routes[0]?.route.path).toMatch(/^[A-Za-z0-9\-._~!$&()*+,;=:@%/{}[\]?]+$/);
+  });
+});
+
 describe('public surface', () => {
   it('rejects a map that did not come from buildMap', () => {
     const fake: RepoMap = {

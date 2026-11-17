@@ -177,7 +177,9 @@ function isDeclarationPosition(
   if (p === 'assignment_pattern' && field === 'left') return true;
   if (p === 'arrow_function' && field === 'parameter') return true;
   if (p === 'member_expression' && field === 'property' && grand?.t === 'assignment_expression') {
-    return grand.f['left'] === parent;
+    // `this.go = function () {}` defines `go`; `o.v = x` may run a setter named `v`.
+    const right = grand.f['right'];
+    return grand.f['left'] === parent && right !== undefined && FN_TYPES.has(right.t);
   }
   return n.t === 'private_property_identifier' && field === 'name';
 }

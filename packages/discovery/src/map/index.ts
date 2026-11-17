@@ -126,6 +126,11 @@ interface SourceEntry {
 
 const MAX_LISTED_SKIPS = 5_000;
 
+/** Control, bidirectional and invisible format characters: not allowed in a name we report. */
+// eslint-disable-next-line no-control-regex
+const UNSAFE_NAME = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/;
+const reduceName = (s: string): string => s.replace(new RegExp(UNSAFE_NAME.source, 'g'), '_');
+
 async function collect(
   root: string,
   limits: MapLimits,
@@ -159,7 +164,10 @@ async function collect(
     const subdirs: { rel: string; depth: number }[] = [];
     for (const e of entries) {
       const rel = cur.rel ? posix.join(cur.rel, e.name) : e.name;
-      if (e.isSymbolicLink()) {
+      if (UNSAFE_NAME.test(e.name) && (e.isDirectory() || grammarFor(e.name) !== undefined)) {
+        // Reported under a reduced name, and never read: the name would reach the output.
+        skipped.push({ path: reduceName(rel), reason: 'unsafe-name', affectsCompleteness: true });
+      } else if (e.isSymbolicLink()) {
         skipped.push({ path: rel, reason: 'symlink', affectsCompleteness: true });
       } else if (e.isDirectory()) {
         const excluded = EXCLUDED_DIRS.get(e.name);
@@ -276,7 +284,7 @@ export async function buildMap(options: MapOptions): Promise<RepoMap> {
     const parsed = await parseSource(text, e.grammar, {
       maxAstDepth: limits.maxAstDepth,
       maxNodes: limits.maxNodesPerFile,
-      maxParseMillis: limits.maxParseMillis,
+      maxParseMillis: Math.max(1, Math.min(limits.maxParseMillis, deadline - Date.now())),
     });
     if (parsed === 'timeout' || parsed === 'failed') {
       skipped.push({

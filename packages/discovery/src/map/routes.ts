@@ -58,9 +58,6 @@ export function looksLikeAuthName(label: string): boolean {
   return AUTH_NAME.test(label) || AUTH_BARE.test(label);
 }
 
-const SESSION_IDENTITY =
-  /^(req|request)\.session\.(userid|user|id|loggedin|isloggedin|passport|uid)/i;
-
 function chainText(n: AstNode | undefined, depth = 0): string | undefined {
   if (!n || depth > 8) return undefined;
   if (n.t === 'identifier' || n.t === 'property_identifier') return n.x;
@@ -74,53 +71,200 @@ function chainText(n: AstNode | undefined, depth = 0): string | undefined {
   return undefined;
 }
 
+/** Chains that say who the caller is. An Authorization header is deliberately not here: its
+ * presence says nothing about whether the credential was checked. */
+const IDENTITY_CHAIN = [
+  /^(req|request)\.session\.(userid|user|id|loggedin|isloggedin|passport|uid)$/i,
+  /^(req|request)\.user$/i,
+  /^ctx\.state\.user$/i,
+  /^(req|request)\.isAuthenticated$/i,
+];
+
+const unwrap = (n: AstNode | undefined): AstNode | undefined => {
+  let x = n;
+  while (x && (x.t === 'parenthesized_expression' || x.t === 'await_expression')) x = x.c[0];
+  return x;
+};
+
+const isIdentityAtom = (n: AstNode | undefined): boolean => {
+  const x = unwrap(n);
+  if (!x) return false;
+  if (x.t === 'call_expression' && (x.f['arguments']?.c.length ?? 0) > 0) return false;
+  const t = chainText(x);
+  return t !== undefined && IDENTITY_CHAIN.some((re) => re.test(t));
+};
+
+/** `pos`: the condition is true when the caller is known; `neg`: true when not. Only a single
+ * identity read (optionally negated) qualifies: anything mixed with another test does not. */
+function polarity(n: AstNode | undefined): 'pos' | 'neg' | undefined {
+  const x = unwrap(n);
+  if (!x) return undefined;
+  if (x.t === 'unary_expression' && x.op === '!') {
+    const inner = polarity(x.c[0]);
+    return inner === 'pos' ? 'neg' : inner === 'neg' ? 'pos' : undefined;
+  }
+  return isIdentityAtom(x) ? 'pos' : undefined;
+}
+
+function walkAll(
+  n: AstNode,
+  visit: (x: AstNode) => void,
+  budget = { left: 20_000 },
+  depth = 0,
+): void {
+  if (budget.left-- <= 0 || depth > 120) return;
+  visit(n);
+  for (const c of n.c) walkAll(c, visit, budget, depth + 1);
+}
+
+const isCallTo = (n: AstNode | undefined, name: string): boolean => {
+  const x = unwrap(n);
+  return (
+    x?.t === 'call_expression' && x.f['function']?.t === 'identifier' && x.f['function'].x === name
+  );
+};
+
+function isDenyExpr(n: AstNode | undefined): boolean {
+  let found = false;
+  if (n) {
+    walkAll(n, (x) => {
+      if (x.t !== 'call_expression') return;
+      const last = (chainText(x.f['function']) ?? '').split('.').pop() ?? '';
+      const arg = x.f['arguments']?.c[0]?.x ?? '';
+      if (last === 'redirect' || last === 'unauthorized' || last === 'forbidden') found = true;
+      if ((last === 'status' || last === 'sendStatus') && /^(401|403)$/.test(arg)) found = true;
+    });
+  }
+  return found;
+}
+
+const refCount = (n: AstNode, name: string): number => {
+  let count = 0;
+  walkAll(n, (x) => {
+    if (x.t === 'identifier' && x.x === name) count++;
+  });
+  return count;
+};
+
+/** The statement ends the function by denying (a returned deny call, or a throw). */
+function endsInDeny(s: AstNode | undefined, next: string): boolean {
+  if (!s) return false;
+  if (s.t === 'return_statement') return isDenyExpr(s.c[0]) && refCount(s, next) === 0;
+  if (s.t === 'throw_statement') return true;
+  if (s.t === 'statement_block')
+    return endsInDeny(s.c[s.c.length - 1], next) && refCount(s, next) === 0;
+  return false;
+}
+
+/** The statement ends the function by calling `next(...)` and returning. */
+function endsInNext(s: AstNode | undefined, next: string): boolean {
+  if (!s) return false;
+  if (s.t === 'return_statement') return isCallTo(s.c[0], next);
+  if (s.t === 'statement_block') {
+    const last = s.c[s.c.length - 1];
+    const before = s.c[s.c.length - 2];
+    if (last?.t === 'return_statement') {
+      if (isCallTo(last.c[0], next)) return true;
+      return (
+        last.c.length === 0 && before?.t === 'expression_statement' && isCallTo(before.c[0], next)
+      );
+    }
+  }
+  return false;
+}
+
 /**
- * Body-based guess: the function reads who the caller is (`req.session.userId`, `req.user`,
- * `req.isAuthenticated()`, `ctx.state.user`, an Authorization header), can deny (redirect, 401,
- * 403, throw) and can let the request through (`next()`). Syntactic only; the walk is bounded.
+ * Body-based verdict on a middleware, strict on purpose. `guard` only for these shapes, where
+ * `next` is the function's third parameter, is called exactly once and is never aliased or
+ * passed on, there is no try/catch, and the test is one identity read (`req.user`,
+ * `req.session.userId`, `req.isAuthenticated()`, `ctx.state.user`), optionally negated:
+ *   if (id) return next(); <deny>          if (!id) <deny>; return next();
+ *   if (id) return next(); else <deny>     if (!id) <deny> else return next();
+ *   id ? next() : <deny>                   (arrow with an expression body)
+ * where <deny> returns (or throws) a redirect, 401 or 403. Anything else that reads an identity,
+ * can deny and can call `next` is `uncertain`; the rest is `no`.
  */
 export function bodyLooksLikeAuthGuard(fn: FnInfo): 'guard' | 'uncertain' | 'no' {
-  let reads = 0;
-  let denies = 0;
-  let passes = 0;
-  let pos = 0;
-  let budget = 20_000;
-  const walk = (n: AstNode, depth: number): void => {
-    if (budget-- <= 0 || depth > 120) return;
-    // A write (`req.session.userId = ...`) is not a read of who the caller is.
-    if (n.t === 'assignment_expression') {
-      const right = n.f['right'];
-      if (right) walk(right, depth + 1);
-      return;
-    }
+  const body = fn.node.f['body'];
+  if (!body) return 'no';
+  // The loose evidence: reads, denies and passes somewhere in the body.
+  let reads = false;
+  let denies = false;
+  let passes = false;
+  let hasTry = false;
+  walkAll(body, (n) => {
     if (n.t === 'member_expression') {
       const t = chainText(n);
       if (
         t &&
-        (SESSION_IDENTITY.test(t) ||
-          /^(req|request)\.(user|auth|isAuthenticated|headers\.authorization)/i.test(t) ||
+        (IDENTITY_CHAIN.some((re) => re.test(t)) ||
+          /^(req|request)\.(user|auth|headers\.authorization)/i.test(t) ||
           /^ctx\.state\.user/i.test(t))
       ) {
-        reads ||= ++pos;
+        reads = true;
       }
     }
     if (n.t === 'call_expression') {
       const t = chainText(n.f['function']) ?? '';
-      const last = t.split('.').pop() ?? '';
-      const argText = n.f['arguments']?.c[0]?.x ?? '';
-      if (last === 'redirect' || last === 'sendStatus' || last === 'unauthorized') denies ||= ++pos;
-      if (last === 'status' && /^(401|403)$/.test(argText)) denies ||= ++pos;
-      if (/^(next|done|cb|callback)$/.test(t)) passes ||= ++pos;
-      if (/^(req|request)\.isAuthenticated$/.test(t)) reads ||= ++pos;
+      if (/^(next|done|cb|callback)$/.test(t)) passes = true;
     }
-    if (n.t === 'throw_statement') denies ||= ++pos;
-    for (const c of n.c) walk(c, depth + 1);
-  };
-  const body = fn.node.f['body'];
-  if (body) walk(body, 0);
+    if (n.t === 'throw_statement') denies = true;
+    if (n.t === 'try_statement') hasTry = true;
+  });
+  if (isDenyExpr(body)) denies = true;
+  const params = fn.node.f['parameters']?.c ?? [];
+  const third = params[2];
+  const nextName = third?.t === 'identifier' ? third.x : third?.f['pattern']?.x;
+  // `next` aliased or handed to a helper still lets the request through.
+  if (nextName && refCount(body, nextName) > 0) passes = true;
   if (!reads || !denies || !passes) return 'no';
-  // The check must come before the request is let through; a `next()` first is not a guard.
-  return reads < passes ? 'guard' : 'uncertain';
+  if (!nextName || hasTry || refCount(body, nextName) !== 1) return 'uncertain';
+
+  if (body.t !== 'statement_block') {
+    const t = unwrap(body);
+    if (t?.t === 'ternary_expression') {
+      const [cond, a, b] = t.c;
+      const pol = polarity(cond);
+      const ok =
+        pol === 'pos'
+          ? isCallTo(a, nextName) && isDenyExpr(b)
+          : pol === 'neg'
+            ? isDenyExpr(a) && isCallTo(b, nextName)
+            : false;
+      return ok ? 'guard' : 'uncertain';
+    }
+    return 'uncertain';
+  }
+  const stmts = body.c;
+  const at = stmts.findIndex((s) => s.t === 'if_statement');
+  const ifs = stmts[at];
+  if (!ifs) return 'uncertain';
+  const pol = polarity(ifs.f['condition']);
+  const alt =
+    ifs.f['alternative']?.t === 'else_clause' ? ifs.f['alternative'].c[0] : ifs.f['alternative'];
+  const rest = stmts.slice(at + 1);
+  const cons = ifs.f['consequence'];
+  const lastRest = rest[rest.length - 1];
+  const before = stmts.slice(0, at);
+  if (before.some((s) => refCount(s, nextName) > 0 || isDenyExpr(s))) return 'uncertain';
+  if (pol === 'pos') {
+    if (!endsInNext(cons, nextName)) return 'uncertain';
+    if (alt)
+      return endsInDeny(alt, nextName) && rest.every((s) => refCount(s, nextName) === 0)
+        ? 'guard'
+        : 'uncertain';
+    return endsInDeny(lastRest, nextName) && rest.length >= 1 ? 'guard' : 'uncertain';
+  }
+  if (pol === 'neg') {
+    if (!endsInDeny(cons, nextName)) return 'uncertain';
+    if (alt) return endsInNext(alt, nextName) ? 'guard' : 'uncertain';
+    const lastIsNext =
+      lastRest !== undefined &&
+      ((lastRest.t === 'return_statement' && isCallTo(lastRest.c[0], nextName)) ||
+        (lastRest.t === 'expression_statement' && isCallTo(lastRest.c[0], nextName)));
+    return lastIsNext && rest.length === 1 ? 'guard' : 'uncertain';
+  }
+  return 'uncertain';
 }
 
 const joinPath = (a: string, b: string): string => {
@@ -138,8 +282,7 @@ const joinCapped = (a: string, b: string): { text: string; cut: boolean } => {
 };
 
 /** Output form of a path: URL path characters only (plus the `${name}` marker). */
-const outPath = (s: string): string =>
-  s.replace(/[^A-Za-z0-9\-._~!$&'()*+,;=:@%/{}[\]^|<>?\\]/g, '_');
+const outPath = (s: string): string => s.replace(/[^A-Za-z0-9\-._~!$&()*+,;=:@%/{}[\]?]/g, '_');
 
 const covers = (scope: string, full: string, dynamic: boolean): boolean => {
   if (dynamic || scope === '/') return true;
@@ -198,6 +341,7 @@ export function buildRoutes(
     const first = closures[0];
     let authGuard: ChainItem['authGuard'];
     let authUncertain = false;
+    let authNone = false;
     // The last function is the handler: whether it checks the caller inline is not middleware.
     if (!final) {
       const nameHit = looksLikeAuthName(ref.label);
@@ -206,10 +350,14 @@ export function buildRoutes(
         const verdicts = closures.map((c) => bodyGuard(c.fn));
         if (verdicts.every((v) => v === 'guard')) authGuard = 'body';
         else if (nameHit || verdicts.some((v) => v !== 'no')) authUncertain = true;
-      } else if (nameHit) {
-        // A package's middleware: the name is the evidence, unless its options can turn it off.
-        if (ref.optional || /\.unless\b/.test(ref.label)) authUncertain = true;
-        else authGuard = 'name';
+      } else if (ref.strategy === 'anonymous-only') {
+        authNone = true;
+      } else if (nameHit || ref.strategy !== undefined) {
+        // A package's middleware: the name is the evidence, unless its options can turn it off
+        // or cannot be read (a variable, a spread, a computed key) or it may be `anonymous`.
+        if (ref.optional || ref.strategy === 'uncertain' || /\.unless\b/.test(ref.label)) {
+          authUncertain = true;
+        } else authGuard = 'name';
       }
     }
     const item: ChainItem = {
@@ -223,6 +371,7 @@ export function buildRoutes(
     if (first) item.fn = fnRef(first.fn);
     if (authGuard) item.authGuard = authGuard;
     if (authUncertain) item.authUncertain = true;
+    if (authNone) item.authNone = true;
     return {
       item,
       scopePath: null,
@@ -266,7 +415,11 @@ export function buildRoutes(
         if (scopeUnsure) unsure = true;
         else certain = true;
       }
-      if (i.unresolved || i.authUncertain || (i.external && !i.authGuard && !benignItem(i))) {
+      if (
+        i.unresolved ||
+        i.authUncertain ||
+        (i.external && !i.authGuard && !i.authNone && !benignItem(i))
+      ) {
         unsure = true;
       }
     }

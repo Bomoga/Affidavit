@@ -2,6 +2,7 @@
  * The abstract values the interpreter tracks. A value set (`Value[]`) is what an expression may
  * evaluate to; an empty set means "nothing tracked" (unknown), which is never read as "none".
  */
+import { createHash } from 'node:crypto';
 import type { AstNode } from './parse.js';
 import type { FnInfo } from './prepass.js';
 
@@ -41,6 +42,8 @@ export interface StrValue {
 }
 export interface ArrValue {
   k: 'arr';
+  /** Identity, for memoization. */
+  id: number;
   items: Value[][];
 }
 export interface ObjValue {
@@ -127,20 +130,25 @@ export function union(a: Value[], b: Value[]): Value[] {
 /** Set by `union` when a value set was cut at the cap; the interpreter reads and clears it. */
 export const capHit = { hit: false };
 
-/** Short structural signature, used to memoize calls by argument shape. */
+const hashOf = (s: string): string => createHash('sha256').update(s).digest('hex').slice(0, 32);
+
+/**
+ * Signature used to memoize calls by argument shape. Lossless: two different values never share
+ * one (long strings by length and a 128-bit hash, arrays and objects by identity, everything
+ * else in full), and linear in the size of the value set, so it cannot blow up.
+ */
 export function sig(vals: readonly Value[]): string {
   return vals
     .map((v) => {
       switch (v.k) {
         case 'str':
-          return `s:${v.v.slice(0, 60)}${v.dyn ? '~' : ''}`;
+          return v.v.length <= 48
+            ? `s${v.v.length}:${v.v}${v.dyn ? '~' : ''}`
+            : `h${v.v.length}:${hashOf(v.v)}${v.dyn ? '~' : ''}`;
         case 'ext':
-          return `e:${v.pkg}.${v.path.join('.')}`;
+          return `e${JSON.stringify([v.pkg, v.path])}`;
         case 'arr':
-          return `a[${v.items
-            .map((i) => sig(i))
-            .join(',')
-            .slice(0, 80)}]`;
+          return `a${v.id}`;
         case 'obj':
           return `o${v.id}`;
         case 'fn':
@@ -148,9 +156,9 @@ export function sig(vals: readonly Value[]): string {
         case 'router':
           return `r${v.id}`;
         case 'route':
-          return `u${v.router}`;
+          return `u${v.router}:${v.paths.map((p) => `${p.text.length}:${p.text}`).join(',')}`;
         case 'coll':
-          return `c:${v.name ?? ''}`;
+          return `c${JSON.stringify(v.name ?? null)}`;
       }
     })
     .join('|');

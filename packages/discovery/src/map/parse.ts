@@ -199,7 +199,11 @@ function copyTree(cursor: CursorLike, limits: ParseLimits): ParseResult {
             parent.c.push(n);
             const field = cursor.currentFieldName;
             if (field) parent.f[field] = n;
-            if (LEAF_TYPES.has(n.t)) n.x = cursor.nodeText.slice(0, LEAF_TEXT_CAP);
+            if (LEAF_TYPES.has(n.t)) {
+              const text = cursor.nodeText;
+              if (text.length > LEAF_TEXT_CAP) incomplete.add('text-limit');
+              n.x = text.slice(0, LEAF_TEXT_CAP);
+            }
             if (stack.length >= limits.maxAstDepth) {
               incomplete.add('depth-limit');
             } else if (cursor.gotoFirstChild()) {

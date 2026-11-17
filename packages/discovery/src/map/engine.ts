@@ -40,8 +40,10 @@ export interface HandlerRef {
   unresolved: boolean;
   /** At least one value is a third-party package member. */
   external: boolean;
-  /** The argument has options that make a check optional (`credentialsRequired`, `.unless`). */
+  /** The argument has options that can switch a check off, or options the map cannot read. */
   optional: boolean;
+  /** `passport.authenticate(...)`: which strategies it names. */
+  strategy?: 'ok' | 'anonymous-only' | 'uncertain';
 }
 
 export type RouterEvent =
@@ -235,17 +237,78 @@ const OPTIONAL_KEYS = new Set([
   'exclude',
 ]);
 
-/** True when a middleware argument carries options that can switch its check off. */
+const LITERAL_ARG = new Set([
+  'string',
+  'number',
+  'true',
+  'false',
+  'null',
+  'regex',
+  'object',
+  'array',
+]);
+
+/**
+ * True unless the middleware's options are fully visible and none can switch its check off:
+ * every call along the chain takes only literal arguments (an object literal, a string, ...),
+ * and no object has a spread, a computed key, a disabling key or `.unless`.
+ */
 function looksOptional(n: AstNode | undefined): boolean {
   let budget = 400;
-  const walk = (x: AstNode, depth: number): boolean => {
-    if (budget-- <= 0) return true;
-    if (depth > 12) return true;
+  const keys = (x: AstNode, depth: number): boolean => {
+    if (budget-- <= 0 || depth > 12) return true;
+    if (x.t === 'spread_element' || x.t === 'computed_property_name') return true;
     if (x.t === 'pair' && OPTIONAL_KEYS.has(keyName(x.f['key']) ?? '')) return true;
+    if (x.t === 'shorthand_property_identifier' && OPTIONAL_KEYS.has(x.x ?? '')) return true;
     if (x.t === 'property_identifier' && x.x === 'unless') return true;
-    return x.c.some((c) => walk(c, depth + 1));
+    if (x.t === 'template_string' && x.c.some((c) => c.t === 'template_substitution')) return true;
+    return x.c.some((c) => keys(c, depth + 1));
   };
-  return n !== undefined && walk(n, 0);
+  let cur: AstNode | undefined = n;
+  while (cur && cur.t !== 'identifier') {
+    if (budget-- <= 0) return true;
+    if (cur.t === 'call_expression') {
+      for (const a of cur.f['arguments']?.c ?? []) {
+        if (
+          !LITERAL_ARG.has(a.t) &&
+          !(a.t === 'template_string' && a.c.every((c) => c.t !== 'template_substitution'))
+        ) {
+          return true;
+        }
+        if (keys(a, 0)) return true;
+      }
+      cur = cur.f['function'];
+    } else if (cur.t === 'member_expression') {
+      if (cur.f['property']?.x === 'unless') return true;
+      cur = cur.f['object'];
+    } else if (cur.t === 'await_expression' || cur.t === 'parenthesized_expression') {
+      cur = cur.c[0];
+    } else {
+      break;
+    }
+  }
+  return false;
+}
+
+/** `passport.authenticate('local')`: names the strategies, or says it cannot tell. */
+function strategyOf(n: AstNode | undefined): 'ok' | 'anonymous-only' | 'uncertain' | undefined {
+  let cur: AstNode | undefined = n;
+  while (cur && cur.t === 'call_expression') {
+    if (labelOf(cur.f['function']).endsWith('authenticate')) {
+      const first = cur.f['arguments']?.c[0];
+      if (!first) return 'uncertain';
+      const one = plainString(first);
+      if (one !== undefined) return one === 'anonymous' ? 'anonymous-only' : 'ok';
+      if (first.t === 'array') {
+        const names = first.c.map((c) => plainString(c));
+        if (names.some((x) => x === undefined || x === 'anonymous')) return 'uncertain';
+        return names.length > 0 ? 'ok' : 'uncertain';
+      }
+      return 'uncertain';
+    }
+    cur = cur.f['function']?.t === 'member_expression' ? cur.f['function'].f['object'] : undefined;
+  }
+  return undefined;
 }
 
 export interface InterpOutput {
@@ -981,7 +1044,7 @@ export class Interpreter {
         }
       }
     }
-    return { k: 'str', v: v.slice(0, 512), dyn };
+    return { k: 'str', v: v.slice(0, 512), dyn: dyn || v.length > 512 };
   }
 
   private array(fr: Frame, n: AstNode): Value {
@@ -1001,7 +1064,7 @@ export class Interpreter {
       this.limitsHit.add('value-set-cap');
       items.length = 256;
     }
-    return { k: 'arr', items };
+    return { k: 'arr', id: this.nextValueId++, items };
   }
 
   private objectLiteral(fr: Frame, n: AstNode): Value {
@@ -1056,7 +1119,10 @@ export class Interpreter {
             v?.k === 'str' ? { s: v.v, dyn: v.dyn } : { s: `\${${labelOf(node)}}`, dyn: true };
           const x = part(a, l);
           const y = part(b, r);
-          return [{ k: 'str', v: (x.s + y.s).slice(0, 512), dyn: x.dyn || y.dyn }];
+          const joined = x.s + y.s;
+          return [
+            { k: 'str', v: joined.slice(0, 512), dyn: x.dyn || y.dyn || joined.length > 512 },
+          ];
         }
         return [];
       }
@@ -1751,6 +1817,7 @@ export class Interpreter {
         unresolved: closures.length === 0 && !ext && !router,
         external: ext && closures.length === 0,
         optional: looksOptional(node),
+        ...(strategyOf(node) ? { strategy: strategyOf(node) } : {}),
       });
     };
     for (let i = from; i < nodes.length; i++) {
