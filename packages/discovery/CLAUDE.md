@@ -34,7 +34,7 @@ Semgrep, OSV-Scanner and gitleaks run as pinned Docker images (`docker/tools/too
 - OSV-Scanner: `lockfile-not-in-report`, `git-dir-extra-content`.
 - gitleaks: `binary-header-mismatch`, `non-text-content`, `unreadable`, `skipped-file-type`, `archive-name-mismatch`, `chunk-split-risk`, `multiline-split-risk`, and from the windows pass `window-skipped` (a file or window could not be written or may still be skipped) and `windows-budget-exceeded` (the byte budget ran out).
 
-An `archive-name-mismatch` message says the file is scanned in a window only when it really was windowed. Otherwise (a PDF, executable or other skipped signature, a window write failure, a quarantined sidecar file) it says the content is NOT scanned. Image, audio and video files are not coverage losses and are listed in `binaryMediaFiles` only.
+An `archive-name-mismatch` message says the file is scanned in a window only when it really was windowed. Otherwise (a PDF, executable or other skipped signature, a window write failure, a quarantined sidecar file) it says the content is NOT scanned. Image, audio and video files are not coverage losses and are listed in `binaryMediaFiles` only. The tools layer does not scan inside them for UTF-16 text or text past a chunk cut, so ingestion fails closed on them: every media file (judged by its leading bytes with `signatureClass`, whatever its name) is left out of the workspace with exclusion reason `media-file`, and a normal repo keeps `status: 'ok'`.
 
 Root CLAUDE.md rules apply here. Do not add dependencies without asking.
 
