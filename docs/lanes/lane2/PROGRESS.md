@@ -39,6 +39,7 @@ Contracts version in use: v1.0
 - 2026-11-14: The witness runner image is built locally from a lockfile and run by image ID, which the sandbox now accepts as pinned alongside registry digests. Vitest is the version the repo already uses (5.1.0), as planned in `packages/judge/CLAUDE.md`.
 - 2026-11-14: `@affidavit/judge` depends on `@affidavit/sandbox` (both Lane 2): the Judge owns the witness runner and is the only bridge to the sandbox.
 - 2026-11-14: Lane 1 tools run on gVisor with the same flags but without the syscall trace. A witness run whose trace is malformed is refused, never judged.
+- 2026-11-17 (L2-02 follow-up, gap from PR #23): `GvisorToolRunner` gives Lane 1 tools a capped writable `/tmp` tmpfs (`TMPDIR` and `XDG_CACHE_HOME` there), allows read-only mounts under `/tmp`, replaces discovery's `/tmp` and `/root/.semgrep` scratch mounts with that tmpfs (their host directories must be empty), runs as the workspace owner instead of nobody (never root), and returns `stderr`. Discovery's real-image suite passed 31 of 31 on it. Witness runs are unchanged. See `sandbox-runner.md`.
 
 ## Metrics from real runs
 

@@ -1,6 +1,6 @@
 import { execFile, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { readFile, readdir, rm, stat } from 'node:fs/promises';
+import { lstat, readFile, readdir, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import type { ToolRunnerPort } from '@affidavit/contracts';
@@ -13,9 +13,10 @@ import {
   PLAIN_RUNTIME,
   RUN_LABEL,
   buildGvisorRunArgs,
+  userArg,
   type Limits,
 } from './args.js';
-import { validateMounts, type Mount } from './mounts.js';
+import { normalizeContainerPath, validateMounts, type Mount } from './mounts.js';
 import type { CaseNetwork } from './network.js';
 import { parseTrace, type TraceObservations } from './trace.js';
 import { assertNoImageVolumes, parseContainerVolumes } from './volumes.js';
@@ -68,6 +69,10 @@ export interface JailedRunInput {
   network?: { net: CaseNetwork; hosts?: Readonly<Record<string, string>> };
   /** Largest file the jail may write; see `GvisorRunSpec.maxFileBytes`. */
   maxFileBytes?: number;
+  /** `uid:gid` to run as; see `GvisorRunSpec.user`. */
+  user?: string;
+  /** Writable `/tmp` tmpfs size; see `GvisorRunSpec.writableTmpMb`. */
+  writableTmpMb?: number;
 }
 
 function capture(stream: NodeJS.ReadableStream): () => string {
@@ -238,6 +243,8 @@ export async function runJailed(
         ? undefined
         : { name: input.network.net.name, hosts: input.network.hosts },
     maxFileBytes: input.maxFileBytes,
+    user: input.user,
+    writableTmpMb: input.writableTmpMb,
   });
 
   const started = Date.now();
@@ -381,39 +388,101 @@ export interface GvisorToolRunnerOptions extends GvisorOptions {
   /** When set, only these exact image references may run. */
   imageAllowlist?: readonly string[];
   timeoutMs?: number;
+  /**
+   * `uid:gid` the tools run as. Default: the uid and gid of this process, which owns the case
+   * workspace, so tools can read `/src` and write `/out`. Root is refused either way.
+   */
+  user?: string;
+  /** Size of the writable `/tmp` tmpfs. Default `DEFAULT_TOOL_TMP_MB`. */
+  tmpMb?: number;
 }
 
 /** Exit codes reported when the sandbox, not the tool, ended the run. */
 export const EXIT_TIMED_OUT = 124;
 export const EXIT_OOM = 137;
 
+/** Default writable `/tmp` for a tool run, in MiB. */
+export const DEFAULT_TOOL_TMP_MB = 512;
+
 /**
- * `ToolRunnerPort` for Lane 1 (Semgrep, OSV, gitleaks): the same jail and flags as witnesses, on
- * gVisor without the trace. Tools are not judged, and tracing every file a scanner opens in a
- * large repo would be slow and could exceed the trace cap, letting a repo block its own scan.
+ * Container paths the runner provides itself as tmpfs. A caller's mount at one of these is a
+ * request for scratch space, not a way in: it is replaced by the jail's own tmpfs, and its host
+ * directory must be empty or absent, so no input can arrive through it and nothing written there
+ * reaches the host disk. `/root/.semgrep` is Semgrep's settings directory when `HOME=/root`; in
+ * the jail `HOME=/scratch`, so Semgrep uses `/scratch/.semgrep`.
+ */
+export const TOOL_SCRATCH_TARGETS: readonly string[] = ['/tmp', '/root/.semgrep'];
+
+async function assertEmptyOrAbsent(hostPath: string): Promise<void> {
+  let st;
+  try {
+    st = await lstat(hostPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw err;
+  }
+  if (!st.isDirectory() || (await readdir(hostPath)).length > 0) {
+    throw new Error(`a scratch mount must be an empty directory: ${hostPath}`);
+  }
+}
+
+function defaultToolUser(): string {
+  const uid = process.getuid?.();
+  const gid = process.getgid?.();
+  if (uid === undefined || gid === undefined) throw new Error('set GvisorToolRunnerOptions.user');
+  return `${uid}:${gid}`;
+}
+
+/**
+ * `ToolRunnerPort` for Lane 1 (Semgrep, OSV, gitleaks): the same jail as witnesses (gVisor, no
+ * network, read-only root, no capabilities, resource limits), on gVisor without the trace, with
+ * three differences the scanners need (docker/tools/README.md, "Runner contract"):
+ *
+ * - `/tmp` is a writable, size-capped tmpfs and `TMPDIR=/tmp`, so a read-only database can be
+ *   mounted under it (`/tmp/osv-scalibr`, where OSV-Scanner looks offline);
+ * - caller mounts at `TOOL_SCRATCH_TARGETS` are replaced by that tmpfs (see there);
+ * - the tools run as the workspace owner instead of nobody, never as root.
+ *
+ * Tools are not judged, and tracing every file a scanner opens in a large repo would be slow and
+ * could exceed the trace cap, letting a repo block its own scan.
  */
 export class GvisorToolRunner implements ToolRunnerPort {
   constructor(private readonly opts: GvisorToolRunnerOptions) {}
 
+  /**
+   * Besides the port's fields, returns the tool's `stderr` (capped like every jailed run), which
+   * `ToolRunnerPort` has no field for yet.
+   */
   async run(
     image: string,
     args: readonly string[],
     mounts: readonly Mount[],
-  ): Promise<{ exitCode: number; outputPath: string }> {
+  ): Promise<{ exitCode: number; outputPath: string; stderr: string }> {
     const allow = this.opts.imageAllowlist;
     if (allow !== undefined && !allow.includes(image)) {
       throw new Error(`image is not on the allowlist: ${image}`);
+    }
+    const user = userArg(this.opts.user ?? defaultToolUser());
+    const kept: Mount[] = [];
+    for (const m of mounts) {
+      if (TOOL_SCRATCH_TARGETS.includes(normalizeContainerPath(m.containerPath))) {
+        await assertEmptyOrAbsent(m.hostPath);
+      } else {
+        kept.push(m);
+      }
     }
     const r = await runJailed(
       {
         image,
         command: args,
-        mounts: validateMounts(mounts, this.opts.allowedRoots),
+        mounts: validateMounts(kept, this.opts.allowedRoots, { allowUnderTmp: true }),
         timeoutMs: this.opts.timeoutMs ?? 10 * 60_000,
+        user,
+        writableTmpMb: this.opts.tmpMb ?? DEFAULT_TOOL_TMP_MB,
       },
       { ...this.opts, trace: false },
     );
     const exitCode = r.timedOut ? EXIT_TIMED_OUT : r.oomKilled ? EXIT_OOM : (r.exitCode ?? 1);
-    return { exitCode, outputPath: this.opts.outputDir };
+    return { exitCode, outputPath: this.opts.outputDir, stderr: r.stderr };
   }
 }

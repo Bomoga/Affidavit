@@ -132,3 +132,46 @@ describe('buildGvisorRunArgs: file size limit', () => {
     expect(() => buildGvisorRunArgs({ ...spec, maxFileBytes: n })).toThrow(/maxFileBytes/);
   });
 });
+
+describe('buildGvisorRunArgs for tool runs', () => {
+  const toolFlags = (over: Partial<Parameters<typeof buildGvisorRunArgs>[0]>) => {
+    const a = buildGvisorRunArgs({ ...spec, ...over });
+    return a.slice(0, a.indexOf(PROBE_IMAGE));
+  };
+  const has = (f: string[], flag: string, value: string) =>
+    f.some((x, i) => x === flag && f[i + 1] === value);
+
+  it('keeps /tmp read-only and TMPDIR on /scratch by default', () => {
+    expect(has(flags, '--env', 'TMPDIR=/scratch')).toBe(true);
+    expect(flags.join(' ')).not.toContain('/tmp:rw');
+    expect(flags.join(' ')).not.toContain('XDG_CACHE_HOME');
+  });
+
+  it('gives a size-capped writable /tmp tmpfs and TMPDIR=/tmp on request', () => {
+    const f = toolFlags({ writableTmpMb: 512 });
+    expect(has(f, '--tmpfs', '/tmp:rw,size=512m,mode=1777')).toBe(true);
+    expect(has(f, '--env', 'TMPDIR=/tmp')).toBe(true);
+    expect(has(f, '--env', 'XDG_CACHE_HOME=/tmp')).toBe(true);
+    expect(has(f, '--mount', 'type=tmpfs,destination=/tmp,readonly')).toBe(false);
+    // Everything else stays: read-only root, no capabilities, scratch home.
+    expect(f).toContain('--read-only');
+    expect(has(f, '--cap-drop', 'ALL')).toBe(true);
+    expect(has(f, '--env', 'HOME=/scratch')).toBe(true);
+    expect(has(f, '--mount', 'type=tmpfs,destination=/dev/shm,readonly')).toBe(true);
+  });
+
+  it.each([0, -1, 1.5, 4097, Number.NaN])('refuses writableTmpMb %s', (mb) => {
+    expect(() => toolFlags({ writableTmpMb: mb })).toThrow();
+  });
+
+  it('runs as a given non-root user', () => {
+    expect(has(toolFlags({ user: '1000:1000' }), '--user', '1000:1000')).toBe(true);
+  });
+
+  it.each(['0:0', '0:1000', '1000:0', 'root', '1000', '1000:1000,0', '-1:5'])(
+    'refuses the user %j',
+    (user) => {
+      expect(() => toolFlags({ user })).toThrow();
+    },
+  );
+});
