@@ -98,6 +98,29 @@ describe('redactBuffer', () => {
 });
 
 describe('SecretRedactor', () => {
+  it('values cannot be copied out by spread, entries, structuredClone or JSON', () => {
+    const r = new SecretRedactor([
+      {
+        id: 1,
+        ruleId: 'r',
+        value: Buffer.from('SUPER-SECRET-VALUE'),
+        exact: true,
+        scope: 'global',
+        placeholder: '[P]',
+        locations: [],
+      },
+    ]);
+    const copies = [
+      JSON.stringify({ ...r }),
+      JSON.stringify(Object.entries(r)),
+      JSON.stringify(Object.getOwnPropertyNames(r)),
+      JSON.stringify(structuredClone(r)),
+      JSON.stringify(Object.assign({}, r)),
+    ];
+    for (const c of copies) expect(c).not.toContain('SUPER');
+    expect(Object.keys(r)).toEqual([]);
+  });
+
   it('never prints or serialises values', () => {
     const r = new SecretRedactor([
       {
@@ -188,9 +211,21 @@ describe('buildRedactionMap', () => {
 
 describe('workspace', () => {
   it('isEnvName', () => {
-    for (const n of ['.env', '.ENV', '.env.local', '.Env.Production', '.envrc'])
+    for (const n of [
+      '.env',
+      '.ENV',
+      '.env.local',
+      '.Env.Production',
+      '.envrc',
+      '.env-local',
+      '.env_production',
+      '.envs',
+      'production.env',
+      'my.ENV',
+      'prod.env.local',
+    ])
       expect(isEnvName(n), n).toBe(true);
-    for (const n of ['env', 'env.js', '.environment', 'my.env', '.envelope']) {
+    for (const n of ['env', 'env.js', '.environment', '.envelope', 'environment.js', 'dotenv.js']) {
       expect(isEnvName(n), n).toBe(false);
     }
   });

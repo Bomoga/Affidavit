@@ -28,24 +28,25 @@ export function placeholderFor(ruleId: string, n: number): string {
  * object that holds one cannot leak through logging.
  */
 export class SecretRedactor {
-  private readonly entries: readonly MapEntry[];
-  private readonly globals: readonly MapEntry[];
+  // #private: spread, Object.entries, structuredClone and postMessage cannot copy these.
+  readonly #entries: readonly MapEntry[];
+  readonly #globals: readonly MapEntry[];
 
   constructor(entries: readonly MapEntry[]) {
-    this.entries = entries;
+    this.#entries = entries;
     // longest first, so a secret that contains another is replaced as a whole
-    this.globals = entries
+    this.#globals = entries
       .filter((e) => e.scope === 'global')
       .sort((a, b) => b.value.length - a.value.length);
   }
 
   get size(): number {
-    return this.entries.length;
+    return this.#entries.length;
   }
 
   /** For ingestion internals (workspace build, leak check). */
   all(): readonly MapEntry[] {
-    return this.entries;
+    return this.#entries;
   }
 
   /**
@@ -55,7 +56,7 @@ export class SecretRedactor {
    */
   apply(text: string): string {
     let out = text;
-    for (const e of this.globals) {
+    for (const e of this.#globals) {
       const needle = e.value.toString('utf8');
       if (needle.length > 0 && out.includes(needle)) out = out.split(needle).join(e.placeholder);
     }
@@ -65,7 +66,7 @@ export class SecretRedactor {
   /** Like apply, with a replacement that is legal in a file name on every platform. */
   applyPath(path: string): string {
     let out = path;
-    for (const e of this.globals) {
+    for (const e of this.#globals) {
       const needle = e.value.toString('utf8');
       if (needle.length > 0 && out.includes(needle)) {
         out = out.split(needle).join(`REDACTED-${e.id}`);
@@ -75,11 +76,11 @@ export class SecretRedactor {
   }
 
   toJSON(): { redactedValues: number } {
-    return { redactedValues: this.entries.length };
+    return { redactedValues: this.#entries.length };
   }
 
   [inspect.custom](): string {
-    return `SecretRedactor { redactedValues: ${this.entries.length} }`;
+    return `SecretRedactor { redactedValues: ${this.#entries.length} }`;
   }
 }
 

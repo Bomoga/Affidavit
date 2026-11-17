@@ -5,10 +5,14 @@ import { listDir } from '../tools/walk.js';
 import { holdsUtf16, redactBuffer, type SecretRedactor } from './redactor.js';
 import type { ExcludedFile, ExclusionReason } from './types.js';
 
-/** `.env`, `.env.*`, any case. `.envrc` (direnv) is kept out too. */
+/**
+ * Conservative on purpose: `.env`, `.env.*`, `.env-local`, `.env_production`, `prod.env`,
+ * `prod.env.local` and the like (any case, any depth), plus `.envs` and `.envrc`. A directory with
+ * such a name is left out whole. Lead question: narrow this set?
+ */
 export function isEnvName(name: string): boolean {
   const n = name.toLowerCase();
-  return n === '.env' || n.startsWith('.env.') || n === '.envrc';
+  return n === '.envs' || n === '.envrc' || /\.env(?:[-_.]|$)/.test(n);
 }
 
 export interface BuiltWorkspace {

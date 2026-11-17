@@ -7,6 +7,7 @@ export {
   IngestInputError,
   RedactionIncompleteError,
   RedactionLeakError,
+  RepoTooLargeError,
   type Detection,
   type ExcludedFile,
   type ExclusionReason,

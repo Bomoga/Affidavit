@@ -117,6 +117,8 @@ export function everything(root: string): string {
 interface FakeOptions {
   /** Only report findings in these repo-relative files (to test global replacement). */
   onlyFiles?: ((rel: string) => boolean) | undefined;
+  /** A second pattern to report (same rule id), for short values. */
+  extra?: RegExp | undefined;
   /** Throws instead of running. */
   fail?: Error | undefined;
 }
@@ -147,7 +149,10 @@ export function fakeGitleaks(opts: FakeOptions = {}): ToolRunnerPort {
           const text = readFileSync(join(src, r)).toString('latin1');
           const lines = text.split('\n');
           lines.forEach((line, i) => {
-            for (const m of line.matchAll(KEY)) {
+            for (const m of [
+              ...line.matchAll(KEY),
+              ...(opts.extra ? line.matchAll(opts.extra) : []),
+            ]) {
               const shift = i === 0 ? 1 : 2;
               results.push({
                 ruleId: 'affidavit-fake-fixture-key',

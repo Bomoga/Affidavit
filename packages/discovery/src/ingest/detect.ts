@@ -32,18 +32,39 @@ interface Walk {
   /** Directory rel path (posix, '' for root) to the file names directly in it. */
   files: Map<string, string[]>;
   counts: { js: number; ts: number; other: Record<string, number> };
+  /** The entry or depth cap was hit, so parts of the tree were not looked at. */
+  truncated: boolean;
 }
 
-async function walk(root: string): Promise<Walk> {
-  const out: Walk = { packageJsons: [], files: new Map(), counts: { js: 0, ts: 0, other: {} } };
+export interface WalkLimits {
+  maxEntries?: number;
+  maxDepth?: number;
+}
+
+async function walk(root: string, limits: WalkLimits): Promise<Walk> {
+  const maxEntries = limits.maxEntries ?? MAX_ENTRIES;
+  const maxDepth = limits.maxDepth ?? MAX_DEPTH;
+  const out: Walk = {
+    packageJsons: [],
+    files: new Map(),
+    counts: { js: 0, ts: 0, other: {} },
+    truncated: false,
+  };
   let seen = 0;
   const visit = async (rel: string, depth: number): Promise<void> => {
     const entries = await listDir(rel === '' ? root : join(root, rel));
     const names: string[] = [];
     for (const e of entries) {
-      if (++seen > MAX_ENTRIES) return;
+      if (++seen > maxEntries) {
+        out.truncated = true;
+        return;
+      }
       if (e.isDirectory) {
-        if (SKIP_DIRS.has(e.name) || depth >= MAX_DEPTH) continue;
+        if (SKIP_DIRS.has(e.name)) continue;
+        if (depth >= maxDepth) {
+          out.truncated = true;
+          continue;
+        }
         await visit(rel === '' ? e.name : `${rel}/${e.name}`, depth + 1);
         continue;
       }
@@ -119,8 +140,8 @@ export type DetectOutcome =
  * parsed with JSON.parse and only dependency NAMES are compared against a fixed list; nothing
  * from it is executed or echoed (evidence is repo paths only).
  */
-export async function detectRepo(root: string): Promise<DetectOutcome> {
-  const w = await walk(root);
+export async function detectRepo(root: string, limits: WalkLimits = {}): Promise<DetectOutcome> {
+  const w = await walk(root, limits);
   const observed: Record<string, number> = {
     javascript: w.counts.js,
     typescript: w.counts.ts,
@@ -129,10 +150,18 @@ export async function detectRepo(root: string): Promise<DetectOutcome> {
   const fail = (
     reason: IngestUnsupported['reason'],
     detail: string,
-  ): { supported: false; unsupported: Omit<IngestUnsupported, 'commit' | 'status'> } => ({
-    supported: false,
-    unsupported: { reason, detail, observed },
-  });
+  ): { supported: false; unsupported: Omit<IngestUnsupported, 'commit' | 'status'> } =>
+    w.truncated
+      ? {
+          supported: false,
+          unsupported: {
+            reason: 'tree-too-large-to-scan',
+            detail:
+              'The tree is too large or too deep to scan fully, so no supported framework was found in the part that was read.',
+            observed,
+          },
+        }
+      : { supported: false, unsupported: { reason, detail, observed } };
 
   if (w.packageJsons.length === 0) {
     return fail('no-package-json', 'No package.json found, so this is not a Node.js project.');

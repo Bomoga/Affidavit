@@ -1,6 +1,7 @@
 import type { CaseId, Redaction, RepoId, TenantId, ToolRunnerPort } from '@affidavit/contracts';
 import type { ToolManifest, ToolNotification } from '../tools/index.js';
 import type { SecretRedactor } from './redactor.js';
+import type { HostResolver } from './source.js';
 
 export type Framework = 'express' | 'koa' | 'fastify' | 'next-api';
 
@@ -21,7 +22,12 @@ export interface Detection {
   packageRoots: string[];
 }
 
-export type UnsupportedReason = 'no-package-json' | 'no-js-ts-sources' | 'no-supported-framework';
+export type UnsupportedReason =
+  | 'no-package-json'
+  | 'no-js-ts-sources'
+  | 'no-supported-framework'
+  /** The tree was too big to walk fully (entry or depth cap), so absence of a framework proves nothing. */
+  | 'tree-too-large-to-scan';
 
 /** The repo is not a Node app we can run. A value, never a thrown error. Nothing is kept on disk. */
 export interface IngestUnsupported {
@@ -68,6 +74,17 @@ export interface IngestScan {
   findings: number;
   /** Distinct secret values in the redaction map. */
   redactedValues: number;
+  /**
+   * Values under 8 bytes. They are replaced only on the lines gitleaks reported, not everywhere,
+   * so another copy elsewhere in the repo can survive. A known limit.
+   */
+  shortValues: number;
+  /**
+   * Values where the exact secret could not be read back from the region, so the whole line is
+   * the map entry. The same secret on a different line is then not matched unless gitleaks
+   * reported it there too.
+   */
+  lineFallbacks: number;
 }
 
 export interface IngestOk {
@@ -121,6 +138,14 @@ export interface IngestDeps {
         maxReportBytes?: number | undefined;
       }
     | undefined;
+  /** Ports a source URL may use. Default [443]. */
+  allowedPorts?: readonly number[] | undefined;
+  /** Resolves host names for the SSRF check. Defaults to the system resolver. */
+  resolveHost?: HostResolver | undefined;
+  /** Pass HTTPS_PROXY and friends to git. Off by default: a proxy bypasses the address pin. */
+  passProxyEnv?: boolean | undefined;
+  /** Cap on fetched objects and on the checked-out tree, in bytes. Default 1 GiB. */
+  maxRepoBytes?: number | undefined;
   /** Tests and the CLI's local mode only. Off by default: the API accepts https URLs only. */
   allowLocalSource?: boolean | undefined;
   /** Path of the git executable. Defaults to `git` on PATH. */
@@ -145,6 +170,17 @@ export class CloneFailedError extends Error {
     super(`git ${step} failed: ${why}`);
     this.name = 'CloneFailedError';
     this.step = step;
+  }
+}
+
+/** A fetch or checkout grew past the byte cap and was killed. */
+export class RepoTooLargeError extends Error {
+  constructor(
+    readonly phase: 'fetch' | 'checkout',
+    readonly limit: number,
+  ) {
+    super(`repository exceeds ${limit} bytes during ${phase}`);
+    this.name = 'RepoTooLargeError';
   }
 }
 

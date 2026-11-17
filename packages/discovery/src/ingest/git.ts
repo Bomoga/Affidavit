@@ -1,8 +1,13 @@
-import { execFile } from 'node:child_process';
-import { isAbsolute } from 'node:path';
-import { statSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { CloneFailedError, CommitMismatchError, IngestInputError } from './types.js';
+import { execFile, type ChildProcess } from 'node:child_process';
+import { lstat, readdir } from 'node:fs/promises';
+import { join } from 'node:path';
+import type { SourcePlan } from './source.js';
+import {
+  CloneFailedError,
+  CommitMismatchError,
+  IngestInputError,
+  RepoTooLargeError,
+} from './types.js';
 
 const FULL_SHA = /^[0-9a-f]{40}$/;
 
@@ -12,70 +17,16 @@ export function assertFullSha(commit: string): void {
   }
 }
 
-const PRIVATE_V4 = [
-  /^127\./,
-  /^10\./,
-  /^192\.168\./,
-  /^172\.(1[6-9]|2\d|3[01])\./,
-  /^169\.254\./,
-  /^0\./,
-  /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./,
-];
-
-/** Cheap SSRF guard on the literal host. DNS rebinding is not handled here (egress policy is). */
-function blockedHost(hostname: string): boolean {
-  const h = hostname.toLowerCase().replace(/^\[|\]$/g, '');
-  if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local')) return true;
-  if (h.includes(':')) return h === '::1' || h.startsWith('fe80:') || /^f[cd]/.test(h);
-  return PRIVATE_V4.some((re) => re.test(h));
-}
-
-/**
- * Returns the string to hand git after `--`. https only unless local sources are allowed. A URL
- * with credentials is refused so a token can never reach a log line or an error message.
- */
-export function validateSource(source: string, allowLocal: boolean): string {
-  if (source.length === 0 || source.length > 2048 || /[\0\r\n]/.test(source)) {
-    throw new IngestInputError('source is empty, too long, or has control characters');
-  }
-  if (allowLocal) {
-    let path: string | undefined;
-    if (/^file:/i.test(source)) path = fileURLToPath(source);
-    else if (isAbsolute(source)) path = source;
-    if (path !== undefined) {
-      let ok: boolean;
-      try {
-        ok = statSync(path).isDirectory();
-      } catch {
-        ok = false;
-      }
-      if (!ok) throw new IngestInputError('local source is not a directory');
-      return path;
-    }
-  }
-  let url: URL;
-  try {
-    url = new URL(source);
-  } catch {
-    throw new IngestInputError('source is not a valid https URL');
-  }
-  if (url.protocol !== 'https:') throw new IngestInputError('source must be an https URL');
-  if (url.username !== '' || url.password !== '') {
-    throw new IngestInputError('source URL must not carry credentials');
-  }
-  if (blockedHost(url.hostname)) throw new IngestInputError('source host is not allowed');
-  return url.toString();
-}
-
 const NULL_PATH = process.platform === 'win32' ? 'NUL' : '/dev/null';
 
 /**
  * Config for every git call, as -c flags: nothing from the repo or the host's git config can
  * run code. Hooks off, no filter drivers (so LFS never smudges), no fsmonitor, no symlinks
  * written to disk (a symlink in the repo becomes a plain file holding its target text), no
- * autocrlf (bytes stay as committed), no submodule recursion, no credential helpers.
+ * autocrlf (bytes stay as committed), no submodule recursion, no credential helpers, no
+ * redirects (a redirect would leave the address that was checked), no proxy from config.
  */
-const GIT_CONFIG: readonly string[] = [
+export const GIT_CONFIG: readonly string[] = [
   'core.hooksPath=/dev/null',
   'core.fsmonitor=false',
   'core.symlinks=false',
@@ -95,6 +46,8 @@ const GIT_CONFIG: readonly string[] = [
   'advice.detachedHead=false',
   'gc.auto=0',
   'maintenance.auto=false',
+  'http.followRedirects=false',
+  'http.proxy=',
 ];
 
 const PASS_ENV = [
@@ -105,17 +58,25 @@ const PASS_ENV = [
   'TEMP',
   'TMP',
   'TMPDIR',
-  'HTTPS_PROXY',
-  'https_proxy',
-  'NO_PROXY',
-  'no_proxy',
   'SSL_CERT_FILE',
   'SSL_CERT_DIR',
 ];
+// A proxy would make the connection somewhere other than the address that was checked, so these
+// are only passed when the caller opts in.
+const PROXY_ENV = [
+  'HTTPS_PROXY',
+  'https_proxy',
+  'HTTP_PROXY',
+  'http_proxy',
+  'ALL_PROXY',
+  'all_proxy',
+  'NO_PROXY',
+  'no_proxy',
+];
 
-function gitEnv(home: string, allowLocal: boolean): NodeJS.ProcessEnv {
+export function gitEnv(home: string, local: boolean, proxy: boolean): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
-  for (const k of PASS_ENV) {
+  for (const k of proxy ? [...PASS_ENV, ...PROXY_ENV] : PASS_ENV) {
     const v = process.env[k];
     if (v !== undefined) env[k] = v;
   }
@@ -128,48 +89,125 @@ function gitEnv(home: string, allowLocal: boolean): NodeJS.ProcessEnv {
     GIT_TERMINAL_PROMPT: '0',
     GIT_LFS_SKIP_SMUDGE: '1',
     GIT_NO_REPLACE_OBJECTS: '1',
-    GIT_ALLOW_PROTOCOL: allowLocal ? 'https:file' : 'https',
+    GIT_ALLOW_PROTOCOL: local ? 'https:file' : 'https',
   };
 }
 
-interface Runner {
-  git(args: readonly string[]): Promise<string>;
+/** Kills a child and everything it started (git-remote-https runs as a child of git). */
+export function killTree(child: ChildProcess): void {
+  const pid = child.pid;
+  if (pid === undefined) return;
+  if (process.platform === 'win32') {
+    execFile('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true }, () => undefined);
+    return;
+  }
+  try {
+    process.kill(-pid, 'SIGKILL'); // the child is a group leader (detached)
+  } catch {
+    child.kill('SIGKILL');
+  }
 }
 
-function runner(
-  exe: string,
-  cwd: string,
-  home: string,
-  allowLocal: boolean,
-  timeoutMs: number,
-): Runner {
-  const base = GIT_CONFIG.flatMap((c) => ['-c', c]);
-  return {
-    git(args) {
-      return new Promise((resolve, reject) => {
-        execFile(
-          exe,
-          [...base, ...args],
-          {
-            cwd,
-            env: gitEnv(home, allowLocal),
-            timeout: timeoutMs,
-            maxBuffer: 1024 * 1024,
-            windowsHide: true,
-            encoding: 'utf8',
-          },
-          (error, stdout, stderr) => {
-            if (error === null) {
-              resolve(stdout);
-              return;
-            }
-            const why = (stderr || error.message).trim().split('\n').slice(-3).join(' | ');
-            reject(new CloneFailedError(args[0] ?? 'git', why.slice(0, 500)));
-          },
+/** Total bytes of regular files under a directory. Never follows symlinks. */
+export async function dirBytes(dir: string): Promise<number> {
+  let total = 0;
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const e of entries) {
+    const p = join(dir, e.name);
+    if (e.isDirectory()) total += await dirBytes(p);
+    else if (e.isFile()) total += (await lstat(p).catch(() => undefined))?.size ?? 0;
+  }
+  return total;
+}
+
+/** Strips `remote:` lines (server text) and anything that is not printable ASCII. */
+export function cleanGitError(text: string): string {
+  return text
+    .split('\n')
+    .filter((l) => !/^\s*remote:/i.test(l))
+    .join(' | ')
+    .replace(/[^\x20-\x7e]/g, '?')
+    .trim()
+    .slice(0, 300);
+}
+
+interface GitOptions {
+  exe: string;
+  cwd: string;
+  home: string;
+  local: boolean;
+  proxy: boolean;
+  timeoutMs: number;
+  extraConfig: readonly string[];
+  /** Kill the process when this directory grows past maxBytes. */
+  watch?: { dir: string; maxBytes: number } | undefined;
+}
+
+function runGit(o: GitOptions, args: readonly string[]): Promise<string> {
+  const base = [...GIT_CONFIG, ...o.extraConfig].flatMap((c) => ['-c', c]);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    // Set when we killed the process. The error is raised only once the process has exited, so
+    // the caller never deletes a directory a dying git still holds open.
+    let killed: Error | undefined;
+    const kill = (why: Error): void => {
+      if (killed !== undefined) return;
+      killed = why;
+      killTree(child);
+      setTimeout(() => finish(() => reject(why)), 10_000).unref();
+    };
+    const finish = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearInterval(poll);
+      fn();
+    };
+    // `detached` makes the child a process group leader on POSIX, so killTree can reach its children.
+    // It is a valid spawn option that ExecFileOptions does not declare, hence the variable.
+    const options = {
+      cwd: o.cwd,
+      env: gitEnv(o.home, o.local, o.proxy),
+      maxBuffer: 1024 * 1024,
+      windowsHide: true,
+      encoding: 'utf8',
+      detached: process.platform !== 'win32',
+    } as const;
+    const child = execFile(o.exe, [...base, ...args], options, (error, stdout, stderr) => {
+      if (killed !== undefined) {
+        const why = killed;
+        finish(() => reject(why));
+      } else if (error === null) finish(() => resolve(stdout));
+      else {
+        finish(() =>
+          reject(new CloneFailedError(args[0] ?? 'git', cleanGitError(stderr || error.message))),
         );
-      });
-    },
-  };
+      }
+    });
+    const timer = setTimeout(() => {
+      kill(new CloneFailedError(args[0] ?? 'git', 'timed out'));
+    }, o.timeoutMs);
+    let busy = false;
+    const poll = setInterval(
+      () => {
+        const w = o.watch;
+        if (w === undefined || busy) return;
+        busy = true;
+        void dirBytes(w.dir).then((n) => {
+          busy = false;
+          if (n > w.maxBytes) {
+            kill(new RepoTooLargeError('fetch', w.maxBytes));
+          }
+        });
+      },
+      o.watch ? 250 : 3_600_000,
+    );
+  });
 }
 
 export interface CheckoutOptions {
@@ -177,37 +215,77 @@ export interface CheckoutOptions {
   dir: string;
   /** A private directory used as HOME so no user git config is read. */
   home: string;
-  source: string;
+  /** From planSource: the validated source and, for https, the address git is pinned to. */
+  plan: SourcePlan;
   commit: string;
-  allowLocal: boolean;
   gitExecutable?: string | undefined;
   timeoutMs?: number | undefined;
+  /** Cap on the fetched objects and on the checked-out tree. Default 1 GiB. */
+  maxRepoBytes?: number | undefined;
+  /** Pass HTTPS_PROXY and friends to git. Off: a proxy bypasses the address pin. */
+  passProxyEnv?: boolean | undefined;
 }
+
+/** -c flags that pin the https connection to the address planSource checked. */
+export function pinConfig(plan: SourcePlan): string[] {
+  if (plan.kind !== 'https') return [];
+  const ip = plan.ip.includes(':') ? `[${plan.ip}]` : plan.ip;
+  return [`http.curloptResolve=${plan.host}:${plan.port}:${ip}`];
+}
+
+export const DEFAULT_MAX_REPO_BYTES = 1024 * 1024 * 1024;
 
 /**
  * Fetches exactly one commit and checks it out detached, then verifies by hash. All values that
  * come from outside (URL, hash) are validated first and follow `--`, git runs through execFile
- * with a fixed argv, and nothing is interpolated into a shell string.
+ * with a fixed argv, and nothing is interpolated into a shell string. For https the connection
+ * is pinned to the address planSource checked (http.curloptResolve), and a fetch that grows past
+ * the byte cap is killed with its child processes.
  */
 export async function checkoutPinned(o: CheckoutOptions): Promise<void> {
   assertFullSha(o.commit);
-  const src = validateSource(o.source, o.allowLocal);
-  const g = runner(o.gitExecutable ?? 'git', o.dir, o.home, o.allowLocal, o.timeoutMs ?? 300_000);
-  await g.git(['init', '--quiet', '--initial-branch=affidavit']);
-  const noTags = ['fetch', '--quiet', '--no-tags', '--no-recurse-submodules'];
+  const max = o.maxRepoBytes ?? DEFAULT_MAX_REPO_BYTES;
+  const pin = pinConfig(o.plan);
+  const base: GitOptions = {
+    exe: o.gitExecutable ?? 'git',
+    cwd: o.dir,
+    home: o.home,
+    local: o.plan.kind === 'local',
+    proxy: o.passProxyEnv === true,
+    timeoutMs: o.timeoutMs ?? 300_000,
+    extraConfig: pin,
+  };
+  const src = o.plan.kind === 'https' ? o.plan.url : o.plan.path;
+  const watched = { ...base, watch: { dir: join(o.dir, '.git'), maxBytes: max } };
+  await runGit(base, ['init', '--quiet', '--initial-branch=affidavit']);
+  const noTags = ['fetch', '--quiet', '--no-tags', '--no-recurse-submodules', '--depth=1'];
   try {
-    await g.git([...noTags, '--depth=1', '--', src, o.commit]);
-  } catch {
-    // Some servers refuse a fetch by hash. Fall back to the branches, then check the hash exists.
-    await g.git([...noTags, '--', src, '+refs/heads/*:refs/remotes/source/*']);
+    await runGit(watched, [...noTags, '--', src, o.commit]);
+  } catch (e) {
+    if (e instanceof RepoTooLargeError) throw e;
+    // Some servers refuse a fetch by hash. Fall back to the branch tips (still depth 1).
+    await runGit(watched, [...noTags, '--', src, '+refs/heads/*:refs/remotes/source/*']);
   }
+  if ((await dirBytes(join(o.dir, '.git'))) > max) throw new RepoTooLargeError('fetch', max);
   try {
-    await g.git(['cat-file', '-e', `${o.commit}^{commit}`]);
+    await runGit(base, ['cat-file', '-e', `${o.commit}^{commit}`]);
   } catch {
     throw new CloneFailedError('fetch', 'the pinned commit is not in the source repository');
   }
-  await g.git(['checkout', '--quiet', '--force', '--detach', o.commit, '--']);
-  await verifyHead(o.dir, o.home, o.commit, o);
+  await runGit({ ...base, watch: { dir: o.dir, maxBytes: max } }, [
+    'checkout',
+    '--quiet',
+    '--force',
+    '--detach',
+    o.commit,
+    '--',
+  ]);
+  if ((await dirBytes(o.dir)) > max) throw new RepoTooLargeError('checkout', max);
+  await verifyHead(o.dir, o.home, o.commit, {
+    allowLocal: o.plan.kind === 'local',
+    gitExecutable: o.gitExecutable,
+    timeoutMs: o.timeoutMs,
+  });
 }
 
 /** Throws CommitMismatchError unless the repository in `dir` has HEAD at exactly `expected`. */
@@ -215,10 +293,24 @@ export async function verifyHead(
   dir: string,
   home: string,
   expected: string,
-  o: Pick<CheckoutOptions, 'allowLocal' | 'gitExecutable' | 'timeoutMs'> = { allowLocal: false },
+  o: { allowLocal: boolean; gitExecutable?: string | undefined; timeoutMs?: number | undefined } = {
+    allowLocal: false,
+  },
 ): Promise<void> {
   assertFullSha(expected);
-  const g = runner(o.gitExecutable ?? 'git', dir, home, o.allowLocal, o.timeoutMs ?? 300_000);
-  const actual = (await g.git(['rev-parse', '--verify', 'HEAD^{commit}'])).trim();
+  const actual = (
+    await runGit(
+      {
+        exe: o.gitExecutable ?? 'git',
+        cwd: dir,
+        home,
+        local: o.allowLocal,
+        proxy: false,
+        timeoutMs: o.timeoutMs ?? 300_000,
+        extraConfig: [],
+      },
+      ['rev-parse', '--verify', 'HEAD^{commit}'],
+    )
+  ).trim();
   if (actual !== expected) throw new CommitMismatchError(expected, actual);
 }
