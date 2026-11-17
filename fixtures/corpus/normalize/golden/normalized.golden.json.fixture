@@ -1,0 +1,101 @@
+{
+  "candidates": [
+    {
+      "schemaVersion": 1,
+      "id": "cand-0194ff9b922d3e68",
+      "tool": "osv",
+      "ruleId": "AFFIDAVIT-NORM-0001",
+      "cls": "injection",
+      "file": "package-lock.json",
+      "range": {
+        "startLine": 1,
+        "endLine": 1
+      },
+      "reachability": "unknown",
+      "score": 0,
+      "scoreInputs": {},
+      "toolAgreement": 1
+    },
+    {
+      "schemaVersion": 1,
+      "id": "cand-b3361b19af2e6803",
+      "tool": "codeql",
+      "ruleId": "js/command-line-injection",
+      "cls": "injection",
+      "file": "src/admin.js",
+      "range": {
+        "startLine": 3,
+        "endLine": 4
+      },
+      "reachability": "unknown",
+      "score": 0,
+      "scoreInputs": {},
+      "toolAgreement": 1
+    },
+    {
+      "schemaVersion": 1,
+      "id": "cand-3daeed9494f9bdf4",
+      "tool": "semgrep",
+      "ruleId": "affidavit.normalize.query-from-request",
+      "cls": "injection",
+      "file": "src/routes.js",
+      "range": {
+        "startLine": 9,
+        "endLine": 9
+      },
+      "reachability": "unknown",
+      "score": 0,
+      "scoreInputs": {},
+      "toolAgreement": 2
+    },
+    {
+      "schemaVersion": 1,
+      "id": "cand-ff79f6a56e4ed6e2",
+      "tool": "semgrep",
+      "ruleId": "affidavit.normalize.nosql-where",
+      "cls": "injection",
+      "file": "src/routes.js",
+      "range": {
+        "startLine": 15,
+        "endLine": 15
+      },
+      "reachability": "unknown",
+      "score": 0,
+      "scoreInputs": {},
+      "toolAgreement": 2
+    },
+    {
+      "schemaVersion": 1,
+      "id": "cand-54dbfe17a03fb204",
+      "tool": "semgrep",
+      "ruleId": "affidavit.normalize.idor-find-by-id",
+      "cls": "idor",
+      "file": "src/routes.js",
+      "range": {
+        "startLine": 21,
+        "endLine": 21
+      },
+      "reachability": "unknown",
+      "score": 0,
+      "scoreInputs": {},
+      "toolAgreement": 1
+    }
+  ],
+  "skipped": [
+    {
+      "tool": "codeql",
+      "ruleId": "js/reflected-xss",
+      "reason": "unmapped-class",
+      "file": "src/routes.js",
+      "cwe": [79]
+    },
+    {
+      "tool": "osv",
+      "ruleId": "AFFIDAVIT-NORM-0002",
+      "reason": "unmapped-class",
+      "file": "package-lock.json",
+      "cwe": []
+    }
+  ],
+  "partialTools": []
+}

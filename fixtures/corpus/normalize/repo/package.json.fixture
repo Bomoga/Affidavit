@@ -1,0 +1,9 @@
+{
+  "name": "normalize-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "sqlish": "1.0.0",
+    "plainlib": "2.0.0"
+  }
+}

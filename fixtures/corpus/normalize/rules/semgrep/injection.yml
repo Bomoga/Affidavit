@@ -1,0 +1,33 @@
+rules:
+  - id: affidavit.normalize.sql-concat
+    message: SQL text built by concatenating a request value
+    severity: ERROR
+    languages: [javascript]
+    metadata:
+      cwe: ['CWE-89: Improper Neutralization of Special Elements used in an SQL Command']
+      affidavit-class: injection
+    pattern: $SQL = "..." + $REQ.query.$X + "..."
+  - id: affidavit.normalize.query-from-request
+    message: A query string is built from a request value
+    severity: WARNING
+    languages: [javascript]
+    metadata:
+      cwe: ['CWE-89: Improper Neutralization of Special Elements used in an SQL Command']
+      affidavit-class: injection
+    pattern: $REQ.query.$X
+  - id: affidavit.normalize.nosql-where
+    message: Request value reaches a $where expression
+    severity: ERROR
+    languages: [javascript]
+    metadata:
+      cwe: ['CWE-943: Improper Neutralization of Special Elements in Data Query Logic']
+      affidavit-class: injection
+    pattern: '{ $where: "..." + $REQ.body.$X }'
+  - id: affidavit.normalize.idor-find-by-id
+    message: Record looked up by a URL parameter with no ownership check
+    severity: WARNING
+    languages: [javascript]
+    metadata:
+      cwe: ['CWE-639: Authorization Bypass Through User-Controlled Key']
+      affidavit-class: idor
+    pattern: $DB.$T.findById($REQ.params.$X)

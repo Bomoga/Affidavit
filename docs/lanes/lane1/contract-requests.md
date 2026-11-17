@@ -30,3 +30,15 @@ The gate issue in NodeGoat at the pinned commit is MongoDB `$where` (NoSQL) inje
 **Problem 2, `verify` to `verdict`.** The contracts changelog says verify goes to verdict "when the jury is disabled or appeals are exhausted". The fake allows it when the jury is disabled, or when the jury is enabled and appeals are exhausted (`appeals >= MAX_APPEALS`). Whether a case with appeals exhausted must still pass through the jury, or may go straight to a `not-proven` verdict, is not stated precisely. The stores follow the fake.
 
 **Request.** Say which of the two paths is intended, and whether the jury-enabled setting belongs on the case (so a database can enforce it) or stays store configuration.
+
+## CR-4: dependency findings have no class or location in `Candidate` (raised by L1-03)
+
+**Problem.** `Candidate.cls` is `injection | idor`, and `range` is a line range. An OSV-Scanner finding is a vulnerable package in a lockfile: it has no line, and most advisories are neither injection nor IDOR. The normalizer therefore (a) places an OSV candidate at line 1 of its lockfile, and (b) emits it only when the advisory's `database_specific.cwe_ids` maps to a MVP class. Every other advisory is returned in `skipped` with reason `unmapped-class`, so L1-06 can record it but cannot give it an `osv-no-path` dismissal (a `Dismissal` needs a `candidateId`).
+
+**Request.** Either add a class such as `dependency` to `VulnClass` (and optional `package`/`version` fields to `Candidate`, or a `Candidate.location` union with a lockfile variant), or state that unmapped OSV findings are never candidates and need a different record.
+
+**Interim.** The normalizer follows the first reading's constraints: no new fields, the `skipped` list carries tool, rule id, file and CWE numbers.
+
+## CR-5: how a Semgrep rule declares its class (raised by L1-03)
+
+Semgrep SARIF carries only a rule's `metadata.cwe` (as tags) in `properties.tags`; other metadata keys such as a custom `affidavit-class` are not emitted (checked on the pinned 1.184.0 image). The normalizer therefore derives `cls` from CWE numbers (injection: 74, 77, 78, 89, 90, 91, 94, 95, 564, 643, 917, 943; idor: 284, 285, 566, 639, 862, 863). Rules written for L1-04 must set `metadata.cwe` to one of these, or their findings are `skipped`. No contract change needed; recorded here so Lane 3 and L1-04 know the convention.
