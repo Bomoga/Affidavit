@@ -30,7 +30,10 @@
     "nodegoat-ssjs-contributions-eval": "Server-side JavaScript injection through eval. The MVP rules cover SQL and NoSQL injection and IDOR only.",
     "nodegoat-loginj-login-username": "Log injection (CWE-117). Not an SQL, NoSQL or IDOR class, so no rule targets it."
   },
-  "idorHandlerEnds": {},
+  "idorHandlerEnds": {
+    "nodegoat-idor-allocations-userid": 31,
+    "nodegoat-idor-benefits-userid": 54
+  },
   "unlabeledFindings": [],
   "allowedNotifications": [
     {

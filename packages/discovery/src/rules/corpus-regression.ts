@@ -182,20 +182,21 @@ function lineDepths(text: string): { start: number[]; end: number[] } {
 
 /**
  * Last line of the block that holds the labeled source (for a source read directly in a handler
- * body, the handler). Two cases, decided by the line `startLine` itself:
- *  - the line opens a block it does not close (`app.get(p, (req, res) => { const id = ...`): that
- *    block is the handler, and it ends on the first line that brings the depth back to where the
- *    line started;
+ * body, the handler). Two cases, decided by the labeled range `startLine` to `endLine`:
+ *  - the range ends inside a block that its first line opened (`app.get(p, (req, res) => { const
+ *    id = ...`): that block is the handler, and it ends on the first line that brings the depth
+ *    back to where the range started. A multi-line destructuring (`const {\n id\n} = req.params`)
+ *    opens and closes inside the range, so it is the second case;
  *  - otherwise the innermost block that holds the line: the first line, from `startLine` on, where
  *    the depth drops below the depth at the start of that line.
  * Strings (also multi-line templates with `${ }`), line comments and block comments are skipped;
  * regular expression literals are not. Returns the last line of the file if no end is found.
  */
-export function handlerEndLine(text: string, startLine: number): number {
+export function handlerEndLine(text: string, startLine: number, endLine = startLine): number {
   const { start, end } = lineDepths(text.replace(/\r\n/g, '\n'));
   const at = Math.max(0, startLine - 1);
   const base = start[at] ?? 0;
-  const opens = (end[at] ?? 0) > base;
+  const opens = (end[Math.max(at, endLine - 1)] ?? 0) > base;
   for (let i = opens ? at + 1 : at; i < end.length; i++) {
     const d = end[i] ?? 0;
     if (opens ? d <= base : d < base) return i + 1;

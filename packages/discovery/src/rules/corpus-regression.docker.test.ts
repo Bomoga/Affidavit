@@ -267,6 +267,7 @@ describe.skipIf(!enabled)('own Semgrep rules, Docker and corpus', { timeout: 900
               handlerEndLine: handlerEndLine(
                 readFileSync(join(vulnerableDir, l.source.file), 'utf8'),
                 l.source.range.startLine,
+                l.source.range.endLine,
               ),
             }
           : l,

@@ -281,6 +281,23 @@ describe('handlerEndLine edge cases', () => {
     expect(handlerEndLine(text, 2)).toBe(7);
   });
 
+  it('measures a multi-line destructuring source to the handler, not to the destructuring', () => {
+    const text = [
+      'const h = (req, res) => {', // 1
+      '  const {', // 2
+      '    id', // 3
+      '  } = req.params;', // 4
+      '  db.find(id);', // 5
+      '};', // 6
+      'const other = () => {', // 7
+      '};', // 8
+    ].join('\n');
+    // Labeled range 2-4: the block the first line opens is closed inside the range.
+    expect(handlerEndLine(text, 2, 4)).toBe(6);
+    // A range on line 2 alone ends inside the destructuring.
+    expect(handlerEndLine(text, 2)).toBe(4);
+  });
+
   it('skips braces in block comments', () => {
     const text = ['f = () => {', '  /* } }', '  } */', '  x();', '};'].join('\n');
     expect(handlerEndLine(text, 4)).toBe(5);

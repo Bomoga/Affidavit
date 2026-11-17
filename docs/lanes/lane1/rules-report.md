@@ -24,7 +24,7 @@ An ownership check is an `if` that compares the identifier with an id-like field
 
 A check placed after the call, and a check inside an unrelated `if`, a loop body, a callback or a function that does not enclose the call, do not count (all tested). Each data call is judged on its own, so a guarded call does not clear another call on the same identifier, not even a call to the same method.
 
-Where an IDOR finding goes: always on the data-access call (a call in the same handler as the read is found with the read as a `pattern-inside`). The first versions reported on the read; that cannot be done per call, so the regression now matches an IDOR finding to a labeled IDOR when it is in the same file and between the labeled source and the end of the block that holds the source (the handler). That end line is computed by brace counting from the fetched file (`handlerEndLine`) and is tested. It reads the whole file in one pass: strings are recognised before comments (`//` inside a string is not a comment), multi-line template literals with `${ }` and block comments are skipped, and a labeled source on the line that opens the handler is measured to that handler's closing line. Remaining limits: regular expression literals are not recognised (a quote or brace inside one can throw the count off), and a source line that both opens and closes a block is measured as the enclosing block. Each IDOR label's expected handler end is therefore pinned in `corpus-expectations.json` (`idorHandlerEnds`), and the Docker regression fails when the computed value differs from the pin, when a label has no pin, or when a pin names no IDOR label.
+Where an IDOR finding goes: always on the data-access call (a call in the same handler as the read is found with the read as a `pattern-inside`). The first versions reported on the read; that cannot be done per call, so the regression now matches an IDOR finding to a labeled IDOR when it is in the same file and between the labeled source and the end of the block that holds the source (the handler). That end line is computed by brace counting from the fetched file (`handlerEndLine`) and is tested. It reads the whole file in one pass: strings are recognised before comments (`//` inside a string is not a comment), multi-line template literals with `${ }` and block comments are skipped, and a labeled source on the line that opens the handler is measured to that handler's closing line. Remaining limits: regular expression literals are not recognised (a quote or brace inside one can throw the count off), and a source line that both opens and closes a block is measured as the enclosing block. The opening-line case is decided from the whole labeled source range, because both NodeGoat sources are multi-line destructurings (`const {` ... `} = req.params;`): a block opened and closed inside the range is not the handler. Pinned ends: allocations 31, benefits 54 (checked by hand against the pinned source). Each IDOR label's expected handler end is therefore pinned in `corpus-expectations.json` (`idorHandlerEnds`), and the Docker regression fails when the computed value differs from the pin, when a label has no pin, or when a pin names no IDOR label.
 
 Known misses of the IDOR rules (not detected, so not reported): Next.js app-router handlers that receive `{ params }` as an argument, a params object copied under another name (`const p = req.params; p.id`), a call whose receiver does not look like data access (a plain helper function, `this.save(...)`), and guards written another way (a `switch`, a ternary, a helper such as `assertOwner(id)`). A guard with an `else` that returns, or one with four or more statements in its body, is not recognised, so the call is reported (an over-report, not a miss). The request-id rule only looks at names ending in `id`, `Id`, `ID` or `_id`, so a field such as `owner` is not seen.
 
@@ -50,12 +50,12 @@ Known false positives:
 | Item               | Value                                                                                               |
 | ------------------ | --------------------------------------------------------------------------------------------------- |
 | Date               | 2026-11-17                                                                                          |
-| Repo commit        | `5b4d842d77e56d07cedae9401dc2c8c6794f797c` (clean working tree at run time)                         |
-| Inputs digest      | `8c4147ff984ac2ef171ddfa1d29c0640e4670a8d60f45ac7e7b8b9c8c1bb22cd`                                  |
+| Repo commit        | `eb3356af0cb2e0c671a7aeb2afb0815ada9bb3f1` plus the uncommitted L1-04b changes (matcher, pins, stamp)                         |
+| Inputs digest      | `2dc5a77cc802d08e0bcbb9c5466e6f4110edd682ed24d53e7cb691186902c990`                                  |
 | Run output digest  | `ad656d2f2eb0a83b32366ee5c23c608b03a2888b53d38e6a5ac121d26da1c86b`                                  |
 | NodeGoat commit    | `c5cb68a7084e4ae7dcc60e6a98768720a81841e8`                                                          |
 | Semgrep image      | `docker.io/semgrep/semgrep@sha256:cc1b68266f267878b39739373ea9985b9a78e5d64497dd875c8de100b22695ed` |
-| Result of the test | 3 of 3 tests passed (62 seconds); the comparison reported no problems                               |
+| Result of the test | 3 of 3 tests passed (102 seconds, vitest duration); the comparison reported no problems                               |
 
 Run history, so the timeout flakiness is visible: with the round 1 inputs the test passed 4 times and failed once (output not captured); with the round 2 rules it failed once on a timeout pair not yet in the tolerated list (`route-param-to-data-access` on `chart/morris-0.4.3.min.js`) and then passed. The tolerated list was widened after each failure (see below). With the round 3 rules, the first Docker run (before the last unit-test fix, same rules) and the final run both passed. Run time varies.
 
@@ -113,7 +113,7 @@ Every run on every tree reported notifications in vendored third-party files und
 ## Not measured
 
 - Recall and false-positive rates on anything but NodeGoat: `[metric]`.
-- Run time per rule: `[metric]` (only the whole test, 65 seconds including the three fetches, was observed in the last run).
+- Run time per rule: `[metric]` (only the whole test file, 102 seconds including the three fetches, was observed in the last run (L1-04b)).
 - Behavior on non-JavaScript repos: `[metric]`; the rules target JavaScript and TypeScript only.
 
 ## Questions for the Lead (not decided here)
