@@ -29,6 +29,15 @@ function cases(db, connection, pool, knex, req, res) {
   // ruleid: affidavit.injection.sql-request-taint
   knex('users').joinRaw(`join t on t.id = ${req.body.id}`);
 
+  // ruleid: affidavit.injection.sql-request-taint
+  query(`SELECT * FROM t WHERE id = ${req.params.id}`);
+
+  // ruleid: affidavit.injection.sql-request-taint
+  db.query({ text: 'SELECT * FROM t WHERE id = ' + req.params.id });
+
+  // ok: affidavit.injection.sql-request-taint
+  db.query({ text: 'SELECT * FROM t WHERE id = $1', values: [req.params.id] });
+
   // ok: affidavit.injection.sql-request-taint
   db.query(`SELECT * FROM users WHERE id = ${parseInt(req.params.id, 10)}`);
 

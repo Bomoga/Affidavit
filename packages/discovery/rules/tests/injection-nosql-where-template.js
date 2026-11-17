@@ -51,3 +51,21 @@ function cases(col, Model, userId, threshold, name) {
   // ok: affidavit.injection.nosql-where-template
   col.find({ userId: parsedUserId });
 }
+
+function viaVariable(col, Model, name) {
+  const expr = `this.name == '${name}'`;
+  // ruleid: affidavit.injection.nosql-where-template
+  col.find({ $where: expr });
+
+  const joined = "this.name == '" + name + "'";
+  // ruleid: affidavit.injection.nosql-where-template
+  Model.find({ $where: joined });
+
+  const safeExpr = `this.stocks > ${Number(name)}`;
+  // ok: affidavit.injection.nosql-where-template
+  col.find({ $where: safeExpr });
+
+  const fixedExpr = 'this.active == true';
+  // ok: affidavit.injection.nosql-where-template
+  col.find({ $where: fixedExpr });
+}

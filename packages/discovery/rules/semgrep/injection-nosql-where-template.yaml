@@ -27,6 +27,28 @@ rules:
           - pattern: '{ "$where": $X + "...", ... }'
           - pattern: '{ $where: "..." + $X + "...", ... }'
           - pattern: '{ "$where": "..." + $X + "...", ... }'
+          # The expression built into a variable first, then used as $where. The finding is on the
+          # object that uses it.
+          - patterns:
+              - pattern: '{ $where: $W, ... }'
+              - pattern-inside: |
+                  $W = `...${$X}...`;
+                  ...
+          - patterns:
+              - pattern: '{ $where: $W, ... }'
+              - pattern-inside: |
+                  $W = "..." + $X;
+                  ...
+          - patterns:
+              - pattern: '{ $where: $W, ... }'
+              - pattern-inside: |
+                  $W = $X + "...";
+                  ...
+          - patterns:
+              - pattern: '$Q.$where($W)'
+              - pattern-inside: |
+                  $W = `...${$X}...`;
+                  ...
           # Mongoose query builder: Model.find().$where(...)
           - pattern: '$Q.$where(`...${$X}...`)'
           - pattern: '$Q.$where("..." + $X)'

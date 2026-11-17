@@ -373,6 +373,9 @@ export function regressionInputsDigest(repo: string): string {
     `${src}/tools/invocations.ts`,
     `${src}/tools/run.ts`,
     `${src}/tools/quarantine.ts`,
+    `${src}/tools/manifest.ts`,
+    `${src}/tools/walk.ts`,
+    `${src}/tools/index.ts`,
   );
   for (const rel of files) add(rel, readText(rel));
 

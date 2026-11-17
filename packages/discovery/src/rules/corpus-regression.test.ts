@@ -1,6 +1,7 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { build } from '../../rules/generate-idor-rules.mjs';
 import { loadToolManifest, repoRoot } from '../tools/index.js';
 import {
   countAnnotations,
@@ -270,6 +271,26 @@ describe('the rule files', () => {
     for (const id of ruleIds) {
       expect(counts[id]?.ruleid ?? 0, `${id} needs ruleid cases`).toBeGreaterThan(0);
       expect(counts[id]?.ok ?? 0, `${id} needs ok cases`).toBeGreaterThan(0);
+    }
+  });
+
+  it('keep the committed IDOR YAML equal to what the generator produces', () => {
+    for (const [rel, text] of Object.entries(build())) {
+      const onDisk = readFileSync(join(root, rel), 'utf8').replace(/\r\n/g, '\n');
+      expect(
+        onDisk,
+        `${rel} differs from rules/generate-idor-rules.mjs output; rerun the generator`,
+      ).toBe(text.replace(/\r\n/g, '\n'));
+    }
+  });
+
+  it('each name one CWE the task covers (SQL injection, NoSQL injection, IDOR)', () => {
+    const allowed = new Set(['CWE-89', 'CWE-943', 'CWE-639']);
+    for (const name of readdirSync(join(root, 'semgrep')).filter((n) => /\.ya?ml$/.test(n))) {
+      const text = readFileSync(join(root, 'semgrep', name), 'utf8');
+      const cwes = [...text.matchAll(/^\s+cwe:\s*'?(CWE-\d+)'?\s*$/gm)].map((m) => m[1]);
+      expect(cwes.length, `${name} needs a cwe`).toBeGreaterThan(0);
+      for (const c of cwes) expect(allowed.has(c ?? ''), `${name}: ${String(c)}`).toBe(true);
     }
   });
 

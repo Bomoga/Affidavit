@@ -20,6 +20,10 @@ function cases(col, Model, req, res) {
   col.aggregate([{ $match: { owner: req.query.owner } }]);
 
   // ruleid: affidavit.injection.nosql-operator-request
+  Model.findById(req.query.id);
+
+  // Route parameters are always strings, so they are not a source for this rule.
+  // ok: affidavit.injection.nosql-operator-request
   Model.findById(req.params.id);
 
   // ruleid: affidavit.injection.nosql-operator-request

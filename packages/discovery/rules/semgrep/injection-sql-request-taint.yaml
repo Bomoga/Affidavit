@@ -1,4 +1,4 @@
-# Affidavit's own rules. Written from scratch; no registry rule or rule text is used or copied.
+﻿# Affidavit's own rules. Written from scratch; no registry rule or rule text is used or copied.
 rules:
   - id: affidavit.injection.sql-request-taint
     languages: [javascript, typescript]
@@ -27,7 +27,18 @@ rules:
       - pattern: Number(...)
     pattern-sinks:
       - patterns:
-          - pattern: $DB.$M($Q, ...)
+          - pattern-either:
+              # The statement itself (not an option object, whose values field holds bound values).
+              - patterns:
+                  - pattern: $DB.$M($Q, ...)
+                  - pattern-not: $DB.$M({ ... }, ...)
+              # A bare call, for example a destructured query function.
+              - patterns:
+                  - pattern: $M($Q, ...)
+                  - pattern-not: $M({ ... }, ...)
+              # Option objects: query({ sql: ... }) and query({ text: ... }).
+              - pattern: '$DB.$M({ sql: $Q, ... }, ...)'
+              - pattern: '$DB.$M({ text: $Q, ... }, ...)'
           - focus-metavariable: $Q
           - metavariable-regex:
               metavariable: $M

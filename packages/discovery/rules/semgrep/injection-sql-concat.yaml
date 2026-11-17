@@ -1,4 +1,4 @@
-# Affidavit's own rules. Written from scratch; no registry rule or rule text is used or copied.
+﻿# Affidavit's own rules. Written from scratch; no registry rule or rule text is used or copied.
 # One rule per file, so each rule has its own test file in ../tests with the same base name.
 rules:
   - id: affidavit.injection.sql-concat
@@ -19,13 +19,25 @@ rules:
         name interpolated from a non-literal variable, and a value validated elsewhere.
     patterns:
       - pattern-either:
+          # Statement as the first argument, on a client, pool, connection or builder.
           - pattern: $DB.$M(`...${$X}...`, ...)
-          - pattern: $DB.$M("..." + $X, ...)
-          - pattern: $DB.$M($X + "...", ...)
-          - pattern: $DB.$M("..." + $X + "...", ...)
+          - pattern: $DB.$M($A + $X, ...)
+          - pattern: $DB.$M($X + $A, ...)
+          # A bare call, for example a destructured query function.
+          - pattern: $M(`...${$X}...`, ...)
+          - pattern: $M($A + $X, ...)
+          - pattern: $M($X + $A, ...)
+          # Option objects: query({ sql: ... }) and query({ text: ... }).
+          - pattern: '$DB.$M({ sql: `...${$X}...`, ... }, ...)'
+          - pattern: '$DB.$M({ sql: $A + $X, ... }, ...)'
+          - pattern: '$DB.$M({ sql: $X + $A, ... }, ...)'
+          - pattern: '$DB.$M({ text: `...${$X}...`, ... }, ...)'
+          - pattern: '$DB.$M({ text: $A + $X, ... }, ...)'
+          - pattern: '$DB.$M({ text: $X + $A, ... }, ...)'
       - metavariable-regex:
           metavariable: $M
           regex: ^(query|execute|raw|queryRaw|\$queryRawUnsafe|\$executeRawUnsafe|unsafe|whereRaw|orderByRaw|havingRaw|joinRaw)$
+      # A value coerced to a number, a number, or a string literal cannot carry SQL.
       - metavariable-pattern:
           metavariable: $X
           patterns:

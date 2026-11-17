@@ -28,6 +28,62 @@ function bodyIds(accountDAO, Order, prisma, Joi) {
     await prisma.order.update({ where: { id: req.query.id }, data: {} });
   };
 
+  this.upperCaseId = (req, res, next) => {
+    // ruleid: affidavit.idor.request-id-to-data-access
+    const orderID = req.body.orderID;
+    Order.findById(orderID);
+  };
+
+  this.guardAfterTheCall = async (req, res, next) => {
+    // ruleid: affidavit.idor.request-id-to-data-access
+    const { userId } = req.body;
+    await accountDAO.remove(userId);
+    if (userId !== req.user.id) {
+      return res.sendStatus(403);
+    }
+  };
+
+  this.bareNextDoesNotStop = (req, res, next) => {
+    // ruleid: affidavit.idor.request-id-to-data-access
+    const { userId } = req.body;
+    if (userId !== req.user.id) {
+      next(new Error('forbidden'));
+    }
+    accountDAO.remove(userId);
+  };
+
+  this.csrfIsNotOwnership = (req, res, next) => {
+    // ruleid: affidavit.idor.request-id-to-data-access
+    const { userId } = req.body;
+    if (userId !== req.session.csrfToken) {
+      return res.sendStatus(403);
+    }
+    accountDAO.remove(userId);
+  };
+
+  this.inlineElseBranch = (req, res, next) => {
+    if (req.body.userId === req.user.id) {
+      return res.end();
+    } else {
+      // ruleid: affidavit.idor.request-id-to-data-access
+      return accountDAO.remove(req.body.userId);
+    }
+  };
+
+  this.guardedBraceless = (req, res, next) => {
+    // ok: affidavit.idor.request-id-to-data-access
+    const { userId } = req.body;
+    if (userId !== req.user.id) return res.sendStatus(403);
+    accountDAO.remove(userId);
+  };
+
+  this.guardedReturnNext = (req, res, next) => {
+    // ok: affidavit.idor.request-id-to-data-access
+    const { userId } = req.body;
+    if (userId !== req.user.id) return next(new Error('forbidden'));
+    accountDAO.remove(userId);
+  };
+
   this.guarded = (req, res, next) => {
     // ok: affidavit.idor.request-id-to-data-access
     const { userId } = req.body;

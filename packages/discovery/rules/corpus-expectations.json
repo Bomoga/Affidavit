@@ -1,13 +1,22 @@
 {
   "app": "nodegoat",
   "rules": {
-    "affidavit.injection.sql-concat": { "catches": [], "flagsControls": [] },
-    "affidavit.injection.sql-request-taint": { "catches": [], "flagsControls": [] },
+    "affidavit.injection.sql-concat": {
+      "catches": [],
+      "flagsControls": []
+    },
+    "affidavit.injection.sql-request-taint": {
+      "catches": [],
+      "flagsControls": []
+    },
     "affidavit.injection.nosql-where-template": {
       "catches": ["nodegoat-nosqli-allocations-where"],
       "flagsControls": ["nodegoat-nc-constant-where"]
     },
-    "affidavit.injection.nosql-operator-request": { "catches": [], "flagsControls": [] },
+    "affidavit.injection.nosql-operator-request": {
+      "catches": [],
+      "flagsControls": []
+    },
     "affidavit.idor.route-param-to-data-access": {
       "catches": ["nodegoat-idor-allocations-userid"],
       "flagsControls": []
@@ -23,10 +32,33 @@
   },
   "unlabeledFindings": [],
   "allowedNotifications": [
-    { "file": "app/assets/vendor/chart/morris-0.4.3.min.js", "rule": null },
+    {
+      "file": "app/assets/vendor/chart/morris-0.4.3.min.js",
+      "rule": null
+    },
+    {
+      "file": "app/assets/vendor/chart/morris-0.4.3.min.js",
+      "rule": "affidavit.idor.request-id-to-data-access"
+    },
+    {
+      "file": "app/assets/vendor/chart/morris-0.4.3.min.js",
+      "rule": "affidavit.idor.route-param-to-data-access"
+    },
+    {
+      "file": "app/assets/vendor/chart/morris-0.4.3.min.js",
+      "rule": "affidavit.injection.nosql-operator-request"
+    },
+    {
+      "file": "app/assets/vendor/chart/morris-0.4.3.min.js",
+      "rule": "affidavit.injection.nosql-where-template"
+    },
     {
       "file": "app/assets/vendor/chart/morris-0.4.3.min.js",
       "rule": "affidavit.injection.sql-concat"
+    },
+    {
+      "file": "app/assets/vendor/chart/morris-0.4.3.min.js",
+      "rule": "affidavit.injection.sql-request-taint"
     },
     {
       "file": "app/assets/vendor/chart/raphael-min.js",
@@ -39,6 +71,14 @@
     {
       "file": "app/assets/vendor/chart/raphael-min.js",
       "rule": "affidavit.injection.nosql-operator-request"
+    },
+    {
+      "file": "app/assets/vendor/chart/raphael-min.js",
+      "rule": "affidavit.injection.nosql-where-template"
+    },
+    {
+      "file": "app/assets/vendor/chart/raphael-min.js",
+      "rule": "affidavit.injection.sql-concat"
     },
     {
       "file": "app/assets/vendor/chart/raphael-min.js",
@@ -55,6 +95,14 @@
     {
       "file": "app/assets/vendor/jquery.min.js",
       "rule": "affidavit.injection.nosql-operator-request"
+    },
+    {
+      "file": "app/assets/vendor/jquery.min.js",
+      "rule": "affidavit.injection.nosql-where-template"
+    },
+    {
+      "file": "app/assets/vendor/jquery.min.js",
+      "rule": "affidavit.injection.sql-concat"
     },
     {
       "file": "app/assets/vendor/jquery.min.js",
