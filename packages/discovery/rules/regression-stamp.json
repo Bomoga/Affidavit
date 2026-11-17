@@ -1,0 +1,6 @@
+{
+  "rulesSha256": "ceb534796da6e2c28c0d01bdbfad2f6331e3b579484dd9519c0c0ee8e0f5d468",
+  "semgrepImage": "docker.io/semgrep/semgrep@sha256:cc1b68266f267878b39739373ea9985b9a78e5d64497dd875c8de100b22695ed",
+  "nodegoatCommit": "c5cb68a7084e4ae7dcc60e6a98768720a81841e8",
+  "ranOn": "2026-11-17"
+}
