@@ -112,6 +112,7 @@ describePg('migrations on a fresh Postgres', () => {
       { proname: 'enqueue_stage', owner: OWNER_ROLE },
       { proname: 'list_open_cases', owner: OWNER_ROLE },
       { proname: 'record_stage_entry', owner: OWNER_ROLE },
+      { proname: 'stage_attempt_handled', owner: OWNER_ROLE },
       { proname: 'stage_run_complete', owner: OWNER_ROLE },
       { proname: 'stage_run_fail', owner: OWNER_ROLE },
       { proname: 'stage_run_heartbeat', owner: OWNER_ROLE },

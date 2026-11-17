@@ -10,7 +10,7 @@ import {
   type StagePayload,
 } from './queue.js';
 import { completeStageRun, failStageRun, resumeDecision, stageRunState } from './stage-runs.js';
-import { BUDGET, describePg, sampleCase, useTestDatabase } from './test-support.js';
+import { BUDGET, childEnv, describePg, sampleCase, useTestDatabase } from './test-support.js';
 
 const A = 'tenant-kill';
 
@@ -50,18 +50,16 @@ describePg('kill and resume with a real process kill', () => {
     const cwd = fileURLToPath(new URL('..', import.meta.url));
     const child = spawn(process.execPath, ['--import', 'tsx', 'src/kill-child.ts'], {
       cwd,
-      env: {
-        // The child gets only its own role URLs, never the superuser one.
-        ...Object.fromEntries(
-          Object.entries(process.env).filter(([k]) => k !== 'AFFIDAVIT_TEST_DATABASE_URL'),
-        ),
+      // The child gets an allowlist (what node needs) and its own role URLs, nothing else: not
+      // the superuser URL, not whatever else the parent's environment carries.
+      env: childEnv({
         CHILD_MODE: mode,
         CHILD_CASE: caseId,
         CHILD_TENANT: A,
         CHILD_LEASE: String(leaseSeconds),
         CHILD_APP_URL: db().appUrl,
         CHILD_WORKER_URL: db().workerUrl,
-      },
+      }),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     const lines: string[] = [];
@@ -74,7 +72,9 @@ describePg('kill and resume with a real process kill', () => {
       buf = parts.pop() ?? '';
       // Only the child's own events; Graphile Worker's log lines are noise here.
       lines.push(
-        ...parts.map((s) => s.trim()).filter((s) => /^(STARTED|DONE|WORKED|READY)( |$)/.test(s)),
+        ...parts
+          .map((s) => s.trim())
+          .filter((s) => /^(STARTED|DONE|WORKED|READY|ENV)( |$)/.test(s)),
       );
     });
     child.stderr.setEncoding('utf8');
@@ -97,6 +97,28 @@ describePg('kill and resume with a real process kill', () => {
     while (!(await cond()) && Date.now() < deadline) await wait(150);
   }
 
+  it('the child process gets an allowlisted environment, not the parent one', async () => {
+    process.env.AFFIDAVIT_PLANTED_SECRET = 'planted';
+    try {
+      const c = spawnChild('print-env', 'none', 1);
+      await until(() => c.lines.some((l) => l.startsWith('ENV ')));
+      const line = c.lines.find((l) => l.startsWith('ENV '));
+      expect(line, c.stderr()).toBeDefined();
+      const keys = JSON.parse(line!.slice(4)) as string[];
+      expect(keys).not.toContain('AFFIDAVIT_PLANTED_SECRET');
+      expect(keys).not.toContain('AFFIDAVIT_TEST_DATABASE_URL');
+      expect(keys).toEqual(
+        expect.arrayContaining(['CHILD_MODE', 'CHILD_APP_URL', 'CHILD_WORKER_URL']),
+      );
+      // The last six are added by Windows itself when it builds the process, not passed on by us.
+      const allowed =
+        /^(CHILD_.*|PATH|PATHEXT|SYSTEMROOT|WINDIR|COMSPEC|TEMP|TMP|TMPDIR|HOME|USERPROFILE|APPDATA|LOCALAPPDATA|LANG|TERM|HOMEDRIVE|HOMEPATH|LOGONSERVER|SYSTEMDRIVE|USERDOMAIN|USERNAME)$/i;
+      expect(keys.filter((k) => !allowed.test(k))).toEqual([]);
+    } finally {
+      delete process.env.AFFIDAVIT_PLANTED_SECRET;
+    }
+  }, 60_000);
+
   it('SIGKILL mid-handler: the attempt is never re-run, the lease expires on its own, the next attempt runs', async () => {
     const file = await newCase();
     const p = pay(file.id);
@@ -110,8 +132,10 @@ describePg('kill and resume with a real process kill', () => {
     await c1.kill();
     // Restart a worker. It must not run attempt 1 again.
     const c2 = spawnChild('complete', file.id, 3);
-    await until(async () => (await resumeDecision(pools(), p)) === 'next-attempt');
-    expect(await resumeDecision(pools(), p)).toBe('next-attempt');
+    // The job is locked by the dead process: it is retried once the lock is stale (3 seconds here).
+    const stale = { staleLockSeconds: 3 };
+    await until(async () => (await resumeDecision(pools(), p, stale)) === 'next-attempt');
+    expect(await resumeDecision(pools(), p, stale)).toBe('next-attempt');
     expect(c2.lines.filter((l) => l.startsWith('STARTED'))).toEqual([]);
     expect(await enqueueStage(db().app, p)).toBe(false);
     // Abandon the dead attempt and move on with attempt 2.

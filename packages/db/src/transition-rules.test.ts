@@ -231,6 +231,30 @@ describe('decideResume', () => {
     expect(d(run('running', future), 'defense')).toBe('wait');
     expect(d(run('running', past), 'defense')).toBe('next-attempt');
   });
+  it('an expired lease whose job is still queued or running waits for the margin; a dead job does not', () => {
+    const margin = 10 * 60_000;
+    const recent = new Date(now.getTime() - 60_000);
+    const old = new Date(now.getTime() - margin - 60_000);
+    const dm = (job: Job, leaseExpiresAt: Date) =>
+      decideResume({
+        run: run('running', leaseExpiresAt),
+        job,
+        caseStage: 'defense',
+        caseVisit: 4,
+        jobStage: 'defense',
+        jobVisit: 4,
+        now,
+        leaseMarginMs: margin,
+      });
+    // The lease expired a minute ago, but the lock is fresh: the holder may be winding down.
+    expect(dm('running', recent)).toBe('wait');
+    expect(dm('queued', recent)).toBe('wait');
+    // Past the margin, or with a job that is stale, failed or gone, the attempt is retried.
+    expect(dm('running', old)).toBe('next-attempt');
+    for (const job of ['stale', 'failed', 'none'] as const) {
+      expect(dm(job, recent)).toBe('next-attempt');
+    }
+  });
   it('a live lease means wait even if the case has already moved on', () => {
     expect(d(run('running', future), 'prosecution')).toBe('wait');
   });
