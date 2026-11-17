@@ -39,6 +39,7 @@ Contracts version in use: v1.0
 - 2026-11-14: The witness runner image is built locally from a lockfile and run by image ID, which the sandbox now accepts as pinned alongside registry digests. Vitest is the version the repo already uses (5.1.0), as planned in `packages/judge/CLAUDE.md`.
 - 2026-11-14: `@affidavit/judge` depends on `@affidavit/sandbox` (both Lane 2): the Judge owns the witness runner and is the only bridge to the sandbox.
 - 2026-11-14: Lane 1 tools run on gVisor with the same flags but without the syscall trace. A witness run whose trace is malformed is refused, never judged.
+- 2026-11-17: `install-gvisor.sh` pins the SHA-512 of `gvisor.tar.zstd` for release 20261109.0 (x86_64 and aarch64), checked against the google/gvisor GitHub release's `SHA512SUMS` and GitHub's own asset digests, outside the bucket. Replaces the `[sha512]` placeholder from PR #14 review. See `sandbox-runner.md`.
 
 ## Metrics from real runs
 

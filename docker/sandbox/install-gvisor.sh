@@ -15,12 +15,12 @@ ARCH="$(uname -m)"
 # .sha512 file published next to the tarball comes from the same bucket, so checking against it
 # only proves the download was not truncated, not that the bucket was not tampered with.
 #
-# [sha512] PLACEHOLDER: the real values have not been recorded yet. Until a maintainer fills them
-# in (from a verified download of RELEASE, noted in docs/lanes/lane2/sandbox-runner.md), this
-# script refuses to install anything.
+# Recorded 2026-11-17 by the Lane 2 owner. Each value was checked against two channels outside the
+# bucket: SHA512SUMS on the google/gvisor GitHub release release-20261109.0, and the SHA-256 that
+# GitHub computed for each uploaded asset. How: docs/lanes/lane2/sandbox-runner.md.
 case "${ARCH}" in
-  x86_64) EXPECTED_SHA512="[sha512]" ;;
-  aarch64) EXPECTED_SHA512="[sha512]" ;;
+  x86_64) EXPECTED_SHA512="0a0041fd862f4ea3042a9db8d41c742f48a01f909699adc2a0256e46d85e53f97b82b9fd154b3dce636f62b8d557677639f91c77d13f3f875ff9fa535275393c" ;;
+  aarch64) EXPECTED_SHA512="a0b5d911512ef5fe70e833821e653a90c4d06c7027246ee49423f1d2fe2b2a509389a637797248958b90e49a069bb079ecde860efe1871b1d980ec0fe17e18ac" ;;
   *)
     echo "ERROR: no pinned gVisor checksum for architecture ${ARCH}" >&2
     exit 1
