@@ -7,10 +7,11 @@ import { RUN_LABEL, removeCaseNetwork } from '@affidavit/sandbox';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Judge } from '../judge.js';
 import { DEFAULT_POLICY } from '../rules.js';
-import { gateCaseFile } from '../test-helpers.js';
+import { gateCaseFile, patchExhibit } from '../test-helpers.js';
 import { BootedTargets, bootVariant, type BootedTarget } from './booted.js';
 import { JailExecutor } from './executor.js';
 import { buildRunnerImage } from './harness.js';
+import { JailedPatchWorkbench, buildPatchApplyImage } from './workbench.js';
 
 // The hand-written Phase 1 witnesses against real NodeGoat, booted with the L2-04 recipes. Needs a
 // sandbox host and AFFIDAVIT_NODEGOAT_DIR (the L1-08 corpus checkout:
@@ -100,6 +101,31 @@ witness<{ pair: { attacker: { userName: string; password: string }; victim: { us
   },
 );
 `;
+
+/** A real `git diff` of one file changed from `from` to `to`, made with the host's git. */
+function realDiff(file: string, from: string, to: string): string {
+  const repo = mkdtempSync(join(tmpdir(), 'affidavit-diff-'));
+  try {
+    const git = (...args: string[]) =>
+      execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], {
+        cwd: repo,
+        encoding: 'utf8',
+      });
+    git('init', '-q');
+    const original = readFileSync(join(nodegoat as string, file), 'utf8');
+    expect(original).toContain(from);
+    mkdirSync(join(repo, file, '..'), { recursive: true });
+    writeFileSync(join(repo, file), original);
+    git('add', '.');
+    git('commit', '-q', '-m', 'v');
+    writeFileSync(join(repo, file), original.replace(from, to));
+    return git('diff');
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+}
+
+const RESCAN_CLEAN = { rescan: () => Promise.resolve({ clean: true, candidates: [] }) };
 
 const POLICY = { ...DEFAULT_POLICY, hardTimeoutMs: 30_000, timeBudgetMs: 20_000 };
 
@@ -260,6 +286,138 @@ describe.runIf(onSandboxHost && nodegoat !== undefined)(
       expect(r.familyResults).toEqual(
         [0, 1, 2].map((paramIndex) => ({ paramIndex, passed: true })),
       );
+    });
+
+    describe('verifyPatch with the real workbench', () => {
+      let applyImage = '';
+      beforeAll(async () => {
+        applyImage = await buildPatchApplyImage();
+      }, 600_000);
+
+      /**
+       * NodeGoat's suite cannot be built in the sandbox: its devDependencies take `grunt-if` from
+       * a GitHub tarball (unpinned master), and the fetch only reaches the npm registry. (Its
+       * `npm test` also points at `test/unit/*.js`, which the repository does not have.)
+       */
+      const NO_SUITE = {
+        state: 'unavailable',
+        reason:
+          'the suite cannot be built: node_modules/grunt-if resolves outside the npm registry',
+      };
+
+      const verifierFor = (safe: BootedTarget) => {
+        const targets = new BootedTargets({ vulnerable: booted.vulnerable!, safe });
+        const workbench = new JailedPatchWorkbench({
+          workRoot: join(root, 'work'),
+          applyImage,
+          vulnerableSource: () => nodegoat as string,
+          targets,
+        });
+        return new Judge(new JailExecutor({ workRoot: root, runnerImage, targets }), POLICY, {
+          workbench,
+          rescan: RESCAN_CLEAN,
+        });
+      };
+
+      it("verifies NodeGoat's own $where fix: the whole family flips; the suite is unavailable", async () => {
+        const cf = caseFor('injection', gateCaseFile().id, booted.vulnerable!, booted.safeNosqli!);
+        const w = witnessFor(
+          cf.id,
+          'injection',
+          witnessSource('nodegoat-nosqli-allocations-where.witness.ts'),
+          NOSQLI_PARAMS,
+        );
+        const diff = realDiff('app/data/allocations-dao.js', NOSQLI_VULNERABLE, NOSQLI_SAFE);
+        const { result: r, suite } = await verifierFor(booted.safeNosqli!).verifyPatchReport(
+          cf,
+          patchExhibit(diff, {}, { raw: true }),
+          w,
+          [],
+        );
+        expect(suite).toEqual(NO_SUITE);
+        expect(r).toMatchObject({
+          familyFlipped: true,
+          suitePassed: false,
+          rescanClean: true,
+          counterexamples: [],
+        });
+        expect(r.rejectedBy).toBeUndefined();
+      });
+
+      it("verifies NodeGoat's own IDOR fix: every (attacker, victim) pair flips", async () => {
+        const cf = caseFor('idor', 'case-nodegoat-idor-001', booted.vulnerable!, booted.safeIdor!);
+        const w = witnessFor(
+          cf.id,
+          'idor',
+          witnessSource('nodegoat-idor-allocations.witness.ts'),
+          IDOR_PARAMS,
+        );
+        const diff = realDiff('app/routes/allocations.js', IDOR_VULNERABLE, IDOR_SAFE);
+        const patch = patchExhibit(diff, { caseId: cf.id }, { raw: true });
+        const { result: r, suite } = await verifierFor(booted.safeIdor!).verifyPatchReport(
+          cf,
+          patch,
+          w,
+          [],
+        );
+        expect(suite).toEqual(NO_SUITE);
+        expect(r).toMatchObject({ familyFlipped: true, suitePassed: false });
+        expect(r.rejectedBy).toBeUndefined();
+      });
+
+      it('rejects a patch that changes the file but not the bug: the family does not flip', async () => {
+        const cf = caseFor('injection', gateCaseFile().id, booted.vulnerable!, booted.safeNosqli!);
+        const w = witnessFor(
+          cf.id,
+          'injection',
+          witnessSource('nodegoat-nosqli-allocations-where.witness.ts'),
+          NOSQLI_PARAMS,
+        );
+        const from = 'const parsedUserId = parseInt(userId);';
+        const diff = realDiff(
+          'app/data/allocations-dao.js',
+          from,
+          `${from}\n        const checkedAt = Date.now();`,
+        );
+        const r = await verifierFor(booted.safeNosqli!).verifyPatch(
+          cf,
+          patchExhibit(diff, {}, { raw: true }),
+          w,
+          [],
+        );
+        // It applied, built and booted; only the family stayed vulnerable.
+        expect(r).toMatchObject({
+          familyFlipped: false,
+          suitePassed: false,
+          rejectedBy: 'differential',
+        });
+      });
+
+      it('rejects a patch that does not apply to the vulnerable commit as schema, before any build', async () => {
+        const cf = caseFor('injection', gateCaseFile().id, booted.vulnerable!, booted.safeNosqli!);
+        const w = witnessFor(
+          cf.id,
+          'injection',
+          witnessSource('nodegoat-nosqli-allocations-where.witness.ts'),
+          NOSQLI_PARAMS,
+        );
+        const lines = realDiff('app/data/allocations-dao.js', NOSQLI_VULNERABLE, NOSQLI_SAFE).split(
+          '\n',
+        );
+        const ctx = lines.findIndex(
+          (l, n) => n > lines.findIndex((h) => h.startsWith('@@')) && l.startsWith(' '),
+        );
+        // Same line counts, so the Judge and git --numstat agree; only the context is wrong.
+        lines[ctx] = `${lines[ctx]} // context that is not in the file`;
+        const diff = lines.join('\n');
+        const r = await verifierFor(booted.safeNosqli!).verifyPatch(
+          cf,
+          patchExhibit(diff, {}, { raw: true }),
+          w,
+          [],
+        );
+        expect(r.rejectedBy).toBe('schema');
+      });
     });
   },
 );

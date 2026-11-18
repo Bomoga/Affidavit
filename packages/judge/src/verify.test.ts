@@ -63,6 +63,16 @@ const addLines = (lines: string[], path = 'app/data/allocations-dao.js'): string
     '',
   ].join('\n');
 
+/** A diff that creates `path` with `lines`. */
+const newFile = (path: string, lines: string[]) =>
+  [
+    `--- /dev/null`,
+    `+++ b/${path}`,
+    `@@ -0,0 +1,${lines.length} @@`,
+    ...lines.map((l) => `+${l}`),
+    '',
+  ].join('\n');
+
 /** The id the Judge mints for a counterexample run over the witness's family. */
 const cid = (c: Exhibit = counterexample()) => counterexampleExhibitId(c, PARAMS);
 const PATCH_ID = patchExhibitId(patchExhibit());
@@ -235,6 +245,46 @@ describe('Judge.verifyPatch', () => {
     });
   });
 
+  it('reports an unavailable suite without holding it against the patch', async () => {
+    const reason = 'the suite cannot be built: node_modules/x resolves outside the npm registry';
+    const { workbench } = setup(fixedByPatch, { suiteUnavailable: reason });
+    const judge = new Judge(new ScriptedExecutor(fixedByPatch), DEFAULT_POLICY, {
+      workbench,
+      rescan: new RecordingRescan(),
+    });
+    const report = await judge.verifyPatchReport(gateCaseFile(), patchExhibit(), witness(), []);
+    expect(report.suite).toEqual({ state: 'unavailable', reason });
+    // Never reported as passed, and no rejection for it.
+    expect(report.result).toMatchObject({ familyFlipped: true, suitePassed: false });
+    expect(report.result.rejectedBy).toBeUndefined();
+    expect(await judge.verifyPatch(gateCaseFile(), patchExhibit(), witness(), [])).toEqual(
+      report.result,
+    );
+  });
+
+  it('still rejects failing patch tests when the suite is unavailable', async () => {
+    const test = newFile('test/sqli.test.js', [`it('blocks', () => get("0' || '1'=='1"));`]);
+    const { verify } = setup(fixedByPatch, {
+      suiteUnavailable: 'no suite',
+      addedTestsPassed: false,
+    });
+    expect((await verify(patchExhibit(GATE_PATCH_DIFF + test))).rejectedBy).toBe('suite-fails');
+  });
+
+  it('says the suite did not run when the patch is refused before building', async () => {
+    const { workbench } = setup();
+    const judge = new Judge(new ScriptedExecutor(fixedByPatch), DEFAULT_POLICY, {
+      workbench,
+      rescan: new RecordingRescan(),
+    });
+    const big = patchExhibit(addLines(Array.from({ length: 150 }, (_, i) => `// ${i}`)));
+    const report = await judge.verifyPatchReport(gateCaseFile(), big, witness(), []);
+    expect(report).toMatchObject({
+      suite: { state: 'not-run' },
+      result: { rejectedBy: 'diff-too-large' },
+    });
+  });
+
   it('rejects with counterexample-survives only for an admissible counterexample', async () => {
     // `still works` beats the patch; `passes everywhere` also passes on the safe variant, so it
     // proves nothing and must not count against the patch.
@@ -370,14 +420,6 @@ describe('Judge.verifyPatch', () => {
   });
 
   describe('test files in the patch', () => {
-    const newFile = (path: string, lines: string[]) =>
-      [
-        `--- /dev/null`,
-        `+++ b/${path}`,
-        `@@ -0,0 +1,${lines.length} @@`,
-        ...lines.map((l) => `+${l}`),
-        '',
-      ].join('\n');
     /** The gate patch plus one more line in allocations-dao.js. */
     const gateWith = (line: string) =>
       GATE_PATCH_DIFF.replace('@@ -70,5 +70,6 @@', '@@ -70,5 +70,7 @@').replace(

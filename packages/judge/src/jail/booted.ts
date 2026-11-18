@@ -4,6 +4,7 @@ import {
   buildTarget,
   createCaseNetwork,
   removeCaseNetwork,
+  type BootRecipe,
   type CaseNetwork,
 } from '@affidavit/sandbox';
 import type { ExecutionRequest } from '../executor.js';
@@ -16,6 +17,8 @@ export interface BootedTarget {
   imageId: string;
   /** Pinned sidecar images by service name, for the evidence bundle. */
   sidecarImages: Readonly<Record<string, string>>;
+  /** The recipe the target was built and booted with (working directory, command). */
+  recipe: BootRecipe;
 }
 
 export class TargetBootError extends Error {
@@ -52,6 +55,7 @@ export async function bootVariant(
       endpoint: { net, hosts: boot.hosts, url: boot.url },
       imageId: build.imageId,
       sidecarImages: boot.sidecarImages,
+      recipe: build.recipe,
     };
   } catch (err) {
     await removeCaseNetwork(net);
@@ -59,20 +63,34 @@ export async function bootVariant(
   }
 }
 
+type Variant = ExecutionRequest['variant'];
+
 /**
  * `TargetProvider` over targets that are already running, one per variant. Asking for a variant
- * that was not booted is an infrastructure failure, so it throws instead of running the witness
- * with no target (which would make a real witness fail and look like evidence).
+ * that has no target is an infrastructure failure, so it throws instead of running the witness
+ * with no target (which would make a real witness fail and look like evidence). The patch
+ * workbench registers the `patched` target while a patch is being verified and removes it after.
  */
 export class BootedTargets implements TargetProvider {
-  constructor(
-    private readonly byVariant: Readonly<
-      Partial<Record<ExecutionRequest['variant'], BootedTarget>>
-    >,
-  ) {}
+  readonly #byVariant = new Map<Variant, BootedTarget>();
+
+  constructor(initial: Readonly<Partial<Record<Variant, BootedTarget>>> = {}) {
+    for (const [v, t] of Object.entries(initial) as [Variant, BootedTarget | undefined][]) {
+      if (t !== undefined) this.#byVariant.set(v, t);
+    }
+  }
+
+  set(variant: Variant, target: BootedTarget): void {
+    if (this.#byVariant.has(variant)) throw new Error(`a ${variant} target is already registered`);
+    this.#byVariant.set(variant, target);
+  }
+
+  delete(variant: Variant): void {
+    this.#byVariant.delete(variant);
+  }
 
   endpoint(req: ExecutionRequest): Promise<TargetEndpoint> {
-    const t = this.byVariant[req.variant];
+    const t = this.#byVariant.get(req.variant);
     if (t === undefined) {
       return Promise.reject(new Error(`no booted target for the ${req.variant} variant`));
     }

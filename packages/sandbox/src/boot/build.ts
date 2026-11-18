@@ -117,6 +117,12 @@ export interface BuildOptions {
   /** Host directory for build workspaces. Each build gets its own directory, removed after. */
   workRoot: string;
   limits?: Readonly<Limits>;
+  /**
+   * Install devDependencies even when the app has no `build` script. Only for an image that runs
+   * the target's own test suite (the patch workbench); a target that witnesses attack is built
+   * as the app ships, without them.
+   */
+  devDependencies?: boolean;
 }
 
 const tail = (r: JailedRun): string => `${r.stderr}\n${r.stdout}`.trim().slice(-1500);
@@ -160,7 +166,13 @@ export async function buildTarget(
     ]);
   let outcome: BuildOutcome | undefined;
   try {
-    outcome = await buildIn(srcDir, parsedHints.data, dir, opts.limits ?? BUILD_LIMITS);
+    outcome = await buildIn(
+      srcDir,
+      parsedHints.data,
+      dir,
+      opts.limits ?? BUILD_LIMITS,
+      opts.devDependencies === true,
+    );
     if (!outcome.ok) outcome = { ...outcome, reason: scrub(outcome.reason) };
     return outcome;
   } finally {
@@ -179,6 +191,7 @@ async function buildIn(
   hints: BootHints,
   dir: string,
   limits: Readonly<Limits>,
+  devDependencies: boolean,
 ): Promise<BuildOutcome> {
   const tree = join(dir, 'tree');
   {
@@ -188,7 +201,7 @@ async function buildIn(
     } catch (err) {
       return { ok: false, unsupported: true, step: 'stage', reason: (err as Error).message };
     }
-    const r = await deriveRecipe(tree, hints);
+    const r = await deriveRecipe(tree, hints, { devDependencies });
     if (!r.ok) return { ok: false, unsupported: true, step: 'recipe', reason: r.reason };
     const recipe = r.recipe;
 
@@ -242,9 +255,10 @@ async function buildIn(
       },
     };
 
-    const install = recipe.buildScript
-      ? ['npm', 'ci', '--ignore-scripts']
-      : ['npm', 'ci', '--ignore-scripts', '--omit=dev'];
+    const install =
+      recipe.buildScript || devDependencies
+        ? ['npm', 'ci', '--ignore-scripts']
+        : ['npm', 'ci', '--ignore-scripts', '--omit=dev'];
     // Pulling, resolving, the fetch setup and its teardown check can all throw; each is a
     // `failed` fetch step, never an exception out of buildTarget.
     let fetched: JailedRun;
@@ -425,13 +439,14 @@ export async function checkBuiltTree(
 }
 
 /**
- * Build steps write as nobody, so the host user cannot delete what they wrote. A jailed janitor,
+ * Removes a directory whose `tree` subdirectory was written by jailed steps (a build, or the patch
+ * workbench's apply step). Build steps write as nobody, so the host user cannot delete what they wrote. A jailed janitor,
  * as the same nobody, first makes everything it owns readable and writable (a build script can
  * leave `chmod 000` directories that even nobody could not descend into), then empties the tree;
  * the host removes what is left. Never throws: returns null when the directory is gone, else what
  * was left and why, for the caller to report.
  */
-async function removeBuildDir(dir: string): Promise<string | null> {
+export async function removeBuildDir(dir: string): Promise<string | null> {
   const tree = join(dir, 'tree');
   const problems: string[] = [];
   let hasTree = true;

@@ -107,6 +107,10 @@ export function numstatMismatch(numstat: string, diff: ParsedDiff): string | nul
  * - `runSuite` runs the vulnerable commit's own suite: its test files, its `package.json` test
  *   script and its runner config (all unchanged in the code build, which has no patch test
  *   files), with the command from the case's boot recipe, never from the patched manifest.
+ *   When the vulnerable commit's own suite cannot be built in the sandbox (decided from the
+ *   vulnerable commit, so a patch cannot make its suite unavailable), it returns
+ *   `{ unavailable: reason }` instead; the Judge reports that and does not hold it against the
+ *   patch.
  * - `runAddedTests` runs the patch's own test files (`PatchPlan.tests`) on top of that build, in a
  *   separate run. A failure counts against the patch; a pass is never required. It returns null
  *   when the plan has no test files or the workbench does not run them.
@@ -115,7 +119,10 @@ export function numstatMismatch(numstat: string, diff: ParsedDiff): string | nul
  */
 export interface PatchWorkbench {
   prepare(caseFile: CaseFile, patch: PatchExhibit, plan: PatchPlan): Promise<PrepareOutcome>;
-  runSuite(caseFile: CaseFile, prepared: PreparedPatch): Promise<{ passed: boolean }>;
+  runSuite(
+    caseFile: CaseFile,
+    prepared: PreparedPatch,
+  ): Promise<{ passed: boolean } | { unavailable: string }>;
   runAddedTests(caseFile: CaseFile, prepared: PreparedPatch): Promise<{ passed: boolean } | null>;
   /** Stops the patched target and deletes its workspace. Called exactly once per prepared patch. */
   release(prepared: PreparedPatch): Promise<void>;

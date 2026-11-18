@@ -182,6 +182,8 @@ export class ScriptedWorkbench implements PatchWorkbench {
     private readonly script: {
       prepare?: PrepareOutcome;
       suitePassed?: boolean;
+      /** When set, `runSuite` reports the suite unavailable with this reason. */
+      suiteUnavailable?: string;
       addedTestsPassed?: boolean | null;
       /**
        * What `git apply --numstat` would print for `renderDiff(plan.code)`, as the real workbench
@@ -199,8 +201,11 @@ export class ScriptedWorkbench implements PatchWorkbench {
     }
     return Promise.resolve(this.script.prepare ?? { ok: true, prepared: PATCHED });
   }
-  runSuite(): Promise<{ passed: boolean }> {
+  runSuite(): Promise<{ passed: boolean } | { unavailable: string }> {
     this.suiteRuns++;
+    if (this.script.suiteUnavailable !== undefined) {
+      return Promise.resolve({ unavailable: this.script.suiteUnavailable });
+    }
     return Promise.resolve({ passed: this.script.suitePassed ?? true });
   }
   runAddedTests(): Promise<{ passed: boolean } | null> {

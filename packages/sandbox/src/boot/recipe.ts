@@ -61,9 +61,14 @@ async function readText(dir: string, rel: string, max = 1024 * 1024): Promise<st
 
 /**
  * Reads a staged tree (see build.ts: no `.git`, `.env`, `.npmrc`, `node_modules` or symlinks) and
- * returns its recipe, or the reason it is unsupported in the MVP.
+ * returns its recipe, or the reason it is unsupported in the MVP. With `devDependencies`, the
+ * fetch will install them, so the lockfile check covers them too.
  */
-export async function deriveRecipe(treeDir: string, hints: BootHints): Promise<RecipeRead> {
+export async function deriveRecipe(
+  treeDir: string,
+  hints: BootHints,
+  opts: { devDependencies?: boolean } = {},
+): Promise<RecipeRead> {
   const fail = (reason: string): RecipeRead => ({ ok: false, reason });
 
   const pkgText = await readText(treeDir, 'package.json');
@@ -78,7 +83,8 @@ export async function deriveRecipe(treeDir: string, hints: BootHints): Promise<R
     return fail('package.json is not JSON');
   }
 
-  const lockProblem = checkLockfile(lockText, { production: typeof scripts.build !== 'string' });
+  const production = typeof scripts.build !== 'string' && opts.devDependencies !== true;
+  const lockProblem = checkLockfile(lockText, { production });
   if (lockProblem !== null) return fail(lockProblem);
 
   let dockerfilePath = hints.path;

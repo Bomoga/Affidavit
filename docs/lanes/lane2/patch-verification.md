@@ -123,20 +123,29 @@ Each line is at most 2000 characters (step 2), and every pattern in `literal.ts`
 
 ## Workbench contract
 
-`PatchWorkbench` (`src/patch/workbench.ts`) is scripted in tests until boot recipes (L2-04) land. The real workbench must:
+`PatchWorkbench` (`src/patch/workbench.ts`) is the port; `JailedPatchWorkbench` (`src/jail/workbench.ts`) is the real one. It must:
 
 - before applying `renderDiff(plan.code)` (the build) and `renderDiff(plan.full)` (the re-scan workspace), run `git apply --numstat` on each inside the jail and return `apply` (`schema`) when `numstatMismatch` reports any path or line count that differs from the Judge's reading;
 - apply with `git apply` (default `-p1`) inside the jail, never with `--unsafe-paths`, and keep git's default refusal to write through a symlink already in the tree: a path beyond a symlink in the vulnerable commit is an `apply` failure (`schema`);
 - after applying, compare every `package.json` with the vulnerable commit's (`suiteManifestChange`) and return `suite` (`suite-fails`) on any difference in `scripts`, `config` or a runner block;
 - write `workspacePath` only from that jailed apply step: the host never writes into it, and nothing later (build, suite, witness, target) gets a writable handle to it;
 - make one patched build, from `PatchPlan.code`, and run the witness, the counterexamples and the suite against it. `PatchPlan.code` may have no files, when the patch only adds tests; the build is then the vulnerable commit rebuilt as is;
-- in `runSuite`, run the vulnerable commit's own suite (its test files, test script and runner config, all unchanged in that build), with the command from the case's boot recipe, never from the patched manifest;
+- in `runSuite`, run the vulnerable commit's own suite (its test files, test script and runner config, all unchanged in that build) with a fixed `npm test` in the recipe's working directory, never a command from the patched manifest;
+- run that suite in a second build of the same patched tree with devDependencies (`buildTarget(..., { devDependencies: true })`). The target that witnesses attack is built as the app ships (`--omit=dev` unless it has a `build` script), and the suite image is never booted or attacked. With devDependencies the lockfile check covers dev-only entries too, so the fetch still reaches only the npm registry;
+- decide whether the suite can be built from the vulnerable commit, never from the patched one. When the vulnerable commit's recipe with devDependencies is refused, `runSuite` returns `{ unavailable: reason }`; when only the patched tree is refused, that is `build` (`suite-fails`), so a patch cannot make its suite unavailable;
 - in `runAddedTests`, run only `PatchPlan.tests` on top of that build, in a separate run, and return null when there are none or they are not run.
+
+## Unavailable suite
+
+When the vulnerable commit's suite cannot be built in the sandbox, the Judge does not reject the patch for it, but `suitePassed` stays false (never true for a suite that did not run). `Judge.verifyPatchReport` returns the `VerifyResult` plus `suite: { state: 'passed' | 'failed' | 'not-run' } | { state: 'unavailable', reason }`. Failing patch tests (`runAddedTests`) still reject with `suite-fails`. Contracts v1.0 have no field for this; a `suite` status on `VerifyResult` is proposed for v1.1.
+
+NodeGoat is the first case: its devDependencies take `grunt-if` from a GitHub tarball (unpinned `master`), which the fetch proxy cannot reach, and its `npm test` runs `test/unit/*.js`, which the repository does not have.
 
 ## What is real and what is scripted
 
 - Real: everything in the Judge, and the family and counterexample reruns through `JailExecutor` on gVisor. `pnpm --filter @affidavit/judge test:sandbox-host` runs `verifyPatch` against stub targets in the jail: a correct fix flips the whole family, a fix that blocks one payload does not, and only an admissible counterexample is used against the patch. The counterexample test was added on 2026-11-15 and has not been run on a sandbox host yet.
-- Scripted until later tasks: `PatchWorkbench` (applying the diff, building and booting the patched target, running its suite) needs boot recipes (L2-04). The re-scan uses `FakeRescan` until Lane 1 provides `RescanPort`.
+- Real since 2026-11-18: `JailedPatchWorkbench` applies the diff in the jail (`docker/sandbox/patch-apply`), builds and boots the patched target with the L2-04 boot recipes, and runs the suite in a devDependencies build. `test:sandbox-host` runs it on a tiny app (`workbench.integration.test.ts`: suite passes, suite fails, suite unavailable, a patch that makes the suite unbuildable) and on NodeGoat with real witnesses (`nodegoat.integration.test.ts`). `runAddedTests` is not run yet (returns null).
+- Scripted until later tasks: the re-scan uses `FakeRescan` until Lane 1 provides `RescanPort`.
 - The gate patch in tests (`GATE_PATCH_DIFF` in `src/test-helpers.ts`) is hand-written against the case file's candidate; it is not yet applied to a real NodeGoat checkout.
 
 ## Results from real runs
