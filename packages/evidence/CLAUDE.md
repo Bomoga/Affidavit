@@ -28,6 +28,6 @@ Layout and rules: `docs/lanes/lane2/evidence-bundles.md`.
 ## Libraries
 
 - `tar-stream` (bundles), `@aws-sdk/client-s3` (S3 store), `zod` (exhibit records).
-- Planned for L2-09: Sigstore cosign (CLI), in-toto statement types.
+- Sigstore cosign (CLI, verification in `attestation.ts`), hand-rolled in-toto statement (contracts). See `docs/lanes/lane2/attestation.md`.
 
 Root CLAUDE.md rules apply here. Do not add dependencies without asking.

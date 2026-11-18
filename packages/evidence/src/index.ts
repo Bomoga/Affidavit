@@ -4,3 +4,4 @@ export * from './errors.js';
 export * from './replay.js';
 export * from './store.js';
 export * from './tar.js';
+export * from './attestation.js';
