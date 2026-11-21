@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { assembleBundle, assembleBundleFile } from './assemble.js';
 import { bundleCoverageProblem } from './coverage.js';
 import { parseBundleManifest } from './format.js';
-import { pruneExcludedDev, readBundleExclusions } from './prune.js';
+import { pruneExcludedDev, pruneOsSkipped, readBundleExclusions } from './prune.js';
 import { integrityOf, lockfile, packageTgz, resolvedFor } from './testkit.js';
 
 let root = '';
@@ -317,5 +317,124 @@ describe('readBundleExclusions', () => {
     expect(
       Array.isArray(readBundleExclusions('nodegoat', 'c5cb68a7084e4ae7dcc60e6a98768720a81841e8')),
     ).toBe(true);
+  });
+});
+
+describe('pruneOsSkipped', () => {
+  const reg = (n: string, v: string): Record<string, unknown> => ({
+    version: v,
+    resolved: `https://registry.npmjs.org/${n}/-/${n}-${v}.tgz`,
+    integrity: `sha512-${Buffer.alloc(64, 1).toString('base64')}`,
+  });
+  // NodeGoat's shape: chokidar (top level and nested under forever-monitor) optionally needs
+  // fsevents, which only runs on macOS and carries a bundled child.
+  const lock = {
+    name: 'app',
+    lockfileVersion: 2,
+    packages: {
+      '': { name: 'app', dependencies: { chokidar: '^2', 'forever-monitor': '^1' } },
+      'node_modules/chokidar': {
+        ...reg('chokidar', '2.1.8'),
+        dependencies: { braces: '^2' },
+        optionalDependencies: { fsevents: '^1.2.7' },
+      },
+      'node_modules/braces': reg('braces', '2.3.2'),
+      'node_modules/fsevents': {
+        ...reg('fsevents', '1.2.9'),
+        optional: true,
+        os: ['darwin'],
+        hasInstallScript: true,
+        bundleDependencies: ['node-pre-gyp'],
+      },
+      'node_modules/fsevents/node_modules/node-pre-gyp': {
+        version: '0.12.0',
+        inBundle: true,
+        optional: true,
+      },
+      'node_modules/forever-monitor': { ...reg('forever-monitor', '1.7.1') },
+      'node_modules/forever-monitor/node_modules/chokidar': {
+        ...reg('chokidar', '2.1.8'),
+        optionalDependencies: { fsevents: '^1.2.7' },
+      },
+    },
+    dependencies: {
+      chokidar: { version: '2.1.8', requires: { braces: '^2', fsevents: '^1.2.7' } },
+      braces: { version: '2.3.2' },
+      fsevents: {
+        version: '1.2.9',
+        optional: true,
+        requires: { 'node-pre-gyp': '^0.12.0' },
+        dependencies: { 'node-pre-gyp': { version: '0.12.0', bundled: true, optional: true } },
+      },
+      'forever-monitor': {
+        version: '1.7.1',
+        requires: { chokidar: '^2' },
+        dependencies: {
+          chokidar: { version: '2.1.8', requires: { fsevents: '^1.2.7' } },
+        },
+      },
+    },
+  };
+  type V1 = { requires?: Record<string, string>; dependencies?: Record<string, V1> };
+
+  it('removes the non-Linux optional package from both trees and every v1 requires on it', () => {
+    const r = pruneOsSkipped(JSON.stringify(lock));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.removed).toEqual([
+      'node_modules/fsevents',
+      'node_modules/fsevents/node_modules/node-pre-gyp',
+    ]);
+    const out = JSON.parse(r.lockText) as {
+      packages: Record<string, unknown>;
+      dependencies: Record<string, V1>;
+    };
+    expect(Object.keys(out.packages).filter((p) => p.includes('fsevents'))).toEqual([]);
+    expect(out.dependencies.fsevents).toBeUndefined();
+    expect(out.dependencies.chokidar?.requires).toEqual({ braces: '^2' });
+    expect(out.dependencies['forever-monitor']?.dependencies?.chokidar?.requires).toEqual({});
+    // Everything that runs on Linux stays.
+    expect(Object.keys(out.packages)).toEqual([
+      '',
+      'node_modules/chokidar',
+      'node_modules/braces',
+      'node_modules/forever-monitor',
+      'node_modules/forever-monitor/node_modules/chokidar',
+    ]);
+    expect(out.dependencies['forever-monitor']?.requires).toEqual({ chokidar: '^2' });
+  });
+
+  it('keeps a requires entry that resolves to a nested copy that stays', () => {
+    const l = structuredClone(lock) as typeof lock & {
+      packages: Record<string, unknown>;
+      dependencies: Record<string, V1>;
+    };
+    l.packages['node_modules/forever-monitor/node_modules/fsevents'] = reg('fsevents', '2.0.0');
+    (l.dependencies['forever-monitor'] as V1).dependencies!.fsevents = { requires: {} };
+    const r = pruneOsSkipped(JSON.stringify(l));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const out = JSON.parse(r.lockText) as { dependencies: Record<string, V1> };
+    expect(out.dependencies['forever-monitor']?.dependencies?.chokidar?.requires).toEqual({
+      fsevents: '^1.2.7',
+    });
+    expect(out.dependencies.chokidar?.requires).toEqual({ braces: '^2' });
+  });
+
+  it('returns the lockfile unchanged when nothing is skipped', () => {
+    const text = lockfile({ 'node_modules/lib': reg('lib', '1.0.0') });
+    const r = pruneOsSkipped(text);
+    expect(r).toEqual({ ok: true, lockText: text, removed: [] });
+  });
+
+  it('keeps an optional package whose os allows Linux', () => {
+    const l = structuredClone(lock);
+    (l.packages['node_modules/fsevents'] as Record<string, unknown>).os = ['darwin', 'linux'];
+    const r = pruneOsSkipped(JSON.stringify(l));
+    expect(r.ok && r.removed).toEqual([]);
+  });
+
+  it('fails closed on a lockfile it cannot read', () => {
+    expect(pruneOsSkipped('{')).toMatchObject({ ok: false });
   });
 });
