@@ -283,6 +283,40 @@ describe('API key handling', () => {
     expect(outputs.filter((o) => o.startsWith('ModelCallError'))).toHaveLength(8);
   });
 
+  it('a key straddling the 500-character clip in any error path leaves no fragment', async () => {
+    const fragments = (text: string): boolean => {
+      for (let i = 0; i + 6 <= CANARY_KEY.length; i++) {
+        if (text.includes(CANARY_KEY.slice(i, i + 6))) return true;
+      }
+      return false;
+    };
+    for (let offset = 500 - CANARY_KEY.length - 30; offset <= 510; offset += 3) {
+      const text = `${'e'.repeat(offset)}${CANARY_KEY}${'f'.repeat(100)}`;
+      const scripts: Script[] = [
+        async function* () {
+          await Promise.resolve();
+          yield result('error_during_execution', { errors: [text] });
+        },
+        async function* () {
+          await Promise.resolve();
+          yield result('success', { isError: true, text });
+        },
+        // eslint-disable-next-line require-yield
+        async function* () {
+          await Promise.resolve();
+          throw new Error(`Error: ${text}`);
+        },
+      ];
+      for (const script of scripts) {
+        const { port, logs } = makePort(script);
+        const err = (await port.runTurn(requestFor('defense')).catch((e: unknown) => e)) as Error;
+        expect(err).toBeInstanceOf(ModelCallError);
+        const all = `${err.message}\n${err.stack ?? ''}\n${logs.map((l) => l.message).join('\n')}`;
+        expect(fragments(all), `offset ${offset}`).toBe(false);
+      }
+    }
+  });
+
   it('a missing key is a typed model-unconfigured error and the transport is never called', async () => {
     const { port, stub } = makePort(submits(GOOD_WITNESS), { key: undefined });
     const err = await port.runTurn(requestFor('defense')).catch((e: unknown) => e);

@@ -1,14 +1,41 @@
 /**
  * Secret scrubbing for anything the model port logs, throws, records, or returns.
  *
- * The configured key is removed by value. Anything shaped like an Anthropic key is removed by
- * pattern too, so a key that reached the text some other way (an echoed header, an error body)
- * does not survive either.
+ * The configured key is removed by value. Anything shaped like an Anthropic key, and the value of
+ * any header, assignment, bearer token, or URL parameter that carries a credential, is removed by
+ * pattern too, so a key that reached the text some other way (an echoed header, an error body, a
+ * request URL) does not survive either.
+ *
+ * Text is always redacted whole before it is shortened. Clipping first could cut a key so that
+ * the part left behind no longer matches anything and leaks as a fragment.
  */
 
 export const REDACTED = '[redacted]';
 
-const KEY_SHAPE = /sk-ant-[A-Za-z0-9_-]{8,}/g;
+/** Characters a credential value runs to, in headers, JSON, and assignments. */
+const VALUE = String.raw`[^\s"',;&}\]]+`;
+
+const PATTERNS: readonly [RegExp, string][] = [
+  // Anthropic-shaped keys anywhere.
+  [/sk-ant-[A-Za-z0-9_-]{4,}/g, REDACTED],
+  // Authorization headers and assignments, with or without a scheme.
+  [
+    new RegExp(String.raw`(authorization["']?\s*[:=]\s*["']?(?:bearer|basic)?\s*)${VALUE}`, 'gi'),
+    `$1${REDACTED}`,
+  ],
+  // Key and token headers or assignments: x-api-key, ANTHROPIC_API_KEY, api_key, access_token.
+  [
+    new RegExp(
+      String.raw`((?:x-api-key|api[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token)["']?\s*[:=]\s*["']?)${VALUE}`,
+      'gi',
+    ),
+    `$1${REDACTED}`,
+  ],
+  // A bare bearer token.
+  [/(\bbearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, `$1${REDACTED}`],
+  // Credential-looking URL query parameters.
+  [/([?&](?:key|token|auth|sig|signature)=)[^&\s"'#]+/gi, `$1${REDACTED}`],
+];
 
 export function redact(text: string, secrets: readonly (string | undefined)[] = []): string {
   let out = text;
@@ -17,7 +44,18 @@ export function redact(text: string, secrets: readonly (string | undefined)[] = 
     .filter((s): s is string => s !== undefined && s.length > 0)
     .sort((a, b) => b.length - a.length);
   for (const s of ordered) out = out.split(s).join(REDACTED);
-  return out.replace(KEY_SHAPE, REDACTED);
+  for (const [pattern, replacement] of PATTERNS) out = out.replace(pattern, replacement);
+  return out;
+}
+
+/** Redacts the whole text, then shortens it to `max` characters. Never the other way round. */
+export function clipRedacted(
+  text: string,
+  secrets: readonly (string | undefined)[],
+  max = 500,
+): string {
+  const clean = redact(text, secrets);
+  return clean.length > max ? `${clean.slice(0, max)}...` : clean;
 }
 
 /** Deep copy of a JSON-like value with every string redacted. Keys are redacted too. */
@@ -37,6 +75,5 @@ export function redactDeep(value: unknown, secrets: readonly (string | undefined
 /** A short, redacted description of something thrown, for an error message. */
 export function describeThrown(err: unknown, secrets: readonly (string | undefined)[]): string {
   const raw = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
-  const clipped = raw.length > 500 ? `${raw.slice(0, 500)}...` : raw;
-  return redact(clipped, secrets);
+  return clipRedacted(raw, secrets);
 }

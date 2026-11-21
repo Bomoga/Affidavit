@@ -51,7 +51,7 @@ One turn is one Agent SDK session that can only call its role's submit tool.
 
 ## Key handling
 
-The key is read from `ANTHROPIC_API_KEY` on every call and goes only into the agent process environment. Every error, log line, returned submission, and recording is scrubbed of the key by value and of anything shaped like an Anthropic key. A missing key throws `ModelUnconfiguredError` (code `model-unconfigured`) from the port's `preflight`, which the orchestrator calls before it charges the turn's budget, so the case halts with `{ status: 'halted', reason: 'model-unconfigured' }`, nothing charged, nothing escalated. A key the provider rejects also halts the case, but after the charge, since the call was made.
+The key is read from `ANTHROPIC_API_KEY` on every call and goes only into the agent process environment. Every error, log line, returned submission, and recording is scrubbed of the key by value, of anything shaped like an Anthropic key, and of the values of credential headers, assignments and URL parameters (`x-api-key`, `Authorization: Bearer`, `ANTHROPIC_API_KEY=`, `?key=`). Text is always redacted whole before it is shortened, so a key cut by a length limit cannot leave a fragment behind. A missing key throws `ModelUnconfiguredError` (code `model-unconfigured`) from the port's `preflight`, which the orchestrator calls before it charges the turn's budget, so the case halts with `{ status: 'halted', reason: 'model-unconfigured' }`, nothing charged, nothing escalated. A key the provider rejects also halts the case, but after the charge, since the call was made.
 
 ## Budgets and caps
 

@@ -10,7 +10,7 @@ import { ModelCallError, ModelConfigError, ModelUnconfiguredError } from './erro
 import { isKnownModelId, type ModelTable } from './models.js';
 import type { PreflightModelPort } from './preflight.js';
 import { FileRecordingStore, type RecordingStore } from './recordings.js';
-import { describeThrown, redact, redactDeep } from './redact.js';
+import { clipRedacted, describeThrown, redact, redactDeep } from './redact.js';
 import {
   DENIED_BUILTIN_TOOLS,
   SUBMIT_SERVER_NAME,
@@ -367,9 +367,9 @@ export class AnthropicModelPort implements PreflightModelPort {
         throw new ModelCallError('agent stream ended without a result');
       }
       if (result.subtype === 'error_during_execution' || result.is_error) {
-        const detail =
-          result.subtype === 'success' ? result.result : result.errors.join('; ').slice(0, 500);
-        throw new ModelCallError(`agent turn failed: ${redact(detail, secrets)}`);
+        const detail = result.subtype === 'success' ? result.result : result.errors.join('; ');
+        // Redacted whole, then clipped: never the other way round.
+        throw new ModelCallError(`agent turn failed: ${clipRedacted(detail, secrets)}`);
       }
     }
 
