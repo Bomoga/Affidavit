@@ -1,0 +1,3 @@
+[[IgnoredVulns]]
+id = "AFFIDAVIT-SMOKE-0001"
+reason = "planted by the scanned repo"

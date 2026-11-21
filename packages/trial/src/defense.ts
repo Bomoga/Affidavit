@@ -160,6 +160,12 @@ async function attempt(
     );
     // Pass or fail comes only from the Judge. Anything the agent claims about it is ignored.
     const result = await judge.runWitness(caseFile, witness, variantsFor(caseFile));
+    const expectedId = witnessExhibitId(caseFile.id, witness.template, witness.params);
+    if (result.exhibitId !== expectedId) {
+      throw new Error(
+        `Judge exhibit id ${result.exhibitId} does not match the witness id ${expectedId}`,
+      );
+    }
     await ctx.record('exhibit-result', { result }, 'judge');
     if (!result.admissible && result.rejectedBy) {
       await ctx.record(

@@ -72,12 +72,19 @@ importers:
       '@affidavit/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@affidavit/db':
+        specifier: workspace:*
+        version: link:../../packages/db
       '@affidavit/evidence':
         specifier: workspace:*
         version: link:../../packages/evidence
       commander:
         specifier: 15.0.0
         version: 15.0.0
+    devDependencies:
+      '@affidavit/worker':
+        specifier: workspace:*
+        version: link:../worker
 
   apps/github-app:
     dependencies:
@@ -287,9 +294,6 @@ importers:
       dockerode:
         specifier: 5.0.1
         version: 5.0.1(supports-color@7.2.0)
-      js-yaml:
-        specifier: 4.3.2
-        version: 4.3.2
     devDependencies:
       '@affidavit/testing':
         specifier: workspace:*

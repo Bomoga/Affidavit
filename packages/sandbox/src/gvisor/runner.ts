@@ -14,7 +14,6 @@ import {
   RUN_LABEL,
   buildGvisorRunArgs,
   type Limits,
-  type FetchNetwork,
   type TmpfsMount,
 } from './args.js';
 import { validateMounts, type Mount } from './mounts.js';
@@ -71,7 +70,6 @@ export interface JailedRunInput {
   /** Largest file the jail may write; see `GvisorRunSpec.maxFileBytes`. */
   maxFileBytes?: number;
   /** See `GvisorRunSpec`: build steps and boot diagnostics use these, witnesses do not. */
-  fetch?: FetchNetwork;
   env?: Readonly<Record<string, string>>;
   workdir?: string;
   tmpfs?: readonly TmpfsMount[];
@@ -246,7 +244,6 @@ export async function runJailed(
         ? undefined
         : { name: input.network.net.name, hosts: input.network.hosts },
     maxFileBytes: input.maxFileBytes,
-    fetch: input.fetch,
     env: input.env,
     workdir: input.workdir,
     tmpfs: input.tmpfs,

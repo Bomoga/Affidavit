@@ -30,6 +30,7 @@ import {
   inOrder,
   makeCaseFile,
   openAt,
+  withRecipeIds,
 } from './test-support.js';
 import {
   buildVerdict,
@@ -41,7 +42,7 @@ import {
   type StructuredVerdict,
 } from './verdict.js';
 import { createVerifyHandler } from './verify.js';
-import { buildWitness, witnessSha256 } from './witness.js';
+import { buildWitness, witnessExhibitId, witnessSha256 } from './witness.js';
 import { InMemoryWorkspace } from './workspace.js';
 
 const EM_DASH = '—';
@@ -153,7 +154,10 @@ describe('verdict writer', () => {
 });
 
 const ADMITTED = ExhibitResult.parse(readFixtureJson('exhibit-results/admissible.json'));
-const PASS = VerifyResult.parse(readFixtureJson('exhibit-results/verify-pass.json'));
+const PASS = VerifyResult.parse({
+  ...(readFixtureJson('exhibit-results/verify-pass.json') as object),
+  counterexamples: [],
+});
 const W = { template: 'witness template', params: [{ name: 'n', values: [1, 2] }] };
 const FILE = 'app/data/allocations-dao.js';
 const DIFF = `--- a/${FILE}\n+++ b/${FILE}\n@@ -1,1 +1,1 @@\n-q(id)\n+q("?", [id])\n`;
@@ -253,7 +257,7 @@ describe('a full trial on fakes records what actually ran', () => {
       handlers: {
         defense: createDefenseHandler({
           caseFiles,
-          judge,
+          judge: withRecipeIds(judge),
           render: renderPrompt,
           workspace,
           config: {
@@ -306,7 +310,7 @@ describe('a full trial on fakes records what actually ran', () => {
       ['defense', 0.05],
       ['remedy', 0.03],
     ]);
-    expect(v?.exhibits[0]).toBe(ADMITTED.exhibitId);
+    expect(v?.exhibits[0]).toBe(witnessExhibitId(CF.id, W.template, W.params));
     expect(v?.exhibits).toHaveLength(2);
     expect(v && checkSummary(v)).toEqual([]);
   });

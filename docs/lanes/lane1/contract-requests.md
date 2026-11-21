@@ -18,3 +18,69 @@ Requests for changes to `packages/contracts`. Lane 1 does not edit contracts; th
 ## CR-2: fixture `nodegoat-sqli-001` mislabels the gate issue (informational)
 
 The gate issue in NodeGoat at the pinned commit is MongoDB `$where` (NoSQL) injection at `app/data/allocations-dao.js` lines 77-79, not SQL, and the fixture's range 70-74 and rule id `sql-concat` do not match the pinned source. The corpus label records the truth. `fixtures/casefiles/` is not edited by Lane 1 in this task; the Lead or L1-04 should decide whether to rename the rule and regenerate the fixture.
+
+## CR-3: the F3 floor rule covers one transition only; verify to verdict is ambiguous (raised by L1-09)
+
+**Problem 1, F3 coverage.** `STAGE_TRANSITIONS` allows `dismissed` from `arraign`, `defense` and `prosecution`. The contracts comment and `FakeCaseStore` enforce the escalation floor (F3) only for `defense` to `dismissed`. `PgCaseStore` mirrors the fake, so a case with candidate score 0.9 and floor 0.7 can go `intake`, `map`, `arraign`, `dismissed` (or `prosecution` to `dismissed`) without ever reaching Defense. A reviewer reproduced this through `PgCaseStore`. That is a silent dismissal of a high-arraignment-score candidate, which the root rules forbid.
+
+**Request.** State the intended rule in `common.ts` and the `CaseStore` docs. Either F3 applies to every transition into `dismissed` (so `arraign` and `prosecution` to `dismissed` are also rejected at or above the floor), or `arraign` to `dismissed` is reserved for Lane 1's own recorded dismissals (`Dismissal` reasons such as `unreachable`) and the table says so. Update `FakeCaseStore` and `PgCaseStore` together; the shared table in `packages/db/src/transition-cases.ts` already has the cases to flip.
+
+**Interim.** Both stores keep the current behaviour (parity with the fake). The SQL guard in the database mirrors it too.
+
+**Problem 2, `verify` to `verdict`.** The contracts changelog says verify goes to verdict "when the jury is disabled or appeals are exhausted". The fake allows it when the jury is disabled, or when the jury is enabled and appeals are exhausted (`appeals >= MAX_APPEALS`). Whether a case with appeals exhausted must still pass through the jury, or may go straight to a `not-proven` verdict, is not stated precisely. The stores follow the fake.
+
+**Request.** Say which of the two paths is intended, and whether the jury-enabled setting belongs on the case (so a database can enforce it) or stays store configuration.
+
+## CR-4: carry ingestion coverage with the case (raised by L1-01)
+
+**Problem.** `ingestRepo` returns three facts that the contracts have no place for: whether the gitleaks run was `partial` (files it may have skipped or cut), the files kept out of the workspace and why (`.env` files, archives or binaries holding a secret, files too large to rewrite), and the `unsupported` outcome for a repo that is not Express, Koa, Fastify or Next API routes. `CaseFile.redactions` carries redaction locations only, which is all it should carry.
+
+**Risk.** A partial secret scan is a signal that the redaction map may be incomplete. If it lives only in the worker's memory, a later stage or a reviewer cannot see that a case was ingested with gaps. Likewise `unsupported` has no `CaseStage` or `Dismissal` reason, so the worker (L1-10) has nowhere to record it except an ad hoc event.
+
+**Request.** Either add an optional `ingest: { partial: boolean, excludedFiles: { path, reason }[] }` object to `CaseFile` (or `BundleManifest`), or state that these are worker-internal events. Add a way to record an unsupported repo: a `Dismissal` reason such as `unsupported-repo`, or an explicit stage outcome.
+
+**Interim.** `@affidavit/discovery` exports typed `IngestOk.scan`, `IngestOk.excluded`, `IngestUnsupported` and `IngestIncomplete`; L1-10 decides how to persist them. `IngestIncomplete` (status `incomplete`, reason `partial-secret-scan`, with the coverage notifications) is what ingestion returns when the secret scan did not cover everything: it fails closed, keeps no workspace and never returns `ok`. The contracts have no stage outcome or `Dismissal` reason for it either, so the same request covers it: it needs a home (for example an escalation to human review, since a repo with an uncovered file cannot be ingested safely). The redaction map with values (`SecretRedactor`) is memory only and is never persisted; the workspace on disk is already redacted, so later stages that slice it never see a secret.
+
+## CR-5: dependency findings have no class or location in `Candidate` (raised by L1-03)
+
+**Problem.** `Candidate.cls` is `injection | idor`, and `range` is a line range. An OSV-Scanner finding is a vulnerable package in a lockfile: it has no line, and most advisories are neither injection nor IDOR. The normalizer therefore (a) places an OSV candidate at line 1 of its lockfile, and (b) emits it only when the advisory's `database_specific.cwe_ids` maps to a MVP class. Every other advisory is returned in `skipped` with reason `unmapped-class`, so L1-06 can record it but cannot give it an `osv-no-path` dismissal (a `Dismissal` needs a `candidateId`).
+
+**Request.** Either add a class such as `dependency` to `VulnClass` (and optional `package`/`version` fields to `Candidate`, or a `Candidate.location` union with a lockfile variant), or state that unmapped OSV findings are never candidates and need a different record.
+
+**Interim.** The normalizer follows the first reading's constraints: no new fields, the `skipped` list carries tool, rule id, file and CWE numbers.
+
+## CR-6: how a Semgrep rule declares its class (raised by L1-03)
+
+Semgrep SARIF carries only a rule's `metadata.cwe` (as tags) in `properties.tags`; other metadata keys such as a custom `affidavit-class` are not emitted (checked on the pinned 1.184.0 image). The normalizer therefore derives `cls` from CWE numbers (injection: 74, 77, 78, 89, 90, 91, 94, 95, 564, 643, 917, 943; idor: 284, 285, 566, 639, 862, 863). Rules written for L1-04 must set `metadata.cwe` to one of these, or their findings are `skipped`. No contract change needed; recorded here so Lane 3 and L1-04 know the convention.
+
+**Open questions for the lead (L1-03 review), not decided here.**
+
+- Whether a `MalformedReportError` escalates the case or fails it.
+- Whether OSV injection or IDOR advisories become trial candidates before CR-5 is answered.
+- Where the merged rule ids live: the normalizer returns them in a Lane 1 side record (`NormalizeResult.merged`, with the OSV package per member) because `Candidate` has one rule id and one range.
+- The CWE set: injection is 74, 77, 78, 89, 90, 91, 94, 95, 564, 643, 917, 943 and idor is 284, 285, 566, 639, 862, 863. Whether 284 and 285 belong in idor, and whether 1336 belongs in injection.
+- An unsafe path on one finding is now a `skipped` entry (reason `unsafe-path`), not a report failure; say if that should escalate.
+- Whether different CWEs in one class on the same range should stay separate candidates (today they merge into one).
+- Whether one bad result (for example a bad line number) should reject a whole report, as now, or be skipped and recorded.
+
+## CR-7: Lane 3 needs a single-stage entry point for the worker (raised by L1-10)
+
+**Problem.** The queue runs one job per case stage, so a killed worker resumes at stage granularity. `Orchestrator.run(caseId)` in `@affidavit/trial` loops from the current stage to a terminal stage, builds its stage context privately, and emits `stage-entered` for the next stage before it checks the kill switch. The worker cannot drive one stage at a time through it without duplicating `stage-entered` events (a halted run emits one, and the next run emits it again). The trial handlers (`createDefenseHandler` and the others) take a context only the orchestrator can build, and there is no jury handler yet.
+
+**Request.** An entry such as `Orchestrator.runStage(caseId)` that runs exactly the case's current stage, applies the resulting transition, emits `stage-exited` and the next `stage-entered` once, and returns. It must be safe to call again for the same stage after a crash (no second `stage-entered`, no second terminal verdict). This is a Lane 3 API rather than a contract change, but the shape belongs with the Lead.
+
+**Interim.** `apps/worker` wires scripted fake trial stages (`apps/worker/src/fakes/stages.ts`). `AFFIDAVIT_TRIAL_IMPL=real` fails at startup with a not-wired error.
+
+## CR-8: how a case that needs a person is escalated (raised by L1-10)
+
+**Problem.** When recovery cannot retry a stage (attempts used up, or the case budget is exhausted) the case must not be dropped and must not be dismissed. `STAGE_TRANSITIONS` allows `escalated` only from `defense` onward, an `Escalation.reason` has no value for "attempts exhausted", and a terminal `escalated` case needs a Verdict that only Lane 3 can build.
+
+**Interim.** `@affidavit/db` writes an insert-only `review_flags` row (tenant, case, stage, attempt, reason `attempts-exhausted` or `budget-exhausted`, detail). The case stays at its stage and is excluded from the recovery sweep until a person acts. Nothing reads the flags yet (API, CLI and the courtroom do not show them).
+
+**Request.** Decide the shape: an `Escalation.reason` member for attempts exhausted, whether `escalated` should be reachable from `intake`, `map` and `arraign` (with a Lane 1 written Verdict), and how a person clears a flag. Then `review_flags` can be replaced by the real escalation.
+
+## CR-9: no push or subscribe API for case events, so the CLI polls (raised by L1-11)
+
+**Problem.** `affidavit scan` has to stream a case's events to the terminal. The only read path is `PgEventSink.events(caseId, afterSeq)` (a Lane 1 method beyond the `EventSink` port, which has `emit` only). There is no subscribe, `LISTEN/NOTIFY` or push API, so the CLI polls it every 500 ms by default (`--poll-ms`) until a terminal event (`verdict-written`, `escalated`, `budget-exhausted`) or a timeout (`--timeout`, default 120 s).
+
+**Request.** None blocking. When L1-12 adds the SSE endpoint, decide whether the CLI should read that stream instead, and whether the `events` read belongs on a port in `packages/contracts` (for example an `EventLog` port with `events(caseId, afterSeq)` and an optional subscribe). Until then the CLI depends on `@affidavit/db` directly, an approved Lane 1 dependency (L1-11 brief).

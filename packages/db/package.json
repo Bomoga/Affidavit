@@ -12,7 +12,9 @@
     "lint": "eslint src",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:pg": "vitest run --config vitest.pg.config.ts",
+    "db:generate": "drizzle-kit generate"
   },
   "dependencies": {
     "@affidavit/contracts": "workspace:*",

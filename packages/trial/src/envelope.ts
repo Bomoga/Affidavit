@@ -1,4 +1,5 @@
-import { Ballot, CounterexampleExhibit, PatchExhibit, Witness } from '@affidavit/contracts';
+import { Ballot, PatchExhibit, Witness } from '@affidavit/contracts';
+import { checkCounterexampleSubmission, type CounterexampleSubmission } from './counterexample.js';
 import type { ModelRole } from './roles.js';
 
 /**
@@ -10,8 +11,11 @@ import type { ModelRole } from './roles.js';
 export const WitnessSubmission = Witness.pick({ template: true, params: true });
 export type WitnessSubmission = ReturnType<typeof WitnessSubmission.parse>;
 
-export const CounterexampleSubmission = CounterexampleExhibit.pick({ code: true });
-export type CounterexampleSubmission = ReturnType<typeof CounterexampleSubmission.parse>;
+/**
+ * Prosecution submits parameter choices drawn from the Defense witness family (see
+ * counterexample.ts), never code. Code, id, hash, author and kind are built in code.
+ */
+export type { CounterexampleSubmission };
 
 /** Remedy submits only the diff. Files touched and lines changed are computed from it in code. */
 export const PatchSubmission = PatchExhibit.pick({ diff: true });
@@ -80,7 +84,7 @@ export const SUBMISSIONS = {
     role: 'prosecution',
     schemaRef: 'Exhibit',
     exhibitKind: 'counterexample',
-    check: checker<CounterexampleSubmission>(CounterexampleSubmission),
+    check: checkCounterexampleSubmission,
   },
   remedy: {
     role: 'remedy',

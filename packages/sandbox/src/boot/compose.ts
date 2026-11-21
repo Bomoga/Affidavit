@@ -1,20 +1,13 @@
 import { execFile } from 'node:child_process';
 import { statSync } from 'node:fs';
 import { chmod, mkdtemp, rm } from 'node:fs/promises';
-import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { shellWords } from './dockerfile.js';
+import { scanYamlKeys } from './yaml-keys.js';
 
 const exec = promisify(execFile);
-
-// js-yaml 4.3.2 ships no types. It is loaded through require with the one signature used here,
-// so packages that compile this file (the Judge) need no ambient declaration.
-const { CORE_SCHEMA, load } = createRequire(import.meta.url)('js-yaml') as {
-  CORE_SCHEMA: unknown;
-  load: (text: string, opts: { schema: unknown }) => unknown;
-};
 
 /** A service from the compose file that the target needs: started from its image, never built. */
 export interface ComposeSidecar {
@@ -91,21 +84,19 @@ export function findHostReadingKey(tree: unknown): string | null {
 }
 
 /**
- * Parses the compose YAML into a tree, before Compose ever sees the file, and refuses any key
- * that reads other files, at any depth: inside `x-` extension blocks, behind anchors and aliases,
- * through merge keys (`<<: *base`, whose aliased map is walked), in flow style (`{env_file: x}`),
- * or quoted or escaped (`"env_file"` parses to `env_file`). The parser uses the YAML core
- * schema: custom tags (Compose's `!reset`, `!override`) and duplicate keys fail to parse, and an
- * unparseable file is refused (fail closed).
+ * Reads every mapping key of the compose file, before Compose ever sees it, and refuses any key
+ * that reads other files (unless its value is empty), wherever it is written: inside `x-`
+ * extension blocks, under an anchor, next to a merge key, in flow style (`{env_file: x}`), quoted
+ * (`"env_file"`) or in upper case. No YAML library is used (lead decision 2026-11-20, PR #18):
+ * `scanYamlKeys` reads the small subset compose files need and refuses everything else, including
+ * custom tags (Compose's `!reset`, `!override`), escaped keys, alias keys, duplicate keys and
+ * unbalanced input. A refused file makes the target `unsupported` (fail closed).
  */
 export function precheckCompose(text: string): string | null {
-  let tree: unknown;
-  try {
-    tree = load(text, { schema: CORE_SCHEMA });
-  } catch (err) {
-    return `compose file is not plain YAML: ${(err as Error).message.split('\n')[0] ?? ''}`;
-  }
-  return findHostReadingKey(tree);
+  const scan = scanYamlKeys(text);
+  if (!scan.ok) return `compose file is outside the supported YAML subset: ${scan.reason}`;
+  const hit = scan.keys.find((k) => READS_FILES.has(k.name.toLowerCase()) && !k.empty);
+  return hit === undefined ? null : `compose key "${hit.name}" reads other files`;
 }
 
 /**

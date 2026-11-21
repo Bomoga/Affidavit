@@ -203,35 +203,15 @@ describe('buildGvisorRunArgs: service and build options (L2-04)', () => {
     expect(() => buildGvisorRunArgs({ ...spec, workdir: '/a/../..' })).toThrow(/workdir/);
   });
 
-  it('runs the fetch step on a per-build network with no resolver and only the proxy', () => {
-    const proxy = { host: 'affidavit-proxy', ip: '172.18.0.2' };
-    const f = buildGvisorRunArgs({ ...spec, fetch: { name: net, proxy } });
-    expect(after(f, '--network', net)).toBe(true);
-    expect(after(f, '--dns', '0.0.0.0')).toBe(true);
-    expect(after(f, '--add-host', 'affidavit-proxy:172.18.0.2')).toBe(true);
-    // The registry itself is never a host entry: only the proxy is reachable.
-    expect(f.filter((a) => a === '--add-host')).toHaveLength(1);
-    expect(f.join(' ')).not.toContain('registry.npmjs.org');
+  it('has no route out: no fetch or egress network, and only a per-case network can be joined', () => {
+    // Lead decision 2026-11-20 (PR #18): the dependency-fetch egress exception is declined.
     for (const name of ['bridge', 'host', 'affidavit-fetch', 'affidavit-egress-0123456789abcdef'])
-      expect(() => buildGvisorRunArgs({ ...spec, fetch: { name, proxy } })).toThrow(
-        /per-build network/,
-      );
-    expect(() =>
-      buildGvisorRunArgs({ ...spec, fetch: { name: net, proxy: { host: 'p', ip: 'x' } } }),
-    ).toThrow(/proxy entry/);
-    expect(() =>
-      buildGvisorRunArgs({ ...spec, network: { name: net }, fetch: { name: net, proxy } }),
-    ).toThrow(/one of/);
-  });
-
-  it('puts only the fetch proxy on a per-build egress bridge, with no resolver', () => {
-    const egress = 'affidavit-egress-0123456789abcdef';
-    const e = buildGvisorRunArgs({ ...spec, egress });
-    expect(after(e, '--network', egress)).toBe(true);
-    expect(after(e, '--dns', '0.0.0.0')).toBe(true);
-    for (const bad of ['bridge', 'host', 'affidavit-egress-x', net])
-      expect(() => buildGvisorRunArgs({ ...spec, egress: bad })).toThrow(/egress network/);
-    expect(() => buildGvisorRunArgs({ ...spec, egress, network: { name: net } })).toThrow(/one of/);
+      expect(() => buildGvisorRunArgs({ ...spec, network: { name } })).toThrow(/per-case network/);
+    for (const extra of [
+      { fetch: { name: net, proxy: { host: 'affidavit-proxy', ip: '172.18.0.2' } } },
+      { egress: 'affidavit-egress-0123456789abcdef' },
+    ])
+      expect(() => buildGvisorRunArgs({ ...spec, ...extra })).toThrow(/unknown run spec key/);
   });
 
   it('reports bad untrusted values without throwing', () => {

@@ -1,8 +1,11 @@
 import { queryOptions, useQuery } from '@tanstack/react-query';
 import { getRouteApi, Link } from '@tanstack/react-router';
-import { useEffect } from 'react';
-import { CaseFile, Stamp } from './CaseFile.js';
+import { useEffect, useMemo } from 'react';
+import { buildCaseView } from '../model/caseView.js';
+import { SAFE_CASE_ID, type BackoffPolicy, type StreamTransport } from '../model/liveStream.js';
+import { CaseFile, ConnectionStatus, Stamp } from './CaseFile.js';
 import { CaseNotFoundError, loadCase, loadCaseList } from './data.js';
+import { useSourceConfig, useTrialStream } from './source.js';
 
 const caseApi = getRouteApi('/cases/$caseId');
 
@@ -22,7 +25,19 @@ const caseQuery = (slug: string) =>
 
 export function CaseListPage() {
   useDocumentTitle('Case files - Affidavit');
-  const q = useQuery(caseListQuery);
+  const live = useSourceConfig().mode === 'live';
+  const q = useQuery({ ...caseListQuery, enabled: !live });
+  if (live)
+    return (
+      <>
+        <p className="label">Affidavit</p>
+        <h1 id="page-heading">Case files</h1>
+        <p>
+          This view is connected to the live API, which has no list of cases. Open a case by its
+          address, for example /cases/your-case-id.
+        </p>
+      </>
+    );
   return (
     <>
       <p className="label">Affidavit</p>
@@ -54,6 +69,60 @@ export function CaseListPage() {
 
 export function CasePage() {
   const { caseId } = caseApi.useParams();
+  const source = useSourceConfig();
+  if (source.mode === 'live') {
+    // The id goes into a URL path, so anything outside the safe set is treated as not found.
+    return SAFE_CASE_ID.test(caseId) ? (
+      <LiveCasePage
+        caseId={caseId}
+        transport={source.transport}
+        {...(source.backoff ? { backoff: source.backoff } : {})}
+        {...(source.maxEvents ? { maxEvents: source.maxEvents } : {})}
+      />
+    ) : (
+      <NotFoundPage />
+    );
+  }
+  return <FixtureCasePage caseId={caseId} />;
+}
+
+function LiveCasePage({
+  caseId,
+  transport,
+  backoff,
+  maxEvents,
+}: {
+  caseId: string;
+  transport: StreamTransport;
+  backoff?: BackoffPolicy;
+  maxEvents?: number;
+}) {
+  const { snapshot, retry } = useTrialStream(caseId, transport, backoff, maxEvents);
+  const view = useMemo(() => buildCaseView(snapshot.events), [snapshot.events]);
+  useDocumentTitle(
+    snapshot.status === 'not-found'
+      ? 'Case file not found - Affidavit'
+      : `${view.headline} - Affidavit`,
+  );
+  // The server said no such case (or no access to it); say so plainly and do not retry.
+  if (snapshot.status === 'not-found') return <NotFoundPage />;
+  return (
+    <CaseFile
+      view={view}
+      slug={caseId}
+      connection={
+        <ConnectionStatus
+          status={snapshot.status}
+          dropped={snapshot.invalidCount}
+          tooLong={snapshot.tooLong}
+          onRetry={retry}
+        />
+      }
+    />
+  );
+}
+
+function FixtureCasePage({ caseId }: { caseId: string }) {
   const q = useQuery(caseQuery(caseId));
   const title = q.data
     ? `${q.data.headline} - Affidavit`

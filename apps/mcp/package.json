@@ -12,6 +12,7 @@
     "lint": "eslint src",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
+    "start": "tsx src/main.ts",
     "test": "vitest run"
   },
   "dependencies": {

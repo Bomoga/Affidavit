@@ -7,10 +7,39 @@ import {
   type Budget,
   type BudgetState,
   type CaseStage,
+  type ExhibitResult,
+  type JudgePort,
+  type ParamSpace,
   type StageCost,
 } from '@affidavit/contracts';
 import { FakeCaseStore, type FakeCaseStoreOptions } from '@affidavit/testing';
 import type { ModelTurnResult } from './orchestrator.js';
+import { witnessExhibitId } from './witness.js';
+
+/**
+ * Wraps a scripted Judge so every witness result carries the id the real Judge would mint for the
+ * witness it was given (the recipe in docs/lanes/lane2/rules-of-evidence.md). Fixture results
+ * have fixed ids, and the handlers refuse a result whose id disagrees with the recipe.
+ */
+export function withRecipeIds(inner: JudgePort): JudgePort {
+  return {
+    runCounterexample: (...a) => inner.runCounterexample(...a),
+    verifyPatch: (...a) => inner.verifyPatch(...a),
+    runWitness: async (cf, witness, variants) => ({
+      ...(await inner.runWitness(cf, witness, variants)),
+      exhibitId: witnessExhibitId(cf.id, witness.template, witness.params),
+    }),
+  };
+}
+
+/** The result a wrapped Judge returns for a fixture result and the witness it ran. */
+export function withId(
+  cf: CaseFile,
+  w: { template: string; params: ParamSpace },
+  r: ExhibitResult,
+): ExhibitResult {
+  return { ...r, exhibitId: witnessExhibitId(cf.id, w.template, w.params) };
+}
 
 export const NOW = 1_700_000_000_000;
 

@@ -12,7 +12,7 @@ import {
 import { envProblem, hostAliasProblem, workdirProblem } from '../gvisor/args.js';
 import { readDockerfile } from './dockerfile.js';
 import { composePathPairs, execErrorText, scrubPaths } from './scrub.js';
-import { checkLockfile } from './lockfile.js';
+import { checkLockfile, dependencyFetchProblem } from './lockfile.js';
 
 /**
  * Everything needed to build and boot one target, derived from its boot hints, compose file and
@@ -62,7 +62,7 @@ async function readText(dir: string, rel: string, max = 1024 * 1024): Promise<st
 /**
  * Reads a staged tree (see build.ts: no `.git`, `.env`, `.npmrc`, `node_modules` or symlinks) and
  * returns its recipe, or the reason it is unsupported in the MVP. With `devDependencies`, the
- * fetch will install them, so the lockfile check covers them too.
+ * build would need them too, so the lockfile checks (and the no-download rule) cover them.
  */
 export async function deriveRecipe(
   treeDir: string,
@@ -83,8 +83,11 @@ export async function deriveRecipe(
     return fail('package.json is not JSON');
   }
 
-  const production = typeof scripts.build !== 'string' && opts.devDependencies !== true;
-  const lockProblem = checkLockfile(lockText, { production });
+  const production = {
+    production: typeof scripts.build !== 'string' && opts.devDependencies !== true,
+  };
+  const lockProblem =
+    checkLockfile(lockText, production) ?? dependencyFetchProblem(lockText, pkgText, production);
   if (lockProblem !== null) return fail(lockProblem);
 
   let dockerfilePath = hints.path;
@@ -110,7 +113,7 @@ export async function deriveRecipe(
       return fail(`compose file did not parse: ${text.slice(0, 500)}`);
     }
     // Second layer: Compose's own reading of the file must not contain them either (a parser
-    // difference between js-yaml and Compose). Nothing it read reaches a container.
+    // difference between our key scanner and Compose). Nothing it read reaches a container.
     const post = findHostReadingKey(normalized);
     if (post !== null) return fail(post);
     const sel = selectServices(normalized, hints.service ?? 'app', treeDir);

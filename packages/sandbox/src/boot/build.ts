@@ -17,15 +17,7 @@ import { PROBE_IMAGE } from '../containment/probes.js';
 import type { Limits } from '../gvisor/args.js';
 import { validateMounts, type Mount } from '../gvisor/mounts.js';
 import { runJailed, type JailedRun } from '../gvisor/runner.js';
-import {
-  FETCH_IMAGE,
-  createFetchEnv,
-  npmProxyEnv,
-  removeFetchEnv,
-  resolveRegistry,
-} from './fetch.js';
-import { baseImageProblem, imageOnBuild, pinImage, pullPinned } from './images.js';
-import { NPM_REGISTRY } from './lockfile.js';
+import { baseImageProblem, imageOnBuild, pinImage } from './images.js';
 import { deriveRecipe, type BootRecipe } from './recipe.js';
 import { composePathPairs, execErrorText, scrubPaths } from './scrub.js';
 
@@ -34,14 +26,13 @@ const exec = promisify(execFile);
 /** Label on every image the split build makes, so they can be listed and removed. */
 export const IMAGE_LABEL = 'affidavit.sandbox.image';
 
-/** Build-step limits: dependency installs need more room than a witness. Configuration only. */
+/** Build-step limits: a build script needs more room than a witness. Configuration only. */
 export const BUILD_LIMITS: Readonly<Limits> = {
   memoryMb: 2048,
   pids: 512,
   cpus: 2,
   scratchMb: 1024,
 };
-const FETCH_TIMEOUT_MS = 10 * 60_000;
 const SCRIPTS_TIMEOUT_MS = 10 * 60_000;
 const MAX_TREE_FILES = 50_000;
 const MAX_TREE_BYTES = 512 * 1024 * 1024;
@@ -101,7 +92,7 @@ export type BuildOutcome = (
       ok: false;
       /** `unsupported`: outside what the MVP can boot without weakening a control. */
       unsupported: boolean;
-      step: 'stage' | 'recipe' | 'base' | 'fetch' | 'scripts' | 'assemble';
+      step: 'stage' | 'recipe' | 'base' | 'scripts' | 'assemble';
       /** Host paths are replaced by placeholders (`<tree>`, `<build>`, `<src>`, `<tmp>`). */
       reason: string;
     }
@@ -118,9 +109,10 @@ export interface BuildOptions {
   workRoot: string;
   limits?: Readonly<Limits>;
   /**
-   * Install devDependencies even when the app has no `build` script. Only for an image that runs
-   * the target's own test suite (the patch workbench); a target that witnesses attack is built
-   * as the app ships, without them.
+   * Count devDependencies as needed even when the app has no `build` script. Only for an image
+   * that runs the target's own test suite (the patch workbench); a target that witnesses attack is
+   * built as the app ships, without them. Nothing is ever downloaded, so with this set a target
+   * that has any devDependency is `unsupported`.
    */
   devDependencies?: boolean;
 }
@@ -129,21 +121,18 @@ const tail = (r: JailedRun): string => `${r.stderr}\n${r.stdout}`.trim().slice(-
 const failed = (r: JailedRun): boolean => r.exitCode !== 0;
 
 /**
- * The split build (L2-04). Nothing from the repository runs outside gVisor, and nothing runs with
- * a route out except npm itself, from Lane 2's pinned image (`FETCH_IMAGE`), with install scripts
- * off, through a per-build proxy that forwards only to the registry:
+ * The split build (L2-04). Nothing from the repository runs outside gVisor, and no step has a
+ * route out. Lead decision 2026-11-20 (PR #18): there is no egress exception for a dependency
+ * fetch, so a target whose install would download anything is `unsupported` at the recipe step
+ * (plan.md, Lane 2 item 3).
  *
  * 1. Stage the checkout (regular files only, no `.git`, `.env*`, `.npmrc`, `node_modules`).
- * 2. Derive the recipe from boot hints, compose file and Dockerfile, without running them, and
- *    check the lockfile only points at the npm registry.
+ * 2. Derive the recipe from boot hints, compose file and Dockerfile, without running them. The
+ *    lockfile and package.json must list nothing to download (`dependencyFetchProblem`).
  * 3. Base: the final stage's base must be an official `node` image; it is pinned by digest, and
  *    refused when it carries ONBUILD triggers.
- * 4. Fetch: `npm ci --ignore-scripts` in gVisor on a fresh internal network whose only peer is
- *    the fetch proxy (fetch.ts). The proxy allows only CONNECT to the registry on 443, at
- *    addresses the host resolved and checked are public.
- * 5. Scripts: `npm rebuild` (dependency install scripts) and the `build` script, offline, on the
- *    pinned base.
- * 6. Assemble: `docker build --network=none` from a generated Dockerfile with only FROM (pinned)
+ * 4. Scripts: the `build` script, if any, offline (no network at all) on the pinned base.
+ * 5. Assemble: `docker build --network=none` from a generated Dockerfile with only FROM (pinned)
  *    and COPY, so no RUN step exists to execute.
  */
 export async function buildTarget(
@@ -248,54 +237,15 @@ async function buildIn(
       maxFileBytes: BUILD_MAX_FILE_BYTES,
       env: {
         npm_config_cache: '/scratch/npm-cache',
-        npm_config_registry: `https://${NPM_REGISTRY}/`,
+        npm_config_offline: 'true',
         npm_config_update_notifier: 'false',
         npm_config_fund: 'false',
         npm_config_audit: 'false',
       },
     };
 
-    const install =
-      recipe.buildScript || devDependencies
-        ? ['npm', 'ci', '--ignore-scripts']
-        : ['npm', 'ci', '--ignore-scripts', '--omit=dev'];
-    // Pulling, resolving, the fetch setup and its teardown check can all throw; each is a
-    // `failed` fetch step, never an exception out of buildTarget.
-    let fetched: JailedRun;
-    try {
-      await pullPinned(FETCH_IMAGE);
-      const fetchEnv = await createFetchEnv(await resolveRegistry());
-      try {
-        fetched = await runJailed(
-          {
-            ...common,
-            image: FETCH_IMAGE,
-            env: { ...common.env, ...npmProxyEnv() },
-            command: install,
-            timeoutMs: FETCH_TIMEOUT_MS,
-            fetch: fetchEnv.fetch,
-          },
-          { trace: false, limits },
-        );
-      } finally {
-        await removeFetchEnv(fetchEnv);
-      }
-    } catch (err) {
-      return {
-        ok: false,
-        unsupported: false,
-        step: 'fetch',
-        reason: execErrorText(err).slice(0, 1500),
-      };
-    }
-    if (failed(fetched))
-      return { ok: false, unsupported: false, step: 'fetch', reason: tail(fetched) };
-    const afterFetch = await checkBuiltTree(tree);
-    if (afterFetch !== null) {
-      return { ok: false, unsupported: false, step: 'fetch', reason: afterFetch };
-    }
-
-    const scripts = [['npm', 'rebuild'], ...(recipe.buildScript ? [['npm', 'run', 'build']] : [])];
+    // Nothing was installed (step 2 refused any dependency), so only the target's own build runs.
+    const scripts = recipe.buildScript ? [['npm', 'run', 'build']] : [];
     for (const command of scripts) {
       let run: JailedRun;
       try {
@@ -378,7 +328,7 @@ async function buildIn(
   }
 }
 
-/** What a built tree may hold after the fetch and scripts steps. Configuration only. */
+/** What a built tree may hold after the scripts step. Configuration only. */
 export interface TreeCaps {
   /** Entries of any kind (files, directories, symlinks). */
   maxEntries: number;
@@ -389,7 +339,7 @@ export const BUILT_TREE_CAPS: Readonly<TreeCaps> = {
   maxEntries: 200_000,
   maxBytes: 2 * 1024 * 1024 * 1024,
 };
-/** RLIMIT_FSIZE for the fetch and scripts steps. Configuration only. */
+/** RLIMIT_FSIZE for the scripts step. Configuration only. */
 export const BUILD_MAX_FILE_BYTES = 256 * 1024 * 1024;
 
 /**

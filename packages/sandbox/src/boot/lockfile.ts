@@ -1,9 +1,10 @@
 /**
- * The split build downloads dependencies with network access (the only build step that has it),
- * so the lockfile decides where that traffic goes. Every package must come from the public npm
- * registry over HTTPS, or be bundled inside another package. Git, file,
- * link and other sources are refused, so the fetch step never contacts anything else, and the
- * repository's `.npmrc` is removed before the fetch so it cannot redirect the registry.
+ * Lockfile rules for the split build. Lead decision 2026-11-20 (PR #18): the build has no route
+ * out, not even to the npm registry, so a target whose install would download anything is
+ * `unsupported` (plan.md, Lane 2 item 3: a target that cannot boot without real egress is marked
+ * unsupported rather than granted an exception to deny-all). `dependencyFetchProblem` decides
+ * that. `checkLockfile` still reads the lockfile's format and sources first, so a lockfile that
+ * points at git, a link or another host is named for what it is.
  */
 
 export const NPM_REGISTRY = 'registry.npmjs.org';
@@ -73,4 +74,66 @@ export function checkLockfile(text: string, opts: { production: boolean }): stri
     return null;
   };
   return walk(lock.dependencies, '');
+}
+
+const DEP_FIELDS = ['dependencies', 'optionalDependencies', 'peerDependencies'] as const;
+
+/**
+ * Null when installing the target downloads nothing; otherwise why it is unsupported. Counted:
+ * every lockfile entry the install would fetch (a package under `node_modules` that is not
+ * bundled inside another one; with `production`, not dev-only), and any dependency `package.json`
+ * declares (with `production`, `devDependencies` are left out), since npm would resolve those
+ * from the network even when the lockfile omits them. Unreadable input is refused.
+ */
+export function dependencyFetchProblem(
+  lockText: string,
+  pkgText: string,
+  opts: { production: boolean },
+): string | null {
+  let lock: unknown;
+  let pkg: unknown;
+  try {
+    lock = JSON.parse(lockText);
+    pkg = JSON.parse(pkgText);
+  } catch {
+    return 'package.json or package-lock.json is not JSON';
+  }
+  if (!isObj(lock) || !isObj(pkg)) return 'package.json or package-lock.json is not an object';
+
+  let packages = 0;
+  const counts = (e: Obj): boolean =>
+    !(opts.production && e.dev === true) && e.bundled !== true && e.inBundle !== true;
+  if (isObj(lock.packages)) {
+    for (const [path, e] of Object.entries(lock.packages)) {
+      if (path === '' || !isObj(e)) continue;
+      if (path.split('/').includes('node_modules') && counts(e)) packages++;
+    }
+  } else {
+    const walk = (deps: unknown): void => {
+      if (!isObj(deps)) return;
+      for (const e of Object.values(deps)) {
+        if (!isObj(e) || !counts(e)) continue;
+        packages++;
+        walk(e.dependencies);
+      }
+    };
+    walk(lock.dependencies);
+  }
+
+  const fields: readonly string[] = opts.production
+    ? DEP_FIELDS
+    : [...DEP_FIELDS, 'devDependencies'];
+  let declared = 0;
+  for (const f of fields) {
+    const v = pkg[f];
+    if (v === undefined) continue;
+    if (!isObj(v)) return `package.json ${f} is not an object`;
+    declared += Object.keys(v).length;
+  }
+  if (packages === 0 && declared === 0) return null;
+  return (
+    `needs a dependency fetch at build time (${packages} package${packages === 1 ? '' : 's'} ` +
+    `in the lockfile, ${declared} declared in package.json); the build has no route out and ` +
+    'deny-all egress has no exception for it, so the target is unsupported'
+  );
 }

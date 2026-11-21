@@ -1,10 +1,16 @@
 import { render, screen, waitFor } from '@testing-library/react';
 import { createMemoryHistory } from '@tanstack/react-router';
 import { App, createAppQueryClient, createAppRouter } from './router.js';
+import type { SourceConfig } from './source.js';
 
-export function renderApp(path: string) {
+export function renderApp(path: string, source?: SourceConfig) {
   const router = createAppRouter(createMemoryHistory({ initialEntries: [path] }));
-  return { router, ...render(<App router={router} client={createAppQueryClient()} />) };
+  return {
+    router,
+    ...render(
+      <App router={router} client={createAppQueryClient()} {...(source ? { source } : {})} />,
+    ),
+  };
 }
 
 /** Waits for the page's h1 to appear and for any "Loading" placeholder to be replaced. */
