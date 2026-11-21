@@ -56,6 +56,29 @@ h3 { font-size: 1rem; margin: 0; }
   font-size: 0.875rem;
   animation: stamp-in 240ms ease-out;
 }
+.stamp-note { margin: -0.5rem 0 1rem; font-family: var(--font-mono); font-size: 0.8125rem; color: var(--color-text); }
+.case-list .stamp-note { margin: 0.5rem 0 0; }
+.proof { display: grid; grid-template-columns: max-content auto; gap: 0.25rem 1rem; margin: 0.5rem 0; font-size: 0.875rem; }
+.proof > div { display: contents; }
+.proof dt { color: var(--color-muted); font-family: var(--font-mono); }
+.proof dd { margin: 0; color: var(--color-text); }
+.docket-section { margin-top: 2rem; }
+.courtroom-now { margin: 0 0 0.75rem; }
+.seats { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.seat {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  letter-spacing: 0.04em;
+  padding: 0.25rem 0.625rem;
+  background: var(--color-surface);
+  color: var(--color-muted);
+  border: 1px dashed var(--color-muted);
+}
+.seat--active { color: var(--color-text); border: 1px solid var(--color-text); font-weight: 600; animation: seat-in 320ms ease-out; }
+@keyframes seat-in {
+  from { opacity: 0.4; }
+  to { opacity: 1; }
+}
 .stamp--verified { border-color: var(--color-accent); color: var(--color-accent); }
 .stamp--warn { border-color: var(--color-warn); color: var(--color-warn); }
 @keyframes stamp-in {

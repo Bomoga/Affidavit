@@ -27,9 +27,12 @@ export interface VerifyDeps {
 }
 
 /**
- * Final stage before the verdict. Reads what the Judge decided from the workspace, builds the
- * structured verdict, then the summary, appends it through `CaseStore.appendVerdict`, emits
- * `verdict-written`, and moves to `verdict`.
+ * Final stage before the verdict. First records one `verify-result` event (actor `judge`) per
+ * `verifyPatch` call Remedy made, carrying the Judge's VerifyResult as returned (CR-1), so a
+ * client reading only the stream sees the Judge's check and not just the verdict's claim. Then it
+ * reads what the Judge decided from the workspace, builds the structured verdict, then the
+ * summary, appends it through `CaseStore.appendVerdict`, emits `verdict-written`, and moves to
+ * `verdict`.
  *
  * No proven outcome without an admitted witness exhibit: if the workspace has none (or the
  * Judge's result for it is not admitted), the case escalates to a human instead.
@@ -38,6 +41,11 @@ export function createVerifyHandler(deps: VerifyDeps): StageHandler {
   const { store, workspace } = deps;
   return {
     async run(ctx): Promise<StageResult> {
+      const patch = await workspace.getPatchOutcome(ctx.caseId);
+      for (const result of patch?.verifyResults ?? []) {
+        await ctx.record('verify-result', { result }, 'judge');
+      }
+
       const exhibits = await workspace.getExhibits(ctx.caseId);
       const admitted = await workspace.getWitness(ctx.caseId);
       if (
@@ -54,7 +62,6 @@ export function createVerifyHandler(deps: VerifyDeps): StageHandler {
         };
       }
 
-      const patch = await workspace.getPatchOutcome(ctx.caseId);
       const patchAccepted =
         patch?.accepted === true && patch.patch !== undefined && exhibits.includes(patch.patch.id);
       const { promptVersions, modelIds } = ctx.runInfo();

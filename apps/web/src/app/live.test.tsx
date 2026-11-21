@@ -35,7 +35,11 @@ describe('live case page', () => {
     await waitFor(() => expect(status().textContent).toContain('Complete'), SLOW);
     expect(status().getAttribute('aria-live')).toBe('polite');
     expect(docketCount()).toBe(String(GATE.length));
-    expect(screen.getByRole('heading', { level: 1 }).textContent).toContain('not yet confirmed');
+    // The streamed Judge verify-result (CR-1) earns the stamp live, as it does from the fixture.
+    expect(screen.getByRole('heading', { level: 1 }).textContent).toContain(
+      'Verified: weakness proven and fix confirmed',
+    );
+    expect(screen.getByText('VERIFIED')).toBeTruthy();
     openAll();
     expect(checkAccessibility(container, APP_CSS)).toEqual([]);
   });

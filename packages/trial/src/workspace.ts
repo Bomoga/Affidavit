@@ -47,6 +47,11 @@ export interface PatchOutcome {
   patch?: PatchExhibit;
   result?: VerifyResult;
   reason: string;
+  /**
+   * Every VerifyResult the Judge returned in this Remedy run, one per `verifyPatch` call, in call
+   * order (accepted or not). The verify stage records one `verify-result` event per entry (CR-1).
+   */
+  verifyResults: VerifyResult[];
 }
 
 export class InMemoryWorkspace implements TrialWorkspace {
