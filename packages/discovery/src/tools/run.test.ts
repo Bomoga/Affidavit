@@ -91,7 +91,8 @@ describe('runTool', () => {
   });
 
   it('refuses a scratch dir reused from an earlier run', async () => {
-    const scratch = tmp();
+    // Inside a private (0700) parent, as every real run dir is, so only freshness is tested here.
+    const scratch = join(tmp(), 's');
     put(scratch, 'tmp/leftover');
     const { runner, calls } = fakeRunner();
     await expect(
@@ -101,7 +102,7 @@ describe('runTool', () => {
   });
 
   it('refuses an output dir that already has content', async () => {
-    const out = tmp();
+    const out = join(tmp(), 'out');
     put(out, 'gitleaks.sarif', 'stale results from another case');
     const { runner, calls } = fakeRunner();
     await expect(
