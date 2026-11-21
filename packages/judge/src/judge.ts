@@ -84,6 +84,19 @@ interface Runnable {
  * the rules of evidence. It is code, not an agent, and it trusts neither the submitted exhibit
  * nor the caller's choice of variants.
  */
+/**
+ * What happened to the target's own suite during `verifyPatchReport`. `unavailable`: the
+ * vulnerable commit's suite cannot be built in the sandbox (for example, a devDependency from
+ * outside the npm registry); `not-run`: the patch was refused before any build.
+ */
+export type SuiteStatus =
+  { state: 'passed' | 'failed' | 'not-run' } | { state: 'unavailable'; reason: string };
+
+export interface PatchReport {
+  result: VerifyResult;
+  suite: SuiteStatus;
+}
+
 export class Judge implements JudgePort {
   readonly #executor: WitnessExecutor;
   readonly #policy: Readonly<JudgePolicy>;
@@ -201,6 +214,11 @@ export class Judge implements JudgePort {
    * `rejectedBy` names the first failed rule in that order. A failed re-scan has no rule of its
    * own in contracts v1.0 and shows only as `rescanClean: false`. When a check never ran, its
    * flag is false.
+   *
+   * A suite the workbench reports unavailable (the vulnerable commit's own suite cannot be built
+   * in the sandbox) fails closed: `suitePassed` is false and the patch is rejected with
+   * `suite-fails`, the closest existing rule (lead decision 2026-11-20, PR #46). It is never a
+   * pass. `verifyPatchReport` gives the reason; contracts have no field for it.
    */
   async verifyPatch(
     caseFile: CaseFile,
@@ -208,6 +226,16 @@ export class Judge implements JudgePort {
     witness: Witness,
     counterexamples: readonly Exhibit[],
   ): Promise<VerifyResult> {
+    return (await this.verifyPatchReport(caseFile, patch, witness, counterexamples)).result;
+  }
+
+  /** `verifyPatch`, plus what happened to the target's own suite. */
+  async verifyPatchReport(
+    caseFile: CaseFile,
+    patch: PatchExhibit,
+    witness: Witness,
+    counterexamples: readonly Exhibit[],
+  ): Promise<PatchReport> {
     const cf = CaseFile.parse(caseFile);
     const deps = this.#verify;
     if (deps === undefined) throw new Error('verifyPatch needs a PatchWorkbench and a RescanPort');
@@ -249,8 +277,9 @@ export class Judge implements JudgePort {
       if (!header.ok || exhibitId === undefined) return refused;
       return { exhibitId, refused: false, code: parsed.data.code, params: header.params };
     });
-    const reject = (rule: AdmissibilityRule): VerifyResult =>
-      VerifyResult.parse({
+    const reject = (rule: AdmissibilityRule): PatchReport => ({
+      suite: { state: 'not-run' },
+      result: VerifyResult.parse({
         schemaVersion: 1,
         patchExhibitId: patchId,
         familyFlipped: false,
@@ -261,7 +290,8 @@ export class Judge implements JudgePort {
           survived: c.code !== undefined,
         })),
         rejectedBy: rule,
-      });
+      }),
+    });
 
     if (
       !p?.success ||
@@ -319,12 +349,25 @@ export class Judge implements JudgePort {
         },
         this.#policy,
       );
-      // The vulnerable commit's own suite, on the same build the witness ran against. The
+      // The vulnerable commit's own suite, on a separate devDependencies build of the same patched
+      // tree (never booted or attacked); the witness ran against the target build. The
       // patch's own tests are an extra check: a failure counts, a pass is never required.
+      // A suite that cannot be built in the sandbox fails closed: the patch is rejected with
+      // `suite-fails` (lead decision 2026-11-20, PR #46), and `verifyPatchReport` says why.
       const ownSuite = await deps.workbench.runSuite(cf, prepared);
       const addedTests =
         plan.tests.files.length === 0 ? null : await deps.workbench.runAddedTests(cf, prepared);
-      const suite = { passed: ownSuite.passed === true && addedTests?.passed !== false };
+      const ownPassed = 'passed' in ownSuite && ownSuite.passed === true;
+      const suite = {
+        passed: ownPassed && addedTests?.passed !== false,
+        // Anything short of the own suite passing and no added test failing rejects, including
+        // an unavailable suite.
+        rejects: !ownPassed || addedTests?.passed === false,
+      };
+      const suiteStatus: SuiteStatus =
+        'unavailable' in ownSuite
+          ? { state: 'unavailable', reason: ownSuite.unavailable }
+          : { state: suite.passed ? 'passed' : 'failed' };
       const results: VerifyResult['counterexamples'] = [];
       const admittedParams: ParamSpace = [];
       for (const { exhibitId, code, params: space } of counters) {
@@ -371,12 +414,12 @@ export class Judge implements JudgePort {
       const rejectedBy: AdmissibilityRule | undefined =
         (tailored ? 'literal-only-patch' : undefined) ??
         family.rejectedBy ??
-        (!suite.passed
+        (suite.rejects
           ? 'suite-fails'
           : results.some((c) => c.survived)
             ? 'counterexample-survives'
             : undefined);
-      return VerifyResult.parse({
+      const result = VerifyResult.parse({
         schemaVersion: 1,
         patchExhibitId: patchId,
         familyFlipped: family.familyFlipped,
@@ -385,6 +428,7 @@ export class Judge implements JudgePort {
         counterexamples: results,
         ...(rejectedBy === undefined ? {} : { rejectedBy }),
       });
+      return { result, suite: suiteStatus };
     } finally {
       await deps.workbench.release(prepared);
     }
