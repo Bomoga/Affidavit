@@ -74,10 +74,16 @@ export class PgEventSink implements EventSink {
     }
   }
 
-  /** Beyond the port: a case's events in seq order, optionally only those after `afterSeq`. */
-  async events(caseId: CaseId, afterSeq = -1): Promise<TrialEvent[]> {
+  /**
+   * Beyond the port: a case's events in seq order, optionally only those after `afterSeq` and at
+   * most `limit` of them (a positive integer; page with the last seq returned).
+   */
+  async events(caseId: CaseId, afterSeq = -1, limit?: number): Promise<TrialEvent[]> {
+    if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1)) {
+      throw new Error('limit must be a positive integer');
+    }
     return withTenant(this.pool, this.tenantId, async (tx) => {
-      const rows = await tx
+      const query = tx
         .select({ event: t.events.event })
         .from(t.events)
         .where(
@@ -87,7 +93,9 @@ export class PgEventSink implements EventSink {
             gt(t.events.seq, afterSeq),
           ),
         )
-        .orderBy(asc(t.events.seq));
+        .orderBy(asc(t.events.seq))
+        .$dynamic();
+      const rows = await (limit === undefined ? query : query.limit(limit));
       return rows.map((r) => TrialEventSchema.parse(r.event));
     });
   }
