@@ -70,7 +70,7 @@ Not covered yet: Koa, Fastify, Hapi, Apollo, NestJS and Next route registration 
 
 ## Arraignment (`src/arraign/`, L1-06)
 
-`arraign({ candidates, reachability, dataAccess, negativeControls, config })` is a pure function (no clock, no I/O, input order does not matter). It fills `reachability`, `score` and `scoreInputs` on each candidate and splits them into `toTrial` (highest score first), `dismissed` (contract `Dismissal`, each with a reason and a detail) and `review`.
+`arraign({ candidates, reachability, dataAccess, negativeControls, config })` is a pure function (no clock, no I/O, input order does not matter: of several matching negative controls the lowest id wins, and two reachability answers for one candidate throw). It fills `reachability`, `score` and `scoreInputs` on each candidate and splits them into `toTrial` (highest score first), `dismissed` (contract `Dismissal`, each with a reason and a detail) and `review`.
 
 - `scoreFacts` is the scoring function. Recorded inputs, each in 0..1: `reachability` (reachable 1, unknown 0.5, unreachable 0), `sinkType` (`SINK_WEIGHTS`: code execution 1, SQL and `$where` 0.9, Mongo operator and IDOR data access 0.7, unclassified 0.5, dependency 0.4), `noAuthOnPath` (no guard 1, unknown 0.5, proven guard 0; always 0.5 for `idor`, which needs a signed-in attacker anyway), `toolAgreement` (`1 - 0.5^tools`). Score is the weighted sum with `SCORE_WEIGHTS` (0.4, 0.3, 0.1, 0.2), rounded to four decimals. The weights are design constants, not measurements.
 - `sinkClassOf`: from our own rule id, raised (never lowered) by a map data-access call inside the candidate's lines; OSV is `dependency`.
