@@ -29,6 +29,8 @@ Run from this directory, or add `--filter @affidavit/trial` from the repo root.
   promptVersions and modelIds, because those are in memory only.
 - A crash between the escalation transition and its events leaves no `escalated` event; only the
   verdict is repaired on rerun.
+- Verify records one `verify-result` per entry in `PatchOutcome.verifyResults` (CR-1). Those
+  events are not deduplicated, so a verify stage run twice for one Remedy run records them twice.
 
 ## Prosecution counterexample rule (L3-08)
 

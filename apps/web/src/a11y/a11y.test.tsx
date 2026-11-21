@@ -8,6 +8,7 @@ import { CaseFile } from '../app/CaseFile.js';
 import { renderApp, settled } from '../app/testUtils.js';
 import { APP_CSS } from '../app/styles.js';
 import { buildCaseView } from '../model/caseView.js';
+import { withVerify } from '../testing/verify.js';
 import { checkAccessibility, tabOrder } from './check.js';
 
 afterEach(cleanup);
@@ -47,7 +48,7 @@ describe('accessibility check on the real views', () => {
           </nav>
         </header>
         <main>
-          <CaseFile view={buildCaseView(events, { verifyResults: [accepted] })} />
+          <CaseFile view={buildCaseView(withVerify(events, [accepted]))} />
         </main>
         <footer>
           <p>Footer</p>

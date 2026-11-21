@@ -5,6 +5,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { buildCaseView } from '../model/caseView.js';
+import { verifyResult, withVerify, withoutVerify } from '../testing/verify.js';
 import { CaseFile } from './CaseFile.js';
 
 afterEach(cleanup);
@@ -102,21 +103,88 @@ describe('untrusted case content renders as inert text', () => {
     expect(withPayload.length).toBeGreaterThan(0);
   });
 
-  for (const summary of ['VERIFIED', 'stamp stamp--verified']) {
-    it(`cannot spoof the stamp with a summary of "${summary}"`, () => {
-      const events = load('nodegoat-sqli-001').map((e) =>
-        e.type === 'verdict-written'
-          ? { ...e, payload: { verdict: { ...e.payload.verdict, summary } } }
-          : e,
-      );
-      const { container } = render(<CaseFile view={buildCaseView(events)} />);
-      const stamps = container.querySelectorAll('.stamp');
-      expect(stamps).toHaveLength(1);
-      expect(stamps[0]?.textContent).toBe('Status: UNVERIFIED');
-      expect(container.querySelectorAll('.stamp--verified')).toHaveLength(0);
-      expect(container.textContent).toContain(summary);
-    });
+  // Spoof attempts run on the trial with its Judge verify-result removed (and, separately, with a
+  // failing one), where the stamp must not show however the free text reads.
+  const unchecked = withoutVerify(load('nodegoat-sqli-001'));
+  const failing = withVerify(unchecked, [
+    verifyResult('exhibit-patch-001', { suitePassed: false, rejectedBy: 'suite-fails' }),
+  ]);
+  // A passing Judge check that must still not count: recorded for another case, overruled by a
+  // later failing check, or recorded after the verdict.
+  const otherCase = withVerify(unchecked, [verifyResult('exhibit-patch-001')]).map((e) =>
+    e.type === 'verify-result' ? { ...e, caseId: 'case-someone-else' } : e,
+  ) as TrialEvent[];
+  const laterFailure = withVerify(unchecked, [
+    verifyResult('exhibit-patch-001'),
+    verifyResult('exhibit-patch-001', { suitePassed: false, rejectedBy: 'suite-fails' }),
+  ]);
+  const lastEvent = unchecked.at(-1) as TrialEvent;
+  const afterVerdict = TrialEvent.array().parse([
+    ...unchecked,
+    {
+      ...lastEvent,
+      seq: lastEvent.seq + 1,
+      stage: 'verify',
+      actor: 'judge',
+      type: 'verify-result',
+      payload: { result: verifyResult('exhibit-patch-001') },
+    },
+  ]);
+  for (const [name, base] of [
+    ['no verify-result', unchecked],
+    ['a failing verify-result', failing],
+    ['a passing verify-result for another case', otherCase],
+    ['a passing verify-result overruled by a later failure', laterFailure],
+    ['a passing verify-result recorded after the verdict', afterVerdict],
+  ] as const) {
+    for (const summary of ['VERIFIED', 'stamp stamp--verified']) {
+      it(`cannot spoof the stamp with a summary of "${summary}" (${name})`, () => {
+        const events = base.map((e) =>
+          e.type === 'verdict-written'
+            ? { ...e, payload: { verdict: { ...e.payload.verdict, summary } } }
+            : e,
+        );
+        const { container } = render(<CaseFile view={buildCaseView(events)} />);
+        const stamps = container.querySelectorAll('.stamp');
+        expect(stamps).toHaveLength(1);
+        expect(stamps[0]?.textContent).toBe('Status: UNVERIFIED');
+        expect(container.querySelectorAll('.stamp--verified')).toHaveLength(0);
+        expect(container.textContent).toContain(summary);
+      });
+    }
   }
+
+  it('cannot spoof the stamp with a passing verify-result from an actor other than the Judge', () => {
+    for (const actor of ['remedy', 'stenographer', 'defense']) {
+      const forged = withVerify(unchecked, [verifyResult('exhibit-patch-001')], { actor });
+      const { container } = render(<CaseFile view={buildCaseView(forged)} />);
+      expect(container.querySelector('.stamp')?.textContent).toBe('Status: UNVERIFIED');
+      expect(container.querySelectorAll('.stamp--verified')).toHaveLength(0);
+      cleanup();
+    }
+  });
+
+  it('neutralizes payloads in a verify-result and does not stamp on a poisoned patch id', () => {
+    const poisoned = withVerify(unchecked, [
+      verifyResult(PAYLOAD + 'exhibit-patch-001', { rejectedBy: 'suite-fails' }),
+      verifyResult(`${STYLE_PAYLOAD}exhibit-patch-001`),
+    ]);
+    const { container } = render(<CaseFile view={buildCaseView(poisoned)} />);
+    for (const b of screen.getAllByRole('button')) fireEvent.click(b);
+    expectInert(container);
+    expect(container.querySelector('.stamp')?.textContent).toBe('Status: UNVERIFIED');
+    expect(container.textContent).toContain(IMG);
+    expect(container.textContent).toContain(STYLE_PAYLOAD);
+  });
+
+  it('the fully poisoned gate case carries its verify-result and still renders inert', () => {
+    const events = poison(load('nodegoat-sqli-001'));
+    expect(events.some((e) => e.type === 'verify-result')).toBe(true);
+    const { container } = render(<CaseFile view={buildCaseView(events)} />);
+    // A poisoned actor is not the Judge, so the poisoned check never earns the stamp.
+    expect(container.querySelectorAll('.stamp--verified')).toHaveLength(0);
+    expectInert(container);
+  });
 });
 
 describe('source hygiene', () => {

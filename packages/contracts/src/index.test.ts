@@ -8,10 +8,11 @@ import {
   STAGE_TRANSITIONS,
   TERMINAL_STAGES,
   TrialEvent,
+  TrialEventType,
   isLegalTransition,
   schemaRegistry,
 } from './index.js';
-import { samples } from './samples.js';
+import { samples, trialEventSamples } from './samples.js';
 
 const names = Object.keys(schemaRegistry);
 
@@ -91,6 +92,45 @@ describe('invariants encoded in the schemas', () => {
     const e = samples['TrialEvent'] as Record<string, unknown>;
     expect(TrialEvent.safeParse({ ...e, type: 'stage-exited', payload: {} }).success).toBe(false);
     expect(TrialEvent.safeParse({ ...e, type: 'not-a-type' }).success).toBe(false);
+  });
+
+  describe('verify-result event (v1.1, CR-1)', () => {
+    const e = trialEventSamples['verify-result'] as Record<string, unknown> & {
+      payload: { result: Record<string, unknown> };
+    };
+
+    it('is the last TrialEventType member, so v1.0 members keep their positions', () => {
+      expect(TrialEventType.options.at(-1)).toBe('verify-result');
+      expect(TrialEventType.options.indexOf('verdict-written')).toBe(12);
+    });
+
+    it('parses a valid sample carrying the Judge VerifyResult', () => {
+      const parsed = TrialEvent.safeParse(e);
+      expect(parsed.success).toBe(true);
+      if (parsed.success && parsed.data.type === 'verify-result') {
+        expect(parsed.data.payload.result).toEqual(samples['VerifyResult']);
+      }
+    });
+
+    it('rejects a payload with no result, or a result that is not a VerifyResult', () => {
+      expect(TrialEvent.safeParse({ ...e, payload: {} }).success).toBe(false);
+      expect(
+        TrialEvent.safeParse({ ...e, payload: { result: samples['ExhibitResult'] } }).success,
+      ).toBe(false);
+      const noSuite = { ...e.payload.result };
+      delete noSuite['suitePassed'];
+      expect(TrialEvent.safeParse({ ...e, payload: { result: noSuite } }).success).toBe(false);
+      expect(
+        TrialEvent.safeParse({
+          ...e,
+          payload: { result: { ...e.payload.result, rejectedBy: 'not-a-rule' } },
+        }).success,
+      ).toBe(false);
+    });
+
+    it('rejects a VerifyResult payload under another event type', () => {
+      expect(TrialEvent.safeParse({ ...e, type: 'exhibit-result' }).success).toBe(false);
+    });
   });
 
   it('a verdict summary field is required and prompt versions are keyed by prompt id', () => {
