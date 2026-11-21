@@ -36,3 +36,22 @@ Fixtures to update in the same PR: `fixtures/trials/nodegoat-sqli-001.events.jso
 ### What Lane 3 did before v1.1
 
 `buildCaseView(events, { verifyResults })` in `apps/web` accepts `VerifyResult` values from outside the stream. With none supplied, a `proven-fixed` verdict renders as `unverified` with the reason "The record has no Judge result accepting a patch for this case." It does not invent events or trust the verdict's claim. When CR-1 lands, the model reads `verify-result` events and the extra input can go.
+
+## CR-2: a read endpoint for a case's exhibit content
+
+- Raised by: L3-13 (web trial terminal). Asks Lane 1 (`apps/api`), with a contracts addition in `api.ts`.
+- Contracts version: v1.1.
+- Status: open.
+- Kind: additive (new route and response schema). Minor bump.
+
+### Problem
+
+The event stream carries exhibit ids only, never the witness code or the patch diff. The API has `GET /cases/:id`, `GET /cases/:id/events` and `GET /cases/:id/verdict`, but nothing that serves an `Exhibit`. So the live terminal cannot show the patch a Remedy agent filed, how many files it touched, or its lines changed.
+
+### Proposed change
+
+`GET /cases/:id/exhibits` returning `Exhibit[]` (the existing schema in `evidence.ts`), one per exhibit the case's events name, or `GET /cases/:id/exhibits/:exhibitId` returning one `Exhibit`. Read-only, same auth as the other case reads. Content is untrusted repo-derived data and is rendered as plain text.
+
+### What Lane 3 does meanwhile
+
+`buildTerminalView(events, content)` takes exhibit content as an optional input. Fixture cases read it from `fixtures/exhibits/<slug>.exhibits.json` through `getCaseExhibits(slug)` in `apps/web/src/app/data.ts`. A live case passes none, so the diff panel is empty and the Remedy bubble says the patch content is not in the record. Nothing is inferred from the patch id.

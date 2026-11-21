@@ -1,4 +1,4 @@
-import { TrialEvent } from '@affidavit/contracts';
+import { Exhibit, TrialEvent } from '@affidavit/contracts';
 import { buildCaseView, type CaseView } from '../model/caseView.js';
 import { createFakeEventSource } from '../model/source.js';
 
@@ -20,6 +20,27 @@ const EVENTS = new Map<string, TrialEvent[]>(
     ])
     .sort(([a], [b]) => a.localeCompare(b)),
 );
+
+// Exhibit content (witness code, patch diff) for fixture cases. The event stream carries only
+// exhibit ids and the API has no exhibit content read yet, so only fixture cases have content.
+const RAW_EXHIBITS = import.meta.glob<unknown>('../../../../fixtures/exhibits/*.exhibits.json', {
+  eager: true,
+  import: 'default',
+});
+
+const EXHIBITS_SUFFIX = '.exhibits.json';
+
+const EXHIBITS = new Map<string, Exhibit[]>(
+  Object.entries(RAW_EXHIBITS).map(([path, json]): [string, Exhibit[]] => [
+    (path.split('/').pop() ?? path).slice(0, -EXHIBITS_SUFFIX.length),
+    Exhibit.array().parse(json),
+  ]),
+);
+
+/** Exhibit content for a case, or an empty array when no source has any. */
+export function getCaseExhibits(slug: string): Exhibit[] {
+  return [...(EXHIBITS.get(slug) ?? [])];
+}
 
 export function listCaseSlugs(): string[] {
   return [...EVENTS.keys()];
