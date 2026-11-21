@@ -136,6 +136,15 @@ const verdict = {
   cost: [{ stage: 'defense', inputTokens: 0, outputTokens: 0, usd: 0, wallMs: 0, attempt: 1 }],
 };
 
+const verifyResult = {
+  schemaVersion: 1,
+  patchExhibitId: 'exhibit-patch-001',
+  familyFlipped: true,
+  suitePassed: true,
+  rescanClean: true,
+  counterexamples: [{ exhibitId: 'exhibit-counter-001', survived: false }],
+};
+
 export const samples: Readonly<Record<string, unknown>> = {
   TargetRef: caseFile.target,
   BootHints: bootHints,
@@ -164,14 +173,7 @@ export const samples: Readonly<Record<string, unknown>> = {
   },
   RunRecord: run,
   ExhibitResult: exhibitResult,
-  VerifyResult: {
-    schemaVersion: 1,
-    patchExhibitId: 'exhibit-patch-001',
-    familyFlipped: true,
-    suitePassed: true,
-    rescanClean: true,
-    counterexamples: [{ exhibitId: 'exhibit-counter-001', survived: false }],
-  },
+  VerifyResult: verifyResult,
   BundleManifest: {
     schemaVersion: 1,
     caseId: 'case-nodegoat-sqli-001',
@@ -216,4 +218,21 @@ export const samples: Readonly<Record<string, unknown>> = {
     expiresAt: '2026-11-05T12:15:00.000Z',
   },
   GithubWebhookRequest: { event: 'pull_request', deliveryId: 'delivery-1', payload: {} },
+};
+
+/**
+ * Valid `TrialEvent` samples per event type, beyond the single `samples.TrialEvent`. The registry
+ * has one sample per schema, so event types added after v1.0 keep theirs here (v1.1: CR-1).
+ */
+export const trialEventSamples: Readonly<Record<string, unknown>> = {
+  'verify-result': {
+    schemaVersion: 1,
+    caseId: 'case-nodegoat-sqli-001',
+    seq: 17,
+    stage: 'verify',
+    at: '2026-11-05T12:00:17.000Z',
+    actor: 'judge',
+    type: 'verify-result',
+    payload: { result: verifyResult },
+  },
 };
