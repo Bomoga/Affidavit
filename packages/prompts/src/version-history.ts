@@ -7,6 +7,9 @@ import type { VersionHistory } from './versioning.js';
 // contracts schema has; agents now end the turn without submitting. Remedy's
 // outputSchemaRef moved from PatchExhibit to Exhibit (the schemaRegistry key). Jurors vote
 // only within their question; insufficient is valid only for evidence-sufficiency.
+// 1.2.0 (prosecution): the agent submits parameter choices drawn from the Defense witness
+// family, not code; the system builds the exhibit. Cite exhibit ids; prose is inadmissible.
+// 1.3.0 (prosecution): no longer promises claim attacks the agent cannot express (CR-T9).
 export const VERSION_HISTORY: VersionHistory = {
   defense: {
     '1.0.0': '667ec1f85cdb32fc740b0ec9e3e6dfb74bd43cde34b5c8f07c8864169dcb7d6e',
@@ -19,6 +22,8 @@ export const VERSION_HISTORY: VersionHistory = {
   prosecution: {
     '1.0.0': '13bb961614bf471822fcfe2f48d5cc6bfd0792affd74f1fc81e9cd83f73ea2e4',
     '1.1.0': '89ae2b56ca7b85f2afe7a51a8a7c621a43c6bdb055791daa9812fdfd91f8ab6c',
+    '1.2.0': 'f6c344942d9a06b62665c3a68d3467530474b871f2b649845d7856be84656ad9',
+    '1.3.0': 'fba511e04822cd234056c4eda1a749584df19b8705f7b1e3648d7e88e1d57db8',
   },
   remedy: {
     '1.0.0': 'd47bdc44f1cf9ea8cad259e5546f334201bbe84b6b346e8715c3c1cef47ada43',

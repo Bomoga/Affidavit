@@ -1,0 +1,42 @@
+# Affidavit's own rules. Written from scratch; no registry rule or rule text is used or copied.
+rules:
+  - id: affidavit.injection.nosql-operator-request
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      A request value (req.body or req.query) reaches a MongoDB query filter in this file as a
+      whole object or as a field value. A JSON or extended query string body can make that value an operator object such as
+      {"$ne": null}. Coerce it to a string (String(...)) or validate its type first.
+    metadata:
+      cls: injection
+      cwe: CWE-943
+      confidence: medium
+      note: Intra-file only. A value that crosses a file boundary before the query is not seen.
+    mode: taint
+    pattern-sources:
+      - pattern: $REQ.body
+      - pattern: $REQ.query
+      # req.params is not a source here: route parameters are always strings in Express, so they
+      # cannot carry an operator object. (The IDOR rules do treat them as a source.)
+    pattern-sanitizers:
+      - pattern: String(...)
+      - pattern: parseInt(...)
+      - pattern: parseFloat(...)
+      - pattern: Number(...)
+      - pattern: Boolean(...)
+    pattern-sinks:
+      # The filter (first argument).
+      - patterns:
+          - pattern: $COL.$M($Q, ...)
+          - focus-metavariable: $Q
+          - metavariable-regex:
+              metavariable: $M
+              regex: ^(find|findOne|findById|findOneAndUpdate|findOneAndDelete|findOneAndReplace|findOneAndRemove|findByIdAndDelete|findByIdAndUpdate|updateOne|updateMany|replaceOne|deleteOne|deleteMany|countDocuments|count|exists|aggregate|remove)$
+      # The update document, the replacement, or distinct's filter (second argument), where a body
+      # can carry operators.
+      - patterns:
+          - pattern: $COL.$M($F, $U, ...)
+          - focus-metavariable: $U
+          - metavariable-regex:
+              metavariable: $M
+              regex: ^(updateOne|updateMany|replaceOne|findOneAndUpdate|findOneAndReplace|findByIdAndUpdate|distinct)$

@@ -1,0 +1,8 @@
+
+# Appended to docker/tools/config/gitleaks.toml by the smoke test, so the real vendored rules are
+# exercised and the obviously fake fixture key is also recognised.
+[[rules]]
+id = "affidavit-fake-fixture-key"
+description = "Obviously fake key used only by the tool smoke fixture"
+regex = '''AFFIDAVIT_FAKE_KEY_[0-9A-F]{16}'''
+keywords = ["affidavit_fake_key_"]

@@ -1,0 +1,1113 @@
+{
+  "id": "9eb0e825-f981-4e30-864d-a4c85c5029a1",
+  "prevId": "65ed3e08-69b7-4285-80de-7882d5b6a817",
+  "version": "7",
+  "dialect": "postgresql",
+  "tables": {
+    "public.ballots": {
+      "name": "ballots",
+      "schema": "",
+      "columns": {
+        "tenant_id": {
+          "name": "tenant_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "case_id": {
+          "name": "case_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "seq": {
+          "name": "seq",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "juror_id": {
+          "name": "juror_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "question": {
+          "name": "question",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "ballot": {
+          "name": "ballot",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ballots_tenant_id_case_id_cases_tenant_id_id_fk": {
+          "name": "ballots_tenant_id_case_id_cases_tenant_id_id_fk",
+          "tableFrom": "ballots",
+          "tableTo": "cases",
+          "columnsFrom": ["tenant_id", "case_id"],
+          "columnsTo": ["tenant_id", "id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "ballots_tenant_id_case_id_seq_pk": {
+          "name": "ballots_tenant_id_case_id_seq_pk",
+          "columns": ["tenant_id", "case_id", "seq"]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ballots_blob_matches": {
+          "name": "ballots_blob_matches",
+          "value": "jsonb_typeof(\"ballots\".\"ballot\") = 'object'\n        and \"ballots\".\"ballot\"->>'jurorId' is not distinct from \"ballots\".\"juror_id\"\n        and \"ballots\".\"ballot\"->>'question' is not distinct from \"ballots\".\"question\""
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.cases": {
+      "name": "cases",
+      "schema": "",
+      "columns": {
+        "tenant_id": {
+          "name": "tenant_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "repo_id": {
+          "name": "repo_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "case_file": {
+          "name": "case_file",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "stage": {
+          "name": "stage",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'intake'"
+        },
+        "candidate_score": {
+          "name": "candidate_score",
+          "type": "double precision",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "escalation_floor": {
+          "name": "escalation_floor",
+          "type": "double precision",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "remaining_input_tokens": {
+          "name": "remaining_input_tokens",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "remaining_output_tokens": {
+          "name": "remaining_output_tokens",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "remaining_usd": {
+          "name": "remaining_usd",
+          "type": "numeric(24, 6)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "exhausted": {
+          "name": "exhausted",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "appeals": {
+          "name": "appeals",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "seq": {
+          "name": "seq",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "cases_tenant_id_repo_id_repos_tenant_id_id_fk": {
+          "name": "cases_tenant_id_repo_id_repos_tenant_id_id_fk",
+          "tableFrom": "cases",
+          "tableTo": "repos",
+          "columnsFrom": ["tenant_id", "repo_id"],
+          "columnsTo": ["tenant_id", "id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "cases_tenant_id_id_pk": {
+          "name": "cases_tenant_id_id_pk",
+          "columns": ["tenant_id", "id"]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "cases_stage_valid": {
+          "name": "cases_stage_valid",
+          "value": "\"cases\".\"stage\" in ('intake', 'map', 'arraign', 'defense', 'prosecution', 'remedy', 'verify', 'jury', 'verdict', 'dismissed', 'escalated')"
+        },
+        "cases_file_matches": {
+          "name": "cases_file_matches",
+          "value": "jsonb_typeof(\"cases\".\"case_file\") = 'object'\n        and \"cases\".\"case_file\"->>'id' is not distinct from \"cases\".\"id\"\n        and \"cases\".\"case_file\"->>'tenantId' is not distinct from \"cases\".\"tenant_id\"\n        and (\"cases\".\"case_file\"->'candidate'->>'score')::double precision is not distinct from \"cases\".\"candidate_score\"\n        and (\"cases\".\"case_file\"->>'escalationFloor')::double precision is not distinct from \"cases\".\"escalation_floor\""
+        },
+        "cases_repo_matches": {
+          "name": "cases_repo_matches",
+          "value": "\"cases\".\"case_file\"->'target'->>'repo' is not distinct from \"cases\".\"repo_id\""
+        },
+        "cases_budget_finite": {
+          "name": "cases_budget_finite",
+          "value": "\"cases\".\"remaining_usd\" <> 'NaN'::numeric"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.cost_rows": {
+      "name": "cost_rows",
+      "schema": "",
+      "columns": {
+        "tenant_id": {
+          "name": "tenant_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "case_id": {
+          "name": "case_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "id": {
+          "name": "id",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "identity": {
+            "type": "always",
+            "name": "cost_rows_id_seq",
+            "schema": "public",
+            "increment": "1",
+            "startWith": "1",
+            "minValue": "1",
+            "maxValue": "9223372036854775807",
+            "cache": "1",
+            "cycle": false
+          }
+        },
+        "stage": {
+          "name": "stage",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "attempt": {
+          "name": "attempt",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "input_tokens": {
+          "name": "input_tokens",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "output_tokens": {
+          "name": "output_tokens",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "usd": {
+          "name": "usd",
+          "type": "numeric(24, 9)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "wall_ms": {
+          "name": "wall_ms",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "cost_rows_tenant_id_case_id_cases_tenant_id_id_fk": {
+          "name": "cost_rows_tenant_id_case_id_cases_tenant_id_id_fk",
+          "tableFrom": "cost_rows",
+          "tableTo": "cases",
+          "columnsFrom": ["tenant_id", "case_id"],
+          "columnsTo": ["tenant_id", "id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "cost_rows_tenant_id_case_id_id_pk": {
+          "name": "cost_rows_tenant_id_case_id_id_pk",
+          "columns": ["tenant_id", "case_id", "id"]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "cost_rows_stage_valid": {
+          "name": "cost_rows_stage_valid",
+          "value": "\"cost_rows\".\"stage\" in ('intake', 'map', 'arraign', 'defense', 'prosecution', 'remedy', 'verify', 'jury', 'verdict', 'dismissed', 'escalated')"
+        },
+        "cost_rows_values_valid": {
+          "name": "cost_rows_values_valid",
+          "value": "\"cost_rows\".\"attempt\" >= 1 and \"cost_rows\".\"input_tokens\" >= 0 and \"cost_rows\".\"output_tokens\" >= 0 and \"cost_rows\".\"usd\" >= 0 and \"cost_rows\".\"usd\" <> 'NaN'::numeric and \"cost_rows\".\"wall_ms\" >= 0"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.escalations": {
+      "name": "escalations",
+      "schema": "",
+      "columns": {
+        "tenant_id": {
+          "name": "tenant_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "case_id": {
+          "name": "case_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "seq": {
+          "name": "seq",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "reason": {
+          "name": "reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "detail": {
+          "name": "detail",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "escalation": {
+          "name": "escalation",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "escalations_tenant_id_case_id_cases_tenant_id_id_fk": {
+          "name": "escalations_tenant_id_case_id_cases_tenant_id_id_fk",
+          "tableFrom": "escalations",
+          "tableTo": "cases",
+          "columnsFrom": ["tenant_id", "case_id"],
+          "columnsTo": ["tenant_id", "id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "escalations_tenant_id_case_id_seq_pk": {
+          "name": "escalations_tenant_id_case_id_seq_pk",
+          "columns": ["tenant_id", "case_id", "seq"]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "escalations_blob_matches": {
+          "name": "escalations_blob_matches",
+          "value": "jsonb_typeof(\"escalations\".\"escalation\") = 'object'\n        and \"escalations\".\"escalation\"->>'caseId' is not distinct from \"escalations\".\"case_id\"\n        and \"escalations\".\"escalation\"->>'reason' is not distinct from \"escalations\".\"reason\""
+        },
+        "escalations_detail_matches": {
+          "name": "escalations_detail_matches",
+          "value": "\"escalations\".\"escalation\"->>'detail' is not distinct from \"escalations\".\"detail\""
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.events": {
+      "name": "events",
+      "schema": "",
+      "columns": {
+        "tenant_id": {
+          "name": "tenant_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "case_id": {
+          "name": "case_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "seq": {
+          "name": "seq",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "type": {
+          "name": "type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "event": {
+          "name": "event",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "events_case_idx": {
+          "name": "events_case_idx",
+          "columns": [
+            {
+              "expression": "tenant_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "case_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "events_tenant_id_case_id_cases_tenant_id_id_fk": {
+          "name": "events_tenant_id_case_id_cases_tenant_id_id_fk",
+          "tableFrom": "events",
+          "tableTo": "cases",
+          "columnsFrom": ["tenant_id", "case_id"],
+          "columnsTo": ["tenant_id", "id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "events_tenant_id_case_id_seq_pk": {
+          "name": "events_tenant_id_case_id_seq_pk",
+          "columns": ["tenant_id", "case_id", "seq"]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "events_blob_matches": {
+          "name": "events_blob_matches",
+          "value": "jsonb_typeof(\"events\".\"event\") = 'object'\n        and \"events\".\"event\"->>'type' is not distinct from \"events\".\"type\"\n        and \"events\".\"event\"->>'caseId' is not distinct from \"events\".\"case_id\"\n        and (\"events\".\"event\"->>'seq')::int is not distinct from \"events\".\"seq\""
+        },
+        "events_verdict_case_matches": {
+          "name": "events_verdict_case_matches",
+          "value": "\"events\".\"type\" <> 'verdict-written'\n        or \"events\".\"event\"->'payload'->'verdict'->>'caseId' is not distinct from \"events\".\"case_id\""
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.exhibits": {
+      "name": "exhibits",
+      "schema": "",
+      "columns": {
+        "tenant_id": {
+          "name": "tenant_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "case_id": {
+          "name": "case_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "author": {
+          "name": "author",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "sha256": {
+          "name": "sha256",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "exhibit": {
+          "name": "exhibit",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "result": {
+          "name": "result",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "exhibits_tenant_id_case_id_cases_tenant_id_id_fk": {
+          "name": "exhibits_tenant_id_case_id_cases_tenant_id_id_fk",
+          "tableFrom": "exhibits",
+          "tableTo": "cases",
+          "columnsFrom": ["tenant_id", "case_id"],
+          "columnsTo": ["tenant_id", "id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "exhibits_tenant_id_case_id_id_pk": {
+          "name": "exhibits_tenant_id_case_id_id_pk",
+          "columns": ["tenant_id", "case_id", "id"]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "exhibits_kind_valid": {
+          "name": "exhibits_kind_valid",
+          "value": "\"exhibits\".\"kind\" in ('witness', 'counterexample', 'patch')"
+        },
+        "exhibits_blob_matches": {
+          "name": "exhibits_blob_matches",
+          "value": "jsonb_typeof(\"exhibits\".\"exhibit\") = 'object'\n        and \"exhibits\".\"exhibit\"->>'id' is not distinct from \"exhibits\".\"id\"\n        and \"exhibits\".\"exhibit\"->>'caseId' is not distinct from \"exhibits\".\"case_id\"\n        and \"exhibits\".\"exhibit\"->>'kind' is not distinct from \"exhibits\".\"kind\"\n        and \"exhibits\".\"exhibit\"->>'author' is not distinct from \"exhibits\".\"author\"\n        and \"exhibits\".\"exhibit\"->>'sha256' is not distinct from \"exhibits\".\"sha256\""
+        },
+        "exhibits_result_valid": {
+          "name": "exhibits_result_valid",
+          "value": "\"exhibits\".\"result\" is null or (jsonb_typeof(\"exhibits\".\"result\") = 'object'\n        and \"exhibits\".\"result\"->>'exhibitId' is not distinct from \"exhibits\".\"id\")"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.repos": {
+      "name": "repos",
+      "schema": "",
+      "columns": {
+        "tenant_id": {
+          "name": "tenant_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "repos_tenant_id_tenants_tenant_id_fk": {
+          "name": "repos_tenant_id_tenants_tenant_id_fk",
+          "tableFrom": "repos",
+          "tableTo": "tenants",
+          "columnsFrom": ["tenant_id"],
+          "columnsTo": ["tenant_id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "repos_tenant_id_id_pk": {
+          "name": "repos_tenant_id_id_pk",
+          "columns": ["tenant_id", "id"]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": true
+    },
+    "public.review_flags": {
+      "name": "review_flags",
+      "schema": "",
+      "columns": {
+        "tenant_id": {
+          "name": "tenant_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "case_id": {
+          "name": "case_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "stage": {
+          "name": "stage",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "attempt": {
+          "name": "attempt",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "visit": {
+          "name": "visit",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "reason": {
+          "name": "reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "detail": {
+          "name": "detail",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "review_flags_tenant_id_case_id_cases_tenant_id_id_fk": {
+          "name": "review_flags_tenant_id_case_id_cases_tenant_id_id_fk",
+          "tableFrom": "review_flags",
+          "tableTo": "cases",
+          "columnsFrom": ["tenant_id", "case_id"],
+          "columnsTo": ["tenant_id", "id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "review_flags_tenant_id_case_id_stage_attempt_pk": {
+          "name": "review_flags_tenant_id_case_id_stage_attempt_pk",
+          "columns": ["tenant_id", "case_id", "stage", "attempt"]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "review_flags_stage_valid": {
+          "name": "review_flags_stage_valid",
+          "value": "\"review_flags\".\"stage\" in ('intake', 'map', 'arraign', 'defense', 'prosecution', 'remedy', 'verify', 'jury', 'verdict', 'dismissed', 'escalated')"
+        },
+        "review_flags_visit_valid": {
+          "name": "review_flags_visit_valid",
+          "value": "\"review_flags\".\"visit\" >= 0"
+        },
+        "review_flags_reason_valid": {
+          "name": "review_flags_reason_valid",
+          "value": "\"review_flags\".\"reason\" in ('attempts-exhausted', 'budget-exhausted')"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.stage_jobs": {
+      "name": "stage_jobs",
+      "schema": "",
+      "columns": {
+        "tenant_id": {
+          "name": "tenant_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "case_id": {
+          "name": "case_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "stage": {
+          "name": "stage",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "attempt": {
+          "name": "attempt",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "visit": {
+          "name": "visit",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "enqueued_at": {
+          "name": "enqueued_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "stage_jobs_tenant_id_case_id_cases_tenant_id_id_fk": {
+          "name": "stage_jobs_tenant_id_case_id_cases_tenant_id_id_fk",
+          "tableFrom": "stage_jobs",
+          "tableTo": "cases",
+          "columnsFrom": ["tenant_id", "case_id"],
+          "columnsTo": ["tenant_id", "id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "stage_jobs_tenant_id_case_id_stage_attempt_pk": {
+          "name": "stage_jobs_tenant_id_case_id_stage_attempt_pk",
+          "columns": ["tenant_id", "case_id", "stage", "attempt"]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "stage_jobs_stage_valid": {
+          "name": "stage_jobs_stage_valid",
+          "value": "\"stage_jobs\".\"stage\" in ('intake', 'map', 'arraign', 'defense', 'prosecution', 'remedy', 'verify', 'jury', 'verdict', 'dismissed', 'escalated')"
+        },
+        "stage_jobs_attempt_valid": {
+          "name": "stage_jobs_attempt_valid",
+          "value": "\"stage_jobs\".\"attempt\" >= 1"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.stage_runs": {
+      "name": "stage_runs",
+      "schema": "",
+      "columns": {
+        "tenant_id": {
+          "name": "tenant_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "case_id": {
+          "name": "case_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "stage": {
+          "name": "stage",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "attempt": {
+          "name": "attempt",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "visit": {
+          "name": "visit",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "worker_id": {
+          "name": "worker_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "lease_token": {
+          "name": "lease_token",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "gen_random_uuid()::text"
+        },
+        "claimed_at": {
+          "name": "claimed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "heartbeat_at": {
+          "name": "heartbeat_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "lease_expires_at": {
+          "name": "lease_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "completed_at": {
+          "name": "completed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "failed_at": {
+          "name": "failed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "error": {
+          "name": "error",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "stage_runs_tenant_id_case_id_cases_tenant_id_id_fk": {
+          "name": "stage_runs_tenant_id_case_id_cases_tenant_id_id_fk",
+          "tableFrom": "stage_runs",
+          "tableTo": "cases",
+          "columnsFrom": ["tenant_id", "case_id"],
+          "columnsTo": ["tenant_id", "id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "stage_runs_tenant_id_case_id_stage_attempt_pk": {
+          "name": "stage_runs_tenant_id_case_id_stage_attempt_pk",
+          "columns": ["tenant_id", "case_id", "stage", "attempt"]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "stage_runs_stage_valid": {
+          "name": "stage_runs_stage_valid",
+          "value": "\"stage_runs\".\"stage\" in ('intake', 'map', 'arraign', 'defense', 'prosecution', 'remedy', 'verify', 'jury', 'verdict', 'dismissed', 'escalated')"
+        },
+        "stage_runs_attempt_valid": {
+          "name": "stage_runs_attempt_valid",
+          "value": "\"stage_runs\".\"attempt\" >= 1"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.stages": {
+      "name": "stages",
+      "schema": "",
+      "columns": {
+        "tenant_id": {
+          "name": "tenant_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "case_id": {
+          "name": "case_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "ordinal": {
+          "name": "ordinal",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "stage": {
+          "name": "stage",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "entered_at": {
+          "name": "entered_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "entry_seq": {
+          "name": "entry_seq",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "stages_tenant_id_case_id_cases_tenant_id_id_fk": {
+          "name": "stages_tenant_id_case_id_cases_tenant_id_id_fk",
+          "tableFrom": "stages",
+          "tableTo": "cases",
+          "columnsFrom": ["tenant_id", "case_id"],
+          "columnsTo": ["tenant_id", "id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "stages_tenant_id_case_id_ordinal_pk": {
+          "name": "stages_tenant_id_case_id_ordinal_pk",
+          "columns": ["tenant_id", "case_id", "ordinal"]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "stages_stage_valid": {
+          "name": "stages_stage_valid",
+          "value": "\"stages\".\"stage\" in ('intake', 'map', 'arraign', 'defense', 'prosecution', 'remedy', 'verify', 'jury', 'verdict', 'dismissed', 'escalated')"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.tenants": {
+      "name": "tenants",
+      "schema": "",
+      "columns": {
+        "tenant_id": {
+          "name": "tenant_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": true
+    },
+    "public.verdicts": {
+      "name": "verdicts",
+      "schema": "",
+      "columns": {
+        "tenant_id": {
+          "name": "tenant_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "case_id": {
+          "name": "case_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "outcome": {
+          "name": "outcome",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "verdict": {
+          "name": "verdict",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "verdicts_tenant_id_case_id_cases_tenant_id_id_fk": {
+          "name": "verdicts_tenant_id_case_id_cases_tenant_id_id_fk",
+          "tableFrom": "verdicts",
+          "tableTo": "cases",
+          "columnsFrom": ["tenant_id", "case_id"],
+          "columnsTo": ["tenant_id", "id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "verdicts_tenant_id_case_id_pk": {
+          "name": "verdicts_tenant_id_case_id_pk",
+          "columns": ["tenant_id", "case_id"]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "verdicts_blob_matches": {
+          "name": "verdicts_blob_matches",
+          "value": "jsonb_typeof(\"verdicts\".\"verdict\") = 'object'\n        and \"verdicts\".\"verdict\"->>'caseId' is not distinct from \"verdicts\".\"case_id\"\n        and \"verdicts\".\"verdict\"->>'outcome' is not distinct from \"verdicts\".\"outcome\""
+        }
+      },
+      "isRLSEnabled": true
+    }
+  },
+  "enums": {},
+  "schemas": {},
+  "sequences": {},
+  "roles": {},
+  "policies": {},
+  "views": {},
+  "_meta": {
+    "columns": {},
+    "schemas": {},
+    "tables": {}
+  }
+}

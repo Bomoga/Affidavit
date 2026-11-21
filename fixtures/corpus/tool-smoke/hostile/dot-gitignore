@@ -1,0 +1,3 @@
+package-lock.json
+src/hidden-by-gitignore.js
+# Obviously fake credential in a file that quarantine moves aside: AFFIDAVIT_FAKE_KEY_ABCDEF0123456789

@@ -11,9 +11,28 @@ import {
 } from '@tanstack/react-router';
 import { useEffect, useRef } from 'react';
 import { CaseListPage, CasePage, NotFoundPage } from './pages.js';
+import { SourceProvider, useSourceConfig, type SourceConfig } from './source.js';
 import { APP_CSS } from './styles.js';
 
+function ConfigErrorPage() {
+  useEffect(() => {
+    document.title = 'Live API URL is missing or not allowed - Affidavit';
+  }, []);
+  return (
+    <>
+      <h1 id="page-heading">Live API URL is missing or not allowed</h1>
+      <p role="alert">
+        This build is set to use the live API, but its address is missing or is not allowed. Set
+        VITE_AFFIDAVIT_API_URL to an https address, or to a localhost address for development, with
+        no login details, query or double slash in the path. Case files are not shown until this is
+        fixed.
+      </p>
+    </>
+  );
+}
+
 function Layout() {
+  const source = useSourceConfig();
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const mainRef = useRef<HTMLElement>(null);
   const previous = useRef(pathname);
@@ -40,7 +59,7 @@ function Layout() {
         </nav>
       </header>
       <main id="main" tabIndex={-1} ref={mainRef}>
-        <Outlet />
+        {source.mode === 'config-error' ? <ConfigErrorPage /> : <Outlet />}
       </main>
       <footer className="site-footer">
         <p>Case content is untrusted data and is shown as plain text only.</p>
@@ -79,13 +98,17 @@ declare module '@tanstack/react-router' {
 export function App({
   router,
   client,
+  source = { mode: 'fake' },
 }: {
   router: ReturnType<typeof createAppRouter>;
   client: QueryClient;
+  source?: SourceConfig;
 }) {
   return (
     <QueryClientProvider client={client}>
-      <RouterProvider router={router} />
+      <SourceProvider value={source}>
+        <RouterProvider router={router} />
+      </SourceProvider>
     </QueryClientProvider>
   );
 }

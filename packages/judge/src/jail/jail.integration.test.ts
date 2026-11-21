@@ -15,6 +15,7 @@ import {
 import { Exhibit, Witness, type ParamSpace } from '@affidavit/contracts';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { ExecutionRequest } from '../executor.js';
+import { counterexampleParamsHeader } from '../counterexample.js';
 import { Judge, counterexampleExhibitId, patchExhibitId } from '../judge.js';
 import { DEFAULT_POLICY } from '../rules.js';
 import {
@@ -236,14 +237,15 @@ describe.runIf(onSandboxHost)('witness jail on a sandbox host', { timeout: 300_0
       expect(rescan.paths).toEqual([PATCHED.workspacePath]);
       return r;
     };
-    const counter = (code: string): Exhibit =>
+    /** A counterexample as Lane 3 builds it: its params header (CR-T8), then the code. */
+    const counter = (code: string, params = witness(SQLI_WITNESS).params): Exhibit =>
       Exhibit.parse({
         schemaVersion: 1,
         id: 'exhibit-counter-it',
         caseId: gateCaseFile().id,
         author: 'prosecution',
         kind: 'counterexample',
-        code,
+        code: `${counterexampleParamsHeader(params)}\n${code}`,
         sha256: '9'.repeat(64),
       });
 
@@ -272,6 +274,21 @@ describe.runIf(onSandboxHost)('witness jail on a sandbox host', { timeout: 300_0
       expect(r.counterexamples).toEqual([
         { exhibitId: counterexampleExhibitId(sqli, params), survived: true },
         { exhibitId: counterexampleExhibitId(health, params), survived: false },
+      ]);
+    });
+
+    it('runs a counterexample over the params in its header, not the Defense family', async () => {
+      // Over the whole family the SQLi counterexample beats the partial fix. Over a header that
+      // keeps only the payload the partial fix blocks, it does not, which shows the header is
+      // what ran. A new value of the same parameter beats it again.
+      const blocked: ParamSpace = [{ name: 'payload', values: ["1'--"] }];
+      const fresh: ParamSpace = [{ name: 'payload', values: ["1'--", "9' AND '1'='1"] }];
+      const onlyBlocked = counter(SQLI_WITNESS, blocked);
+      const withNew = counter(SQLI_WITNESS, fresh);
+      const r = await verify('patched-partial', [onlyBlocked, withNew]);
+      expect(r.counterexamples).toEqual([
+        { exhibitId: counterexampleExhibitId(onlyBlocked, blocked), survived: false },
+        { exhibitId: counterexampleExhibitId(withNew, fresh), survived: true },
       ]);
     });
 
