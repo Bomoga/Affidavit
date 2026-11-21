@@ -2,27 +2,37 @@
 
 `packages/sandbox/src/boot` builds a target from its checkout and boots it on a case network. Entry points: `buildTarget(srcDir, bootHints, { workRoot })` and `bootTarget(caseNetwork, imageId, recipe)`.
 
+## Lead decision 2026-11-20: no egress exception, no js-yaml
+
+PR #18 asked for two exceptions. Both were declined:
+
+- **No dependency fetch.** An earlier version of this PR let `npm ci --ignore-scripts` reach `registry.npmjs.org` through a per-build CONNECT proxy. That is gone (`fetch.ts`, the proxy, the egress bridge and the `fetch` and `egress` run spec options were removed). Deny-all egress has no exception. A target whose install would download anything is `unsupported` at the recipe step, per plan.md (Lane 2, item 3: a target that cannot boot without real egress is marked unsupported rather than granted an exception). `buildGvisorRunArgs` now refuses any run spec key it does not know, so no caller can add a route out.
+- **No `js-yaml`.** The compose precheck reads the small YAML subset compose files use with our own key scanner (`yaml-keys.ts`) and refuses anything outside it.
+
+**Consequence, stated plainly: NodeGoat cannot be built any more.** It installs its dependencies at build time (its lockfile lists packages, and its Dockerfile runs `npm install`), so both the vulnerable and the safe variant are `unsupported` with reason "needs a dependency fetch at build time". The L2-04 done-when ("NodeGoat vulnerable and safe variants boot, report healthy, and return their digests") is not met, and the L2-07 workbench and L2-10 NodeGoat witnesses cannot run against a booted NodeGoat until there is a way to supply dependencies without egress. Nothing in the jail was weakened to get around this. Options for the lead (not implemented): a dependency set prepared offline by a human and mounted read-only after review, or a corpus that vendors `node_modules` under review. Either is a new decision.
+
+What still builds: a target with no dependencies at all (nothing in the lockfile to download, nothing declared in `package.json`; with no `build` script, dev-only entries do not count).
+
 ## Why a split build
 
 A target's Dockerfile usually runs `npm install`, which needs the network and runs package install scripts. `docker build` runs RUN steps with runc and full egress, outside gVisor, which the threat model does not allow ("Docker alone is not the boundary"). A Remedy patch would have its code built the same way. So the target's RUN steps are never executed as written (decision 2026-11-15, chosen by the Lane 2 owner):
 
-| Step        | What runs                                                                                                                                                          | Where                        | Network                                                                                                    |
-| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| 1. Stage    | Copy of the checkout: regular files only. No `.git`, `node_modules`, `.env*`, `.npmrc`, symlinks                                                                   | Host (our code)              | n/a                                                                                                        |
-| 2. Recipe   | Boot hints (parsed with the contract schema first), compose file and Dockerfile are read, never run. The lockfile must only point at `https://registry.npmjs.org/` | Host (our code)              | none                                                                                                       |
-| Base        | The final-stage base must be an official `node` image. It is pinned by digest, and refused if it has `ONBUILD` triggers                                            | Host (our code)              | Docker Hub pull, by the daemon                                                                             |
-| 3. Fetch    | `npm ci --ignore-scripts` (`--omit=dev` unless the app has a `build` script), run with Lane 2's own pinned npm image (`FETCH_IMAGE`), never the target's base      | gVisor, as nobody            | A fresh internal case network whose only peer is a CONNECT proxy that forwards to `registry.npmjs.org:443` |
-| 4. Scripts  | `npm rebuild` (dependency install scripts), then `npm run build` if present, with the pinned base image                                                            | gVisor, as nobody            | none                                                                                                       |
-| 5. Assemble | `docker build --network none` from a generated Dockerfile with only `FROM <base@digest>`, `COPY` and `WORKDIR`                                                     | BuildKit, no RUN step exists | none                                                                                                       |
+| Step        | What runs                                                                                                                                                                                                         | Where                        | Network                        |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------- | ------------------------------ |
+| 1. Stage    | Copy of the checkout: regular files only. No `.git`, `node_modules`, `.env*`, `.npmrc`, symlinks                                                                                                                  | Host (our code)              | n/a                            |
+| 2. Recipe   | Boot hints (parsed with the contract schema first), compose file and Dockerfile are read, never run. The lockfile and `package.json` must list nothing to download (`dependencyFetchProblem`), else `unsupported` | Host (our code)              | none                           |
+| Base        | The final-stage base must be an official `node` image. It is pinned by digest, and refused if it has `ONBUILD` triggers                                                                                           | Host (our code)              | Docker Hub pull, by the daemon |
+| 3. Scripts  | `npm run build` if present, with the pinned base image and `npm_config_offline`                                                                                                                                   | gVisor, as nobody            | none                           |
+| 4. Assemble | `docker build --network none` from a generated Dockerfile with only `FROM <base@digest>`, `COPY` and `WORKDIR`                                                                                                    | BuildKit, no RUN step exists | none                           |
 
-The fetch step is the only one with a route out, and it runs no repository or package code (install scripts are off). The lockfile check refuses git, file, link, workspace and non-registry tarball sources. Dev-only entries are skipped when the install omits dev dependencies, because they are never downloaded. Integrity hashes are checked by npm when the lockfile has them; old lockfiles often do not, which is accepted.
+No step has a route out. The lockfile check (`checkLockfile`) still runs first and names git, file, link, workspace and non-registry sources for what they are; then `dependencyFetchProblem` refuses any package the install would download, even from the registry.
 
 ### Host disk and cleanup
 
-The fetch and scripts steps mount the staged tree read-write from the host's work root, and the scripts step runs repository and package code. So their writes are bounded on three levels:
+The scripts step mounts the staged tree read-write from the host's work root and runs repository code. So their writes are bounded on three levels:
 
 - Each jailed step runs with `RLIMIT_FSIZE` at `BUILD_MAX_FILE_BYTES` (256 MiB, configuration): no single file, sparse or not, can pass it (`truncate` to 1 TiB fails with `EFBIG`).
-- After the fetch step and again after the scripts step, before the tree becomes a build context, `checkBuiltTree` walks it with `lstat` (links counted, never followed) and an explicit stack. More than `BUILT_TREE_CAPS.maxEntries` (200 000) entries, more than `maxBytes` (2 GiB, the sum of `st_size`, which is what `COPY .` writes for a sparse file), any FIFO, socket or device, or any directory the host cannot read stops the build at that step (`failed`, reason with tree-relative paths).
+- After the scripts step, before the tree becomes a build context, `checkBuiltTree` walks it with `lstat` (links counted, never followed) and an explicit stack. More than `BUILT_TREE_CAPS.maxEntries` (200 000) entries, more than `maxBytes` (2 GiB, the sum of `st_size`, which is what `COPY .` writes for a sparse file), any FIFO, socket or device, or any directory the host cannot read stops the build at that step (`failed`, reason with tree-relative paths).
 - **Host setup:** the work root should sit on its own filesystem or quota, so that what a step writes before the walk sees it (up to the tree caps, plus `/scratch` and `/tmp` in RAM) cannot fill the host disk. Not enforced by this code.
 
 Build steps write into the staged tree as uid 65534, which the host user cannot delete. A jailed janitor container, as the same user, first gives owner rwx to every directory that lacks it, one at a time as `find` visits it and before it descends (a build script can leave `chmod 000` directories that even uid 65534 cannot descend into; busybox `chmod -R` does not work here because it stops at the host-owned `/w`), and then runs `find /w -mindepth 1 -delete`; its exit status is checked. The host then removes the build directory. Cleanup never throws, so it cannot replace the build's real outcome. If the directory is still there afterwards, the outcome carries `leftovers` (a separate operational signal, not an error), or a process warning is emitted when the build itself threw.
@@ -31,38 +41,15 @@ Build steps write into the staged tree as uid 65534, which the host user cannot 
 
 Outcome reasons end up in evidence and the courtroom UI. Errors from `execFile` begin with `Command failed: <bin> <args>`, which repeats every host path in the arguments, so only their stderr is used (`execErrorText`). Every build reason then goes through `scrubPaths`, which replaces the tree, build directory, source checkout, work root, host temp directory and the Compose binary with `<tree>`, `<build>`, `<src>`, `<workRoot>`, `<tmp>` and `<compose>`.
 
-## The fetch network
+### Residual risk (follow-up)
 
-The allowlist is enforced by the network, not by name resolution. (An earlier version only withheld DNS and added a hosts entry for the registry on a bridge with egress, so a dependency fetch could still reach any IP literal, the bridge gateway and the host. That claim was wrong and is withdrawn.)
-
-Each build gets its own setup, created and removed by `createFetchEnv` and `removeFetchEnv` in `fetch.ts`. Nothing is shared across builds or cases.
-
-- npm joins a fresh case network: `--internal`, IPv6 off, and `inhibit_ipv4` so the host side of the bridge has no address (see `witness-jail.md`). From there an IP literal, the bridge gateway, the host, RFC 1918 and link-local addresses are all unreachable. There is no DNS server (`--dns 0.0.0.0`). The proxy is the one `/etc/hosts` name.
-- The proxy joins that network and a fresh egress bridge (IPv6 off, no inter-container traffic). It is a few lines of our own Node (`PROXY_SCRIPT`), started from `FETCH_IMAGE` under gVisor. It answers only `CONNECT registry.npmjs.org:443`, and everything else gets 403 (plain HTTP, another host, another port, an IP literal). It never resolves a name. It dials only the addresses the host resolved before the build, each of which must be a public IPv4 address (`publicIpv4Problem`, so a rebinding answer such as `169.254.169.254` aborts the build). TLS runs end to end between npm and the registry.
-- npm is pointed at the proxy with `npm_config_proxy` and `npm_config_https_proxy`.
-
-The proxy is attached to the internal network with `docker network connect` before `docker start`. That two-network start under runsc has unit tests for its arguments only; it has not yet run on a sandbox host.
-
-The proxy is bounded (`PROXY_LIMITS`, configuration): 64 concurrent connections, 8 KiB of headers within 10 s, 15 s per request, a 10 s upstream dial, and 60 s idle on either side of a tunnel. Teardown removes the proxy, then the egress bridge, then the internal network, and throws if `docker network inspect` still finds the egress bridge afterwards.
-
-Every failure in this step (pulling `FETCH_IMAGE`, resolving the registry, creating or removing the setup) is a `failed` outcome at step `fetch`, never an exception out of `buildTarget`.
-
-### Residual risks (need the lead's acceptance)
-
-1. **The proxy's own network reach is not firewalled.** The egress bridge is an ordinary Docker bridge, so at the network layer the proxy container could reach the host's bridge gateway, RFC 1918 addresses and `169.254.169.254`. What stops that today is the proxy's code: it dials only the checked public addresses, on 443, and takes no address from the client. A bug in Node's HTTP parser that gave the client code execution inside the proxy would remove that check. The fix is host firewall rules in the `DOCKER-USER` chain that let traffic from each egress bridge reach only the resolved registry addresses on 443. The orchestrator runs as an unprivileged member of the docker group and cannot write iptables rules, so this needs a privileged host-setup helper (sandbox host setup, P0-10). Not done in this PR.
-2. **Domain fronting.** The proxy checks the CONNECT target, not what travels inside the TLS tunnel. The registry sits behind a shared CDN, so a client that controls TLS could ask the CDN for another hostname (a different SNI or `Host`) through a tunnel opened to `registry.npmjs.org:443`. In the fetch step the only client is Lane 2's npm, with install scripts off and a lockfile that names only registry URLs, so no repository or package code is running that could do this. The risk is that npm itself is steered (a bug, or a crafted registry response), which would give a channel to other sites on the same CDN, but no route into the host or the case network.
-
-3. **Docker's data root fills with images (follow-up).** Sidecar images can be any Docker Hub reference, with no limit on how many a compose file names or how large they are, and pulled images (sidecars, bases, `FETCH_IMAGE`) and assembled target images are never removed. That is the same disk risk as unbounded build writes, on Docker's data root instead of the work root. Needs a sidecar count and size cap and an image garbage collector (assembled images carry `affidavit.sandbox.image`). Not done in this PR.
-
-### Why a Lane 2 npm image
-
-The target's base image is untrusted. Running npm from it would let the target choose the npm (or a `node` binary) that runs on the one step with a route out. `FETCH_IMAGE` is `node:22.11.0-bookworm-slim` pinned by its index digest, owned by Lane 2 and bumped deliberately. It is Debian (glibc), so a target on an Alpine (musl) base may get glibc builds of platform-specific optional packages. `npm rebuild` in step 4 runs with the target's base and rebuilds native modules from source where they ship it. Packages that ship only prebuilt binaries for one libc are a known gap.
+**Docker's data root fills with images.** Sidecar images can be any Docker Hub reference, with no limit on how many a compose file names or how large they are, and pulled images (sidecars, bases) and assembled target images are never removed. That is the same disk risk as unbounded build writes, on Docker's data root instead of the work root. Needs a sidecar count and size cap and an image garbage collector (assembled images carry `affidavit.sandbox.image`). Not done in this PR.
 
 ### Base allowlist and ONBUILD
 
-The final-stage base must match `node`, `node:<tag>`, `node@sha256:<digest>` or the same under `library/` (`baseImageProblem` in `images.ts`). Anything else is `unsupported` at step `base`, before any pull. The base runs repository and package code in step 4, and it is the root of the assembled image. An allowlist of the official image keeps that root to one known publisher.
+The final-stage base must match `node`, `node:<tag>`, `node@sha256:<digest>` or the same under `library/` (`baseImageProblem` in `images.ts`). Anything else is `unsupported` at step `base`, before any pull. The base runs repository code in step 3, and it is the root of the assembled image. An allowlist of the official image keeps that root to one known publisher.
 
-After pinning, `docker image inspect --format '{{json .Config.OnBuild}}'` must be empty. An `ONBUILD RUN` in a base would run during step 5 with BuildKit and no gVisor. A non-empty list is `unsupported`; an unreadable answer throws.
+After pinning, `docker image inspect --format '{{json .Config.OnBuild}}'` must be empty. An `ONBUILD RUN` in a base would run during step 4 with BuildKit and no gVisor. A non-empty list is `unsupported`; an unreadable answer throws.
 
 ## Boot
 
@@ -99,9 +86,7 @@ All opt-in; witness runs keep the L2-03 flags (checked by the containment suite,
 - `writableTmpMb`: a capped writable `/tmp` (MongoDB puts its socket there). Witnesses keep a read-only `/tmp`.
 - `tmpfs`: capped writable tmpfs mounts, for image volumes. Reserved paths (`/`, `/proc`, `/sys`, `/dev`, `/etc`, `/scratch`, `/tmp`) are refused.
 - `env` and `workdir`. `HOME` and `TMPDIR` stay `/scratch`. A working directory may not be or sit under a reserved path.
-- `fetch`: `{ name, proxy }`. Joins a per-build case network with no DNS and one hosts entry, the proxy.
-- `egress`: a per-build egress bridge (`affidavit-egress-<16 hex>`), with no DNS. Only the fetch proxy uses it.
-- A run joins exactly one of a case network, a fetch network or an egress network; asking for two throws.
+- There is no network option besides `none` and a per-case internal network. A run spec with an unknown key (`fetch`, `egress`, `dns`, ...) throws.
 - Host aliases on a case network may now be dotted names, for stubs such as `payments.example.com`.
 
 ## Environment values
@@ -110,9 +95,11 @@ Compose values written in the file are used as is; `${...}` values are never res
 
 ## Compose precheck
 
-Before Compose sees the file, it is parsed into a tree with `js-yaml` (core schema) and walked to any depth. Keys that read other files are refused wherever they appear: `include`, `extends`, `env_file`, `label_file`, `secrets`, `configs`, `ssh` and `additional_contexts`. That covers `x-` extension blocks, anchors and aliases, merge keys (`<<: *base`), flow style (`{env_file: x}`) and quoted or escaped keys. Custom tags (Compose's `!reset` and `!override`), duplicate keys, several documents and unparseable text are refused (fail closed). An empty value (`secrets: []`) names no file and is allowed.
+Before Compose sees the file, `scanYamlKeys` (`yaml-keys.ts`, our own code, no YAML library) tokenizes it and reports every mapping key and whether its value is empty. Keys that read other files are refused wherever they are written: `include`, `extends`, `env_file`, `label_file`, `secrets`, `configs`, `ssh` and `additional_contexts`, compared case-insensitively. That covers `x-` extension blocks, keys under anchors, merge keys (`<<: *base`), flow style (`{env_file: x}`, and `{env_file:/x}` with no space) and quoted keys. An empty value (`secrets: []`, `secrets:` with nothing under it) names no file and is allowed.
 
-`js-yaml` and Compose are different parsers and could disagree on an edge case. So the normalized output of Compose's `config --no-interpolate` is walked again with the same check, and the recipe is refused if Compose's own reading has any of those keys. Compose has then read the file, but nothing it read reaches a container.
+Anything outside the subset is refused, so the target is `unsupported` (fail closed): YAML tags (Compose's `!reset` and `!override`, `!!binary`), explicit `?` keys, directives, more than one document, tab indentation, NUL, a byte order mark, a bare carriage return, reserved indicators, an alias used as a key, a key that spans lines, a double-quoted key with an escape, duplicate keys in one mapping, unterminated quotes and unbalanced brackets. Block scalars (`|`, `>`) are skipped as text.
+
+The scanner and Compose are different parsers and could disagree on an edge case. So the normalized output of Compose's `config --no-interpolate` (JSON, read with `JSON.parse`) is walked again with `findHostReadingKey`, and the recipe is refused if Compose's own reading has any of those keys. Compose has then read the file, but nothing it read reaches a container.
 
 ### Compose runs on the host, with nothing from the tree
 
@@ -130,20 +117,10 @@ The only other host-side CLI call that touches the tree is the assemble step's `
 - Base images: official `node` only. Sidecar images must be plain Docker Hub names (no registry host, which could point the Docker daemon at an internal address).
 - The final Dockerfile stage cannot build on an earlier stage, and compose build args are not supported.
 
-## Verified on the sandbox host (2026-11-16, owner's workstation)
+## Sandbox-host runs
 
-Re-run on the hardened tip of PR #18 (round-3 fixes plus the two fixes below). `pnpm --filter @affidavit/sandbox test:sandbox-host` with `AFFIDAVIT_NODEGOAT_DIR` pointing at the L1-08 corpus checkout (`node packages/corpus/scripts/fetch-pinned.mjs nodegoat`, NodeGoat `c5cb68a7`): 337 of 337 pass, none skipped, and no containers or networks are left behind. That covers:
+**After the 2026-11-20 rework: not run.** The rework (no fetch, no js-yaml) was made on a Windows machine without gVisor. `pnpm --filter @affidavit/sandbox test:sandbox-host` has not run on it. The NodeGoat cases now assert `unsupported`; a new case checks a build script reaches neither the registry, a public IP nor cloud metadata, and that no `affidavit-egress-` network exists. The fetch-network cases were removed with the fetch step.
 
-- NodeGoat vulnerable and safe (its own documented `$where` fix) build through the proxy, boot healthy with the mongo sidecar, and return their image IDs.
-- A target that needs an external HTTP service boots against a stub.
-- A target that connects to an outside address, and one that looks up an outside name, are `unsupported`. A target that never listens is `failed`. A lockfile pointing outside the registry is refused before any build step.
-- The tests added in review: the fetch step cannot reach an IP literal, a documentation address, cloud metadata or the default bridge gateway, and the case network gives the host no address; the proxy forwards only the registry; ONBUILD is detected; a non-node base is refused; a `.docker/cli-plugins/docker-compose` shipped in the tree never runs; a 1 TiB sparse file and a tree over the byte cap are stopped; a `chmod 000` directory left by a build script is cleaned up; failed build reasons carry no host paths.
-
-Two fixes came out of this run:
-
-- **Janitor.** Busybox `chmod -R u+rwX /w` never reached a locked directory: it does not descend into a directory it failed to chmod, and `/w` belongs to the host user, so it stopped at the top and the build directory was left behind. The janitor now runs `find /w -mindepth 1 -type d ! -perm -u=rwx -exec chmod u+rwx {} \;`, which fixes each directory as `find` visits it, before descending. Checked on runsc with nested `chmod 000` directories under both nobody-owned and host-owned parents, plus a symlink.
-- **Gateway test.** The case network sets `inhibit_ipv4`, so it has no gateway (Docker 29 prints `invalid IP`), and Docker hands `.1` to the first container on it, which is the proxy. The test now asserts the case network has no gateway and probes the default bridge gateway on 22, 80, 2375 and 3128.
-
-The judge jail tests (`pnpm --filter @affidavit/judge test:sandbox-host`, 31 of 31) and both containment suites (8 of 8, contained and recorded) pass on the same tip.
+**Before the rework (2026-11-16, owner's workstation, history):** on the earlier tip of PR #18, with the fetch step, 337 of 337 sandbox-host tests passed with NodeGoat `c5cb68a7`, including NodeGoat vulnerable and safe building through the proxy and booting healthy. Those results no longer describe this code. Two fixes from that run are still in: the janitor (`find /w -mindepth 1 -type d ! -perm -u=rwx -exec chmod u+rwx {} \;`, which fixes each locked directory before descending) and the case-network gateway check.
 
 Build and boot times: [metric] until they are measured on the shared sandbox host.

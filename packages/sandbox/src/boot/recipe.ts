@@ -12,7 +12,7 @@ import {
 import { envProblem, hostAliasProblem, workdirProblem } from '../gvisor/args.js';
 import { readDockerfile } from './dockerfile.js';
 import { composePathPairs, execErrorText, scrubPaths } from './scrub.js';
-import { checkLockfile } from './lockfile.js';
+import { checkLockfile, dependencyFetchProblem } from './lockfile.js';
 
 /**
  * Everything needed to build and boot one target, derived from its boot hints, compose file and
@@ -78,7 +78,9 @@ export async function deriveRecipe(treeDir: string, hints: BootHints): Promise<R
     return fail('package.json is not JSON');
   }
 
-  const lockProblem = checkLockfile(lockText, { production: typeof scripts.build !== 'string' });
+  const production = { production: typeof scripts.build !== 'string' };
+  const lockProblem =
+    checkLockfile(lockText, production) ?? dependencyFetchProblem(lockText, pkgText, production);
   if (lockProblem !== null) return fail(lockProblem);
 
   let dockerfilePath = hints.path;
@@ -104,7 +106,7 @@ export async function deriveRecipe(treeDir: string, hints: BootHints): Promise<R
       return fail(`compose file did not parse: ${text.slice(0, 500)}`);
     }
     // Second layer: Compose's own reading of the file must not contain them either (a parser
-    // difference between js-yaml and Compose). Nothing it read reaches a container.
+    // difference between our key scanner and Compose). Nothing it read reaches a container.
     const post = findHostReadingKey(normalized);
     if (post !== null) return fail(post);
     const sel = selectServices(normalized, hints.service ?? 'app', treeDir);

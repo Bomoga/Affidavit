@@ -294,9 +294,6 @@ importers:
       dockerode:
         specifier: 5.0.1
         version: 5.0.1(supports-color@7.2.0)
-      js-yaml:
-        specifier: 4.3.2
-        version: 4.3.2
     devDependencies:
       '@affidavit/testing':
         specifier: workspace:*

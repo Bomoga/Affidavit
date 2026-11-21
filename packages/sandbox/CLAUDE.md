@@ -18,13 +18,14 @@ Run from this directory, or add `--filter @affidavit/sandbox` from the repo root
 
 ## Libraries
 
-- `js-yaml` 4.3.2: the compose precheck parses YAML to a tree (added in the PR #18 review; pending the lead's approval)
+- No YAML library: the compose precheck uses `src/boot/yaml-keys.ts` (lead decision 2026-11-20, PR #18 declined `js-yaml`)
 - gVisor (runsc) as a host runtime, not an npm dep
 - A Docker API client (TBD, not installed)
 
 ## Invariants
 
-- The dependency fetch runs npm from `FETCH_IMAGE` (pinned by Lane 2), never from the target's image, on a per-build internal network whose only peer is the registry proxy.
+- Deny-all egress, no exceptions: no build or boot step has a route out. A target that needs a dependency fetch at build time is `unsupported` (lead decision 2026-11-20, PR #18).
+- `buildGvisorRunArgs` refuses unknown run spec keys.
 - Target bases are official `node` images without `ONBUILD`.
 
 Root CLAUDE.md rules apply here. Do not add dependencies without asking.

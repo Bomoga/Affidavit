@@ -15,21 +15,11 @@ import { join } from 'node:path';
 import type { BootHints } from '@affidavit/contracts';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { RUN_LABEL } from '../gvisor/args.js';
-import { ipv4ToInt } from '../gvisor/cidr.js';
 import { createCaseNetwork, removeCaseNetwork } from '../gvisor/network.js';
-import { runJailed } from '../gvisor/runner.js';
 import { bootTarget, type BootOutcome } from './boot.js';
 import { buildTarget, type BuildOutcome } from './build.js';
 import { normalizeCompose, withEmptyDockerConfig } from './compose.js';
-import {
-  FETCH_IMAGE,
-  PROXY_PORT,
-  createFetchEnv,
-  removeFetchEnv,
-  resolveRegistry,
-  type FetchEnv,
-} from './fetch.js';
-import { imageOnBuild, pullPinned } from './images.js';
+import { imageOnBuild } from './images.js';
 
 // Needs a sandbox host (docs/lanes/lane2/sandbox-runner.md) and pulls images from Docker Hub.
 // Run with `pnpm --filter @affidavit/sandbox test:sandbox-host`. The NodeGoat cases also need
@@ -131,8 +121,11 @@ describe.runIf(onSandboxHost)('boot recipes on a sandbox host', { timeout: 900_0
   });
 
   describe.runIf(nodegoat !== undefined)('NodeGoat (the gate target)', () => {
+    // Lead decision 2026-11-20 (PR #18): no egress exception for the dependency fetch. NodeGoat
+    // installs its dependencies at build time, so both variants are unsupported until a target
+    // can be built without a fetch. This test pins that; it used to assert a healthy boot.
     it.each(['vulnerable', 'safe'] as const)(
-      'builds and boots the %s variant healthy, and returns its digest',
+      'marks the %s variant unsupported: it needs a dependency fetch at build time',
       async (variant) => {
         let src = nodegoat as string;
         if (variant === 'safe') {
@@ -144,13 +137,39 @@ describe.runIf(onSandboxHost)('boot recipes on a sandbox host', { timeout: 900_0
           writeFileSync(file, code.replace(VULNERABLE_QUERY, SAFE_QUERY));
         }
         const { build, boot } = await buildAndBoot(src, NODEGOAT_HINTS);
-        expect(build.ok && build.imageId).toMatch(/^sha256:[0-9a-f]{64}$/);
-        expect(boot).toMatchObject({ status: 'healthy', url: 'http://target:4000' });
-        expect(boot?.status === 'healthy' && boot.sidecarImages.mongo).toMatch(
-          /^mongo@sha256:[0-9a-f]{64}$/,
-        );
+        expect(build).toMatchObject({ ok: false, unsupported: true, step: 'recipe' });
+        expect(!build.ok && build.reason).toMatch(/dependency fetch/);
+        expect(boot).toBeUndefined();
       },
     );
+  });
+
+  it('gives a build script no route out, to the registry or anywhere else', async () => {
+    const src = tinyApp(root, 'build-probe', LISTEN);
+    writeFileSync(
+      join(src, 'probe.js'),
+      `const net = require('net');
+const tries = [['registry.npmjs.org', 443], ['1.1.1.1', 443], ['169.254.169.254', 80]];
+let left = tries.length;
+for (const [host, port] of tries) {
+  const s = net.connect(port, host);
+  s.setTimeout(5000);
+  s.on('connect', () => { console.error('CONNECTED ' + host); process.exit(4); });
+  const done = () => { s.destroy(); if (--left === 0) process.exit(0); };
+  s.on('error', done);
+  s.on('timeout', done);
+}`,
+    );
+    writeFileSync(
+      join(src, 'package.json'),
+      JSON.stringify({ name: 'tiny', version: '1.0.0', scripts: { build: 'node probe.js' } }),
+    );
+    const build = await buildTarget(src, tinyHints(), { workRoot });
+    expect(build).toMatchObject({ ok: true });
+    const egress = execFileSync('docker', ['network', 'ls', '--format', '{{.Name}}'], {
+      encoding: 'utf8',
+    });
+    expect(egress).not.toMatch(/affidavit-egress-/);
   });
 
   it('starts a stub for an external service the target needs to boot', async () => {
@@ -302,98 +321,6 @@ describe.runIf(onSandboxHost)('boot recipes on a sandbox host', { timeout: 900_0
     });
   });
 });
-
-/** Exits 0 and prints CONNECTED if a TCP connection opens, else prints why and exits 3. */
-const connectProbe = (host: string, port: number): string =>
-  `const s = require('net').connect(${port}, ${JSON.stringify(host)});
-s.setTimeout(5000);
-s.on('connect', () => { console.log('CONNECTED'); process.exit(0); });
-s.on('error', (e) => { console.log(e.code); process.exit(3); });
-s.on('timeout', () => { console.log('TIMEOUT'); process.exit(3); });`;
-
-/** Sends `CONNECT target` to the proxy and prints the status line. */
-const connectVia = (proxy: string, target: string): string =>
-  `const s = require('net').connect(${PROXY_PORT}, ${JSON.stringify(proxy)}, () =>
-  s.write('CONNECT ${target} HTTP/1.1\\r\\nHost: ${target}\\r\\n\\r\\n'));
-s.setTimeout(10000);
-s.once('data', (d) => { console.log(String(d).split('\\r\\n')[0]); process.exit(0); });
-s.on('error', (e) => { console.log(e.code); process.exit(3); });
-s.on('timeout', () => { console.log('TIMEOUT'); process.exit(3); });`;
-
-describe.runIf(onSandboxHost)(
-  'the fetch step network on a sandbox host',
-  { timeout: 300_000 },
-  () => {
-    let env: FetchEnv | undefined;
-    const fetchEnv = (): FetchEnv => env as FetchEnv;
-    const probe = async (code: string) =>
-      runJailed(
-        {
-          image: FETCH_IMAGE,
-          command: ['node', '-e', code],
-          mounts: [],
-          timeoutMs: 60_000,
-          fetch: fetchEnv().fetch,
-        },
-        { trace: false },
-      );
-    const ipamConfig = (net: string): { Gateway?: string; Subnet?: string } => {
-      const [config] = JSON.parse(
-        execFileSync('docker', ['network', 'inspect', '--format', '{{json .IPAM.Config}}', net], {
-          encoding: 'utf8',
-        }),
-      ) as { Gateway?: string; Subnet?: string }[];
-      if (config === undefined) throw new Error(`network ${net} has no IPAM config`);
-      return config;
-    };
-
-    beforeAll(async () => {
-      await pullPinned(FETCH_IMAGE);
-      env = await createFetchEnv(await resolveRegistry());
-    });
-    afterAll(async () => {
-      if (env !== undefined) await removeFetchEnv(env);
-      const left = execFileSync(
-        'docker',
-        ['network', 'ls', '--quiet', '--filter', `label=${RUN_LABEL}`],
-        { encoding: 'utf8' },
-      );
-      expect(left.trim()).toBe('');
-    });
-
-    it.each([
-      ['a public IP literal', '1.1.1.1', 443],
-      ['a documentation address', '203.0.113.10', 443],
-      ['cloud metadata', '169.254.169.254', 80],
-    ])('cannot connect directly to %s from the fetch step', async (_, host, port) => {
-      const run = await probe(connectProbe(host, port));
-      expect(run.stdout).not.toContain('CONNECTED');
-      expect(run.exitCode).not.toBe(0);
-    });
-
-    it('has no host address on its own network, and cannot connect to the default bridge gateway', async () => {
-      // inhibit_ipv4: the host bridge of the case network gets no IPv4 address, so there is no
-      // gateway to reach. (Docker then hands the first address, .1, to the first container,
-      // which is the proxy; reaching it is the point, so it is not probed as a gateway here.)
-      const own = ipamConfig(fetchEnv().net.name);
-      expect(own.Gateway === undefined || ipv4ToInt(own.Gateway) === null).toBe(true);
-      const gw = ipamConfig('bridge').Gateway ?? '';
-      expect(gw).toMatch(/^\d+\.\d+\.\d+\.\d+$/);
-      for (const port of [22, 80, 2375, 3128]) {
-        const run = await probe(connectProbe(gw, port));
-        expect(run.stdout, `${gw}:${port}`).not.toContain('CONNECTED');
-      }
-    });
-
-    it('reaches the registry through the proxy, and the proxy refuses anything else', async () => {
-      const proxy = fetchEnv().fetch.proxy.host;
-      expect((await probe(connectVia(proxy, 'registry.npmjs.org:443'))).stdout).toMatch(/ 200 /);
-      for (const target of ['example.com:443', '1.1.1.1:443', 'registry.npmjs.org:80']) {
-        expect((await probe(connectVia(proxy, target))).stdout, target).toMatch(/ 403 /);
-      }
-    });
-  },
-);
 
 describe.runIf(onSandboxHost)('ONBUILD detection on a sandbox host', { timeout: 300_000 }, () => {
   const tag = `affidavit-onbuild-test:${process.pid}`;

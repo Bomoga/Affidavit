@@ -109,6 +109,27 @@ describe('deriveRecipe (Dockerfile targets)', () => {
     expect((await deriveRecipe(root, h)).ok).toBe(false);
   });
 
+  it('is unsupported when the target needs a dependency fetch, even from the npm registry', async () => {
+    // Lead decision 2026-11-20 (PR #18): deny-all egress has no exception for a build-time fetch.
+    app('FROM node:22\nCMD ["node","x"]');
+    write(
+      'package-lock.json',
+      JSON.stringify({
+        lockfileVersion: 3,
+        packages: {
+          '': {},
+          'node_modules/express': {
+            version: '4.21.2',
+            resolved: 'https://registry.npmjs.org/express/-/express-4.21.2.tgz',
+          },
+        },
+      }),
+    );
+    const r = await deriveRecipe(root, hints());
+    expect(r.ok).toBe(false);
+    expect(!r.ok && r.reason).toMatch(/dependency fetch/);
+  });
+
   it('refuses a Dockerfile or seed path that leaves the tree', async () => {
     app('FROM node:22\nCMD ["node","x"]');
     expect((await deriveRecipe(root, hints({ path: '../Dockerfile' }))).ok).toBe(false);
