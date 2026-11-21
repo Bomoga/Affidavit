@@ -21,16 +21,21 @@ import {
 } from '@affidavit/contracts';
 import type { Arraigned } from '../arraign/index.js';
 import { routeInfoOf, type FnRef, type ReachPath } from '../map/index.js';
-import { cleanSource, sliceOf, type CleanFile } from './slice.js';
+import { cleanSource, safeName, sliceOf, type CleanFile } from './slice.js';
 
 export {
   cleanSource,
   escapeInvisible,
   isProse,
   PROSE_MARKER,
+  proseIdentifier,
+  proseRegex,
+  provenCode,
+  safeName,
   sliceOf,
   WITHHELD_MARKER,
   type CleanFile,
+  type NameKind,
   type SliceOptions,
 } from './slice.js';
 
@@ -231,21 +236,31 @@ export async function assembleCaseFile(input: AssembleInput): Promise<AssembleRe
       cleaned.set(w.file, clean);
       if (clean.text === undefined) withheld.push(w.file);
     }
-    slices.push(sliceOf(w.file, clean, w, { redact: input.redact }));
+    slices.push(sliceOf(safeName('file', w.file), clean, w, { redact: input.redact }));
   }
 
+  // Every repo-derived name that reaches the case file goes through `safeName` (strict charset,
+  // no prose-like parts), not only the slice text.
   const draft: Record<string, unknown> = {
     schemaVersion: 1,
     id: input.caseId,
     tenantId: input.tenantId,
     target: { repo: input.repo, commit: input.commit, variant: 'vulnerable' },
-    candidate: a.candidate,
+    candidate: { ...a.candidate, file: safeName('file', a.candidate.file) },
     slices,
     bootHints,
-    redactions: [...input.redactions],
+    redactions: input.redactions.map((r) => ({ ...r, file: safeName('file', r.file) })),
     escalationFloor: a.escalationFloor,
   };
-  if (path) draft['route'] = routeInfoOf(path);
+  if (path) {
+    const route = routeInfoOf(path);
+    draft['route'] = {
+      ...route,
+      path: safeName('route-path', route.path),
+      handlerFile: safeName('file', route.handlerFile),
+      middleware: route.middleware.map((m) => safeName('label', m)),
+    };
+  }
   if (match.safe) draft['safeVariant'] = match.safe.target;
   const parsed = CaseFile.safeParse(draft);
   if (!parsed.success) {
