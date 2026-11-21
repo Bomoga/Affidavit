@@ -11,6 +11,15 @@ export * from './quarantine.js';
 export * from './lockfiles.js';
 export * from './run.js';
 export * from './unscannable.js';
+export { fontFormatOf, FONT_HEAD_BYTES, type FontFormat } from './fonts.js';
+export {
+  PROOF_CAPS,
+  WINDOW_PROOF_NAMES,
+  inWindowProofClass,
+  measureText,
+  statsProveCoverage,
+  type TextStats,
+} from './windowproof.js';
 export {
   WindowsDirNotFreshError,
   remapWindowReport,

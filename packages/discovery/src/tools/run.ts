@@ -1,5 +1,5 @@
 import { lstat, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import type { ToolRunnerPort } from '@affidavit/contracts';
 import { buildInvocation, type ToolInvocation, type ToolRunOptions } from './invocations.js';
 import { findOsvLockfiles } from './lockfiles.js';
@@ -12,6 +12,12 @@ import {
   type QuarantinedSnapshot,
 } from './quarantine.js';
 import { findGitleaksUnscannable, type Unscannable } from './unscannable.js';
+import {
+  inWindowProofClass,
+  measureText,
+  statsProveCoverage,
+  usesAnalyzedConfig,
+} from './windowproof.js';
 import {
   assertMaxWindowBytes,
   remapWindowReport,
@@ -75,6 +81,19 @@ export interface ToolRunResult {
    * rule, path and region.
    */
   windowedFiles: string[];
+  /**
+   * Font files (TrueType, OpenType, WOFF, WOFF2, EOT) whose structure checks out, as `/src/<path>`.
+   * gitleaks does NOT scan them: each also has a `binary-font` notification, so they make the run
+   * partial. Listed apart so ingestion can keep exactly these files out of the workspace.
+   */
+  binaryFontFiles: string[];
+  /**
+   * Files flagged `chunk-split-risk` whose windows pass is a proof of full coverage (see
+   * windowproof.ts): generated data (lockfiles, SVG) windowed completely, with no window skipped,
+   * short lines and whitespace runs, no gate word, and the analyzed gitleaks config. Their
+   * `chunk-split-risk` notification is dropped; they are also in `windowedFiles`.
+   */
+  windowProvenFiles: string[];
   /** The output directory the run wrote into (the one passed in options). */
   outputPath: string;
   /** Name of the main report file. When `empty`, no file was written under this name. */
@@ -225,6 +244,8 @@ function osvMissingLockfiles(doc: unknown, lockfiles: readonly string[]): string
 }
 
 const KIND_TEXT: Record<Exclude<Unscannable['kind'], 'binary-media'>, string> = {
+  'binary-font':
+    'is a font file (TrueType, OpenType, WOFF or EOT, its structure checked) that gitleaks skips, so its content is NOT scanned; ingestion keeps font files out of the workspace',
   'binary-header-mismatch':
     'starts with a file signature gitleaks skips (archive, PDF, executable, database and similar) that does not match its extension, so a secret could be hidden behind that header',
   'skipped-file-type':
@@ -257,6 +278,7 @@ const KIND_ORDER = [
   'non-text-content',
   'unreadable',
   'skipped-file-type',
+  'binary-font',
   'archive-name-mismatch',
   'chunk-split-risk',
   'multiline-split-risk',
@@ -283,6 +305,7 @@ function coverageSplit(
 ): {
   notifications: ToolNotification[];
   binaryMediaFiles: string[];
+  binaryFontFiles: string[];
 } {
   const notifications: ToolNotification[] = [];
   for (const kind of KIND_ORDER) {
@@ -299,7 +322,10 @@ function coverageSplit(
   const binaryMediaFiles = files
     .filter((f) => f.kind === 'binary-media')
     .map((f) => `/src/${f.path}`);
-  return { notifications, binaryMediaFiles };
+  const binaryFontFiles = files
+    .filter((f) => f.kind === 'binary-font')
+    .map((f) => `/src/${f.path}`);
+  return { notifications, binaryMediaFiles, binaryFontFiles };
 }
 
 /**
@@ -469,6 +495,8 @@ export async function runTool(
       notifications: [],
       binaryMediaFiles: [],
       windowedFiles: [],
+      binaryFontFiles: [],
+      windowProvenFiles: [],
       reports: [],
     };
   }
@@ -479,6 +507,8 @@ export async function runTool(
   const notifications: ToolNotification[] = [];
   let binaryMediaFiles: string[] = [];
   let windowedFiles: string[] = [];
+  let binaryFontFiles: string[] = [];
+  const windowProvenFiles: string[] = [];
 
   if (name === 'semgrep') notifications.push(...semgrepNotifications(doc));
 
@@ -522,8 +552,9 @@ export async function runTool(
       });
       for (const f of side) {
         const original = mapSidecarPath(f.path, snapshot.mapping);
-        if (original !== undefined)
-          unscanned.push({ path: original, kind: f.kind, quarantined: true });
+        // A quarantined font is not one ingestion can keep out by its path: a plain coverage loss.
+        const kind = f.kind === 'binary-font' ? 'skipped-file-type' : f.kind;
+        if (original !== undefined) unscanned.push({ path: original, kind, quarantined: true });
       }
     }
 
@@ -553,6 +584,8 @@ export async function runTool(
     // removed, so two runs on one copy (or a leftover from another run) never delete each
     // other's windows.
     const windowsDir = await mkdtemp(`${resolve(snapshot.dir)}.windows-`);
+    // Files not windowed completely, or with a window gitleaks may skip: no proof for them.
+    const notFullyWindowed = new Set<string>();
     try {
       // files that already carry a coverage flag are windowed first if the budget is tight
       const priority = new Set(
@@ -566,6 +599,8 @@ export async function runTool(
         maxBytes: maxWindowBytes,
         priority,
       });
+      for (const f of win.failed) notFullyWindowed.add(f.original);
+      for (const f of win.skippedForBudget) notFullyWindowed.add(f);
       for (const f of win.failed) {
         notifications.push({
           level: 'warning',
@@ -586,6 +621,9 @@ export async function runTool(
         const byName = new Map(win.entries.map((e) => [e.name, e]));
         for (const hit of await findGitleaksUnscannable(windowsDir)) {
           notifications.push(windowHitNotification(hit, byName));
+          const parts = windowPathParts(hit.path);
+          const w = parts === undefined ? undefined : byName.get(parts.name);
+          if (w !== undefined) notFullyWindowed.add(w.original);
         }
         const winOut = `${outputDir}-windows`;
         await execute(
@@ -613,12 +651,31 @@ export async function runTool(
       // is the unique directory created above, never a path another run could own.
       await rm(windowsDir, { recursive: true, force: true });
     }
+    // Lift chunk-split-risk where the windows pass proves full coverage (windowproof.ts).
+    const windowed = new Set(windowedFiles);
+    const risky = unscanned.filter(
+      (f) =>
+        f.kind === 'chunk-split-risk' &&
+        f.quarantined !== true &&
+        inWindowProofClass(basename(f.path)) &&
+        windowed.has(`/src/${f.path}`) &&
+        !notFullyWindowed.has(f.path),
+    );
+    if (risky.length > 0 && (await usesAnalyzedConfig(rest.configDir, rest.gitleaksConfigFile))) {
+      for (const f of risky) {
+        const stats = await measureText(join(snapshot.dir, ...f.path.split('/')));
+        if (!statsProveCoverage(stats)) continue;
+        unscanned.splice(unscanned.indexOf(f), 1);
+        windowProvenFiles.push(`/src/${f.path}`);
+      }
+    }
     const split = coverageSplit(
       unscanned.sort((a, b) => a.path.localeCompare(b.path)),
-      new Set(windowedFiles),
+      windowed,
     );
     notifications.push(...split.notifications);
     binaryMediaFiles = split.binaryMediaFiles;
+    binaryFontFiles = split.binaryFontFiles;
   }
 
   return {
@@ -628,6 +685,8 @@ export async function runTool(
     notifications,
     binaryMediaFiles,
     windowedFiles,
+    binaryFontFiles,
+    windowProvenFiles: windowProvenFiles.sort(),
     reports,
   };
 }
