@@ -180,6 +180,64 @@ describe('measureText, segments gitleaks decodes together on one line', () => {
     expect(s.decodeIncomplete).toBe(true);
   });
 
+  // Second delta review: gitleaks v8.30.1 finds private-key in each of these.
+  const pct = (s: string): string =>
+    [...Buffer.from(s, 'latin1')].map((b) => `%${b.toString(16).padStart(2, '0')}`).join('');
+  const hex = (s: string): string => Buffer.from(s, 'latin1').toString('hex');
+
+  it('base64 followed directly by percent-encoded text', async () => {
+    const head = b64('-----BEGIN RSA PRIV');
+    expect(head.endsWith('==')).toBe(true);
+    const s = await measureText(file(`${head}${pct('ATE KEY-----')}\n${b64Lines}`));
+    expect(s.gates).toEqual(['private']);
+    expect(statsProveCoverage(s)).toBe(false);
+  });
+
+  it('base64 followed directly by hex', async () => {
+    const line = `${b64('-----BEGIN RSA PRIV')}${hex('ATE KEY-----MIIEvQIBADANBgkqhkiG9w0BAQEF')}`;
+    const s = await measureText(file(`${line}\n${b64Lines}`));
+    expect(s.gates).toEqual(['private']);
+    expect(statsProveCoverage(s)).toBe(false);
+  });
+
+  it('base64, hex and percent side by side', async () => {
+    const head = b64('-----BEGIN RSA PR');
+    expect(head.endsWith('=')).toBe(true);
+    const line = `x=${head}${hex('IVA')}${pct('TE KEY-----')}`;
+    const s = await measureText(file(`${line}\n${b64Lines}`));
+    expect(s.gates).toEqual(['private']);
+  });
+
+  it('a short raw run between decoded segments is kept raw in the join', async () => {
+    const line = `${b64('-----BEGIN RSA PRI')}=VATE`;
+    const s = await measureText(file(`${line}\n`));
+    expect(s.gates).toEqual(['private']);
+  });
+
+  it('a file that runs out of time gives no proof', async () => {
+    const s = await measureText(file(`${b64('a'.repeat(60))}\n`), { maxMillis: 0 });
+    expect(s.decodeIncomplete).toBe(true);
+    expect(statsProveCoverage(s)).toBe(false);
+  });
+
+  it('eight joined nested-base64 segments per line stay fast', async () => {
+    // 50 different lines, each 8 joined segments of base64 nested four deep, near the line cap.
+    const lines: string[] = [];
+    for (let i = 0; i < 50; i++) {
+      const segs: string[] = [];
+      for (let k = 0; k < 8; k++) {
+        let inner = `${i}-${k}-`.repeat(60).slice(0, 300);
+        for (let d = 0; d < 4; d++) inner = b64(inner);
+        segs.push(`${inner.slice(0, 480).replace(/=+$/, '')}=`);
+      }
+      lines.push(segs.join('').slice(0, 4000));
+    }
+    const t0 = performance.now();
+    const s = await measureText(file(`${lines.join('\n')}\n`));
+    expect(performance.now() - t0).toBeLessThan(1_000);
+    expect(s).toMatchObject({ gates: [], decodeIncomplete: false });
+  });
+
   it('1 MB of small separate segments stays well under a second', async () => {
     const line = 'QUFBQUFB '.repeat(450);
     const body = `${line}\n`.repeat(Math.ceil((1024 * 1024) / (line.length + 1)));

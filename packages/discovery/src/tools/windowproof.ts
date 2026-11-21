@@ -152,7 +152,11 @@ export interface TextStats {
 export interface MeasureOptions {
   /** Most decoded bytes produced for one file before the search gives up (no proof). */
   decodeBudgetBytes?: number;
+  /** Wall-clock milliseconds for the decoded search of one file; past it, no proof. */
+  maxMillis?: number;
 }
+
+const DEFAULT_MAX_MILLIS = 2_000;
 
 const READ_BYTES = 64 * 1024;
 /** gitleaks' default --max-decode-depth, which the invocation does not change. */
@@ -179,26 +183,52 @@ function gatesIn(text: string, found: Set<string>): void {
   }
 }
 
-/** Most segments in one joined group (see `decodings`); more gives no proof. */
+/** Most base64 or hex runs in one joined group (see `decodings`); more gives no proof. */
 export const MAX_JOINED_SEGMENTS = 8;
-/** Text between two segments that gitleaks can consume or decode in the same pass. */
-const JOIN_GAP = /^(?:=|%[0-9A-Fa-f]{2})*$/;
 const pctDecode = (s: string): string =>
   s.replace(PCT, (h) => String.fromCharCode(parseInt(h.slice(1), 16)));
 const b64Decode = (s: string): string => Buffer.from(s, 'base64').toString('latin1');
+const hexDecode = (s: string): string =>
+  Buffer.from(s.slice(0, s.length & ~1), 'hex').toString('latin1');
+/** Tokens that can touch in one gitleaks pass: alphabet runs (any length), `=` padding, `%XX`. */
+const TOKEN = /[A-Za-z0-9+/_-]+|=+|%[0-9A-Fa-f]{2}/g;
+const IS_HEX = /^[0-9A-Fa-f]+$/;
+/** gitleaks' shortest base64 segment; shorter runs stay raw in its pass. */
+const GITLEAKS_MIN_B64 = 16;
+type JoinMode = 'b64' | 'hex' | 'gitleaks-min' | 'drop-pct';
+
+/** One joined reading of a group of touching tokens. */
+function joinGroup(group: readonly RegExpExecArray[], mode: JoinMode): string {
+  let out = '';
+  for (const m of group) {
+    const t = m[0];
+    if (t.startsWith('=')) continue;
+    if (t.startsWith('%')) {
+      if (mode !== 'drop-pct') out += pctDecode(t);
+      continue;
+    }
+    if (t.length < 6 || (mode === 'gitleaks-min' && t.length < GITLEAKS_MIN_B64)) out += t;
+    else if (mode === 'hex' && IS_HEX.test(t)) out += hexDecode(t);
+    else out += b64Decode(t);
+  }
+  return out;
+}
 
 /**
  * Every decoding gitleaks could make of a segment of `text`, each with CONTEXT characters of the
  * text around it. Base64 runs are decoded at all four alignments (gitleaks' segment may start
  * anywhere in a longer run) and hex runs at both; percent escapes are decoded in place.
  *
- * gitleaks replaces every segment of a line in one pass, so segments that touch (only `=` padding
- * or percent escapes between them) also decode to one text. Such a group is searched joined three
- * ways: each segment decoded from its start with the gap between decoded too, the decoded
- * segments with nothing between them, and the whole group as one base64 run with the padding
- * stripped. Separate segments need no join: the text between them is raw and holds no letter of
- * the alphabet, so no gate word and no new segment can cross it. A group of more than
- * MAX_JOINED_SEGMENTS segments returns undefined (no proof), which also bounds the work.
+ * gitleaks replaces every segment of a line in one pass, whatever its encoding, so tokens that
+ * touch (alphabet runs of any length, `=` padding and `%XX` escapes with nothing between them)
+ * also decode to one text. Each such group is searched joined, in order, several ways: every run
+ * of 6 or more as base64; hex runs as hex and the rest as base64; runs shorter than gitleaks'
+ * 16-character minimum left raw; percent escapes decoded or dropped; and the whole group as one
+ * base64 run with padding and escapes stripped. Shorter runs stay raw in every reading. The join
+ * is searched again to DECODE_DEPTH like any decoding. Tokens that do not touch need no join: the
+ * text between them is raw and holds no letter of the alphabet, so no gate word and no new
+ * segment can cross it. A group of more than MAX_JOINED_SEGMENTS runs returns undefined (no
+ * proof), which also bounds the work.
  */
 function decodings(text: string): string[] | undefined {
   const out = new Set<string>();
@@ -207,39 +237,35 @@ function decodings(text: string): string[] | undefined {
       text.slice(Math.max(0, start - CONTEXT), start) + decoded + text.slice(end, end + CONTEXT),
     );
   };
-  const runs = [...text.matchAll(B64_RUN)];
-  for (let i = 0; i < runs.length;) {
+  const tokens = [...text.matchAll(TOKEN)];
+  for (let i = 0; i < tokens.length;) {
     let j = i;
-    while (j + 1 < runs.length) {
-      const cur = runs[j] as RegExpExecArray;
-      const next = runs[j + 1] as RegExpExecArray;
-      if (!JOIN_GAP.test(text.slice(cur.index + cur[0].length, next.index))) break;
+    while (j + 1 < tokens.length) {
+      const cur = tokens[j] as RegExpExecArray;
+      if ((tokens[j + 1] as RegExpExecArray).index !== cur.index + cur[0].length) break;
       j++;
     }
     if (j > i) {
-      if (j - i + 1 > MAX_JOINED_SEGMENTS) return undefined;
-      const group = runs.slice(i, j + 1);
-      const first = group[0] as RegExpExecArray;
-      const lastRun = group[group.length - 1] as RegExpExecArray;
-      const start = first.index;
-      const end = lastRun.index + lastRun[0].length;
-      let withGaps = '';
-      let bare = '';
-      group.forEach((m, k) => {
-        const d = b64Decode(m[0]);
-        bare += d;
-        withGaps += d;
-        const next = group[k + 1];
-        if (next) withGaps += pctDecode(text.slice(m.index + m[0].length, next.index));
-      });
-      around(start, end, withGaps);
-      around(start, end, bare);
-      const whole = text.slice(start, end);
-      around(start, end, b64Decode(whole.replace(/=|%[0-9A-Fa-f]{2}/g, '')));
-      around(start, end, b64Decode(pctDecode(whole).replace(/=/g, '')));
+      const group = tokens.slice(i, j + 1);
+      const runs = group.filter((m) => m[0].length >= 6 && !/^[=%]/.test(m[0])).length;
+      const pcts = group.filter((m) => m[0].startsWith('%')).length;
+      if (runs > MAX_JOINED_SEGMENTS) return undefined;
+      if (runs + pcts >= 1) {
+        const first = group[0] as RegExpExecArray;
+        const lastTok = group[group.length - 1] as RegExpExecArray;
+        const start = first.index;
+        const end = lastTok.index + lastTok[0].length;
+        for (const mode of ['b64', 'hex', 'gitleaks-min', 'drop-pct'] as const) {
+          around(start, end, joinGroup(group, mode));
+        }
+        const whole = text.slice(start, end);
+        around(start, end, b64Decode(whole.replace(/=|%[0-9A-Fa-f]{2}/g, '')));
+        around(start, end, b64Decode(pctDecode(whole).replace(/=/g, '')));
+      }
     }
     i = j + 1;
   }
+  const runs = [...text.matchAll(B64_RUN)];
   for (const m of runs) {
     for (let off = 0; off < 4 && m[0].length - off >= 6; off++) {
       const start = m.index + off;
@@ -262,22 +288,32 @@ function decodings(text: string): string[] | undefined {
 }
 
 /** Searches the decoded forms of one line, recursively to DECODE_DEPTH. False when out of budget. */
-function searchDecoded(
-  text: string,
-  depth: number,
-  found: Set<string>,
-  budget: { left: number },
-): boolean {
+function searchDecoded(text: string, depth: number, found: Set<string>, budget: Budget): boolean {
   if (depth === 0 || found.size === GATES.length) return true;
+  if (Date.now() >= budget.deadline) return false;
   const all = decodings(text);
   if (all === undefined) return false;
   for (const d of all) {
+    // A text already searched to at least this depth adds nothing (the same text recurs often:
+    // every alignment and join of a short segment decodes to the same few strings).
+    const key = `${depth}\u0000${d}`;
+    if (budget.seen.has(key)) continue;
     budget.left -= d.length;
     if (budget.left < 0) return false;
+    budget.seen.add(key);
     gatesIn(d, found);
     if (!searchDecoded(d, depth - 1, found, budget)) return false;
   }
   return true;
+}
+
+interface Budget {
+  /** Decoded bytes left for this file. */
+  left: number;
+  /** Date.now() after which the search gives up (no proof). */
+  deadline: number;
+  /** Texts already searched, with the depth left, for this line. */
+  seen: Set<string>;
 }
 
 /** Streams a file once and measures what the proof needs. Bounded memory. */
@@ -291,7 +327,11 @@ export async function measureText(path: string, opts: MeasureOptions = {}): Prom
     let maxWs = 0;
     let carry = '';
     const found = new Set<string>();
-    const budget = { left: opts.decodeBudgetBytes ?? DEFAULT_DECODE_BUDGET };
+    const budget: Budget = {
+      left: opts.decodeBudgetBytes ?? DEFAULT_DECODE_BUDGET,
+      deadline: Date.now() + (opts.maxMillis ?? DEFAULT_MAX_MILLIS),
+      seen: new Set(),
+    };
     let decodeIncomplete = false;
     // the current line, kept up to PROOF_CAPS.line bytes for the decoded search
     const lineBuf = Buffer.alloc(PROOF_CAPS.line);
@@ -301,6 +341,7 @@ export async function measureText(path: string, opts: MeasureOptions = {}): Prom
       if (lineTooLong) decodeIncomplete = true;
       else if (!decodeIncomplete && lineLen > 0) {
         const text = lineBuf.toString('latin1', 0, lineLen);
+        budget.seen.clear();
         if (!searchDecoded(text, DECODE_DEPTH, found, budget)) decodeIncomplete = true;
       }
       lineLen = 0;
