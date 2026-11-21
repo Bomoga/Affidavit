@@ -138,6 +138,25 @@ describe('deriveRecipe (Dockerfile targets)', () => {
     ).toBe(false);
   });
 
+  it('checks dev-only lockfile entries when the build will install devDependencies', async () => {
+    app('FROM node:22\nCMD ["node","x"]');
+    write(
+      'package-lock.json',
+      JSON.stringify({
+        lockfileVersion: 3,
+        packages: {
+          '': {},
+          'node_modules/tool': { version: 'git+https://example.test/tool.git', dev: true },
+        },
+      }),
+    );
+    expect((await deriveRecipe(root, hints())).ok).toBe(true);
+    expect(await deriveRecipe(root, hints(), { devDependencies: true })).toEqual({
+      ok: false,
+      reason: 'node_modules/tool comes from git+https://example.test/tool.git',
+    });
+  });
+
   it('clamps the health timeout the hints ask for to the Lane 2 maximum', async () => {
     app('FROM node:22\nCMD ["node","x"]');
     const r = await deriveRecipe(root, hints({ healthTimeoutMs: 24 * 3600 * 1000 }));
