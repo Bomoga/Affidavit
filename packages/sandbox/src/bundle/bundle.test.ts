@@ -1,4 +1,5 @@
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -306,10 +307,77 @@ describe('inspectPackageTarball', () => {
     ]);
   });
 
-  it('counts prepare as an install script', async () => {
-    const prep = await packageTgz({ name: 'p', version: '1.0.0', scripts: { prepare: 'tsc' } });
+  // Re-review decision: npm runs `prepare` only for the root project and git or folder sources,
+  // never for a registry tarball, and the install uses --ignore-scripts, so `prepare` is reported
+  // apart from the scripts that make a section unsupported.
+  it('reports prepare apart from install scripts, for the package and nested packages', async () => {
+    const prep = await packageTgz(
+      { name: 'p', version: '1.0.0', scripts: { prepare: 'tsc' } },
+      {
+        'node_modules/n/package.json': JSON.stringify({
+          name: 'n',
+          version: '1.0.0',
+          scripts: { prepare: 'x', postinstall: 'y' },
+        }),
+      },
+    );
     const read = await inspectPackageTarball(prep, DEPENDENCY_BUNDLE_CAPS.maxUnpackedPackageBytes);
-    expect(read.ok && read.info.installScripts).toEqual(['prepare']);
+    expect(read.ok && read.info.installScripts).toEqual(['node_modules/n: postinstall']);
+    expect(read.ok && read.info.prepareScripts).toEqual(['prepare', 'node_modules/n: prepare']);
+  });
+
+  it('a registry package with only prepare is bundled, flagged prepareScriptIgnored', async () => {
+    const prep = await packageTgz({ name: 'p', version: '1.0.0', scripts: { prepare: 'tsc' } });
+    const lockText = lockfile(
+      {
+        'node_modules/p': {
+          version: '1.0.0',
+          resolved: resolvedFor('p', '1.0.0'),
+          integrity: integrityOf(prep),
+        },
+      },
+      { dependencies: { p: '1.0.0' } },
+    );
+    const input = {
+      app: 'testapp',
+      commit: COMMIT,
+      lockText,
+      tarballFor: () => Promise.resolve(prep),
+    };
+    const { manifest } = await assembleBundle(input);
+    const s = manifest.sections.production;
+    expect(s.status === 'ok' && s.packages[0]?.prepareScriptIgnored).toBe(true);
+    // The flag is under the digest: a manifest that drops it fails its section digest.
+    expect(parseBundleManifest(JSON.stringify(manifest)).ok).toBe(true);
+    // And a bundle whose manifest does not state it for a prepare package does not open.
+    const file = join(bundles, 'prep.tar');
+    const built = await assembleBundleFile(input, file);
+    expect((await openDependencyBundle(ref(file, built.sha256), work)).ok).toBe(true);
+    if (s.status !== 'ok') return;
+    const forged: DependencyBundleManifest = {
+      ...manifest,
+      sections: {
+        ...manifest.sections,
+        production: makeSection({
+          status: 'ok',
+          packages: s.packages.map((p) => {
+            const copy = { ...p };
+            delete copy.prepareScriptIgnored;
+            return copy;
+          }),
+        }),
+      },
+    };
+    const r = await crafted([
+      { name: 'manifest.json', data: JSON.stringify(forged) },
+      { name: `tarballs/${s.packages[0]?.sha512 ?? ''}.tgz`, data: prep },
+    ]);
+    expect(await openDependencyBundle(r, work)).toEqual({
+      ok: false,
+      unsupported: false,
+      reason:
+        'dependency bundle tarball for node_modules/p has a prepare script the manifest does not record',
+    });
   });
 
   it('refuses a tarball that unpacks past the cap', async () => {
@@ -615,6 +683,54 @@ describe('openDependencyBundle', () => {
     const opened = await openDependencyBundle(ref(b.file, 'f'.repeat(64)), work);
     expect(opened.ok).toBe(false);
     expect(readdirSync(work)).toEqual([]);
+  });
+
+  it('verifies the whole-bundle digest before writing anything (not even the work directory)', async () => {
+    const b = await build(await fixture());
+    const fresh = join(work, 'never-created');
+    expect((await openDependencyBundle(ref(b.file, 'f'.repeat(64)), fresh)).ok).toBe(false);
+    expect(existsSync(fresh)).toBe(false);
+    // A bundle that is a valid tar of good tarballs but not the pinned one is also never written.
+    const r = await crafted([{ name: 'manifest.json', data: '{}' }]);
+    expect(
+      (await openDependencyBundle({ ...r, sha256: 'e'.repeat(64) }, join(work, 'also-never'))).ok,
+    ).toBe(false);
+    expect(existsSync(join(work, 'also-never'))).toBe(false);
+  });
+
+  it('refuses a tarball whose package.json has no version', async () => {
+    const noVersion = await packageTgz({ name: 'left' });
+    const sha512 = parseIntegrity(integrityOf(noVersion))?.[0]?.hex as string;
+    const manifest: DependencyBundleManifest = {
+      schema: BUNDLE_SCHEMA,
+      app: 'testapp',
+      commit: COMMIT,
+      lockfileSha256: 'a'.repeat(64),
+      sections: {
+        production: makeSection({
+          status: 'ok',
+          packages: [
+            {
+              path: 'node_modules/left',
+              name: 'left',
+              version: '1.0.0',
+              resolved: resolvedFor('left', '1.0.0'),
+              integrity: integrityOf(noVersion),
+              sha512,
+            },
+          ],
+        }),
+        dev: makeSection({ status: 'ok', packages: [] }),
+      },
+    };
+    const r = await crafted([
+      { name: 'manifest.json', data: JSON.stringify(manifest) },
+      { name: `tarballs/${sha512}.tgz`, data: noVersion },
+    ]);
+    const opened = await openDependencyBundle(r, work);
+    expect(!opened.ok && opened.reason).toBe(
+      'dependency bundle tarball for node_modules/left is version undefined, not 1.0.0',
+    );
   });
 
   it('removes the store on any other refusal too', async () => {

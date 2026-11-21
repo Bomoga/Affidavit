@@ -112,11 +112,15 @@ export function pruneExcludedDev(
     return { ok: false, reason: 'dev exclusions need a v2 or v3 lockfile (with packages)' };
   }
   const packages = lock.packages;
+  // The lockfile as written, for resolving what each kept package needs.
+  const original: Obj = { ...packages };
   const removed = new Set<string>();
-  const drop = (path: string): void => {
+  const excludedPaths = new Map<string, ExcludedDevPackage>();
+  const drop = (path: string, ex: ExcludedDevPackage): void => {
     for (const p of Object.keys(packages)) {
       if (p === path || p.startsWith(`${path}/`)) {
         removed.add(p);
+        excludedPaths.set(p, ex);
         delete packages[p];
       }
     }
@@ -143,18 +147,18 @@ export function pruneExcludedDev(
         reason: `dev exclusion ${ex.name}@${ex.version} is not a dev-only package (${notDev[0]})`,
       };
     }
-    for (const [p] of hits) drop(p);
+    for (const [p] of hits) drop(p, ex);
     for (const holder of [packages[''], pkg]) {
       if (isObj(holder) && isObj(holder.devDependencies)) delete holder.devDependencies[ex.name];
     }
   }
 
   // Keep only what the root still reaches (Node resolution: nearest node_modules upwards).
-  const resolve = (from: string, name: string): string | null => {
+  const resolve = (from: string, name: string, map: Obj = packages): string | null => {
     let base = from;
     for (;;) {
       const candidate = base === '' ? `node_modules/${name}` : `${base}/node_modules/${name}`;
-      if (candidate in packages) return candidate;
+      if (candidate in map) return candidate;
       if (base === '') return null;
       const i = base.lastIndexOf('/node_modules/');
       base = i === -1 ? '' : base.slice(0, i);
@@ -195,6 +199,31 @@ export function pruneExcludedDev(
     if (!reached.has(p)) {
       removed.add(p);
       delete packages[p];
+    }
+  }
+
+  // A kept package that needs an excluded one (as the lockfile resolves it) would break at run
+  // time, so the list does not apply: refuse, naming both. The root's devDependencies on the
+  // excluded names are what the list removes, so they are not checked.
+  for (const from of [...reached].sort()) {
+    const e = original[from];
+    if (!isObj(e)) continue;
+    for (const f of DEP_FIELDS) {
+      const deps = e[f];
+      if (!isObj(deps)) continue;
+      for (const name of Object.keys(deps)) {
+        const to = resolve(from, name, original);
+        const ex = to === null ? undefined : excludedPaths.get(to);
+        if (ex === undefined) continue;
+        const who =
+          from === ''
+            ? 'the root package'
+            : `kept package ${typeof e.name === 'string' ? e.name : nameFromPath(from)}@${String(e.version)} (${from})`;
+        return {
+          ok: false,
+          reason: `dev exclusion ${ex.name}@${ex.version} is needed by ${who}`,
+        };
+      }
     }
   }
 

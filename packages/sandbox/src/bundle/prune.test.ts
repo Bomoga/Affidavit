@@ -148,6 +148,30 @@ describe('pruneExcludedDev', () => {
     });
   });
 
+  it.each(['dependencies', 'optionalDependencies', 'peerDependencies'])(
+    'refuses when a kept package needs an excluded one (%s), naming both',
+    (field) => {
+      const lock = JSON.parse(lockText) as {
+        packages: Record<string, unknown>;
+      };
+      lock.packages['node_modules/cypress-plugin'] = {
+        version: '1.0.0',
+        resolved: resolvedFor('cypress-plugin', '1.0.0'),
+        integrity: h('p'),
+        dev: true,
+        [field]: { cypress: '3.3.1' },
+      };
+      (lock.packages[''] as { devDependencies: Record<string, string> }).devDependencies[
+        'cypress-plugin'
+      ] = '1.0.0';
+      expect(pruneExcludedDev(JSON.stringify(lock), pkgText, EXCLUDE)).toEqual({
+        ok: false,
+        reason:
+          'dev exclusion cypress@3.3.1 is needed by kept package cypress-plugin@1.0.0 (node_modules/cypress-plugin)',
+      });
+    },
+  );
+
   it('refuses exclusions on a v1-only lockfile', () => {
     expect(
       pruneExcludedDev(JSON.stringify({ lockfileVersion: 1, dependencies: {} }), pkgText, EXCLUDE),

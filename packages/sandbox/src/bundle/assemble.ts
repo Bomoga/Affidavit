@@ -112,6 +112,9 @@ export async function assembleBundle(input: AssembleInput): Promise<AssembleResu
         resolved: p.resolved,
         integrity: p.integrity,
         sha512,
+        ...(inspected.info.prepareScripts.length > 0
+          ? { prepareScriptIgnored: true as const }
+          : {}),
       });
     }
     if (problems.length > 0) {

@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import type { BootHints } from '@affidavit/contracts';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { assembleBundleFile } from '../bundle/assemble.js';
-import { pinnedBundleSha256 } from '../bundle/pins.js';
+import { pinnedBundleSha256, pinnedDependencyBundle } from '../bundle/pins.js';
 import { integrityOf, lockfile, packageTgz, resolvedFor } from '../bundle/testkit.js';
 import { createCaseNetwork, removeCaseNetwork } from '../gvisor/network.js';
 import { bootTarget } from './boot.js';
@@ -12,7 +12,8 @@ import { buildTarget } from './build.js';
 
 // Sandbox-host only (gVisor and Docker): `pnpm --filter @affidavit/sandbox test:sandbox-host`.
 // The NodeGoat case also needs AFFIDAVIT_NODEGOAT_DIR (a checkout at the corpus pin) and
-// AFFIDAVIT_NODEGOAT_BUNDLE (the bundle tar a human built), and a digest in pins.json.
+// AFFIDAVIT_NODEGOAT_BUNDLE (the bundle tar a human built) inside AFFIDAVIT_DEPENDENCY_BUNDLE_ROOT
+// (the configured bundle store), and a digest in pins.json.
 const onSandboxHost = process.env.AFFIDAVIT_SANDBOX_HOST === '1';
 const nodegoat = process.env.AFFIDAVIT_NODEGOAT_DIR;
 const nodegoatBundle = process.env.AFFIDAVIT_NODEGOAT_BUNDLE;
@@ -165,7 +166,17 @@ describe.runIf(onSandboxHost)('dependency bundles on a sandbox host', { timeout:
   it.runIf(nodegoat !== undefined && nodegoatBundle !== undefined && pinned !== null)(
     'builds and boots NodeGoat from its pinned bundle',
     async () => {
-      const bundleRoot = join(nodegoatBundle as string, '..');
+      // The configured bundle store (host setup), not the bundle's own folder.
+      const storeRoot = process.env.AFFIDAVIT_DEPENDENCY_BUNDLE_ROOT;
+      if (storeRoot === undefined) {
+        throw new Error('set AFFIDAVIT_DEPENDENCY_BUNDLE_ROOT to the dependency bundle store');
+      }
+      const ref = await pinnedDependencyBundle({
+        app: 'nodegoat',
+        commit: NODEGOAT_COMMIT,
+        path: nodegoatBundle as string,
+        storeRoot,
+      });
       const build = await buildTarget(
         nodegoat as string,
         {
@@ -180,11 +191,7 @@ describe.runIf(onSandboxHost)('dependency bundles on a sandbox host', { timeout:
         },
         {
           workRoot,
-          dependencyBundle: {
-            path: nodegoatBundle as string,
-            sha256: pinned as string,
-            allowedRoot: bundleRoot,
-          },
+          dependencyBundle: ref,
         },
       );
       expect(build).toMatchObject({ ok: true, dependencyBundle: { sha256: `sha256:${pinned}` } });

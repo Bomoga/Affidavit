@@ -1,7 +1,9 @@
-import { readFileSync, readdirSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import * as guard from './egress-guard.js';
 import { EGRESS_ALLOWLIST, findEgress } from './egress-guard.js';
 
 // Nothing under src/ may reach the network or run a package manager or fetch tool on the host.
@@ -11,19 +13,45 @@ import { EGRESS_ALLOWLIST, findEgress } from './egress-guard.js';
 
 const SRC = fileURLToPath(new URL('..', import.meta.url));
 
-function sourceFiles(dir: string): string[] {
-  const out: string[] = [];
-  for (const e of readdirSync(dir, { withFileTypes: true })) {
-    const p = join(dir, e.name);
-    if (e.isDirectory()) out.push(...sourceFiles(p));
-    else if (e.name.endsWith('.ts') && !e.name.endsWith('.test.ts') && e.name !== 'testkit.ts') {
-      out.push(p);
-    }
-  }
-  return out;
-}
+// Read through the namespace so this file still loads (and fails test by test) against a guard
+// that does not export it yet.
+const sourceFiles = (dir: string): string[] =>
+  (guard as { guardedSourceFiles?: (d: string) => string[] }).guardedSourceFiles?.(dir) ?? [];
 
 describe('egress guard over src/', () => {
+  it('scans every JS and TS source kind, and skips tests and test helpers', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'affidavit-guard-'));
+    try {
+      mkdirSync(join(dir, 'sub'));
+      const names = [
+        'a.ts',
+        'b.tsx',
+        'c.mts',
+        'd.cts',
+        'e.js',
+        'sub/f.mjs',
+        'sub/g.cjs',
+        'h.test.ts',
+        'i.test.mjs',
+        'testkit.ts',
+        'testutil.js',
+        'notes.md',
+        'data.json',
+      ];
+      for (const n of names) writeFileSync(join(dir, n), '');
+      const found = sourceFiles(dir)
+        .map((f) => relative(dir, f).split('\\').join('/'))
+        .sort();
+      expect(found).toEqual(['a.ts', 'b.tsx', 'c.mts', 'd.cts', 'e.js', 'sub/f.mjs', 'sub/g.cjs']);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('src/ has sources to scan', () => {
+    expect(sourceFiles(SRC).length).toBeGreaterThan(20);
+  });
+
   it('finds no network import, fetch, or host package-manager or fetch-tool spawn', () => {
     const findings = sourceFiles(SRC).flatMap((f) =>
       findEgress(relative(SRC, f).split('\\').join('/'), readFileSync(f, 'utf8')),
@@ -105,16 +133,82 @@ describe('egress guard self-test: each snippet must be caught', () => {
     ],
     ['unresolvable command', `import { execFile } from 'node:child_process'; execFile(bin, args);`],
   ];
-  it.each(caught)('catches %s', (_label, code) => {
+  /** Review of #55 (9af2a8e): evasions the first guard missed. */
+  const evasions: [string, string][] = [
+    ['import() of a concatenated name', `const m = await import('node:' + 'https');`],
+    ['import() of a template-built name', 'const m = await import(`node:${"https"}`);'],
+    [
+      'createRequire',
+      `import { createRequire } from 'node:module'; const r = createRequire(import.meta.url); r('node:https');`,
+    ],
+    ['bracket access globalThis fetch', `globalThis['fetch'](u);`],
+    ['aliased globalThis.fetch', `const f = globalThis.fetch; f(u);`],
+    ['fetch.call', `fetch.call(null, u);`],
+    [
+      'destructured from a namespace',
+      `import * as cp from 'node:child_process'; const { execFile } = cp; execFile('npm', ['i']);`,
+    ],
+    [
+      'bracket access on a namespace',
+      `import * as cp from 'node:child_process'; cp['execFile']('npm', ['i']);`,
+    ],
+    ['require().execFile', `require('node:child_process').execFile('npm', ['i']);`],
+    [
+      'destructured dynamic import',
+      `const { spawn } = await import('node:child_process'); spawn('npm', ['i']);`,
+    ],
+    [
+      '/usr/bin/env npm',
+      `import { execFile } from 'node:child_process'; execFile('/usr/bin/env', ['npm', 'install']);`,
+    ],
+    [
+      'shell with an args variable',
+      `import { execFile } from 'node:child_process'; execFile('sh', argsVar);`,
+    ],
+    [
+      'docker run npm install',
+      `import { execFile } from 'node:child_process'; execFile('docker', ['run', 'node:22', 'npm', 'install']);`,
+    ],
+    [
+      'docker on the host network',
+      `import { execFile } from 'node:child_process'; execFile('docker', ['run', '--network', 'host', 'x']);`,
+    ],
+    [
+      'docker args spread',
+      `import { execFile } from 'node:child_process'; execFile('docker', ['run', ...more]);`,
+    ],
+    [
+      'an aliased spawn function',
+      `import { execFile } from 'node:child_process'; const e = execFile; e('npm', ['i']);`,
+    ],
+    ['EventSource', `const s = new EventSource(u);`],
+    ['destructured fetch', `const { fetch: f } = globalThis; f(u);`],
+    ['computed global key', `globalThis[name](u);`],
+    ['node:module', `import { builtinModules } from 'node:module';`],
+  ];
+  // Each is caught in an ordinary file and in a file that may import child_process.
+  it.each([...caught, ...evasions])('catches %s', (_label, code) => {
     expect(findEgress('snippet.ts', code, [])).not.toEqual([]);
+    expect(findEgress('gvisor/runner.ts', code, [])).not.toEqual([]);
+  });
+
+  it.each([
+    ['snippet.js', `const h = require('https'); h.get(u);`],
+    ['snippet.mjs', `await fetch(u);`],
+    ['snippet.cjs', `require('node:child_process').execFile('npm', ['i']);`],
+    ['snippet.tsx', `const x = fetch(u);`],
+  ])('catches network code in %s', (file, code) => {
+    expect(findEgress(file, code, [])).not.toEqual([]);
+  });
+
+  it('child_process is a finding outside the sanctioned files, even calling docker', () => {
+    const code = `import { execFile } from 'node:child_process'; execFile('docker', ['ps']);`;
+    expect(findEgress('bundle/open.ts', code, [])).not.toEqual([]);
+    expect(findEgress('gvisor/runner.ts', code, [])).toEqual([]);
   });
 
   const allowed: [string, string][] = [
     ['type-only net import', `import type { AddressInfo } from 'node:net';`],
-    [
-      'docker',
-      `import { execFile } from 'node:child_process'; execFile('docker', ['build', '--network', 'none']);`,
-    ],
     ['fetch inside a script string', 'const S = `await fetch(url)`;'],
     [
       'a jailed command array',
@@ -124,6 +218,19 @@ describe('egress guard self-test: each snippet must be caught', () => {
   ];
   it.each(allowed)('allows %s', (_label, code) => {
     expect(findEgress('snippet.ts', code, [])).toEqual([]);
+  });
+
+  it.each([
+    [
+      'docker with --network none, in a sanctioned file',
+      `import { execFile } from 'node:child_process'; execFile('docker', ['build', '--network', 'none']);`,
+    ],
+    [
+      'promisified docker with typed values, in a sanctioned file',
+      `import { execFile } from 'node:child_process'; import { promisify } from 'node:util'; const exec = promisify(execFile); await exec('docker', ['rm', '--force', name]).catch(() => undefined);`,
+    ],
+  ])('allows %s', (_label, code) => {
+    expect(findEgress('gvisor/runner.ts', code, [])).toEqual([]);
   });
 
   it('an allowlist entry only covers its own file and finding', () => {

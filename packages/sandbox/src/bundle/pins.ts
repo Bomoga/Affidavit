@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { createReadStream, readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { lstat, realpath } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 import { SHA256_HEX } from './integrity.js';
@@ -56,17 +57,39 @@ const HUMAN_STEP =
   'docker/sandbox/dependency-bundles/pins.json';
 
 /**
- * A ref to a bundle file for `buildTarget` / `bootVariant`, checked against the pin before it is
- * returned: throws (fail closed) when the app has no pin, the pin is null, or the file's sha256
- * differs. The bundle's directory becomes the allowed root. `openDependencyBundle` checks the
- * digest again when the build reads it.
+ * A ref to a bundle file for `buildTarget` / `bootVariant`, checked before it is returned. Throws
+ * (fail closed) when the app has no pin, the pin is null, the file's sha256 differs, the store
+ * root is not absolute, or the file's real path (after resolving every link) is not inside the
+ * configured store root. That root, not the bundle's own folder, becomes the allowed root.
+ * `openDependencyBundle` checks both again when the build reads the bundle.
  */
 export async function pinnedDependencyBundle(input: {
   app: string;
   commit: string;
   path: string;
+  /** The configured dependency bundle store (host setup), absolute. */
+  storeRoot: string;
   pinsFile?: string;
 }): Promise<DependencyBundleRef> {
+  if (!isAbsolute(input.storeRoot) || !isAbsolute(input.path)) {
+    throw new Error('the dependency bundle path and store root must be absolute');
+  }
+  let root: string;
+  let real: string;
+  try {
+    root = await realpath(input.storeRoot);
+    real = await realpath(input.path);
+  } catch {
+    throw new Error(`dependency bundle ${input.path} or its store cannot be read`);
+  }
+  const rel = relative(root, real);
+  if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
+    throw new Error(
+      `dependency bundle ${input.path} resolves outside the dependency bundle store ${input.storeRoot}`,
+    );
+  }
+  if (!(await lstat(real)).isFile())
+    throw new Error(`dependency bundle ${input.path} is not a file`);
   const pinned = pinnedBundleSha256(input.app, input.commit, input.pinsFile);
   if (pinned === null) {
     throw new Error(
@@ -74,14 +97,14 @@ export async function pinnedDependencyBundle(input: {
     );
   }
   const hash = createHash('sha256');
-  await pipeline(createReadStream(input.path), hash);
+  await pipeline(createReadStream(real), hash);
   const actual = hash.digest('hex');
   if (actual !== pinned) {
     throw new Error(
       `dependency bundle sha256 ${actual} does not match the pinned ${pinned} (${input.path}): ${HUMAN_STEP}`,
     );
   }
-  return { path: input.path, sha256: pinned, allowedRoot: dirname(input.path) };
+  return { path: real, sha256: pinned, allowedRoot: root };
 }
 
 /** The pinned digest for an app at a commit, or null when none is pinned. */

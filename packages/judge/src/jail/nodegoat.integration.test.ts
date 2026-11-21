@@ -249,10 +249,16 @@ describe.skipIf(SKIP_REASON !== null)(
       mkdirSync(workRoot);
       const pin = readDependencyBundlePins().find((p) => p.app === 'nodegoat');
       if (pin === undefined) throw new Error('pins.json has no nodegoat entry');
+      // The configured bundle store (host setup); the bundle file must resolve inside it.
+      const storeRoot = process.env.AFFIDAVIT_DEPENDENCY_BUNDLE_ROOT;
+      if (storeRoot === undefined) {
+        throw new Error('set AFFIDAVIT_DEPENDENCY_BUNDLE_ROOT to the dependency bundle store');
+      }
       dependencyBundle = await pinnedDependencyBundle({
         app: 'nodegoat',
         commit: pin.commit,
         path: bundle as string,
+        storeRoot,
       });
       runnerImage = await buildRunnerImage();
       booted.vulnerable = await bootVariant(nodegoat as string, HINTS, {
@@ -372,20 +378,16 @@ describe.skipIf(SKIP_REASON !== null)(
       }, 600_000);
 
       /**
-       * NodeGoat's suite cannot be built in the sandbox yet. The reviewed exclusions
-       * (bundle-exclusions.json) take out cypress, nodemon and `grunt-if` (a GitHub tarball), but
-       * three dev packages left in the bundle (domelementtype, entities, uuid) declare a `prepare`
-       * script, which the L2-04c review rule refuses, so the bundle's dev section is unsupported
-       * and no build step has a route out (deny-all egress, lead decision 2026-11-20). (Its
-       * `npm test` also points at `test/unit/*.js`, which the repository does not have.) An
-       * unavailable suite rejects the patch with `suite-fails`.
+       * With the pinned bundle (dev section ok after the reviewed exclusions; `prepare` in registry
+       * tarballs is recorded, not run), NodeGoat's suite image builds offline. Its suite runs no
+       * meaningful tests: `npm test` is `grunt test`, whose `mochaTest:unit` globs `test/unit/*.js`,
+       * which the repository does not have, and the Gruntfile sets `force`. On the bundle host,
+       * `grunt test` printed "No files to check...OK" and exited 0. So a passing suite here proves
+       * only that the patched image builds; the patch evidence on NodeGoat is the family rerun and
+       * the counterexamples.
        */
-      const expectNoSuite = (suite: unknown) => {
-        const s = suite as { state: string; reason: string };
-        expect(s.state).toBe('unavailable');
-        expect(s.reason).toMatch(
-          /^the suite cannot be built: the dependency bundle's dev section is unsupported: .*\(prepare\)/,
-        );
+      const expectVacuousSuite = (suite: unknown) => {
+        expect(suite).toEqual({ state: 'passed' });
       };
 
       const verifierFor = (safe: BootedTarget) => {
@@ -403,7 +405,7 @@ describe.skipIf(SKIP_REASON !== null)(
         });
       };
 
-      it("rejects NodeGoat's own $where fix with suite-fails: the family flips, but the suite is unavailable", async () => {
+      it("accepts NodeGoat's own $where fix on the family rerun: the family flips; the suite builds and passes vacuously", async () => {
         const cf = caseFor('injection', gateCaseFile().id, booted.vulnerable!, booted.safeNosqli!);
         const w = witnessFor(
           cf.id,
@@ -418,17 +420,17 @@ describe.skipIf(SKIP_REASON !== null)(
           w,
           [],
         );
-        expectNoSuite(suite);
+        expectVacuousSuite(suite);
         expect(r).toMatchObject({
           familyFlipped: true,
-          suitePassed: false,
+          suitePassed: true,
           rescanClean: true,
           counterexamples: [],
         });
-        expect(r.rejectedBy).toBe('suite-fails');
+        expect(r.rejectedBy).toBeUndefined();
       });
 
-      it("rejects NodeGoat's own IDOR fix with suite-fails: every pair flips, but the suite is unavailable", async () => {
+      it("accepts NodeGoat's own IDOR fix on the family rerun: every pair flips; the suite passes vacuously", async () => {
         const cf = caseFor('idor', 'case-nodegoat-idor-001', booted.vulnerable!, booted.safeIdor!);
         const w = witnessFor(
           cf.id,
@@ -444,9 +446,9 @@ describe.skipIf(SKIP_REASON !== null)(
           w,
           [],
         );
-        expectNoSuite(suite);
-        expect(r).toMatchObject({ familyFlipped: true, suitePassed: false });
-        expect(r.rejectedBy).toBe('suite-fails');
+        expectVacuousSuite(suite);
+        expect(r).toMatchObject({ familyFlipped: true, suitePassed: true });
+        expect(r.rejectedBy).toBeUndefined();
       });
 
       it('rejects a patch that changes the file but not the bug: the family does not flip', async () => {

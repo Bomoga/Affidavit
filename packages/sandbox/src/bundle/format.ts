@@ -31,6 +31,12 @@ export interface BundlePackage {
   integrity: string;
   /** sha512 (hex) of the tarball bytes, which is also its name in the bundle. */
   sha512: string;
+  /**
+   * Set when the tarball (or a package nested in it) declares a `prepare` script. npm never runs
+   * `prepare` for a registry tarball and the install uses `--ignore-scripts`; recorded so a
+   * reviewer sees it, and under the section digest.
+   */
+  prepareScriptIgnored?: true;
 }
 
 /**
@@ -141,7 +147,18 @@ export function parseBundleManifest(
       const packages: BundlePackage[] = [];
       for (const p of s.packages as unknown[]) {
         if (!isObj(p)) return fail(`section ${name} has a malformed package`);
-        const { path, name: pkgName, version, resolved, integrity, sha512 } = p;
+        const {
+          path,
+          name: pkgName,
+          version,
+          resolved,
+          integrity,
+          sha512,
+          prepareScriptIgnored,
+        } = p;
+        if (prepareScriptIgnored !== undefined && prepareScriptIgnored !== true) {
+          return fail(`package ${String(path)} has a bad prepareScriptIgnored`);
+        }
         if (!nonEmpty(path) || !nonEmpty(pkgName) || !nonEmpty(version)) {
           return fail(`section ${name} has a package without path, name or version`);
         }
@@ -163,6 +180,7 @@ export function parseBundleManifest(
           resolved,
           integrity: integrity as string,
           sha512,
+          ...(prepareScriptIgnored === true ? { prepareScriptIgnored: true as const } : {}),
         });
       }
       rec = { status: 'ok', sha256: s.sha256, packages };

@@ -81,9 +81,10 @@ export function bundleEntryProblem(name: string, type: string | null | undefined
 }
 
 /**
- * Opens a pinned dependency bundle on the host, in one pass over its bytes: the sha256 of the
- * whole file is computed while its tar entries are parsed, and nothing from it is used unless that
- * sha256 equals the pinned digest (fail closed on mismatch). Then the manifest is validated, every
+ * Opens a pinned dependency bundle on the host. A first streaming pass hashes the whole file and
+ * nothing is created or written unless that sha256 equals the pinned digest (fail closed on
+ * mismatch). A second pass parses the tar, hashing again, and is refused if the file changed in
+ * between. Then the manifest is validated, every
  * tarball's sha512 must match its name, every hash in each package's lockfile integrity must match
  * its tarball, and each tarball is inspected for install scripts. Refused at any point: a path
  * outside `allowedRoot` or a link, a file over the size cap, more entries than the cap, a symlink,
@@ -125,6 +126,13 @@ export async function openDependencyBundle(
     return broken('cannot be read');
   }
   if (size > caps.maxBundleBytes) return broken(`is over ${caps.maxBundleBytes} bytes`);
+
+  // The digest decides first, before anything is created or written.
+  const first = await sha256Capped(file, caps.maxBundleBytes);
+  if (!first.ok) return broken(first.reason);
+  if (first.sha256 !== expected) {
+    return broken(`sha256 ${first.sha256} does not match the pinned ${expected}`);
+  }
 
   // Verified tarballs go to a fresh 0700 directory that only the host user can read, and it is
   // removed on any refusal, so nothing from a bundle that fails verification is left behind.
@@ -170,8 +178,13 @@ async function readAndVerify(
         hash.update(chunk);
         if (parsing && !extractClosed && !extract.write(chunk)) {
           await new Promise<void>((resolve) => {
-            extract.once('drain', resolve);
-            extract.once('close', resolve);
+            const done = (): void => {
+              extract.off('drain', done);
+              extract.off('close', done);
+              resolve();
+            };
+            extract.once('drain', done);
+            extract.once('close', done);
           });
         }
       }
@@ -235,11 +248,11 @@ async function readAndVerify(
   if (!extractClosed) extract.destroy();
   await feeding;
 
-  // The digest decides first: a bundle that is not the pinned one is refused whatever it holds.
+  // The first pass already matched the pin; a different digest now means the file changed.
   if (readError !== null) return broken(readError);
   const actual = hash.digest('hex');
   if (actual !== expected) {
-    return broken(`sha256 ${actual} does not match the pinned ${expected}`);
+    return broken(`changed while it was read (sha256 ${actual}, pinned ${expected})`);
   }
   if (entryProblem !== null) return broken(entryProblem);
   if (manifestText === null) return broken('has no manifest.json');
@@ -282,14 +295,39 @@ async function readAndVerify(
           'target is unsupported',
       };
     }
+    if (read.info.prepareScripts.length > 0 && p.prepareScriptIgnored !== true) {
+      return broken(`tarball for ${p.path} has a prepare script the manifest does not record`);
+    }
     if (read.info.name !== p.name) {
       return broken(`tarball for ${p.path} is package ${String(read.info.name)}, not ${p.name}`);
     }
-    if (read.info.version !== undefined && read.info.version !== p.version) {
+    if (read.info.version !== p.version) {
       return broken(`tarball for ${p.path} is version ${read.info.version}, not ${p.version}`);
     }
   }
   return { ok: true, bundle: { sha256: actual, manifest, storeDir } };
+}
+
+/** sha256 of a file in one streaming pass, refusing a file that grows past `cap`. */
+async function sha256Capped(
+  file: string,
+  cap: number,
+): Promise<{ ok: true; sha256: string } | { ok: false; reason: string }> {
+  const hash = createHash('sha256');
+  let total = 0;
+  const source = createReadStream(file);
+  try {
+    for await (const chunk of source as AsyncIterable<Buffer>) {
+      total += chunk.length;
+      if (total > cap) return { ok: false, reason: `is over ${cap} bytes` };
+      hash.update(chunk);
+    }
+  } catch {
+    return { ok: false, reason: 'cannot be read' };
+  } finally {
+    source.destroy();
+  }
+  return { ok: true, sha256: hash.digest('hex') };
 }
 
 /**

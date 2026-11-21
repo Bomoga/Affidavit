@@ -7,18 +7,24 @@ export interface PackageInspection {
   /**
    * What npm would run at install time if scripts were enabled, for the package and for every
    * package nested under `node_modules` inside its tarball (bundled dependencies):
-   * `preinstall`, `install`, `postinstall` and `prepare` from each package.json, and `binding.gyp`
-   * (npm's implicit `node-gyp rebuild` when a package ships one without its own install script).
-   * The package's own entries are bare (`postinstall`); nested ones carry their path
+   * `preinstall`, `install` and `postinstall` from each package.json, and `binding.gyp` (npm's
+   * implicit `node-gyp rebuild` when a package ships one without its own install script). The
+   * package's own entries are bare (`postinstall`); nested ones carry their path
    * (`node_modules/x: postinstall`). Empty for a package that needs none.
    */
   installScripts: string[];
+  /**
+   * `prepare` scripts, labelled the same way. npm runs `prepare` only for the root project and for
+   * git or folder sources, never for a registry tarball, and the install uses `--ignore-scripts`,
+   * so they do not make a package unsupported; the manifest records `prepareScriptIgnored`.
+   */
+  prepareScripts: string[];
 }
 
 export type InspectRead = { ok: true; info: PackageInspection } | { ok: false; reason: string };
 
 const MAX_PACKAGE_JSON_BYTES = 1024 * 1024;
-const INSTALL_SCRIPTS = ['preinstall', 'install', 'postinstall', 'prepare'] as const;
+const INSTALL_SCRIPTS = ['preinstall', 'install', 'postinstall'] as const;
 
 /** A directory inside the package that npm treats as a package root: '' or nested node_modules. */
 const PACKAGE_ROOT =
@@ -101,6 +107,7 @@ export async function inspectPackageTarball(
   if (top.length > 1) return { ok: false, reason: 'has more than one package.json' };
 
   const installScripts: string[] = [];
+  const prepareScripts: string[] = [];
   let own: Obj | undefined;
   for (const [dir, list] of [...manifests].sort(([a], [b]) => (a < b ? -1 : 1))) {
     for (const buf of list) {
@@ -123,6 +130,14 @@ export async function inspectPackageTarball(
       for (const s of scriptsOf(pkg as Obj, gyps.has(dir))) {
         installScripts.push(dir === '' ? s : `${dir}: ${s}`);
       }
+      const scripts = (pkg as Obj).scripts;
+      if (
+        typeof scripts === 'object' &&
+        scripts !== null &&
+        typeof (scripts as Obj).prepare === 'string'
+      ) {
+        prepareScripts.push(dir === '' ? 'prepare' : `${dir}: prepare`);
+      }
     }
   }
   // A binding.gyp in a nested package root without a package.json is still a native build.
@@ -135,6 +150,7 @@ export async function inspectPackageTarball(
       name: typeof own?.name === 'string' ? own.name : undefined,
       version: typeof own?.version === 'string' ? own.version : undefined,
       installScripts,
+      prepareScripts,
     },
   };
 }
