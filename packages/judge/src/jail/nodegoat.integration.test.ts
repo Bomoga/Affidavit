@@ -156,7 +156,12 @@ witness<{ threshold: string }>(async ({ threshold }, { target }) => {
 const BENIGN_PARAMS: ParamSpace = [{ name: 'threshold', values: ['0', '00', '0.5'] }];
 
 /** A real `git diff` of one file changed from `from` to `to`, made with the host's git. */
-function realDiff(file: string, from: string, to: string): string {
+function realDiff(
+  file: string,
+  from: string,
+  to: string,
+  added: Readonly<Record<string, string>> = {},
+): string {
   const repo = mkdtempSync(join(tmpdir(), 'affidavit-diff-'));
   try {
     const git = (...args: string[]) =>
@@ -172,6 +177,11 @@ function realDiff(file: string, from: string, to: string): string {
     git('add', '.');
     git('commit', '-q', '-m', 'v');
     writeFileSync(join(repo, file), original.replace(from, to));
+    for (const [path, text] of Object.entries(added)) {
+      mkdirSync(join(repo, path, '..'), { recursive: true });
+      writeFileSync(join(repo, path), text);
+    }
+    git('add', '-N', '.');
     return git('diff');
   } finally {
     rmSync(repo, { recursive: true, force: true });
@@ -454,6 +464,64 @@ describe.skipIf(SKIP_REASON !== null)(
         expectVacuousSuite(suite);
         expect(r).toMatchObject({ familyFlipped: true, suitePassed: true });
         expect(r.rejectedBy).toBeUndefined();
+      });
+
+      // runAddedTests: the patch's own test file runs with NodeGoat's mocha (2.5.3, from the dev
+      // bundle) on the suite image, separately from `npm test`.
+      const whereFixWithTest = (body: string) =>
+        realDiff('app/data/allocations-dao.js', NOSQLI_VULNERABLE, NOSQLI_SAFE, {
+          'test/unit/threshold.test.js': [
+            "const assert = require('assert');",
+            "describe('threshold parsing', function () {",
+            "  it('reads the threshold as a base 10 integer', function () {",
+            `    ${body}`,
+            '  });',
+            '});',
+            '',
+          ].join('\n'),
+        });
+
+      it('runs a test file the patch adds and accepts the fix when it passes', async () => {
+        const cf = caseFor('injection', gateCaseFile().id, booted.vulnerable!, booted.safeNosqli!);
+        const w = witnessFor(
+          cf.id,
+          'injection',
+          witnessSource('nodegoat-nosqli-allocations-where.witness.ts'),
+          NOSQLI_PARAMS,
+        );
+        const diff = whereFixWithTest("assert.strictEqual(parseInt('42', 10), 42);");
+        const { result: r, suite } = await verifierFor(booted.safeNosqli!).verifyPatchReport(
+          cf,
+          patchExhibit(diff, {}, { raw: true }),
+          w,
+          [],
+        );
+        expectVacuousSuite(suite);
+        expect(r).toMatchObject({ familyFlipped: true, suitePassed: true });
+        expect(r.rejectedBy).toBeUndefined();
+      });
+
+      it('rejects the same fix when the test file it adds fails (suite-fails)', async () => {
+        const cf = caseFor('injection', gateCaseFile().id, booted.vulnerable!, booted.safeNosqli!);
+        const w = witnessFor(
+          cf.id,
+          'injection',
+          witnessSource('nodegoat-nosqli-allocations-where.witness.ts'),
+          NOSQLI_PARAMS,
+        );
+        const diff = whereFixWithTest("assert.strictEqual(parseInt('42', 10), 43);");
+        const r = await verifierFor(booted.safeNosqli!).verifyPatch(
+          cf,
+          patchExhibit(diff, {}, { raw: true }),
+          w,
+          [],
+        );
+        // The family still flips; only the patch's own failing test rejects it.
+        expect(r).toMatchObject({
+          familyFlipped: true,
+          suitePassed: false,
+          rejectedBy: 'suite-fails',
+        });
       });
 
       it('rejects a patch that changes the file but not the bug: the family does not flip', async () => {
