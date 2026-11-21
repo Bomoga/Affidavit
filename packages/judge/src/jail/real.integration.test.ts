@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { createServer, type Server } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CaseFile, Witness, type BootHints, type ParamSpace } from '@affidavit/contracts';
@@ -7,7 +8,7 @@ import { RUN_LABEL, readDependencyBundlePins } from '@affidavit/sandbox';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { gateCaseFile, patchExhibit } from '../test-helpers.js';
 import { buildRunnerImage } from './harness.js';
-import { createRealJudge, realJudgeHostProbe, type RealJudge } from './real.js';
+import { createRealJudge, type RealJudge } from './real.js';
 import { directorySources } from './targets.js';
 import { buildPatchApplyImage } from './workbench.js';
 
@@ -66,6 +67,7 @@ describe.skipIf(SKIP_REASON !== null)(
   () => {
     let root = '';
     let real: RealJudge | undefined;
+    let signerStandIn: Server | undefined;
     let cf: CaseFile;
     let witness: Witness;
 
@@ -75,6 +77,15 @@ describe.skipIf(SKIP_REASON !== null)(
       const evidenceRoot = join(root, 'evidence');
       mkdirSync(workRoot);
       mkdirSync(evidenceRoot);
+      // A listening unix socket stands in for apps/signer, so the startup check runs unmodified
+      // (it resolves the socket path and checks where it lives). Nothing signs in this test.
+      const signerSocket = join(root, 'signer.sock');
+      const server = createServer((conn) => conn.destroy());
+      signerStandIn = server;
+      await new Promise<void>((done, fail) => {
+        server.once('error', fail);
+        server.listen(signerSocket, () => done());
+      });
       const pin = readDependencyBundlePins().find((p) => p.app === 'nodegoat');
       if (pin === undefined) throw new Error('pins.json has no nodegoat entry');
       const base = gateCaseFile();
@@ -103,46 +114,45 @@ describe.skipIf(SKIP_REASON !== null)(
         author: 'defense',
         sha256: '0'.repeat(64),
       });
-      real = await createRealJudge(
-        {
-          workRoot,
-          runnerImage: await buildRunnerImage(),
-          applyImage: await buildPatchApplyImage(),
-          evidenceRoot,
-          evidence: {
-            put: () => Promise.reject(new Error('unused')),
-            get: () => Promise.resolve(null),
-          },
-          signerSocket: join(root, 'signer.sock'),
-          signer: { sign: () => Promise.reject(new Error('unused')) },
-          sources: directorySources([
-            {
-              repo: cf.target.repo,
-              commit: pin.commit,
-              variant: 'vulnerable',
-              dir: vulnerableDir as string,
-            },
-            { repo: cf.target.repo, commit: pin.commit, variant: 'safe', dir: safeDir as string },
-          ]),
-          dependencyBundles: [
-            {
-              app: 'nodegoat',
-              repo: cf.target.repo,
-              path: bundle as string,
-              storeRoot: bundleStore as string,
-            },
-          ],
-          rescan: { rescan: () => Promise.resolve({ clean: true, candidates: [] }) },
+      real = await createRealJudge({
+        workRoot,
+        runnerImage: await buildRunnerImage(),
+        applyImage: await buildPatchApplyImage(),
+        evidenceRoot,
+        evidence: {
+          put: () => Promise.reject(new Error('unused')),
+          get: () => Promise.resolve(null),
         },
-        // The signer is not exercised here (no stage seals yet); every other check is real.
-        { probe: { ...realJudgeHostProbe, isSocket: () => Promise.resolve(true) } },
-      );
+        signerSocket: join(root, 'signer.sock'),
+        signer: { sign: () => Promise.reject(new Error('unused')) },
+        sources: directorySources([
+          {
+            repo: cf.target.repo,
+            commit: pin.commit,
+            variant: 'vulnerable',
+            dir: vulnerableDir as string,
+          },
+          { repo: cf.target.repo, commit: pin.commit, variant: 'safe', dir: safeDir as string },
+        ]),
+        dependencyBundles: [
+          {
+            app: 'nodegoat',
+            repo: cf.target.repo,
+            path: bundle as string,
+            storeRoot: bundleStore as string,
+          },
+        ],
+        rescan: { rescan: () => Promise.resolve({ clean: true, candidates: [] }) },
+      });
     }, 1_800_000);
 
     afterAll(async () => {
       try {
         await real?.close();
       } finally {
+        await new Promise<void>((done) =>
+          signerStandIn ? signerStandIn.close(() => done()) : done(),
+        );
         rmSync(root, { recursive: true, force: true });
       }
       expect(leftovers('ps')).toBe('');
