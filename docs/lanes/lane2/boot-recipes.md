@@ -65,13 +65,30 @@ pnpm --filter @affidavit/sandbox bundle:build --app nodegoat \
   --checkout packages/corpus/data/src/nodegoat --out <bundle dir>
 ```
 
-`packages/sandbox/scripts/build-dependency-bundle.ts` is the only Lane 2 code that fetches dependencies. It is not exported from `@affidavit/sandbox`, the Judge and worker never call it, and two tests keep it that way: `deny-all.test.ts` checks that nothing under `src/` imports from `scripts/`, and `egress-guard.test.ts` parses every `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.mjs` and `.cjs` file under `src/` (not tests or test helpers) with the TypeScript compiler and fails closed (`egress-guard.ts`):
+`packages/sandbox/scripts/build-dependency-bundle.ts` is the only Lane 2 code that fetches dependencies. It is not exported from `@affidavit/sandbox`, and the Judge and worker never call it. Two tests check this. `deny-all.test.ts` checks that nothing under `src/` imports from `scripts/`. `egress-guard.test.ts` parses every `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs` and `.cjs` file under `src/` with the TypeScript compiler (not tests, test helpers or the lint itself). It runs an allowlist lint over them (`egress-guard.ts`).
 
-- **Modules.** Any `import()` or `require()` whose module name is not a plain string literal is a finding. So is any use of `createRequire` or `node:module`, and any import of `node:http`, `https`, `http2`, `net`, `tls`, `dgram`, `dns` or `undici`.
-- **Network globals.** Any reference to `fetch`, `XMLHttpRequest`, `WebSocket` or `EventSource` is a finding: bare, through `globalThis`, `self`, `window` or `global` (dot or bracket), aliased, destructured, or through `.call`, `.apply` or `.bind`. So is any bracket access on a global with a computed key.
-- **`child_process`.** Only the files in `CHILD_PROCESS_FILES` may import it, and only as named spawn functions called directly or through `promisify`. In those files the executable must be a string literal from `ALLOWED_EXECUTABLES` (`docker`, `tar`; git, npm and fetch tools are not on it). The argv must be an array literal with no spread, no package-manager or fetch-tool word, no `install` or `ci`, and no `--network` other than `none`.
-- **Reviewed exceptions.** Each one names its file, its exact finding and its reason in `EGRESS_ALLOWLIST`: the containment `node:http` listener, the fixed Compose binary and its arguments, and the docker argv built by tested builders or from run-local values.
-- **Self-tests.** Every rule has one, including the 13 evasions from the #55 re-review and the `.js`/`.mjs`/`.cjs` cases. A test also fails on a stale allowlist entry.
+**The egress guard is a lint, not a security boundary.** It raises the cost of a mistake, and of slipping a network call past review, in this package's host code. A determined author can write code a static check does not understand. The runtime boundary is gVisor with `--network none` (or an internal-only case network) and no egress for anything the Judge or an agent runs. The bundle build is a human-run host step. What the lint allows:
+
+- **Modules (allowlist).** Relative imports, the built-ins in `ALLOWED_BUILTINS`, and the packages in this package's `dependencies` are allowed. The built-ins are `fs`, `fs/promises`, `path`, `crypto`, `stream`, `stream/promises`, `zlib`, `os`, `url`, `util`, `events`, `buffer`, `string_decoder` and `assert`, plus `child_process` in the sanctioned files only. Any other import, re-export, `import()` or `require()` is a finding (for example `http`, `net`, `vm`, `worker_threads`, `inspector`, `module`, or an undeclared package). So is a module name that is not a plain string literal, `createRequire`, and an aliased `require`.
+- **Globals.** These are findings:
+  - any value reference to `fetch`, `XMLHttpRequest`, `WebSocket`, `EventSource`, `eval` or `Function`
+  - any reference to `globalThis`, `window`, `self` or `global` other than `typeof` (so aliasing one is a finding)
+  - `process.binding`, `process.dlopen` and `process.getBuiltinModule` (dot, bracket or destructured), and computed access on `process`
+  - `Reflect.get`, `Reflect.apply` and `Reflect.construct`
+- **`child_process`.**
+  - Only the files in `CHILD_PROCESS_FILES` may import it, and only as named spawn functions called directly or through `promisify`.
+  - The executable must be a string literal from `ALLOWED_EXECUTABLES` (`docker`, `tar`).
+  - The argv must be an array literal of literals and typed values. It may have no spread and no package-manager or fetch-tool word.
+  - **docker:** only the allowlisted subcommands: `build`, `run`, `create`, `start`, `stop`, `rm`, `rmi`, `inspect`, `kill`, `ps`, `wait`, `logs`, `image inspect|rm|ls`, `network create|rm|inspect|ls` and `volume inspect|rm|ls`. There is no `pull`, `exec`, `cp` or `push`. `build`, `run` and `create` need `--network none`, and `network create` needs `--internal`.
+  - **tar:** only `-x -c -t -f -z -v` clusters, `-C`, `--no-same-owner` and `--no-same-permissions`. So there is no `--to-command`, `-I`, `--use-compress-program`, `--checkpoint-action`, `-T` or `--files-from`.
+- **Reviewed exceptions.** Each one names its file, its exact finding and its reason in `EGRESS_ALLOWLIST`:
+  - the containment `node:http` listener
+  - the fixed Compose binary and its arguments
+  - `docker pull` in `images.ts`: the daemon pins a base or sidecar image by digest, and no container runs
+  - the sidecar readiness `docker exec` on the internal case network
+  - the `@affidavit/testing` flags for the plain-Docker containment baseline
+  - the docker argv built by tested builders or from run-local values
+- **Self-tests.** Every rule has one, including every evasion from the #55 re-review and delta review and the `.js`, `.jsx`, `.mjs` and `.cjs` cases. A test also fails on a stale allowlist entry.
 
 The builder script refuses to run inside a container. It:
 

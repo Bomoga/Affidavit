@@ -6,10 +6,11 @@ import { describe, expect, it } from 'vitest';
 import * as guard from './egress-guard.js';
 import { EGRESS_ALLOWLIST, findEgress } from './egress-guard.js';
 
-// Nothing under src/ may reach the network or run a package manager or fetch tool on the host.
-// The one networked step is the human-run scripts/build-dependency-bundle.ts, outside src/.
-// The jailed install (`bundleInstallCommand`) is a command string run under gVisor with
-// `--network none`, not a host child_process call, so it is not a finding.
+// A LINT, not a security boundary: it raises the cost of a mistake (or of slipping a network call
+// past review) in this package's host code. The runtime boundary is gVisor with `--network none`
+// and no egress for anything the Judge or an agent runs; the bundle build is a human-run host step
+// (scripts/build-dependency-bundle.ts, outside src/). The jailed install (`bundleInstallCommand`)
+// is a command string run under gVisor, not a host child_process call, so it is not a finding.
 
 const SRC = fileURLToPath(new URL('..', import.meta.url));
 
@@ -31,6 +32,7 @@ describe('egress guard over src/', () => {
         'e.js',
         'sub/f.mjs',
         'sub/g.cjs',
+        'k.jsx',
         'h.test.ts',
         'i.test.mjs',
         'testkit.ts',
@@ -42,7 +44,16 @@ describe('egress guard over src/', () => {
       const found = sourceFiles(dir)
         .map((f) => relative(dir, f).split('\\').join('/'))
         .sort();
-      expect(found).toEqual(['a.ts', 'b.tsx', 'c.mts', 'd.cts', 'e.js', 'sub/f.mjs', 'sub/g.cjs']);
+      expect(found).toEqual([
+        'a.ts',
+        'b.tsx',
+        'c.mts',
+        'd.cts',
+        'e.js',
+        'k.jsx',
+        'sub/f.mjs',
+        'sub/g.cjs',
+      ]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -186,8 +197,28 @@ describe('egress guard self-test: each snippet must be caught', () => {
     ['computed global key', `globalThis[name](u);`],
     ['node:module', `import { builtinModules } from 'node:module';`],
   ];
+  /** Delta review of #55 (339dc35): evasions of the denylist guard; the allowlist design catches them. */
+  const delta: [string, string][] = [
+    ['aliased globalThis', `const g = globalThis; g.fetch(u);`],
+    ['comma-wrapped globalThis', `(0, globalThis).fetch(u);`],
+    ['Reflect.get on globalThis', `Reflect.get(globalThis, 'fe' + 'tch')(u);`],
+    ['Reflect.apply', `Reflect.apply(f, null, [u]);`],
+    ['process.getBuiltinModule', `const h = process.getBuiltinModule('node:https');`],
+    ['eval', `eval('fet' + 'ch(u)');`],
+    ['Function constructor', `const f = Function('return fetch')();`],
+    ['new Function', `const f = new Function('u', 'return fetch(u)');`],
+    ['node:vm', `import vm from 'node:vm';`],
+    ['node:worker_threads', `import { Worker } from 'node:worker_threads';`],
+    ['node:inspector', `import inspector from 'node:inspector';`],
+    ['process.binding', `const tcp = process.binding('tcp_wrap');`],
+    ['process.dlopen', `process.dlopen(m, '/tmp/x.node');`],
+    ['computed process access', `process['bin' + 'ding']('tcp_wrap');`],
+    ['an undeclared npm package', `import leftPad from 'left-pad';`],
+    ['a builtin outside the allowlist, bare', `import cluster from 'cluster';`],
+    ['self', `self.postMessage(u);`],
+  ];
   // Each is caught in an ordinary file and in a file that may import child_process.
-  it.each([...caught, ...evasions])('catches %s', (_label, code) => {
+  it.each([...caught, ...evasions, ...delta])('catches %s', (_label, code) => {
     expect(findEgress('snippet.ts', code, [])).not.toEqual([]);
     expect(findEgress('gvisor/runner.ts', code, [])).not.toEqual([]);
   });
@@ -197,8 +228,52 @@ describe('egress guard self-test: each snippet must be caught', () => {
     ['snippet.mjs', `await fetch(u);`],
     ['snippet.cjs', `require('node:child_process').execFile('npm', ['i']);`],
     ['snippet.tsx', `const x = fetch(u);`],
+    ['snippet.jsx', `const x = fetch(u);`],
   ])('catches network code in %s', (file, code) => {
     expect(findEgress(file, code, [])).not.toEqual([]);
+  });
+
+  const sanctionedCaught: [string, string][] = [
+    ['docker pull', `spawn('docker', ['pull', 'x']);`],
+    [
+      'docker run with no --network none',
+      `spawn('docker', ['run', 'alpine', 'nc', 'evil', '80']);`,
+    ],
+    ['docker create with no --network none', `spawn('docker', ['create', 'alpine']);`],
+    ['docker build with no --network none', `spawn('docker', ['build', '.']);`],
+    ['docker exec', `spawn('docker', ['exec', name, 'sh']);`],
+    ['docker cp', `spawn('docker', ['cp', '/etc/passwd', 'c:/x']);`],
+    ['docker push', `spawn('docker', ['push', 'x']);`],
+    ['docker network create without --internal', `spawn('docker', ['network', 'create', 'n']);`],
+    ['docker with a non-literal subcommand', `spawn('docker', [sub, 'x']);`],
+    ['tar --to-command', `spawn('tar', ['-x', '-f', f, '--to-command=sh -c id']);`],
+    ['tar -I', `spawn('tar', ['-I', 'sh -c id', '-x', '-f', f]);`],
+    ['tar --use-compress-program', `spawn('tar', ['--use-compress-program=x', '-xf', f]);`],
+    ['tar --checkpoint-action', `spawn('tar', ['--checkpoint-action=exec=id', '-xf', f]);`],
+    ['tar -T', `spawn('tar', ['-c', '-f', f, '-T', '/etc/list']);`],
+    ['tar --files-from', `spawn('tar', ['-c', '-f', f, '--files-from=/etc/list']);`],
+  ];
+  it.each(sanctionedCaught)('catches %s in a sanctioned file', (_label, call) => {
+    const code = `import { spawn } from 'node:child_process'; ${call}`;
+    expect(findEgress('gvisor/runner.ts', code, [])).not.toEqual([]);
+  });
+
+  it.each([
+    ['docker run --network none', `spawn('docker', ['run', '--rm', '--network', 'none', img]);`],
+    ['docker run --network=none', `spawn('docker', ['run', '--network=none', img]);`],
+    [
+      'docker network create --internal',
+      `spawn('docker', ['network', 'create', '--internal', n]);`,
+    ],
+    ['docker image inspect', `spawn('docker', ['image', 'inspect', '--format', '{{.Id}}', ref]);`],
+    ['docker rm', `spawn('docker', ['rm', '--force', '--volumes', name]);`],
+    [
+      'tar extract',
+      `spawn('tar', ['-x', '-f', f, '-C', dir, '--no-same-owner', '--no-same-permissions']);`,
+    ],
+  ])('allows %s in a sanctioned file', (_label, call) => {
+    const code = `import { spawn } from 'node:child_process'; ${call}`;
+    expect(findEgress('gvisor/runner.ts', code, [])).toEqual([]);
   });
 
   it('child_process is a finding outside the sanctioned files, even calling docker', () => {
@@ -215,6 +290,15 @@ describe('egress guard self-test: each snippet must be caught', () => {
       `export const c = ['sh', '-c', 'npm ci --offline --ignore-scripts'];`,
     ],
     ['a method named fetch on another object', `cache.fetch('x');`],
+    ['a typeof check on globalThis', `const hasWindow = typeof window !== 'undefined';`],
+    ['a declared dependency', `import tar from 'tar-stream';`],
+    ['a type-only import of a dev tool', `import type ts from 'typescript';`],
+    [
+      'an allowlisted builtin',
+      `import { createHash } from 'node:crypto'; import zlib from 'zlib';`,
+    ],
+    ['a relative import', `import { x } from './x.js';`],
+    ['a property named self', `const o = { self: 1 }; o.self;`],
   ];
   it.each(allowed)('allows %s', (_label, code) => {
     expect(findEgress('snippet.ts', code, [])).toEqual([]);
