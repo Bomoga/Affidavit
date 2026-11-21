@@ -1,4 +1,4 @@
-﻿import { extname } from 'node:path';
+import { extname } from 'node:path';
 
 /**
  * Font files whose structure checks out. gitleaks skips TrueType, OpenType and WOFF files (probed

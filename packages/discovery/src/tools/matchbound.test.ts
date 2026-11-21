@@ -54,6 +54,35 @@ describe('maxMatchBytes', () => {
     expect(maxMatchBytes('(?:(?s)x).*', caps)).toBe(100);
   });
 
+  // Go folds k to U+212A KELVIN SIGN (3 bytes in UTF-8) and s to U+017F LONG S (2 bytes) under
+  // (?i), in literals, classes, \w and posix classes alike.
+  it.each([
+    ['k', 1],
+    ['s', 1],
+    ['(?i)k', 3],
+    ['(?i)K', 3],
+    ['(?i)s', 2],
+    ['(?i)S', 2],
+    ['(?i)a', 1],
+    ['(?i)key', 5],
+    ['(?i:k)k', 4], // the flag ends with its group
+    ['(?i)(?-i:k)', 1],
+    ['(?i)[a-z]{2}', 6],
+    ['(?i)[a-j]{2}', 2],
+    ['(?i)[r-t]', 2],
+    ['(?i)[A-Z0-9]', 3],
+    ['(?i)[0-9]{4}', 4],
+    ['(?i)\\w{2}', 6],
+    ['(?i)[\\w-]', 3],
+    ['(?i)[[:alpha:]]', 3],
+    ['(?i)[[:digit:]]', 1],
+    ['(?i)\\Qks\\E', 5],
+    ['(?i)é', 4], // a non-ASCII letter may fold to a longer encoding: counted as 4
+    ['(?i)[a-z]+', 100], // still one line at most
+  ])('case folding: %s is at most %d bytes', (pattern, bound) => {
+    expect(maxMatchBytes(pattern, caps)).toBe(bound);
+  });
+
   it.each(['(abc', 'abc)', '[abc', '\\', '*a', '\\8', '\\C', '(?#comment)', '[[:nope:]]'])(
     'throws on what it does not understand: %s',
     (pattern) => {

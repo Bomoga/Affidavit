@@ -1,10 +1,13 @@
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
+import { buildInvocation } from './invocations.js';
+import { loadToolManifest, repoRoot } from './manifest.js';
 import { cleanupTmp, tmp } from './testkit.js';
 import {
   inWindowProofClass,
   measureText,
+  mountedConfigFile,
   PROOF_CAPS,
   statsProveCoverage,
   usesAnalyzedConfig,
@@ -22,7 +25,7 @@ describe('measureText', () => {
   it('measures the longest line and whitespace run in bytes', async () => {
     const s = await measureText(file(`ab\n${'x'.repeat(50)}\n  \t \nyy`));
     // the whitespace run is newline, space, space, tab, space, newline
-    expect(s).toEqual({ maxLine: 50, maxWs: 6, gates: [] });
+    expect(s).toEqual({ maxLine: 50, maxWs: 6, gates: [], decodeIncomplete: false });
   });
 
   it('a newline run counts as whitespace', async () => {
@@ -49,11 +52,17 @@ describe('measureText', () => {
 
 describe('statsProveCoverage', () => {
   it('holds only under both caps and without a gate word', () => {
-    const fine = { maxLine: PROOF_CAPS.line, maxWs: PROOF_CAPS.ws, gates: [] };
+    const fine = {
+      maxLine: PROOF_CAPS.line,
+      maxWs: PROOF_CAPS.ws,
+      gates: [],
+      decodeIncomplete: false,
+    };
     expect(statsProveCoverage(fine)).toBe(true);
     expect(statsProveCoverage({ ...fine, maxLine: PROOF_CAPS.line + 1 })).toBe(false);
     expect(statsProveCoverage({ ...fine, maxWs: PROOF_CAPS.ws + 1 })).toBe(false);
     expect(statsProveCoverage({ ...fine, gates: ['curl'] })).toBe(false);
+    expect(statsProveCoverage({ ...fine, decodeIncomplete: true })).toBe(false);
   });
 });
 
@@ -68,12 +77,123 @@ describe('inWindowProofClass', () => {
   });
 });
 
-describe('usesAnalyzedConfig', () => {
+const b64 = (s: string | Buffer): string => Buffer.from(s).toString('base64');
+
+describe('measureText, gate words in decoded text (gitleaks decodes base64, hex, percent)', () => {
+  const pem = '-----BEGIN RSA PRIVATE KEY-----';
+
+  it('finds a gate word inside a base64 segment', async () => {
+    expect((await measureText(file(`${b64(pem)}\n<svg/>\n`))).gates).toEqual(['private']);
+    expect((await measureText(file(`a="${b64(`x curl -u a:b`)}"\n`))).gates).toEqual(['curl']);
+  });
+
+  it('whatever the alignment of the segment in its run, and in the URL-safe alphabet', async () => {
+    for (const lead of ['', 'Q', 'QQ', 'QQQ', 'QQQQQ'])
+      expect((await measureText(file(`${lead}${b64(pem)}\n`))).gates, lead).toEqual(['private']);
+    const url = Buffer.from(`\xfb\xff ${pem}`, 'latin1').toString('base64url');
+    expect(url).toMatch(/[-_]/);
+    expect((await measureText(file(`${url}\n`))).gates).toEqual(['private']);
+  });
+
+  it('finds a gate word inside a hex segment, at either nibble alignment', async () => {
+    const hex = Buffer.from('curl -H x').toString('hex');
+    expect((await measureText(file(`v=${hex}\n`))).gates).toEqual(['curl']);
+    expect((await measureText(file(`v=a${hex}\n`))).gates).toEqual(['curl']);
+  });
+
+  it('finds a gate word in percent-encoded text, fully or partly encoded', async () => {
+    expect((await measureText(file('u=%63%75%72%6c%20-u\n'))).gates).toEqual(['curl']);
+    expect((await measureText(file('u=cu%72l\n'))).gates).toEqual(['curl']);
+    expect((await measureText(file('u=%50RIVATE\n'))).gates).toEqual(['private']);
+  });
+
+  it('finds a gate word decoded twice (base64 of base64, hex of base64)', async () => {
+    expect((await measureText(file(`${b64(b64(pem))}\n`))).gates).toEqual(['private']);
+    const hexOfB64 = Buffer.from(b64('ZXlKhbGciOi')).toString('hex');
+    expect((await measureText(file(`${hexOfB64}\n`))).gates).toEqual(['ZXlK']);
+  });
+
+  it('finds a gate word half in raw text and half in a decoded segment', async () => {
+    expect((await measureText(file(`pri${b64('vate key')}\n`))).gates).toEqual(['private']);
+  });
+
+  it('decoded text without a gate word adds none', async () => {
+    const s = await measureText(
+      file(`"integrity": "sha512-${b64('nothing to see here, only a hash')}"\n`),
+    );
+    expect(s.gates).toEqual([]);
+    expect(s.decodeIncomplete).toBe(false);
+  });
+
+  it('a line too long to decode, or a decode budget that runs out, gives no proof', async () => {
+    const long = await measureText(file(`${'Q'.repeat(PROOF_CAPS.line + 1)}\n`));
+    expect(long.decodeIncomplete).toBe(true);
+    expect(statsProveCoverage(long)).toBe(false);
+    const tight = await measureText(file(`${b64('x'.repeat(200))}\n`), { decodeBudgetBytes: 10 });
+    expect(tight.decodeIncomplete).toBe(true);
+    expect(statsProveCoverage(tight)).toBe(false);
+  });
+});
+
+describe('the config the proof hashes is the file the gitleaks container mounts', () => {
+  const manifest = loadToolManifest();
+  const inv = (o: { configDir?: string; gitleaksConfigFile?: string }) =>
+    buildInvocation(manifest, 'gitleaks', {
+      sourceDir: tmp(),
+      outputDir: tmp(),
+      scratchDir: tmp(),
+      ...o,
+    });
+  const vendored = readFileSync(join(repoRoot(), 'docker', 'tools', 'config', 'gitleaks.toml'));
+
+  it('resolves --config through the mounts to the host file', () => {
+    const dir = tmp();
+    expect(mountedConfigFile(inv({ configDir: dir }))).toBe(join(dir, 'gitleaks.toml'));
+    expect(mountedConfigFile(inv({ configDir: dir, gitleaksConfigFile: 'alt.toml' }))).toBe(
+      join(dir, 'alt.toml'),
+    );
+    expect(mountedConfigFile(inv({}))).toBe(
+      join(repoRoot(), 'docker', 'tools', 'config', 'gitleaks.toml'),
+    );
+  });
+
   it('true for the vendored config, false for a changed or missing one', async () => {
-    expect(await usesAnalyzedConfig(undefined, undefined)).toBe(true);
+    expect(await usesAnalyzedConfig(mountedConfigFile(inv({})))).toBe(true);
     const dir = tmp();
     writeFileSync(join(dir, 'gitleaks.toml'), 'title = "other"\n');
-    expect(await usesAnalyzedConfig(dir, undefined)).toBe(false);
-    expect(await usesAnalyzedConfig(dir, 'missing.toml')).toBe(false);
+    expect(await usesAnalyzedConfig(mountedConfigFile(inv({ configDir: dir })))).toBe(false);
+    const missing = inv({ configDir: dir, gitleaksConfigFile: 'missing.toml' });
+    expect(await usesAnalyzedConfig(mountedConfigFile(missing))).toBe(false);
+    expect(await usesAnalyzedConfig(undefined)).toBe(false);
+  });
+
+  it('follows the mounted file name, not a default next to it (the two diverge here)', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'gitleaks.toml'), vendored); // the analyzed text under the default name
+    writeFileSync(join(dir, 'alt.toml'), 'title = "other"\n'); // what the container really loads
+    const alt = inv({ configDir: dir, gitleaksConfigFile: 'alt.toml' });
+    expect(await usesAnalyzedConfig(mountedConfigFile(alt))).toBe(false);
+    writeFileSync(join(dir, 'alt.toml'), vendored);
+    writeFileSync(join(dir, 'gitleaks.toml'), 'title = "other"\n');
+    expect(await usesAnalyzedConfig(mountedConfigFile(alt))).toBe(true);
+  });
+
+  it('no proof when --config is missing, not under a mount, or escapes it', () => {
+    const base = inv({});
+    const at = base.args.indexOf('--config');
+    const withArg = (v: string | undefined) => ({
+      ...base,
+      args:
+        v === undefined
+          ? base.args.filter((_, k) => k !== at && k !== at + 1)
+          : base.args.map((a, k) => (k === at + 1 ? v : a)),
+    });
+    expect(mountedConfigFile(withArg(undefined))).toBeUndefined();
+    expect(mountedConfigFile(withArg('/elsewhere/gitleaks.toml'))).toBeUndefined();
+    expect(mountedConfigFile(withArg('/tool-config/../src/gitleaks.toml'))).toBeUndefined();
+    expect(mountedConfigFile(withArg('/tool-config/'))).toBeUndefined();
+    expect(mountedConfigFile({ ...base, args: [...base.args, '--config', '/src/x'] })).toBe(
+      undefined,
+    );
   });
 });

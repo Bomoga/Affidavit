@@ -180,16 +180,15 @@ export async function ingestRepo(deps: IngestDeps, req: IngestRequest): Promise<
     if (partial) return incomplete();
     const built = await buildWorkspace(repoDir, wsDir, r, map.excluded, maxFileBytes);
     // Every font the scan skipped must be absent from the workspace (left out as `font-file`, or
-    // inside a directory left out for another reason). Otherwise fail closed.
+    // inside a directory left out for another reason). Otherwise fail closed. Only ENOENT proves
+    // absence; any other lstat error means the check could not be made, which is also incomplete.
     for (const p of run.binaryFontFiles) {
       const inWs = join(wsDir, ...r.applyPath(p.replace(/^\/src\//, '')).split('/'));
-      if (
-        await lstat(inWs).then(
-          () => true,
-          () => false,
-        )
-      )
-        return incomplete();
+      const absent = await lstat(inWs).then(
+        () => false,
+        (e: unknown) => (e as NodeJS.ErrnoException | null)?.code === 'ENOENT',
+      );
+      if (!absent) return incomplete();
     }
     const leaks = await findLeaks(wsDir, r);
     if (leaks.length > 0) throw new RedactionLeakError(leaks.map((p) => r.applyPath(p)));

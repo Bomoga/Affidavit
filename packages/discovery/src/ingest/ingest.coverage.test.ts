@@ -10,7 +10,7 @@ import { randomBytes } from 'node:crypto';
 import { cpSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
-import { eot, sfnt, woff } from '../tools/fontkit.js';
+import { eot, sfnt, woff } from '../tools/fontkit.testutil.js';
 import { repoRoot } from '../tools/index.js';
 import { ingestRepo, type IngestDeps, type IngestIncomplete, type IngestOk } from './index.js';
 import {
@@ -180,6 +180,20 @@ describe('a lockfile flagged chunk-split-risk is covered by the windows pass', (
     const r = await ok({ 'public/fonts/icons.svg': svg });
     expect(r.scan.windowProvenFiles).toEqual(['/src/public/fonts/icons.svg']);
     expect(listFiles(r.workspacePath)).toContain('public/fonts/icons.svg');
+  });
+
+  it('a large SVG whose first line is a base64 private key header keeps the partial flag', async () => {
+    // gitleaks decodes base64 and runs the rules on the decoded text, where the unbounded
+    // private-key rule can start. The raw bytes hold no gate word; the decoded text does.
+    const first = Buffer.from('-----BEGIN RSA PRIVATE KEY-----').toString('base64');
+    expect(first.toLowerCase()).not.toContain('private');
+    const glyph = (n: number) =>
+      `<glyph unicode="&#x${n.toString(16)};" d="M${randomBytes(40).toString('hex')}z" />\n`;
+    let svg = `${first}\n<svg xmlns="http://www.w3.org/2000/svg">\n`;
+    for (let n = 0; svg.length < 210_000; n++) svg += glyph(n);
+    svg += '</svg>\n';
+    const r = await incomplete({ 'public/fonts/icons.svg': svg });
+    expect(ids(r)).toEqual(['chunk-split-risk']);
   });
 });
 

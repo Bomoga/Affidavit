@@ -1,5 +1,8 @@
+import { readdirSync, readFileSync } from 'node:fs';
+import { dirname, join, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { eot, sfnt, woff } from './fontkit.js';
+import { eot, sfnt, woff, woff2 } from './fontkit.testutil.js';
 import { fontFormatOf } from './fonts.js';
 
 const judge = (name: string, b: Buffer) => fontFormatOf(name, b.subarray(0, 100_000), b.length);
@@ -90,5 +93,77 @@ describe('fontFormatOf', () => {
     const e = Buffer.from(eot());
     e.writeUInt32LE(e.readUInt32LE(4) - 4, 4); // font data said to be 4 bytes shorter
     expect(judge('a.eot', e)).toBeUndefined();
+  });
+});
+
+describe('fontFormatOf, WOFF 2', () => {
+  it('accepts a valid header, with or without metadata and private blocks', () => {
+    expect(judge('a.woff2', woff2())).toBe('woff2');
+    expect(judge('A.WOFF2', woff2())).toBe('woff2');
+    expect(judge('a.woff2', woff2(undefined, Buffer.alloc(8, 2), Buffer.alloc(4, 3)))).toBe(
+      'woff2',
+    );
+  });
+
+  it('refuses a WOFF 2 under another extension, and a WOFF 1 under .woff2', () => {
+    expect(judge('a.woff', woff2())).toBeUndefined();
+    expect(judge('a.ttf', woff2())).toBeUndefined();
+    expect(judge('a.woff2', woff())).toBeUndefined();
+  });
+
+  it('fails closed on a length field that is not the file size (bytes appended or cut)', () => {
+    expect(judge('a.woff2', Buffer.concat([woff2(), key]))).toBeUndefined();
+    expect(judge('a.woff2', woff2().subarray(0, 60))).toBeUndefined();
+    const w = Buffer.from(woff2());
+    w.writeUInt32BE(w.length + 1, 8);
+    expect(judge('a.woff2', w)).toBeUndefined();
+  });
+
+  it('fails closed on a header shorter than 48 bytes, a bad reserved field or table count', () => {
+    const short = Buffer.from(woff2()).subarray(0, 40);
+    short.writeUInt32BE(40, 8);
+    expect(judge('a.woff2', short)).toBeUndefined();
+    const reserved = Buffer.from(woff2());
+    reserved.writeUInt16BE(1, 14);
+    expect(judge('a.woff2', reserved)).toBeUndefined();
+    const none = Buffer.from(woff2());
+    none.writeUInt16BE(0, 12);
+    expect(judge('a.woff2', none)).toBeUndefined();
+    const many = Buffer.from(woff2());
+    many.writeUInt16BE(1025, 12);
+    expect(judge('a.woff2', many)).toBeUndefined();
+  });
+
+  it('fails closed on metadata or private blocks out of bounds', () => {
+    const withBlocks = (): Buffer =>
+      Buffer.from(woff2(undefined, Buffer.alloc(8, 2), Buffer.alloc(4, 3)));
+    const metaPast = withBlocks();
+    metaPast.writeUInt32BE(metaPast.length - 4, 28); // 8 bytes from 4 before the end
+    expect(judge('a.woff2', metaPast)).toBeUndefined();
+    const metaInHeader = withBlocks();
+    metaInHeader.writeUInt32BE(40, 28); // inside the 48-byte header
+    expect(judge('a.woff2', metaInHeader)).toBeUndefined();
+    const privPast = withBlocks();
+    privPast.writeUInt32BE(0xfffffff0, 40);
+    expect(judge('a.woff2', privPast)).toBeUndefined();
+    const privLong = withBlocks();
+    privLong.writeUInt32BE(5, 44); // one byte past the end
+    expect(judge('a.woff2', privLong)).toBeUndefined();
+  });
+});
+
+describe('fontkit.testutil.ts is test-only', () => {
+  it('no source file other than a test imports a .testutil module', () => {
+    const src = join(dirname(fileURLToPath(import.meta.url)), '..');
+    const offenders: string[] = [];
+    for (const e of readdirSync(src, { recursive: true, withFileTypes: true })) {
+      if (!e.isFile() || !e.name.endsWith('.ts')) continue;
+      if (e.name.endsWith('.test.ts') || e.name.endsWith('.testutil.ts')) continue;
+      const path = join(e.parentPath, e.name);
+      if (/from\s+['"][^'"]*\.testutil(?:\.js)?['"]/.test(readFileSync(path, 'utf8'))) {
+        offenders.push(relative(src, path));
+      }
+    }
+    expect(offenders).toEqual([]);
   });
 });

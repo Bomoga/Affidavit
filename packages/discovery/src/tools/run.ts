@@ -15,6 +15,7 @@ import { findGitleaksUnscannable, type Unscannable } from './unscannable.js';
 import {
   inWindowProofClass,
   measureText,
+  mountedConfigFile,
   statsProveCoverage,
   usesAnalyzedConfig,
 } from './windowproof.js';
@@ -661,7 +662,7 @@ export async function runTool(
         windowed.has(`/src/${f.path}`) &&
         !notFullyWindowed.has(f.path),
     );
-    if (risky.length > 0 && (await usesAnalyzedConfig(rest.configDir, rest.gitleaksConfigFile))) {
+    if (risky.length > 0 && (await usesAnalyzedConfig(mountedConfigFile(run.inv)))) {
       for (const f of risky) {
         const stats = await measureText(join(snapshot.dir, ...f.path.split('/')));
         if (!statsProveCoverage(stats)) continue;

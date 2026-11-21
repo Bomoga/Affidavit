@@ -1,4 +1,6 @@
-// Test helpers: small, structurally valid font files. Not part of the tools API.
+// Test helpers: small, structurally valid font files. Not part of the tools API. The
+// `.testutil.ts` suffix keeps it out of the build (tsconfig.build.json) like the tests, and
+// fonts.test.ts checks that no non-test source imports it.
 
 const be16 = (n: number): Buffer => {
   const b = Buffer.alloc(2);
@@ -90,6 +92,37 @@ export function woff(tables = DEFAULT_TABLES): Buffer {
     be32(0),
   ]);
   return Buffer.concat([header, ...dir, ...body]);
+}
+
+/**
+ * A WOFF 2 file: the 48-byte header, then `body` (stands in for the table directory and the
+ * compressed stream, which are not parsed), then optional metadata and private blocks.
+ */
+export function woff2(
+  body: Buffer = Buffer.alloc(32, 7),
+  meta: Buffer = Buffer.alloc(0),
+  priv: Buffer = Buffer.alloc(0),
+): Buffer {
+  const metaOffset = meta.length === 0 ? 0 : 48 + body.length;
+  const privOffset = priv.length === 0 ? 0 : 48 + body.length + meta.length;
+  const total = 48 + body.length + meta.length + priv.length;
+  const header = Buffer.concat([
+    Buffer.from('wOF2'),
+    be32(0x00010000), // flavor
+    be32(total), // length
+    be16(3), // numTables
+    be16(0), // reserved
+    be32(0), // totalSfntSize (not checked)
+    be32(body.length), // totalCompressedSize (not checked)
+    be16(1),
+    be16(0), // version
+    be32(metaOffset),
+    be32(meta.length),
+    be32(meta.length), // metaOrigLength
+    be32(privOffset),
+    be32(priv.length),
+  ]);
+  return Buffer.concat([header, body, meta, priv]);
 }
 
 const utf16name = (s: string): Buffer => {

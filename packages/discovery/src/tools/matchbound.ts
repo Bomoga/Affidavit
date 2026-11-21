@@ -12,7 +12,9 @@
  *  - a piece that can match a newline and repeats without a bound (`[^"]{3,}`, `(?s:.)*`,
  *    `[\s\S]+`) has no bound at all;
  *  - otherwise lengths add up (sequences), take the larger (alternatives) or multiply (bounded
- *    repeats). A character counts as 4 bytes unless it is ASCII.
+ *    repeats). A character counts as its UTF-8 length. Under the `i` flag, a k or K (and any
+ *    class or `\w` holding one) counts as 3 bytes and an s or S as 2, since Go folds them to
+ *    U+212A and U+017F; a non-ASCII character counts as 4.
  *
  * Anything this parser does not understand throws, so a config change that brings in new syntax
  * fails the test that runs it instead of being bounded wrongly.
@@ -43,12 +45,27 @@ export class MatchBoundSyntaxError extends Error {
 const ZERO: Bound = { nl: false, ws: true, max: 0 };
 const WS_CODES = new Set([0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20]);
 
-function charBound(cp: number): Bound {
-  return {
-    nl: cp === 0x0a,
-    ws: WS_CODES.has(cp),
-    max: cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4,
-  };
+const utf8Bytes = (cp: number): number => (cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4);
+const covers = (lo: number, hi: number, ...cps: number[]): boolean =>
+  cps.some((cp) => lo <= cp && cp <= hi);
+
+/**
+ * Longest UTF-8 encoding of a character in [lo, hi] or of anything it folds to. Under the `i`
+ * flag Go (RE2) folds k and K to U+212A KELVIN SIGN (3 bytes) and s and S to U+017F LATIN SMALL
+ * LETTER LONG S (2 bytes); these are the only ASCII letters with a non-ASCII fold. A non-ASCII
+ * character under the flag counts as 4 bytes, an upper bound for any fold.
+ */
+function rangeBytes(lo: number, hi: number, fold: boolean): number {
+  let max = utf8Bytes(hi);
+  if (!fold) return max;
+  if (hi >= 0x80) return 4;
+  if (covers(lo, hi, 0x4b, 0x6b)) max = Math.max(max, 3);
+  if (covers(lo, hi, 0x53, 0x73)) max = Math.max(max, 2);
+  return max;
+}
+
+function charBound(cp: number, fold = false): Bound {
+  return { nl: cp === 0x0a, ws: WS_CODES.has(cp), max: rangeBytes(cp, cp, fold) };
 }
 
 /** Escapes that stand for a set of characters, outside or inside a class. */
@@ -60,6 +77,22 @@ const CLASS_ESCAPES: Record<string, Bound> = {
   w: { nl: false, ws: false, max: 1 },
   W: { nl: true, ws: false, max: 4 },
 };
+/** A class escape under the `i` flag: `\w` holds k and s, so it also matches U+212A and U+017F. */
+function classEscape(c: string, fold: boolean): Bound {
+  const b = CLASS_ESCAPES[c] as Bound;
+  return fold && c === 'w' ? { ...b, max: 3 } : b;
+}
+/** POSIX classes holding k (folded to U+212A, 3 bytes, under the `i` flag). */
+const POSIX_WITH_K = new Set([
+  'alnum',
+  'alpha',
+  'lower',
+  'upper',
+  'word',
+  'graph',
+  'print',
+  'ascii',
+]);
 const CONTROL_ESCAPES: Record<string, number> = {
   n: 0x0a,
   r: 0x0d,
@@ -178,24 +211,24 @@ export function maxMatchBytes(pattern: string, caps: MatchCaps): number {
   };
 
   /** One escape outside a class; `i` is just after the backslash. */
-  const escapeAtom = (): Bound | 'Q' => {
+  const escapeAtom = (fold: boolean): Bound | 'Q' => {
     const c = peek();
     if (c === undefined) return fail('trailing backslash');
     i++;
-    if (c in CLASS_ESCAPES) return CLASS_ESCAPES[c] as Bound;
+    if (c in CLASS_ESCAPES) return classEscape(c, fold);
     if (c in CONTROL_ESCAPES) return charBound(CONTROL_ESCAPES[c] as number);
     if ('bBAz'.includes(c)) return ZERO;
-    if (c === 'x') return charBound(readHex());
+    if (c === 'x') return charBound(readHex(), fold);
     if (c === 'p' || c === 'P') {
       skipUnicodeClass();
       return { nl: true, ws: false, max: 4 };
     }
     if (c === 'Q') return 'Q';
     if (/[0-9A-Za-z]/.test(c)) return fail(`unsupported escape \\${c}`);
-    return charBound(c.codePointAt(0) as number);
+    return charBound(c.codePointAt(0) as number, fold);
   };
 
-  const classAtom = (): Bound => {
+  const classAtom = (fold: boolean): Bound => {
     // after `[`
     let negated = false;
     if (peek() === '^') {
@@ -207,7 +240,7 @@ export function maxMatchBytes(pattern: string, caps: MatchCaps): number {
     let maxBytes = 1;
     let first = true;
     const addCp = (cp: number): void => {
-      const b = charBound(cp);
+      const b = charBound(cp, fold);
       hasNl ||= b.nl;
       allWs &&= b.ws;
       maxBytes = Math.max(maxBytes, b.max);
@@ -232,6 +265,7 @@ export function maxMatchBytes(pattern: string, caps: MatchCaps): number {
         }
         const p = POSIX[name];
         if (p === undefined) fail(`unknown posix class ${name}`);
+        if (fold && POSIX_WITH_K.has(name)) maxBytes = Math.max(maxBytes, 3);
         hasNl ||= (p as { nl: boolean }).nl;
         allWs &&= (p as { ws: boolean }).ws;
         i = end + 2;
@@ -244,7 +278,7 @@ export function maxMatchBytes(pattern: string, caps: MatchCaps): number {
         if (e === undefined) fail('trailing backslash');
         i++;
         if (e !== undefined && e in CLASS_ESCAPES) {
-          const b = CLASS_ESCAPES[e] as Bound;
+          const b = classEscape(e, fold);
           hasNl ||= b.nl;
           allWs &&= b.ws;
           maxBytes = Math.max(maxBytes, b.max);
@@ -278,7 +312,7 @@ export function maxMatchBytes(pattern: string, caps: MatchCaps): number {
         if (hi < lo) fail('reversed range');
         hasNl ||= lo <= 0x0a && hi >= 0x0a;
         allWs &&= lo === hi && WS_CODES.has(lo);
-        maxBytes = Math.max(maxBytes, charBound(hi).max);
+        maxBytes = Math.max(maxBytes, rangeBytes(lo, hi, fold));
       } else addCp(lo);
     }
     if (negated) return { nl: !hasNl, ws: false, max: 4 };
@@ -309,6 +343,8 @@ export function maxMatchBytes(pattern: string, caps: MatchCaps): number {
 
   interface Flags {
     s: boolean;
+    /** Case-insensitive: letters also match their Unicode folds (see rangeBytes). */
+    i: boolean;
   }
 
   const parseFlags = (spec: string, flags: Flags): void => {
@@ -316,7 +352,8 @@ export function maxMatchBytes(pattern: string, caps: MatchCaps): number {
     for (const f of spec) {
       if (f === '-') on = false;
       else if (f === 's') flags.s = on;
-      else if (!'imU'.includes(f)) fail(`unknown flag ${f}`);
+      else if (f === 'i') flags.i = on;
+      else if (!'mU'.includes(f)) fail(`unknown flag ${f}`);
     }
   };
 
@@ -353,7 +390,7 @@ export function maxMatchBytes(pattern: string, caps: MatchCaps): number {
         i++;
       } else if (c === '[') {
         i++;
-        atom = classAtom();
+        atom = classAtom(flags.i);
       } else if (c === '.') {
         i++;
         atom = { nl: flags.s, ws: false, max: 4 };
@@ -362,19 +399,19 @@ export function maxMatchBytes(pattern: string, caps: MatchCaps): number {
         atom = ZERO;
       } else if (c === '\\') {
         i++;
-        const e = escapeAtom();
+        const e = escapeAtom(flags.i);
         if (e === 'Q') {
           const end = pattern.indexOf('\\E', i);
           const lit = pattern.slice(i, end < 0 ? pattern.length : end);
           i = end < 0 ? pattern.length : end + 2;
-          for (const ch of lit) parts.push(charBound(ch.codePointAt(0) as number));
+          for (const ch of lit) parts.push(charBound(ch.codePointAt(0) as number, flags.i));
           continue;
         }
         atom = e;
       } else if (c === '*' || c === '+' || c === '?') {
         return fail('quantifier without atom');
       } else {
-        atom = charBound(readCodePoint());
+        atom = charBound(readCodePoint(), flags.i);
       }
       const q = quantifier();
       parts.push(q === undefined ? atom : combineRepeat(atom, q.min, q.max, caps));
@@ -383,7 +420,7 @@ export function maxMatchBytes(pattern: string, caps: MatchCaps): number {
     return combineAlt(alts);
   };
 
-  const root = alternation({ s: false });
+  const root = alternation({ s: false, i: false });
   if (i !== pattern.length) fail('unbalanced )');
   return root.max;
 }
