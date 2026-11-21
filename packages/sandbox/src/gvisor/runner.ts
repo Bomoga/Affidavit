@@ -15,6 +15,7 @@ import {
   buildGvisorRunArgs,
   userArg,
   type Limits,
+  type TmpfsMount,
 } from './args.js';
 import { normalizeContainerPath, validateMounts, type Mount } from './mounts.js';
 import type { CaseNetwork } from './network.js';
@@ -71,6 +72,10 @@ export interface JailedRunInput {
   maxFileBytes?: number;
   /** `uid:gid` to run as; see `GvisorRunSpec.user`. */
   user?: string;
+  /** See `GvisorRunSpec`: build steps and boot diagnostics use these, witnesses do not. */
+  env?: Readonly<Record<string, string>>;
+  workdir?: string;
+  tmpfs?: readonly TmpfsMount[];
   /** Writable `/tmp` tmpfs size; see `GvisorRunSpec.writableTmpMb`. */
   writableTmpMb?: number;
 }
@@ -244,6 +249,9 @@ export async function runJailed(
         : { name: input.network.net.name, hosts: input.network.hosts },
     maxFileBytes: input.maxFileBytes,
     user: input.user,
+    env: input.env,
+    workdir: input.workdir,
+    tmpfs: input.tmpfs,
     writableTmpMb: input.writableTmpMb,
   });
 

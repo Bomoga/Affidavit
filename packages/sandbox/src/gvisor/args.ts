@@ -26,7 +26,9 @@ export const DEFAULT_LIMITS: Readonly<Limits> = {
 
 /** Name of a per-case network created by `createCaseNetwork`; nothing else can be joined. */
 export const CASE_NETWORK = /^affidavit-net-[0-9a-f]{16}$/;
-const HOST_ALIAS = /^[a-z][a-z0-9-]{0,62}$/;
+/** A host name: labels of letters, digits and hyphens, separated by dots (stub aliases). */
+const HOST_ALIAS =
+  /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/;
 
 /** A per-case internal network, and the names the jail may use for hosts on it. */
 export interface JailNetwork {
@@ -34,6 +36,36 @@ export interface JailNetwork {
   /** Host name to IPv4 address, written into the jail's /etc/hosts. */
   hosts?: Readonly<Record<string, string>>;
 }
+
+/** An extra writable tmpfs, for example over an image's declared VOLUME. Memory-backed, capped. */
+export interface TmpfsMount {
+  path: string;
+  sizeMb: number;
+}
+
+const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** Paths the spec controls itself, which a caller's tmpfs may not cover. */
+const RESERVED_TMPFS = ['/', '/proc', '/sys', '/dev', '/dev/shm', '/scratch', '/tmp', '/etc'];
+const TMPFS_PATH = /^\/[\w./@+-]*$/;
+
+/** Every key a `GvisorRunSpec` may have; `buildGvisorRunArgs` refuses any other. */
+const SPEC_KEYS = new Set<string>([
+  'name',
+  'runId',
+  'image',
+  'command',
+  'mounts',
+  'limits',
+  'stdin',
+  'runtime',
+  'network',
+  'maxFileBytes',
+  'env',
+  'workdir',
+  'user',
+  'tmpfs',
+  'writableTmpMb',
+]);
 
 /** An unprivileged uid and gid inside the jail (nobody). */
 export const JAIL_USER = '65534:65534';
@@ -58,11 +90,17 @@ export interface GvisorRunSpec {
    * the case workspace, so they can read `/src` and write `/out`; root (uid or gid 0) is refused.
    */
   user?: string;
+  /** Environment for the process. HOME and TMPDIR are always set by the jail and cannot be overridden. */
+  env?: Readonly<Record<string, string>>;
+  workdir?: string;
+  /** Writable tmpfs mounts besides /scratch (service volumes). */
+  tmpfs?: readonly TmpfsMount[];
   /**
-   * Make `/tmp` a writable tmpfs of this many MiB and point `TMPDIR` at it, for tools that need
-   * a temp directory at `/tmp` (Lane 1 scanners); `XDG_CACHE_HOME` is `/tmp` too. Default: `/tmp` is a read-only tmpfs and
-   * `TMPDIR=/scratch`, as for witnesses. tmpfs lives in the sandbox's memory, so it counts against
-   * the memory limit and never touches the host disk.
+   * Size of a writable /tmp in MiB, at most `MAX_WRITABLE_TMP_MB`. Unset, /tmp is a read-only tmpfs
+   * and `TMPDIR=/scratch` (witnesses). Set, `TMPDIR` and `XDG_CACHE_HOME` point at /tmp: services
+   * such as a database need it for sockets and temporary files, and Lane 1 scanners for their temp
+   * and cache directories. tmpfs lives in the sandbox's memory, so it counts against the memory
+   * limit and never touches the host disk.
    */
   writableTmpMb?: number;
 }
@@ -77,20 +115,6 @@ export function userArg(user: string | undefined): string {
   if (m === null) throw new Error(`user must be uid:gid: ${user}`);
   if (Number(m[1]) === 0 || Number(m[2]) === 0) throw new Error('refusing to run the jail as root');
   return user;
-}
-
-function tmpArgs(writableTmpMb: number | undefined): string[] {
-  if (writableTmpMb === undefined) {
-    return ['--mount', 'type=tmpfs,destination=/tmp,readonly'];
-  }
-  if (
-    !Number.isSafeInteger(writableTmpMb) ||
-    writableTmpMb <= 0 ||
-    writableTmpMb > MAX_WRITABLE_TMP_MB
-  ) {
-    throw new Error(`bad writableTmpMb: ${writableTmpMb}`);
-  }
-  return ['--tmpfs', `/tmp:rw,size=${writableTmpMb}m,mode=1777`];
 }
 
 function networkArgs(network: JailNetwork | undefined): string[] {
@@ -108,10 +132,94 @@ function networkArgs(network: JailNetwork | undefined): string[] {
   return ['--network', network.name, '--dns-search', '.', ...hosts];
 }
 
+function envArgs(env: Readonly<Record<string, string>> | undefined): string[] {
+  return Object.entries(env ?? {}).flatMap(([k, v]) => {
+    if (!ENV_KEY.test(k) || k === 'HOME' || k === 'TMPDIR') throw new Error(`bad env key: ${k}`);
+    if (/[\n\r\0]/.test(v)) throw new Error(`bad env value for ${k}`);
+    return ['--env', `${k}=${v}`];
+  });
+}
+
+const positiveMb = (n: number, what: string): number => {
+  if (!Number.isSafeInteger(n) || n <= 0 || n > 16_384) throw new Error(`bad ${what}: ${n}`);
+  return n;
+};
+
+/** Null when `p` may carry an extra tmpfs (for an image volume), else why not. Non-throwing. */
+export function tmpfsPathProblem(p: string): string | null {
+  const path = p.replace(/\/+$/, '');
+  if (
+    !TMPFS_PATH.test(path) ||
+    path.split('/').includes('..') ||
+    RESERVED_TMPFS.some((r) => path === r || (r !== '/' && path.startsWith(`${r}/`)))
+  ) {
+    return `bad tmpfs path: ${p}`;
+  }
+  return null;
+}
+
+function writableTmpBytes(mb: number): number {
+  if (positiveMb(mb, 'writableTmpMb') > MAX_WRITABLE_TMP_MB)
+    throw new Error(`bad writableTmpMb: ${mb}`);
+  return mb * 1024 * 1024;
+}
+
+function tmpfsArgs(spec: GvisorRunSpec): string[] {
+  const tmp =
+    spec.writableTmpMb === undefined
+      ? 'type=tmpfs,destination=/tmp,readonly'
+      : `type=tmpfs,destination=/tmp,tmpfs-size=${writableTmpBytes(spec.writableTmpMb)},tmpfs-mode=1777`;
+  const extra = (spec.tmpfs ?? []).flatMap((t) => {
+    const problem = tmpfsPathProblem(t.path);
+    if (problem !== null) throw new Error(problem);
+    const path = t.path.replace(/\/+$/, '');
+    const bytes = positiveMb(t.sizeMb, 'tmpfs size') * 1024 * 1024;
+    return ['--mount', `type=tmpfs,destination=${path},tmpfs-size=${bytes},tmpfs-mode=1777`];
+  });
+  return ['--mount', tmp, '--mount', 'type=tmpfs,destination=/dev/shm,readonly', ...extra];
+}
+
 function fileSizeArgs(bytes: number | undefined): string[] {
   if (bytes === undefined) return [];
   if (!Number.isSafeInteger(bytes) || bytes <= 0) throw new Error(`bad maxFileBytes: ${bytes}`);
   return ['--ulimit', `fsize=${bytes}:${bytes}`];
+}
+
+function checkWorkdir(w: string): string {
+  if (!TMPFS_PATH.test(w) || w.split('/').includes('..')) throw new Error(`bad workdir: ${w}`);
+  return w;
+}
+
+/**
+ * Non-throwing checks for values that come from an untrusted target (boot recipes), so a bad
+ * value becomes an `unsupported` outcome instead of an exception deep inside a run.
+ */
+export function hostAliasProblem(alias: string): string | null {
+  return HOST_ALIAS.test(alias) ? null : `host alias ${JSON.stringify(alias)} is not a host name`;
+}
+
+export function envProblem(env: Readonly<Record<string, string>>): string | null {
+  for (const [k, v] of Object.entries(env)) {
+    if (!ENV_KEY.test(k) || k === 'HOME' || k === 'TMPDIR') {
+      return `environment key ${JSON.stringify(k)} is not allowed`;
+    }
+    if (/[\n\r\0]/.test(v)) return `environment value of ${k} has a line break or NUL`;
+  }
+  return null;
+}
+
+/** Container paths a target's working directory (a bind mount target) may not be or sit under. */
+const RESERVED_WORKDIR = ['/', '/proc', '/sys', '/dev', '/scratch', '/tmp', '/etc'];
+
+export function workdirProblem(w: string): string | null {
+  if (!TMPFS_PATH.test(w) || w.split('/').includes('..') || /[,:=]/.test(w)) {
+    return `working directory ${JSON.stringify(w)} is not a plain absolute path`;
+  }
+  const p = w.replace(/\/+$/, '') || '/';
+  if (RESERVED_WORKDIR.some((r) => p === r || (r !== '/' && p.startsWith(`${r}/`)))) {
+    return `working directory ${p} is reserved by the jail`;
+  }
+  return null;
 }
 
 /**
@@ -130,10 +238,17 @@ const isPinned = (image: string): boolean =>
  *   the container is replaced by gVisor's own sandbox. See docs/lanes/lane2/sandbox-runner.md.
  * - No network, or only a per-case internal network (see network.ts), read-only root, all capabilities dropped, no privilege gain, unprivileged user.
  * - Memory with swap equal to memory, so the limit cannot be stretched with swap (L2-01 finding).
- * - `/tmp` and `/dev/shm` are read-only tmpfs; `/scratch` is the only writable path. A tool run
- *   may ask for a writable, size-capped `/tmp` tmpfs instead (`writableTmpMb`).
+ * - `/tmp` and `/dev/shm` are read-only tmpfs and `/scratch` is the only writable path, unless the
+ *   caller asks for a capped writable `/tmp` (services and Lane 1 tools) or extra capped tmpfs
+ *   mounts (services only).
+ * - No route out for anything: only `--network none` or a per-case internal network. There is no
+ *   egress exception (lead decision 2026-11-20, PR #18), and a spec with any key this function
+ *   does not know (`fetch`, `egress`, `dns`, ...) is refused, so no caller can add one.
  */
 export function buildGvisorRunArgs(spec: GvisorRunSpec): string[] {
+  for (const key of Object.keys(spec)) {
+    if (!SPEC_KEYS.has(key)) throw new Error(`unknown run spec key: ${key}`);
+  }
   if (!isPinned(spec.image))
     throw new Error(`image must be pinned by sha256 digest or image ID: ${spec.image}`);
   const l = spec.limits ?? DEFAULT_LIMITS;
@@ -171,9 +286,9 @@ export function buildGvisorRunArgs(spec: GvisorRunSpec): string[] {
     'none',
     '--tmpfs',
     `/scratch:rw,size=${l.scratchMb}m,mode=1777`,
-    ...tmpArgs(spec.writableTmpMb),
-    '--mount',
-    'type=tmpfs,destination=/dev/shm,readonly',
+    ...tmpfsArgs(spec),
+    ...(spec.workdir === undefined ? [] : ['--workdir', checkWorkdir(spec.workdir)]),
+    ...envArgs(spec.env),
     '--env',
     'HOME=/scratch',
     '--env',

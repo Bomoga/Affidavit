@@ -1,5 +1,27 @@
 import { describe, expect, it } from 'vitest';
-import { assertNoImageVolumes, parseContainerVolumes, parseImageVolumes } from './volumes.js';
+import {
+  assertNoImageVolumes,
+  parseContainerVolumes,
+  parseImageVolumes,
+  uncoveredVolumes,
+} from './volumes.js';
+
+describe('uncoveredVolumes', () => {
+  it('is empty when every declared volume has a tmpfs over it', () => {
+    expect(
+      uncoveredVolumes(
+        ['/data/db', '/data/configdb'],
+        [{ path: '/data/db/' }, { path: '/data/configdb' }],
+      ),
+    ).toEqual([]);
+  });
+
+  it('lists volumes with no tmpfs exactly over them (a parent or child path does not count)', () => {
+    expect(
+      uncoveredVolumes(['/data/db', '/var/lib/x'], [{ path: '/data' }, { path: '/var/lib/x/y' }]),
+    ).toEqual(['/data/db', '/var/lib/x']);
+  });
+});
 
 describe('parseImageVolumes', () => {
   it('reads no volumes from null or an empty object', () => {

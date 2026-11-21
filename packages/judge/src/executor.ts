@@ -5,9 +5,12 @@ export type Attempt = 1 | 2 | 3;
 /** The variants a witness or counterexample is judged on. `patched` belongs to verifyPatch. */
 export type EvidenceVariant = 'vulnerable' | 'safe';
 
+/** Every variant an executor may be asked to run; `patched` comes only from verifyPatch (L2-07). */
+export type ExecutionVariant = EvidenceVariant | 'patched';
+
 export interface ExecutionRequest {
   caseFile: CaseFile;
-  variant: EvidenceVariant;
+  variant: ExecutionVariant;
   target: TargetRef;
   attempt: Attempt;
   /** Witness or counterexample source. Untrusted: it only ever runs inside the jail. */

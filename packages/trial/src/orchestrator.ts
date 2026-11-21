@@ -17,6 +17,8 @@ import {
 } from '@affidavit/contracts';
 import { digestOf } from './canonical.js';
 import type { SubmissionSpec } from './envelope.js';
+import { ModelUnconfiguredError } from './model/errors.js';
+import { hasPreflight } from './model/preflight.js';
 import { assertAllowedTools, type ModelRole } from './roles.js';
 import { buildVerdict, finalizeVerdict } from './verdict.js';
 import type { TrialWorkspace } from './workspace.js';
@@ -106,12 +108,20 @@ export interface OrchestratorDeps {
 }
 
 /**
- * What `run` returns. A tripped kill switch is not an escalation and not a budget problem: the
- * case is left at its current stage, untouched, so an operator can resume it by running again.
+ * Why a run stopped without finishing. Neither is an escalation or a budget problem.
+ * - `kill-switch`: the global kill switch tripped.
+ * - `model-unconfigured`: the model port has no API key (or the provider refused it). Checked
+ *   before the call's budget is charged, so nothing is spent.
+ */
+export type HaltReason = 'kill-switch' | 'model-unconfigured';
+
+/**
+ * What `run` returns. A halted case is left at its current stage, untouched, so an operator can
+ * resume it by running again.
  */
 export type RunOutcome =
   | { status: 'terminal'; stage: CaseStage }
-  | { status: 'halted'; stage: CaseStage; reason: 'kill-switch' };
+  | { status: 'halted'; stage: CaseStage; reason: HaltReason };
 
 /** Throw from a handler to run the stage again. The next agent call is charged first. */
 export class RetryStageError extends Error {
@@ -185,7 +195,7 @@ export const EVENT_ACTOR_FOR_STAGE: Readonly<Record<CaseStage, Role>> = {
   escalated: 'stenographer',
 };
 
-type StageRun = StageResult | { kind: 'halted' };
+type StageRun = StageResult | { kind: 'halted'; reason: HaltReason };
 
 function isTerminal(stage: CaseStage): boolean {
   return TERMINAL_STAGES.includes(stage);
@@ -239,7 +249,7 @@ export class Orchestrator {
       }
 
       const outcome = await this.runStage(caseId, stage, handler);
-      if (outcome.kind === 'halted') return { status: 'halted', stage, reason: 'kill-switch' };
+      if (outcome.kind === 'halted') return { status: 'halted', stage, reason: outcome.reason };
 
       let next: CaseStage;
       if (outcome.kind === 'advance') {
@@ -271,7 +281,10 @@ export class Orchestrator {
         if (err instanceof BudgetExhaustedError) {
           return { kind: 'escalate', reason: 'budget-exhausted', detail: err.detail };
         }
-        if (err instanceof KillSwitchError) return { kind: 'halted' };
+        if (err instanceof KillSwitchError) return { kind: 'halted', reason: 'kill-switch' };
+        if (err instanceof ModelUnconfiguredError) {
+          return { kind: 'halted', reason: 'model-unconfigured' };
+        }
         if (err instanceof RetryStageError && attempt < max) continue;
         throw err;
       }
@@ -384,6 +397,21 @@ export class Orchestrator {
     }
     if (await config.killSwitch()) throw new KillSwitchError();
 
+    const turn: ModelTurnRequest = {
+      promptId: req.promptId,
+      promptVersion: req.promptVersion,
+      model: req.model,
+      system: req.system,
+      user: req.user,
+      tools: req.tools,
+      outputSchemaRef: req.outputSchemaRef,
+      maxTurns: req.maxTurns,
+      budget: req.budget,
+    };
+    // A port that can refuse a call without spending (no API key, unknown model) does so before
+    // the charge, so a missing key halts the case with nothing charged.
+    if (hasPreflight(model)) await model.preflight(turn);
+
     // Charge the turn's whole budget before the call, so a retry cannot spend unrecorded money.
     // The model port is held to the same budget, so what it spends cannot exceed this charge.
     const reservation: StageCost = {
@@ -402,17 +430,6 @@ export class Orchestrator {
       );
     }
 
-    const turn: ModelTurnRequest = {
-      promptId: req.promptId,
-      promptVersion: req.promptVersion,
-      model: req.model,
-      system: req.system,
-      user: req.user,
-      tools: req.tools,
-      outputSchemaRef: req.outputSchemaRef,
-      maxTurns: req.maxTurns,
-      budget: req.budget,
-    };
     // Recorded per call, keyed by prompt id, so the verdict lists exactly the prompts that ran.
     info.promptVersions[promptId.data] = req.promptVersion;
     info.modelIds[promptId.data] = req.model;

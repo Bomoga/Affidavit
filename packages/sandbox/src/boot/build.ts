@@ -1,0 +1,670 @@
+import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import {
+  chmod,
+  copyFile,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
+import { BootHints } from '@affidavit/contracts';
+import { PROBE_IMAGE } from '../containment/probes.js';
+import type { Limits } from '../gvisor/args.js';
+import { validateMounts, type Mount } from '../gvisor/mounts.js';
+import { runJailed, type JailedRun } from '../gvisor/runner.js';
+import { baseImageProblem, imageOnBuild, pinImage } from './images.js';
+import { deriveRecipe, type BootRecipe } from './recipe.js';
+import { composePathPairs, execErrorText, scrubPaths } from './scrub.js';
+import { DEPENDENCY_MOUNT, bundleInstallCommand } from '../bundle/coverage.js';
+import {
+  materializeNpmCache,
+  openDependencyBundle,
+  type DependencyBundleCaps,
+  type DependencyBundleRef,
+  type OpenedBundle,
+} from '../bundle/open.js';
+import type { BundleSection } from '../bundle/plan.js';
+import { pruneExcludedDev, type ExcludedDevPackage } from '../bundle/prune.js';
+
+const exec = promisify(execFile);
+
+/** Label on every image the split build makes, so they can be listed and removed. */
+export const IMAGE_LABEL = 'affidavit.sandbox.image';
+
+/** Build-step limits: a build script needs more room than a witness. Configuration only. */
+export const BUILD_LIMITS: Readonly<Limits> = {
+  memoryMb: 2048,
+  pids: 512,
+  cpus: 2,
+  scratchMb: 1024,
+};
+const SCRIPTS_TIMEOUT_MS = 10 * 60_000;
+const MAX_TREE_FILES = 50_000;
+const MAX_TREE_BYTES = 512 * 1024 * 1024;
+
+/**
+ * Never copied into a staged tree: VCS data, installed modules, real env files, npm config, and
+ * Docker CLI config (`.docker` can carry `cli-plugins/` binaries and a `config.json` that picks
+ * plugin directories, contexts and proxies for any Docker CLI pointed at it).
+ */
+export const SKIPPED = (name: string): boolean =>
+  name === '.git' ||
+  name === 'node_modules' ||
+  name === '.docker' ||
+  name === '.npmrc' ||
+  name === '.env' ||
+  name.startsWith('.env.');
+
+export interface StageReport {
+  files: number;
+  bytes: number;
+  /** Symlinks and other non-regular files left out (a symlink could point anywhere on the host). */
+  skippedLinks: number;
+}
+
+/**
+ * Copies a source checkout into `dest` with only regular files and directories, so nothing the
+ * build later touches on the host can follow a link out of the tree. Directories are made
+ * world-writable and files world-readable, because build steps run as nobody.
+ */
+export async function stageTree(src: string, dest: string): Promise<StageReport> {
+  return walkStageable(src, {
+    async dir(rel) {
+      const to = join(dest, rel);
+      await mkdir(to, { recursive: true });
+      await chmod(to, 0o777);
+    },
+    async file(rel, abs, executable) {
+      await copyFile(abs, join(dest, rel));
+      await chmod(join(dest, rel), executable ? 0o777 : 0o666);
+    },
+  });
+}
+
+/** Staging caps (files, bytes). Configuration only; tests lower them. */
+export interface StageCaps {
+  files: number;
+  bytes: number;
+}
+const STAGE_CAPS: Readonly<StageCaps> = { files: MAX_TREE_FILES, bytes: MAX_TREE_BYTES };
+
+interface StageVisitor {
+  /** A directory to create, relative to the tree (`''` is the root). */
+  dir(rel: string): Promise<void>;
+  /** A regular file to copy; `executable` is the one mode bit staging keeps. */
+  file(rel: string, abs: string, executable: boolean): Promise<void>;
+}
+
+/**
+ * The one definition of what staging copies: directories and regular files, minus `SKIPPED`
+ * names; symlinks, FIFOs, sockets and devices are left out (counted). Files keep only whether any
+ * exec bit was set. Names are visited in sorted order. Throws past the staging caps.
+ */
+async function walkStageable(
+  src: string,
+  visit: StageVisitor,
+  opts: { lstat?: typeof lstat; caps?: Readonly<StageCaps> } = {},
+): Promise<StageReport> {
+  const stat = opts.lstat ?? lstat;
+  const caps = opts.caps ?? STAGE_CAPS;
+  const report: StageReport = { files: 0, bytes: 0, skippedLinks: 0 };
+  const walk = async (rel: string): Promise<void> => {
+    await visit.dir(rel);
+    for (const name of (await readdir(join(src, rel))).sort()) {
+      if (SKIPPED(name)) continue;
+      const r = rel === '' ? name : `${rel}/${name}`;
+      const abs = join(src, r);
+      const s = await stat(abs);
+      if (s.isDirectory()) await walk(r);
+      else if (s.isFile()) {
+        report.files++;
+        report.bytes += s.size;
+        if (report.files > caps.files || report.bytes > caps.bytes) {
+          throw new Error('source tree is over the size limit');
+        }
+        await visit.file(r, abs, (s.mode & 0o111) !== 0);
+      } else report.skippedLinks++;
+    }
+  };
+  await walk('');
+  return report;
+}
+
+/**
+ * SHA-256 of exactly what `stageTree` would copy into a build context (same walker): each
+ * directory's path, and each regular file's path, exec bit and bytes, in sorted order. Two trees
+ * with the same fingerprint stage identically. Read only; never follows a link. `lstat` and `caps`
+ * are for tests.
+ */
+export async function fingerprintStageTree(
+  src: string,
+  opts: { lstat?: typeof lstat; caps?: Readonly<StageCaps> } = {},
+): Promise<string> {
+  const hash = createHash('sha256');
+  await walkStageable(
+    src,
+    {
+      dir(rel) {
+        hash.update(`d\0${rel}\0`);
+        return Promise.resolve();
+      },
+      async file(rel, abs, executable) {
+        const body = await readFile(abs);
+        hash.update(`f\0${rel}\0${executable ? 'x' : '-'}\0${body.length}\0`);
+        hash.update(body);
+      },
+    },
+    opts,
+  );
+  return hash.digest('hex');
+}
+
+/** What a build installed from a dependency bundle, for the evidence bundle and replay. */
+export interface BundleUse {
+  /** `sha256:<hex>` of the bundle tar, equal to the pin. */
+  sha256: string;
+  /** The digest of each section the install step mounted. */
+  sections: Partial<Record<BundleSection, string>>;
+  packages: number;
+  /** The reviewed dev exclusions pruned before the install (security relevant; human reviewed). */
+  excludedDev?: ExcludedDevPackage[];
+}
+
+/**
+ * Prunes reviewed dev exclusions from a staged tree's package.json and package-lock.json, so the
+ * offline `npm ci` never looks for them. Returns the lockfile paths removed; throws when the list
+ * does not apply to this lockfile (fail closed).
+ */
+export async function applyDevExclusions(
+  tree: string,
+  excluded: readonly ExcludedDevPackage[],
+): Promise<string[]> {
+  const pkgPath = join(tree, 'package.json');
+  const lockPath = join(tree, 'package-lock.json');
+  const pruned = pruneExcludedDev(
+    await readFile(lockPath, 'utf8'),
+    await readFile(pkgPath, 'utf8'),
+    excluded,
+  );
+  if (!pruned.ok) throw new Error(pruned.reason);
+  await writeFile(lockPath, pruned.lockText);
+  await writeFile(pkgPath, pruned.pkgText);
+  return pruned.removed;
+}
+
+export type BuildOutcome = (
+  | {
+      ok: true;
+      imageId: string;
+      baseImage: string;
+      recipe: BootRecipe;
+      stage: StageReport;
+      /**
+       * Set when a dependency bundle was given. Its digest is an input of the image: replay must
+       * build with the same pinned bundle (`dependencyBundleToolVersions` carries it into
+       * `BundleManifest.toolVersions`).
+       */
+      dependencyBundle?: BundleUse;
+    }
+  | {
+      ok: false;
+      /** `unsupported`: outside what the MVP can boot without weakening a control. */
+      unsupported: boolean;
+      step: 'bundle' | 'stage' | 'recipe' | 'base' | 'scripts' | 'assemble';
+      /** Host paths are replaced by placeholders (`<tree>`, `<build>`, `<src>`, `<tmp>`). */
+      reason: string;
+    }
+) & {
+  /**
+   * Operational signal, separate from the build's result: set when the build directory could not
+   * be fully removed, so untrusted files may be left under the work root. Not an exception.
+   */
+  leftovers?: string;
+};
+
+export interface BuildOptions {
+  /** Host directory for build workspaces. Each build gets its own directory, removed after. */
+  workRoot: string;
+  limits?: Readonly<Limits>;
+  /**
+   * Count devDependencies as needed even when the app has no `build` script. Only for an image
+   * that runs the target's own test suite (the patch workbench); a target that witnesses attack is
+   * built as the app ships, without them. Nothing is ever downloaded, so with this set a target
+   * that has any devDependency is `unsupported`.
+   */
+  devDependencies?: boolean;
+  /**
+   * A pinned dependency bundle (lead decision 2026-11-20, L2-04c), built on a networked host by a
+   * human, never by this code. It is verified against its pinned sha256 before anything in it is
+   * used (a mismatch is a `failed` build at step `bundle`), then the sections the build needs are
+   * mounted read only into a jailed `npm ci --offline --ignore-scripts`. No step gains a route out.
+   */
+  dependencyBundle?: DependencyBundleRef;
+  /** Caps for reading the bundle; tests lower them. */
+  dependencyBundleCaps?: Readonly<DependencyBundleCaps>;
+}
+
+const tail = (r: JailedRun): string => `${r.stderr}\n${r.stdout}`.trim().slice(-1500);
+const failed = (r: JailedRun): boolean => r.exitCode !== 0;
+
+/**
+ * The split build (L2-04). Nothing from the repository runs outside gVisor, and no step has a
+ * route out. Lead decision 2026-11-20 (PR #18): there is no egress exception for a dependency
+ * fetch, so a target whose install would download anything is `unsupported` at the recipe step
+ * (plan.md, Lane 2 item 3).
+ *
+ * 1. Stage the checkout (regular files only, no `.git`, `.env*`, `.npmrc`, `node_modules`).
+ * 2. Derive the recipe from boot hints, compose file and Dockerfile, without running them. The
+ *    lockfile and package.json must list nothing to download (`dependencyFetchProblem`).
+ * 3. Base: the final stage's base must be an official `node` image; it is pinned by digest, and
+ *    refused when it carries ONBUILD triggers.
+ * 4. Scripts: the `build` script, if any, offline (no network at all) on the pinned base.
+ * 5. Assemble: `docker build --network=none` from a generated Dockerfile with only FROM (pinned)
+ *    and COPY, so no RUN step exists to execute.
+ */
+export async function buildTarget(
+  srcDir: string,
+  bootHints: BootHints,
+  opts: BuildOptions,
+): Promise<BuildOutcome> {
+  const parsedHints = BootHints.safeParse(bootHints);
+  if (!parsedHints.success) {
+    return { ok: false, unsupported: false, step: 'recipe', reason: 'boot hints do not parse' };
+  }
+  const dir = await mkdtemp(join(opts.workRoot, 'build-'));
+  const scrub = (text: string): string =>
+    scrubPaths(text, [
+      ['<tree>', join(dir, 'tree')],
+      ['<build>', dir],
+      ['<src>', srcDir],
+      ['<workRoot>', opts.workRoot],
+      ...composePathPairs(),
+    ]);
+  let outcome: BuildOutcome | undefined;
+  try {
+    outcome = await buildIn(
+      srcDir,
+      parsedHints.data,
+      dir,
+      opts.limits ?? BUILD_LIMITS,
+      opts.devDependencies === true,
+      opts.dependencyBundle,
+      opts.dependencyBundleCaps,
+    );
+    if (!outcome.ok) outcome = { ...outcome, reason: scrub(outcome.reason) };
+    return outcome;
+  } finally {
+    // Never throws: an exception here would replace the build's real outcome. What could not be
+    // removed is reported on the outcome (or, if the build itself threw, as a process warning).
+    const leftovers = await removeBuildDir(dir);
+    if (leftovers !== null) {
+      if (outcome !== undefined) outcome.leftovers = scrub(leftovers);
+      else process.emitWarning(`build directory not fully removed: ${scrub(leftovers)}`);
+    }
+  }
+}
+
+async function buildIn(
+  srcDir: string,
+  hints: BootHints,
+  dir: string,
+  limits: Readonly<Limits>,
+  devDependencies: boolean,
+  bundleRef?: DependencyBundleRef,
+  bundleCaps?: Readonly<DependencyBundleCaps>,
+): Promise<BuildOutcome> {
+  const tree = join(dir, 'tree');
+  {
+    // The bundle is checked first, before the checkout is even staged: nothing from a bundle that
+    // is not the pinned one is ever used (fail closed).
+    let bundle: OpenedBundle | undefined;
+    if (bundleRef !== undefined) {
+      const opened = await openDependencyBundle(bundleRef, dir, bundleCaps);
+      if (!opened.ok) {
+        return {
+          ok: false,
+          unsupported: opened.unsupported,
+          step: 'bundle',
+          reason: opened.reason,
+        };
+      }
+      bundle = opened.bundle;
+    }
+    let stage: StageReport;
+    try {
+      stage = await stageTree(srcDir, tree);
+    } catch (err) {
+      return { ok: false, unsupported: true, step: 'stage', reason: (err as Error).message };
+    }
+    const r = await deriveRecipe(tree, hints, {
+      devDependencies,
+      ...(bundle === undefined ? {} : { bundle: bundle.manifest }),
+    });
+    if (!r.ok) return { ok: false, unsupported: true, step: 'recipe', reason: r.reason };
+    const recipe = r.recipe;
+
+    const baseProblem = baseImageProblem(recipe.base);
+    if (baseProblem !== null) {
+      return { ok: false, unsupported: true, step: 'base', reason: baseProblem };
+    }
+    let baseImage: string;
+    let onBuild: string[];
+    try {
+      baseImage = await pinImage(recipe.base);
+      onBuild = await imageOnBuild(baseImage);
+    } catch (err) {
+      return {
+        ok: false,
+        unsupported: true,
+        step: 'base',
+        reason: execErrorText(err).slice(0, 500),
+      };
+    }
+    if (onBuild.length > 0) {
+      return {
+        ok: false,
+        unsupported: true,
+        step: 'base',
+        reason: `base image ${recipe.base} has ONBUILD triggers, which would run inside the build`,
+      };
+    }
+
+    // Only the sections the recipe needs are laid out, so a runtime image never sees dev packages.
+    let bundleUse: BundleUse | undefined;
+    const cacheDir = join(dir, 'npm-cache');
+    if (bundle !== undefined) {
+      const sections = recipe.install?.sections ?? [];
+      const packages = await materializeNpmCache(bundle, sections, cacheDir);
+      const excludedDev = recipe.install?.excludedDev ?? [];
+      if (excludedDev.length > 0) {
+        try {
+          await applyDevExclusions(tree, excludedDev);
+        } catch (err) {
+          return { ok: false, unsupported: true, step: 'recipe', reason: (err as Error).message };
+        }
+      }
+      bundleUse = {
+        sha256: `sha256:${bundle.sha256}`,
+        sections: Object.fromEntries(sections.map((s) => [s, bundle.manifest.sections[s].sha256])),
+        packages,
+        ...(excludedDev.length > 0 ? { excludedDev } : {}),
+      };
+    }
+
+    let mounts: Mount[];
+    let installMounts: Mount[] = [];
+    try {
+      mounts = validateMounts(
+        [{ hostPath: tree, containerPath: recipe.workdir, readOnly: false }],
+        [dir],
+      );
+      if (recipe.install !== undefined) {
+        installMounts = validateMounts(
+          [
+            { hostPath: tree, containerPath: recipe.workdir, readOnly: false },
+            { hostPath: cacheDir, containerPath: DEPENDENCY_MOUNT, readOnly: true },
+          ],
+          [dir],
+        );
+      }
+    } catch (err) {
+      return { ok: false, unsupported: true, step: 'recipe', reason: (err as Error).message };
+    }
+    const common = {
+      mounts,
+      workdir: recipe.workdir,
+      writableTmpMb: 256,
+      // RLIMIT_FSIZE in the jail: no single file the steps write (sparse or not) may pass this.
+      maxFileBytes: BUILD_MAX_FILE_BYTES,
+      env: {
+        npm_config_cache: '/scratch/npm-cache',
+        npm_config_offline: 'true',
+        npm_config_update_notifier: 'false',
+        npm_config_fund: 'false',
+        npm_config_audit: 'false',
+      },
+    };
+
+    // Without a bundle nothing is installed (step 2 refused any dependency). With one, the install
+    // runs first, offline and with lifecycle scripts disabled, from the read-only bundle mount.
+    const scripts: { command: string[]; mounts: Mount[] }[] = [];
+    if (recipe.install !== undefined) {
+      scripts.push({
+        command: bundleInstallCommand(recipe.install.sections),
+        mounts: installMounts,
+      });
+    }
+    if (recipe.buildScript) scripts.push({ command: ['npm', 'run', 'build'], mounts });
+    for (const { command, mounts: stepMounts } of scripts) {
+      let run: JailedRun;
+      try {
+        run = await runJailed(
+          {
+            ...common,
+            mounts: stepMounts,
+            image: baseImage,
+            command,
+            timeoutMs: SCRIPTS_TIMEOUT_MS,
+          },
+          { trace: false, limits },
+        );
+      } catch (err) {
+        return {
+          ok: false,
+          unsupported: false,
+          step: 'scripts',
+          reason: `${command.join(' ')}: ${execErrorText(err).slice(0, 1500)}`,
+        };
+      }
+      if (failed(run)) {
+        return {
+          ok: false,
+          unsupported: false,
+          step: 'scripts',
+          reason: `${command.join(' ')}: ${tail(run)}`,
+        };
+      }
+    }
+    // The scripts ran repository and package code with write access to the tree. Before the
+    // tree becomes a build context (which `COPY .` writes out in full, sparse files unsparse),
+    // walk it again without following links and hold it to the caps.
+    const afterScripts = await checkBuiltTree(tree);
+    if (afterScripts !== null) {
+      return { ok: false, unsupported: false, step: 'scripts', reason: afterScripts };
+    }
+
+    const ctxDir = join(dir, 'dockerfile');
+    await mkdir(ctxDir);
+    const dockerfile = join(ctxDir, 'Dockerfile');
+    await writeFile(
+      dockerfile,
+      `FROM ${baseImage}\nCOPY . ${recipe.workdir}\nWORKDIR ${recipe.workdir}\n`,
+    );
+    // An empty ignore file next to the generated Dockerfile takes precedence over the tree's own.
+    await writeFile(`${dockerfile}.dockerignore`, '');
+    const iid = join(dir, 'iid');
+    try {
+      await exec('docker', assembleBuildArgs(dockerfile, tree, iid), {
+        timeout: 600_000,
+        maxBuffer: 16 * 1024 * 1024,
+        env: { ...process.env, DOCKER_BUILDKIT: '1' },
+      });
+    } catch (err) {
+      // stderr only: the error message repeats the command line, with every host path in it.
+      return {
+        ok: false,
+        unsupported: false,
+        step: 'assemble',
+        reason: execErrorText(err).slice(-1500),
+      };
+    }
+    const imageId = (await readFile(iid, 'utf8')).trim();
+    if (!/^sha256:[0-9a-f]{64}$/.test(imageId)) {
+      return { ok: false, unsupported: false, step: 'assemble', reason: `bad image id ${imageId}` };
+    }
+    return {
+      ok: true,
+      imageId,
+      baseImage,
+      recipe,
+      stage,
+      ...(bundleUse === undefined ? {} : { dependencyBundle: bundleUse }),
+    };
+  }
+}
+
+/**
+ * The assemble step's `docker build` arguments: no network (`--network none`), no pull, no build
+ * args, no proxy, no extra hosts, no secrets or SSH. The generated Dockerfile has no RUN step, so
+ * nothing would use a network anyway; the flag makes that hold even if it did.
+ */
+export function assembleBuildArgs(dockerfile: string, context: string, iidFile: string): string[] {
+  return [
+    'build',
+    '--network',
+    'none',
+    '--pull=false',
+    '--quiet',
+    '--label',
+    `${IMAGE_LABEL}=1`,
+    '--iidfile',
+    iidFile,
+    '-f',
+    dockerfile,
+    context,
+  ];
+}
+
+/** What a built tree may hold after the scripts step. Configuration only. */
+export interface TreeCaps {
+  /** Entries of any kind (files, directories, symlinks). */
+  maxEntries: number;
+  /** Sum of `st_size` over regular files: the bytes `COPY .` would write. */
+  maxBytes: number;
+}
+export const BUILT_TREE_CAPS: Readonly<TreeCaps> = {
+  maxEntries: 200_000,
+  maxBytes: 2 * 1024 * 1024 * 1024,
+};
+/** RLIMIT_FSIZE for the scripts step. Configuration only. */
+export const BUILD_MAX_FILE_BYTES = 256 * 1024 * 1024;
+
+/**
+ * Walks a tree the jailed steps wrote, with `lstat` (links are counted, never followed) and an
+ * explicit stack (no recursion depth to exhaust). Null when the tree is within `caps`, else the
+ * reason, with paths relative to the tree. Refused: more entries or bytes than the caps, any
+ * entry that is not a regular file, directory or symlink (FIFOs, sockets, devices), and any
+ * directory the host cannot read.
+ */
+export async function checkBuiltTree(
+  root: string,
+  caps: Readonly<TreeCaps> = BUILT_TREE_CAPS,
+): Promise<string | null> {
+  let entries = 0;
+  let bytes = 0;
+  const stack: string[] = [''];
+  while (stack.length > 0) {
+    const rel = stack.pop() as string;
+    let names: string[];
+    try {
+      names = await readdir(join(root, rel));
+    } catch {
+      return `built tree has an unreadable directory: ${rel === '' ? '.' : rel}`;
+    }
+    for (const name of names) {
+      const childRel = rel === '' ? name : `${rel}/${name}`;
+      entries++;
+      if (entries > caps.maxEntries) {
+        return `built tree has more than ${caps.maxEntries} entries`;
+      }
+      let s: Awaited<ReturnType<typeof lstat>>;
+      try {
+        s = await lstat(join(root, childRel));
+      } catch {
+        return `built tree has an unreadable entry: ${childRel}`;
+      }
+      if (s.isDirectory()) stack.push(childRel);
+      else if (s.isFile()) {
+        bytes += s.size;
+        if (bytes > caps.maxBytes) return `built tree is over ${caps.maxBytes} bytes`;
+      } else if (!s.isSymbolicLink()) {
+        return `built tree has a special file: ${childRel}`;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Removes a directory whose `tree` subdirectory was written by jailed steps (a build, or the patch
+ * workbench's apply step). Build steps write as nobody, so the host user cannot delete what they wrote. A jailed janitor,
+ * as the same nobody, first makes everything it owns readable and writable (a build script can
+ * leave `chmod 000` directories that even nobody could not descend into), then empties the tree;
+ * the host removes what is left. Never throws: returns null when the directory is gone, else what
+ * was left and why, for the caller to report.
+ */
+export async function removeBuildDir(dir: string): Promise<string | null> {
+  const tree = join(dir, 'tree');
+  const problems: string[] = [];
+  let hasTree = true;
+  try {
+    await lstat(tree);
+  } catch {
+    hasTree = false;
+  }
+  if (hasTree) {
+    try {
+      const mounts = validateMounts(
+        [{ hostPath: tree, containerPath: '/w', readOnly: false }],
+        [dir],
+      );
+      const janitor = await runJailed(
+        {
+          image: PROBE_IMAGE,
+          command: JANITOR_COMMAND,
+          mounts,
+          timeoutMs: 120_000,
+        },
+        { trace: false },
+      );
+      if (janitor.exitCode !== 0) {
+        problems.push(`janitor exited ${janitor.exitCode}: ${janitor.stderr.slice(-300)}`);
+      }
+    } catch (err) {
+      problems.push(`janitor did not run: ${(err as Error).message.slice(0, 300)}`);
+    }
+  }
+  try {
+    await rm(dir, { recursive: true, force: true });
+  } catch (err) {
+    problems.push(`host removal failed: ${(err as NodeJS.ErrnoException).code ?? 'error'}`);
+  }
+  try {
+    await lstat(dir);
+  } catch {
+    return null; // gone
+  }
+  return `<build> still exists${problems.length > 0 ? ` (${problems.join('; ')})` : ''}`;
+}
+
+/**
+ * The janitor's command. The first `find` visits every directory before reading it and gives
+ * each one that lacks owner rwx those bits, so a `chmod 000` directory the build left (at any
+ * depth, under any parent) becomes traversable before `find` descends into it. Only directories
+ * matter: deleting an entry needs write and search on its parent, not rights on the entry.
+ * `-type d` uses lstat, so a symlink is never chmodded through. Directories the host staged are
+ * already 0777 and do not match. (Busybox `chmod -R` cannot do this: it does not descend into a
+ * directory it failed to chmod, and `/w` itself belongs to the host user.) The second `find`
+ * empties the tree, and its exit status is the janitor's.
+ */
+export const JANITOR_COMMAND = [
+  'sh',
+  '-c',
+  'find /w -mindepth 1 -type d ! -perm -u=rwx -exec chmod u+rwx {} \\; 2>/dev/null; find /w -mindepth 1 -delete',
+];

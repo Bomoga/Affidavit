@@ -2,7 +2,6 @@ export { buildCaseView } from './model/caseView.js';
 export type {
   CaseStatus,
   CaseView,
-  CaseViewInput,
   DocketEntry,
   ExhibitView,
   Outcome,

@@ -35,6 +35,22 @@ export function assertNoImageVolumes(image: string, json: string): void {
 }
 
 /**
+ * Declared volumes that no tmpfs mount covers exactly. A long-running service (a database
+ * sidecar) may use an image with `VOLUME` only when every declared path gets a capped tmpfs:
+ * Docker then mounts the tmpfs there and creates no anonymous volume, so the rule above (no Docker
+ * volume ever exists for a jailed container) still holds. `startJailedService` refuses any image
+ * this returns a path for, and checks the started container has no volume mount at all.
+ */
+export function uncoveredVolumes(
+  volumes: readonly string[],
+  tmpfs: readonly { path: string }[],
+): string[] {
+  const norm = (p: string): string => p.replace(/\/+$/, '') || '/';
+  const covered = new Set(tmpfs.map((t) => norm(t.path)));
+  return volumes.filter((v) => !covered.has(norm(v)));
+}
+
+/**
  * Names of the Docker volumes a container had mounted, from
  * `docker inspect --format '{{json .Mounts}}'`. Bind and tmpfs mounts are not volumes.
  */

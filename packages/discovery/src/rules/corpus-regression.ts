@@ -508,6 +508,8 @@ export function regressionInputsDigest(repo: string): string {
     `${src}/tools/lockfiles.ts`,
     `${src}/tools/unscannable.ts`,
     `${src}/tools/windows.ts`,
+    `${src}/tools/fonts.ts`,
+    `${src}/tools/windowproof.ts`,
   );
   for (const rel of files) add(rel, readText(rel));
 

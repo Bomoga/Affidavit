@@ -1,0 +1,10 @@
+{
+  "pins": [
+    {
+      "app": "nodegoat",
+      "commit": "c5cb68a7084e4ae7dcc60e6a98768720a81841e8",
+      "bundleSha256": null,
+      "note": "Not pinned yet. A human builds the bundle on a networked host with packages/sandbox/scripts/build-dependency-bundle.ts, reviews the manifest, then sets the digest here."
+    }
+  ]
+}

@@ -15,6 +15,7 @@ export type {
   ModelTurnResult,
   OrchestratorConfig,
   OrchestratorDeps,
+  HaltReason,
   RunOutcome,
   StageContext,
   StageHandler,
@@ -77,3 +78,4 @@ export type { StructuredVerdict, VerdictInput, VerdictOutcome } from './verdict.
 export { createVerifyHandler } from './verify.js';
 export type { VerifyDeps } from './verify.js';
 export type { RunInfo } from './orchestrator.js';
+export * from './model/index.js';

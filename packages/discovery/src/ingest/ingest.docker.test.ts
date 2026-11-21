@@ -301,6 +301,51 @@ describe.skipIf(!enabled)('ingest with the real gitleaks image', () => {
     expect(JSON.stringify(ok)).not.toContain(marker);
   });
 
+  it('L1-01c: a lockfile token across the chunk cut and window ends is caught with the shipped config', async () => {
+    // The shipped config (no fixture rule appended) so the windows proof applies. A GitHub token
+    // shape made at run time from random characters: never a real token, never committed.
+    const alnum = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    const token = `ghp_${[...randomBytes(36)].map((b) => alnum[b % alnum.length]).join('')}`;
+    let s = '{\n  "name": "app",\n  "lockfileVersion": 3,\n  "packages": {\n';
+    let i = 0;
+    const lead = '    "k": "';
+    // across the 100,000-byte read, at 110,000 and 125,000 (where a hard cut can fall), and near
+    // the ends of the first windows (about 90,000 and 164,000)
+    for (const t of [90_000, 100_000, 110_000, 125_000, 164_000]) {
+      const start = t - 10 - lead.length;
+      while (s.length + 200 < start) {
+        s += `    "node_modules/p${String(i++).padStart(6, '0')}": "${randomBytes(30).toString('hex')}",\n`;
+      }
+      s += `    "pad": "${'0'.repeat(start - s.length - 15)}",\n`;
+      s += `${lead}${token}",\n`;
+    }
+    while (s.length < 260_000) {
+      s += `    "node_modules/p${String(i++).padStart(6, '0')}": "${randomBytes(30).toString('hex')}",\n`;
+    }
+    s += '    "end": "0"\n  }\n}\n';
+    const { dir, shas } = makeRepo([
+      {
+        'package.json': EXPRESS_PKG,
+        'src/app.js': "require('express')();\n",
+        'package-lock.json': s,
+      },
+    ]);
+    const r = await ingestRepo(
+      { runner, workRoot: tmpDir(), allowLocalSource: true },
+      request({ source: dir, commit: shas[0] as string }),
+    );
+    if (r.status !== 'ok')
+      throw new Error(`expected ok: ${JSON.stringify(r).replaceAll(token, '<t>')}`);
+    expect(r.scan.partial).toBe(false);
+    expect(r.scan.windowProvenFiles).toEqual(['/src/package-lock.json']);
+    const lines = new Set(
+      r.redactions.filter((x) => x.file === 'package-lock.json').map((x) => x.startLine),
+    );
+    expect(lines.size).toBe(5);
+    expect(everything(r.workspacePath)).not.toContain(token);
+    expect(JSON.stringify(r)).not.toContain(token);
+  });
+
   it('a PNG with a UTF-16LE key and a 205 KB PNG with a key across the 125,000-byte cut are left out', async () => {
     const utf16Key = fakeKey();
     const cutKey = fakeKey();
