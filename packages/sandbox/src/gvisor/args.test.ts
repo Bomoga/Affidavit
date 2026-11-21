@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { PROBE_IMAGE } from '../containment/probes.js';
-import { AUDIT_RUNTIME, RUN_LABEL, buildGvisorRunArgs } from './args.js';
+import {
+  AUDIT_RUNTIME,
+  RUN_LABEL,
+  buildGvisorRunArgs,
+  envProblem,
+  hostAliasProblem,
+  workdirProblem,
+} from './args.js';
 
 const spec = {
   name: 'affidavit-test',
@@ -130,5 +137,104 @@ describe('buildGvisorRunArgs: file size limit', () => {
 
   it.each([0, -1, 1.5, Number.NaN])('refuses %s', (n) => {
     expect(() => buildGvisorRunArgs({ ...spec, maxFileBytes: n })).toThrow(/maxFileBytes/);
+  });
+});
+
+describe('buildGvisorRunArgs: service and build options (L2-04)', () => {
+  const after = (a: string[], flag: string, value: string) =>
+    a.some((f, i) => f === flag && a[i + 1] === value);
+  const net = 'affidavit-net-0123456789abcdef';
+
+  it('keeps /tmp read-only unless a capped writable /tmp is asked for', () => {
+    expect(after(args, '--mount', 'type=tmpfs,destination=/tmp,readonly')).toBe(true);
+    const w = buildGvisorRunArgs({ ...spec, writableTmpMb: 64 });
+    expect(
+      after(
+        w,
+        '--mount',
+        `type=tmpfs,destination=/tmp,tmpfs-size=${64 * 1024 * 1024},tmpfs-mode=1777`,
+      ),
+    ).toBe(true);
+    expect(w).not.toContain('type=tmpfs,destination=/tmp,readonly');
+    expect(after(w, '--mount', 'type=tmpfs,destination=/dev/shm,readonly')).toBe(true);
+  });
+
+  it('adds capped tmpfs mounts for volumes and refuses reserved or odd paths', () => {
+    const v = buildGvisorRunArgs({ ...spec, tmpfs: [{ path: '/data/db/', sizeMb: 512 }] });
+    expect(
+      after(
+        v,
+        '--mount',
+        `type=tmpfs,destination=/data/db,tmpfs-size=${512 * 1024 * 1024},tmpfs-mode=1777`,
+      ),
+    ).toBe(true);
+    for (const path of [
+      '/',
+      '/proc',
+      '/etc/x',
+      '/scratch',
+      '/tmp',
+      'rel',
+      '/a/../etc',
+      '/a,b',
+      '/dev/shm',
+    ])
+      expect(() => buildGvisorRunArgs({ ...spec, tmpfs: [{ path, sizeMb: 1 }] })).toThrow(/tmpfs/);
+    for (const sizeMb of [0, -1, 1.5, 1e9])
+      expect(() => buildGvisorRunArgs({ ...spec, tmpfs: [{ path: '/d', sizeMb }] })).toThrow();
+  });
+
+  it('passes env and workdir, but never lets env override HOME or TMPDIR', () => {
+    const e = buildGvisorRunArgs({
+      ...spec,
+      env: { MONGODB_URI: 'mongodb://mongo/x' },
+      workdir: '/home/node/app',
+    });
+    expect(after(e, '--env', 'MONGODB_URI=mongodb://mongo/x')).toBe(true);
+    expect(after(e, '--workdir', '/home/node/app')).toBe(true);
+    expect(e.lastIndexOf('HOME=/scratch')).toBeGreaterThan(
+      e.indexOf('MONGODB_URI=mongodb://mongo/x'),
+    );
+    for (const env of [{ HOME: '/' }, { TMPDIR: '/' }, { 'A B': 'x' }, { A: 'x\ny' }] as Record<
+      string,
+      string
+    >[])
+      expect(() => buildGvisorRunArgs({ ...spec, env })).toThrow(/env/);
+    expect(() => buildGvisorRunArgs({ ...spec, workdir: '/a/../..' })).toThrow(/workdir/);
+  });
+
+  it('has no route out: no fetch or egress network, and only a per-case network can be joined', () => {
+    // Lead decision 2026-11-20 (PR #18): the dependency-fetch egress exception is declined.
+    for (const name of ['bridge', 'host', 'affidavit-fetch', 'affidavit-egress-0123456789abcdef'])
+      expect(() => buildGvisorRunArgs({ ...spec, network: { name } })).toThrow(/per-case network/);
+    for (const extra of [
+      { fetch: { name: net, proxy: { host: 'affidavit-proxy', ip: '172.18.0.2' } } },
+      { egress: 'affidavit-egress-0123456789abcdef' },
+    ])
+      expect(() => buildGvisorRunArgs({ ...spec, ...extra })).toThrow(/unknown run spec key/);
+  });
+
+  it('reports bad untrusted values without throwing', () => {
+    expect(hostAliasProblem('mongo')).toBeNull();
+    expect(hostAliasProblem('a_b')).toMatch(/host name/);
+    expect(envProblem({ NODE_ENV: 'x' })).toBeNull();
+    expect(envProblem({ HOME: '/' })).toMatch(/not allowed/);
+    expect(envProblem({ 'A B': 'x' })).toMatch(/not allowed/);
+    expect(envProblem({ A: 'x\ny' })).toMatch(/line break/);
+    expect(workdirProblem('/usr/src/app')).toBeNull();
+    for (const w of ['/', '/tmp', '/scratch/x', '/proc', '/etc/app', '/a/../b', 'rel', '/a,b'])
+      expect(workdirProblem(w)).not.toBeNull();
+  });
+
+  it('accepts dotted stub names on a case network', () => {
+    const d = buildGvisorRunArgs({
+      ...spec,
+      network: { name: net, hosts: { 'payments.example.com': '172.18.0.3' } },
+    });
+    expect(after(d, '--add-host', 'payments.example.com:172.18.0.3')).toBe(true);
+    for (const host of ['-a.example', 'a..b', 'a.b-', 'a_b'])
+      expect(() =>
+        buildGvisorRunArgs({ ...spec, network: { name: net, hosts: { [host]: '1.2.3.4' } } }),
+      ).toThrow(/bad host/);
   });
 });

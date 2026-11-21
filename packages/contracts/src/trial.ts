@@ -14,7 +14,7 @@ import {
   StageCost,
 } from './common.js';
 import { Dismissal } from './discovery.js';
-import { ExhibitResult } from './evidence.js';
+import { ExhibitResult, VerifyResult } from './evidence.js';
 
 const BallotBase = z.object({
   schemaVersion: SchemaVersion,
@@ -87,6 +87,8 @@ export const TrialEventType = z.enum([
   'escalated',
   'dismissed',
   'verdict-written',
+  // v1.1 (CR-1): appended at the end, additive.
+  'verify-result',
 ]);
 export type TrialEventType = z.infer<typeof TrialEventType>;
 
@@ -121,5 +123,11 @@ export const TrialEvent = z.discriminatedUnion('type', [
   event('escalated', z.object({ escalation: Escalation })),
   event('dismissed', z.object({ dismissal: Dismissal })),
   event('verdict-written', z.object({ verdict: Verdict })),
+  /**
+   * v1.1 (CR-1): the Judge's `VerifyResult` for one `JudgePort.verifyPatch` call. Emitted by actor
+   * `judge` in stage `verify`, once per call, so appeals produce one per round. Clients that read
+   * only the stream (web, CLI) learn from this event, not from the verdict, whether a patch passed.
+   */
+  event('verify-result', z.object({ result: VerifyResult })),
 ]);
 export type TrialEvent = z.infer<typeof TrialEvent>;

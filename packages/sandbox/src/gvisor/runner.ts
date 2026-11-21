@@ -14,6 +14,7 @@ import {
   RUN_LABEL,
   buildGvisorRunArgs,
   type Limits,
+  type TmpfsMount,
 } from './args.js';
 import { validateMounts, type Mount } from './mounts.js';
 import type { CaseNetwork } from './network.js';
@@ -68,6 +69,11 @@ export interface JailedRunInput {
   network?: { net: CaseNetwork; hosts?: Readonly<Record<string, string>> };
   /** Largest file the jail may write; see `GvisorRunSpec.maxFileBytes`. */
   maxFileBytes?: number;
+  /** See `GvisorRunSpec`: build steps and boot diagnostics use these, witnesses do not. */
+  env?: Readonly<Record<string, string>>;
+  workdir?: string;
+  tmpfs?: readonly TmpfsMount[];
+  writableTmpMb?: number;
 }
 
 function capture(stream: NodeJS.ReadableStream): () => string {
@@ -238,6 +244,10 @@ export async function runJailed(
         ? undefined
         : { name: input.network.net.name, hosts: input.network.hosts },
     maxFileBytes: input.maxFileBytes,
+    env: input.env,
+    workdir: input.workdir,
+    tmpfs: input.tmpfs,
+    writableTmpMb: input.writableTmpMb,
   });
 
   const started = Date.now();
