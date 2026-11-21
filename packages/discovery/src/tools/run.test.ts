@@ -3,6 +3,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  rmSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -153,7 +154,12 @@ describe('runTool', () => {
   it.skipIf(!symlinks)('refuses a symlink planted at the report path', async () => {
     const target = join(tmp(), 'elsewhere.json');
     writeFileSync(target, '{"runs":[]}');
-    const { runner } = fakeRunner((out) => symlinkSync(target, join(out, 'gitleaks.sarif')));
+    // The pre-created report file is replaced by a link (a 0755 /out stops a jailed tool from
+    // doing this, but runTool must refuse the link on its own too).
+    const { runner } = fakeRunner((out) => {
+      rmSync(join(out, 'gitleaks.sarif'));
+      symlinkSync(target, join(out, 'gitleaks.sarif'));
+    });
     await expect(runTool(runner, manifest, 'gitleaks', await options())).rejects.toBeInstanceOf(
       ToolOutputMissingError,
     );
