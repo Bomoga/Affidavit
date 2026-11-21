@@ -147,3 +147,7 @@ What this demo does not show, and must not be claimed:
 - No evidence bundle was produced, signed or replayed.
 - The walking-skeleton gate (Semgrep candidate to signed verdict, differential admission, family flip, replay on a second machine, containment suite) is not met by this demo.
 - No accuracy, cost, speed or false-positive figure exists yet. Use [metric] for every number.
+
+## Hosted fixture demo (Vercel)
+
+The web UI alone (fixture streams, no backend) is deployed from `apps/web` as a static Vite build, with `apps/web/vercel.json` rewriting every route to `index.html` for client-side routing. It shows the two recorded cases only (`/cases/nodegoat-sqli-001` and `/cases/escalated-001`). It is a recorded fixture, not a live run: no scanner, model, Judge or sandbox is involved, and cost and time read `[metric]`. The real Judge needs a Linux gVisor host and cannot run on Vercel.
