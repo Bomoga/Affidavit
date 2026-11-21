@@ -229,6 +229,7 @@ export class AnthropicModelPort implements PreflightModelPort {
     let timedOut = false;
     let overBudget = false;
     let authFailed = false;
+    let providerError: string | undefined;
     let result: SDKResultMessage | undefined;
     const seen = new Map<string, Usage>();
 
@@ -310,6 +311,13 @@ export class AnthropicModelPort implements PreflightModelPort {
         if (killed) break;
         if (msg.type === 'assistant') {
           if (msg.error === 'authentication_failed') authFailed = true;
+          else if (msg.error !== undefined && providerError === undefined) {
+            // Any other provider error (overloaded, rate_limit, server_error, billing_error, and
+            // the rest) is a call error on its own, whatever the result later says. Only a code
+            // from the closed snake_case set goes into the message.
+            const code = String(msg.error);
+            providerError = /^[a-z_]{1,40}$/.test(code) ? code : 'unrecognised';
+          }
           const u = msg.message.usage;
           seen.set(msg.message.id, {
             inputTokens:
@@ -378,6 +386,9 @@ export class AnthropicModelPort implements PreflightModelPort {
       if (!box.captured) {
         if (timedOut) {
           throw new ModelCallError('agent turn hit the wall-clock cap before any submission');
+        }
+        if (providerError !== undefined) {
+          throw new ModelCallError(`agent turn failed: provider error ${providerError}`);
         }
         if (streamError !== undefined) {
           throw new ModelCallError(`agent turn failed: ${describeThrown(streamError, secrets)}`);

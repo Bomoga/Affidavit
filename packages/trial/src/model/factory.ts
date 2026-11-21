@@ -16,8 +16,12 @@ export const MODEL_TIMEOUT_ENV_VAR = 'AFFIDAVIT_MODEL_TIMEOUT_MS';
 export const MODEL_FIXTURES_ENV_VAR = 'AFFIDAVIT_MODEL_FIXTURES_DIR';
 /** Where record mode writes. Required for record mode; there is no default. */
 export const RECORD_DIR_ENV_VAR = 'AFFIDAVIT_RECORD_DIR';
-/** The deployment environment. In `production` only live mode is allowed. */
+/** The deployment environment. Record and replay need it to be one of `RECORD_REPLAY_ENVS`. */
 export const DEPLOY_ENV_VAR = 'AFFIDAVIT_ENV';
+/** The only deployment environments (trimmed, case-insensitive) where record or replay may run. */
+export const RECORD_REPLAY_ENVS = ['development', 'test'] as const;
+/** Set to `1` to record a submission holding credential-shaped text verbatim. */
+export const RECORD_ALLOW_SECRETS_ENV_VAR = 'AFFIDAVIT_RECORD_ALLOW_SECRETS';
 
 /** Per-turn wall-clock cap when none is configured. A placeholder until real runs tune it. */
 export const DEFAULT_MODEL_TIMEOUT_MS = 300_000;
@@ -50,9 +54,12 @@ export function createModelPortFromEnv(
   overrides: Partial<AnthropicModelPortConfig> = {},
 ): AnthropicModelPort {
   const mode = modelModeFrom(env);
-  if (mode !== 'live' && env[DEPLOY_ENV_VAR] === 'production') {
+  // Fail closed: record and replay run only where the deployment says it is development or
+  // test. Unset, production, or anything else means live only.
+  const deployEnv = (env[DEPLOY_ENV_VAR] ?? '').trim().toLowerCase();
+  if (mode !== 'live' && !(RECORD_REPLAY_ENVS as readonly string[]).includes(deployEnv)) {
     throw new ModelConfigError(
-      `${MODEL_MODE_ENV_VAR}=${mode} is refused when ${DEPLOY_ENV_VAR}=production; only live runs there`,
+      `${MODEL_MODE_ENV_VAR}=${mode} needs ${DEPLOY_ENV_VAR} set to development or test; anywhere else only live runs`,
     );
   }
   let recordings: FileRecordingStore | undefined;
@@ -61,7 +68,9 @@ export function createModelPortFromEnv(
     if (dir === undefined || dir.trim() === '') {
       throw new ModelConfigError(`${MODEL_MODE_ENV_VAR}=record needs ${RECORD_DIR_ENV_VAR} set`);
     }
-    recordings = new FileRecordingStore(dir);
+    recordings = new FileRecordingStore(dir, {
+      allowSecrets: env[RECORD_ALLOW_SECRETS_ENV_VAR] === '1',
+    });
   } else if (mode === 'replay') {
     const dir = env[MODEL_FIXTURES_ENV_VAR];
     recordings = dir !== undefined && dir !== '' ? new FileRecordingStore(dir) : undefined;

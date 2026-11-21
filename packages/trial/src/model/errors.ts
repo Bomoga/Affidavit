@@ -42,6 +42,23 @@ export class ModelCallError extends Error {
   }
 }
 
+/**
+ * Replay found a recording marked `redacted: true`: its submission was altered after the agent
+ * sent it, so it is not what was submitted and must never reach the Judge. A call error, so it
+ * cannot read as "no submission".
+ */
+export class JudgeIneligibleRecordingError extends ModelCallError {
+  constructor(
+    readonly promptId: string,
+    readonly inputSha256: string,
+  ) {
+    super(
+      `recording for prompt ${promptId} input ${inputSha256} is redacted and not eligible for the Judge`,
+    );
+    this.name = 'JudgeIneligibleRecordingError';
+  }
+}
+
 /** Replay mode found no recording for a request. Fails closed: replay never calls a model. */
 export class NoModelRecordingError extends Error {
   constructor(

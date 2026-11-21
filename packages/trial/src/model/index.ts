@@ -3,6 +3,7 @@ export type { AnthropicModelPortConfig, ModelLogEntry, ModelMode } from './anthr
 export { hasPreflight } from './preflight.js';
 export type { PreflightModelPort } from './preflight.js';
 export {
+  JudgeIneligibleRecordingError,
   ModelCallError,
   ModelConfigError,
   ModelUnconfiguredError,
@@ -12,7 +13,9 @@ export {
   DEFAULT_MODEL_TIMEOUT_MS,
   DEPLOY_ENV_VAR,
   MODEL_FIXTURES_ENV_VAR,
+  RECORD_ALLOW_SECRETS_ENV_VAR,
   RECORD_DIR_ENV_VAR,
+  RECORD_REPLAY_ENVS,
   MODEL_MODE_ENV_VAR,
   MODEL_TIMEOUT_ENV_VAR,
   createModelPortFromEnv,

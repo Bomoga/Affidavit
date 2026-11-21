@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -24,9 +24,11 @@ import {
 import {
   ModelCallError,
   ModelConfigError,
+  JudgeIneligibleRecordingError,
   ModelUnconfiguredError,
   NoModelRecordingError,
 } from './errors.js';
+import { createModelPortFromEnv } from './factory.js';
 import { DEFAULT_MODEL_TABLE } from './models.js';
 import { FileRecordingStore } from './recordings.js';
 import {
@@ -409,6 +411,58 @@ describe('API key handling', () => {
     await expect(port.runTurn(requestFor('defense'))).rejects.toBeInstanceOf(
       ModelUnconfiguredError,
     );
+  });
+});
+
+describe('provider errors on an assistant message', () => {
+  const CODES = [
+    'oauth_org_not_allowed',
+    'account_on_hold',
+    'verification_required',
+    'billing_error',
+    'rate_limit',
+    'overloaded',
+    'invalid_request',
+    'model_not_found',
+    'server_error',
+    'unknown',
+    'max_output_tokens',
+    'cloud_credential_error',
+    'some_future_code',
+  ];
+  for (const code of CODES) {
+    it(`${code} is a call error even when the result does not say is_error`, async () => {
+      const { port } = makePort(async function* () {
+        await Promise.resolve();
+        yield assistant('m1', 1, 1, code);
+        yield result('success', { isError: false });
+      });
+      const err = await port.runTurn(requestFor('defense')).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ModelCallError);
+      expect((err as Error).message).toContain(code);
+    });
+  }
+
+  it('authentication_failed stays model-unconfigured', async () => {
+    const { port } = makePort(async function* () {
+      await Promise.resolve();
+      yield assistant('m1', 1, 1, 'authentication_failed');
+      yield result('success', { isError: false });
+    });
+    await expect(port.runTurn(requestFor('defense'))).rejects.toBeInstanceOf(
+      ModelUnconfiguredError,
+    );
+  });
+
+  it('an error code carrying odd text is not echoed into the message', async () => {
+    const { port } = makePort(async function* () {
+      await Promise.resolve();
+      yield assistant('m1', 1, 1, `x-api-key: ${CANARY_KEY}`);
+      yield result('success', { isError: false });
+    });
+    const err = (await port.runTurn(requestFor('defense')).catch((e: unknown) => e)) as Error;
+    expect(err).toBeInstanceOf(ModelCallError);
+    expect(err.message).not.toContain('CANARY');
   });
 });
 
@@ -846,17 +900,62 @@ describe('agent submissions are never rewritten', () => {
     ],
   };
 
-  it('passes a witness with bearer, header and URL token text through byte-identical, live, recorded and replayed', async () => {
+  it('passes a witness with bearer, header and URL token text through byte-identical when live', async () => {
     const live = makePort(submits(TOKENISH));
     const out = await live.port.runTurn(requestFor('defense'));
     expect(JSON.stringify(out.submission)).toBe(JSON.stringify(TOKENISH));
+  });
 
+  it('refuses to record a submission carrying credential-shaped text, naming no value', async () => {
     const dir = tmp();
-    const req = requestFor('defense', 'token case');
-    const rec = makePort(submits(TOKENISH), {
+    const { port, logs } = makePort(submits(TOKENISH), {
       mode: 'record',
       recordings: new FileRecordingStore(dir),
     });
+    const err = await port.runTurn(requestFor('defense', 'token case')).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ModelCallError);
+    expect((err as Error).message).toMatch(/AFFIDAVIT_RECORD_ALLOW_SECRETS/);
+    const text = `${(err as Error).message} ${(err as Error).stack ?? ''} ${logs.map((l) => l.message).join(' ')}`;
+    for (const value of [
+      'abc123',
+      'zzz',
+      'eyJhbGci',
+      'abcdef0123456789',
+      'qwertyuiop',
+      'hunter2',
+    ]) {
+      expect(text).not.toContain(value);
+    }
+    expect(readdirSync(dir, { recursive: true })).toEqual([]);
+  });
+
+  it('records it verbatim only with AFFIDAVIT_RECORD_ALLOW_SECRETS=1, and replays it byte-identical', async () => {
+    const dir = tmp();
+    const req = requestFor('defense', 'token case');
+    // Without the flag the factory-built store refuses; with it the store writes verbatim.
+    const refused = createModelPortFromEnv(
+      { AFFIDAVIT_ENV: 'test', AFFIDAVIT_MODEL_MODE: 'record', AFFIDAVIT_RECORD_DIR: dir },
+      {
+        transport: stubTransport(submits(TOKENISH)).transport,
+        env: () => ({ ANTHROPIC_API_KEY: CANARY_KEY }),
+      },
+    );
+    await expect(refused.runTurn(req)).rejects.toBeInstanceOf(ModelCallError);
+    expect(readdirSync(dir, { recursive: true })).toEqual([]);
+    const rec = {
+      port: createModelPortFromEnv(
+        {
+          AFFIDAVIT_ENV: 'test',
+          AFFIDAVIT_MODEL_MODE: 'record',
+          AFFIDAVIT_RECORD_DIR: dir,
+          AFFIDAVIT_RECORD_ALLOW_SECRETS: '1',
+        },
+        {
+          transport: stubTransport(submits(TOKENISH)).transport,
+          env: () => ({ ANTHROPIC_API_KEY: CANARY_KEY }),
+        },
+      ),
+    };
     const recorded = await rec.port.runTurn(req);
     expect(JSON.stringify(recorded.submission)).toBe(JSON.stringify(TOKENISH));
     const files = readdirSync(join(dir, 'defense'));
@@ -874,6 +973,14 @@ describe('agent submissions are never rewritten', () => {
     });
     const replayed = await replay.runTurn(req);
     expect(JSON.stringify(replayed.submission)).toBe(JSON.stringify(TOKENISH));
+
+    // A recording someone scrubbed by hand carries `redacted: true`; it no longer matches what
+    // the agent submitted, so replay refuses to hand it to the Judge.
+    const file = join(dir, 'defense', files[0]!);
+    writeFileSync(file, JSON.stringify({ ...body, redacted: true }), 'utf8');
+    const err = await replay.runTurn(req).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(JudgeIneligibleRecordingError);
+    expect(err).toBeInstanceOf(ModelCallError);
   });
 
   it('refuses a submission that contains the API key, and records nothing', async () => {

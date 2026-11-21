@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { PromptId, StageCost } from '@affidavit/contracts';
 import { canonicalJson, sha256Hex } from '../canonical.js';
 import type { ModelTurnRequest, ModelTurnResult } from '../orchestrator.js';
-import { ModelCallError, NoModelRecordingError } from './errors.js';
+import { JudgeIneligibleRecordingError, ModelCallError, NoModelRecordingError } from './errors.js';
 import { containsSecret, redactDeep } from './redact.js';
 
 /** Where recorded agent outputs live by default: `fixtures/models/` at the repo root (Lane 3). */
@@ -48,6 +48,11 @@ export interface ModelRecording {
   inputSha256: string;
   userSha256: string;
   result: ModelTurnResult;
+  /**
+   * Set by a person who scrubbed the submission after recording (for example to remove a target
+   * repo secret before committing). Replay refuses such a recording for judging.
+   */
+  redacted?: boolean;
 }
 
 export interface RecordingStore {
@@ -74,6 +79,10 @@ function parseRecording(raw: unknown, req: ModelTurnRequest, hash: string): Mode
   ) {
     throw new Error(`recording for prompt ${req.promptId} input ${hash} is malformed`);
   }
+  // Hand-scrubbed recordings no longer hold what the agent submitted: never judge them.
+  if (r.redacted !== undefined && r.redacted !== false) {
+    throw new JudgeIneligibleRecordingError(req.promptId, hash);
+  }
   const out: ModelTurnResult = { outcome: result.outcome!, cost: cost.data };
   if ('submission' in result) out.submission = result.submission;
   return out;
@@ -81,7 +90,11 @@ function parseRecording(raw: unknown, req: ModelTurnRequest, hash: string): Mode
 
 /** Recordings as JSON files: `<dir>/<prompt id>/<input sha256>.json`. */
 export class FileRecordingStore implements RecordingStore {
-  constructor(readonly dir: string = DEFAULT_RECORDINGS_DIR) {}
+  constructor(
+    readonly dir: string = DEFAULT_RECORDINGS_DIR,
+    /** `allowSecrets`: record a submission verbatim even if it holds credential-shaped text. */
+    private readonly options: { allowSecrets?: boolean } = {},
+  ) {}
 
   private path(req: ModelTurnRequest, hash: string): string {
     return join(this.dir, safeSegment(req.promptId), `${hash}.json`);
@@ -111,6 +124,20 @@ export class FileRecordingStore implements RecordingStore {
     if (containsSecret(submission, secrets)) {
       return Promise.reject(
         new ModelCallError('refusing to record a submission that contains the API key'),
+      );
+    }
+    // A witness can quote credentials from the target repo (a hardcoded JWT, a cloud key). The
+    // submission is never rewritten, so instead of committing them verbatim the recording is
+    // refused unless the operator opted in. The message names no value.
+    if (
+      !this.options.allowSecrets &&
+      submission !== undefined &&
+      canonicalJson(redactDeep(submission, secrets)) !== canonicalJson(submission)
+    ) {
+      return Promise.reject(
+        new ModelCallError(
+          'refusing to record a submission that contains credential-shaped text; set AFFIDAVIT_RECORD_ALLOW_SECRETS=1 to record it verbatim',
+        ),
       );
     }
     const stored = redactDeep(rest, secrets) as ModelTurnResult;

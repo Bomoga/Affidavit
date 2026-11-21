@@ -51,7 +51,7 @@ export AFFIDAVIT_MODEL_MODE=live   # or record, or replay (no key needed)
 # export AFFIDAVIT_RECORD_DIR=fixtures/models
 ```
 
-With `AFFIDAVIT_ENV=production`, record and replay are refused at startup; only live runs. The worker image must contain no Claude Code managed-settings file: `settingSources: []` still reads it.
+Record and replay start only when `AFFIDAVIT_ENV` is `development` or `test` (trimmed, any case); unset or anything else means live only. Record refuses a submission holding credential-shaped text unless `AFFIDAVIT_RECORD_ALLOW_SECRETS=1`; a recording marked `redacted: true` is never replayed to the Judge. The worker image must contain no Claude Code managed-settings file: `settingSources: []` still reads it.
 
 **Set a monthly spend limit on the key in the Anthropic Console before the first run.** The per-case budget is a second guard, not the only one. Optional: `AFFIDAVIT_MODEL_TIMEOUT_MS`, `AFFIDAVIT_MODEL_FIXTURES_DIR`, `AFFIDAVIT_MODEL_CONFIG`, and one `ANTHROPIC_MODEL_<PROMPT>` per prompt id (see the guide).
 
@@ -64,7 +64,7 @@ Invariants, each covered by a test in `src/model/anthropic.test.ts` with a stubb
 - Submit tools are `alwaysLoad`, and their advertised schemas accept any JSON per field, so a validating runtime cannot bounce a call.
 - The first submission is captured raw and ends the turn (PreToolUse, PostToolUseFailure or PostToolUse, whichever the runtime reaches); a malformed one becomes `exhibit-inadmissible`, never a silent retry.
 - Submissions are never rewritten or pattern-redacted. One containing the exact key value throws `ModelCallError` and is not recorded.
-- Provider failures (timeout, abort, hung or broken stream, no result) throw `ModelCallError` unless the agent already submitted; only an agent that used its turns is `turn-cap`. An outage cannot dismiss a candidate.
+- Provider failures (timeout, abort, hung or broken stream, no result, any assistant `error` code other than `authentication_failed`) throw `ModelCallError` unless the agent already submitted; only an agent that used its turns is `turn-cap`. An outage cannot dismiss a candidate.
 
 ## Intended libraries (notes for later, not installed yet)
 

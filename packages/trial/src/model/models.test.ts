@@ -100,28 +100,51 @@ describe('createModelPortFromEnv', () => {
     expect(() => modelModeFrom({ AFFIDAVIT_MODEL_MODE: 'yolo' })).toThrow(ModelConfigError);
   });
 
-  it('refuses record and replay in production; live only there', () => {
-    const prod = { AFFIDAVIT_ENV: 'production', AFFIDAVIT_RECORD_DIR: tmpdir() };
-    expect(() => createModelPortFromEnv({ ...prod, AFFIDAVIT_MODEL_MODE: 'record' })).toThrow(
-      /production/,
-    );
-    expect(() => createModelPortFromEnv({ ...prod, AFFIDAVIT_MODEL_MODE: 'replay' })).toThrow(
-      /production/,
-    );
-    expect(() => createModelPortFromEnv({ ...prod, AFFIDAVIT_MODEL_MODE: 'live' })).not.toThrow();
-    expect(() => createModelPortFromEnv({ AFFIDAVIT_ENV: 'production' })).not.toThrow();
+  it('allows record and replay only when AFFIDAVIT_ENV is development or test; live otherwise', () => {
+    const dir = { AFFIDAVIT_RECORD_DIR: tmpdir() };
+    for (const deployEnv of [
+      undefined,
+      '',
+      'production',
+      'Production',
+      'PRODUCTION ',
+      'staging',
+      'prod',
+      'dev',
+      'testing',
+    ]) {
+      const env = deployEnv === undefined ? dir : { ...dir, AFFIDAVIT_ENV: deployEnv };
+      for (const mode of ['record', 'replay']) {
+        expect(
+          () => createModelPortFromEnv({ ...env, AFFIDAVIT_MODEL_MODE: mode }),
+          `${String(deployEnv)} ${mode}`,
+        ).toThrow(/AFFIDAVIT_ENV/);
+      }
+      expect(() => createModelPortFromEnv({ ...env, AFFIDAVIT_MODEL_MODE: 'live' })).not.toThrow();
+      expect(() => createModelPortFromEnv(env)).not.toThrow();
+    }
+    for (const deployEnv of ['development', 'test', ' Development ', 'TEST']) {
+      for (const mode of ['record', 'replay']) {
+        expect(
+          () =>
+            createModelPortFromEnv({
+              ...dir,
+              AFFIDAVIT_ENV: deployEnv,
+              AFFIDAVIT_MODEL_MODE: mode,
+            }),
+          `${deployEnv} ${mode}`,
+        ).not.toThrow();
+      }
+    }
   });
 
   it('record mode runs only with an explicit AFFIDAVIT_RECORD_DIR', () => {
-    expect(() => createModelPortFromEnv({ AFFIDAVIT_MODEL_MODE: 'record' })).toThrow(
-      /AFFIDAVIT_RECORD_DIR/,
+    const dev = { AFFIDAVIT_ENV: 'development', AFFIDAVIT_MODEL_MODE: 'record' };
+    expect(() => createModelPortFromEnv(dev)).toThrow(/AFFIDAVIT_RECORD_DIR/);
+    expect(() => createModelPortFromEnv({ ...dev, AFFIDAVIT_RECORD_DIR: '' })).toThrow(
+      ModelConfigError,
     );
-    expect(() =>
-      createModelPortFromEnv({ AFFIDAVIT_MODEL_MODE: 'record', AFFIDAVIT_RECORD_DIR: '' }),
-    ).toThrow(ModelConfigError);
-    expect(() =>
-      createModelPortFromEnv({ AFFIDAVIT_MODEL_MODE: 'record', AFFIDAVIT_RECORD_DIR: tmpdir() }),
-    ).not.toThrow();
+    expect(() => createModelPortFromEnv({ ...dev, AFFIDAVIT_RECORD_DIR: tmpdir() })).not.toThrow();
   });
 
   it('builds without an API key, since the key is read only at call time', () => {
