@@ -199,6 +199,11 @@ describe('Remedy', () => {
       expect(t.model.requests[1]?.user).toContain('judge-feedback');
       expect(t.model.requests[1]?.user).toContain(rule);
       expect((await t.workspace.getPatchOutcome(t.cf.id))?.accepted).toBe(true);
+      // Every verifyPatch call is kept for the verify stage's verify-result events (CR-1).
+      expect((await t.workspace.getPatchOutcome(t.cf.id))?.verifyResults).toEqual([
+        reject(rule),
+        PASS,
+      ]);
     },
   );
 
@@ -213,6 +218,7 @@ describe('Remedy', () => {
       const outcome = await t.workspace.getPatchOutcome(t.cf.id);
       expect(outcome).toMatchObject({ accepted: false });
       expect(outcome?.result?.rejectedBy).toBe(rule);
+      expect(outcome?.verifyResults).toEqual([reject(rule), reject(rule)]);
       expect(t.events().some((e) => e.type === 'escalated')).toBe(false);
       expect(await t.workspace.getExhibits(t.cf.id)).toEqual([]);
     },
@@ -259,7 +265,10 @@ describe('Remedy', () => {
     const t = await run([none], {});
     expect(await t.final()).toBe('verdict');
     expect(t.judge.verifyArgs).toHaveLength(0);
-    expect(await t.workspace.getPatchOutcome(t.cf.id)).toMatchObject({ accepted: false });
+    expect(await t.workspace.getPatchOutcome(t.cf.id)).toMatchObject({
+      accepted: false,
+      verifyResults: [],
+    });
   });
 
   it('records schema failures as inadmissible and feeds them back', async () => {

@@ -3,7 +3,7 @@ import { getRouteApi, Link } from '@tanstack/react-router';
 import { useEffect, useMemo } from 'react';
 import { buildCaseView } from '../model/caseView.js';
 import { SAFE_CASE_ID, type BackoffPolicy, type StreamTransport } from '../model/liveStream.js';
-import { CaseFile, ConnectionStatus, Stamp } from './CaseFile.js';
+import { CaseFile, ConnectionStatus, Stamp, StampNote } from './CaseFile.js';
 import { CaseNotFoundError, loadCase, loadCaseList } from './data.js';
 import { useSourceConfig, useTrialStream } from './source.js';
 
@@ -59,6 +59,7 @@ export function CaseListPage() {
               </Link>
               <p>{view.headline}</p>
               <Stamp view={view} />
+              <StampNote view={view} />
             </li>
           ))}
         </ul>
