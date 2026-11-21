@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import type { CaseStage, JudgePort, ModelPort } from '@affidavit/contracts';
+import type { CaseStage, JudgePort, ModelPort, RescanPort } from '@affidavit/contracts';
 import {
   stageHandler,
   type AppPool,
@@ -17,7 +17,7 @@ import {
   type WorkerConfig,
 } from './config.js';
 import { fakeIntakeCores, fakeJudge, fakeTrialCores } from './fakes/stages.js';
-import { buildDiscover, buildJudge, buildModel } from './real/components.js';
+import { buildDiscover, buildJudge, buildModel, buildRescan } from './real/components.js';
 import { realIntakeCores, type Discover } from './real/intake.js';
 import {
   PrerequisiteError,
@@ -56,7 +56,16 @@ export interface Components {
    * Replaces `createRealJudge` itself, keeping the host checks: for tests of the build order and
    * of closing the Judge when a later step fails.
    */
-  realJudgeFactory?: (s: JudgeSettings, probe?: RealJudgeHostProbe) => Promise<RealJudge>;
+  realJudgeFactory?: (
+    s: JudgeSettings,
+    probe?: RealJudgeHostProbe,
+    rescan?: RescanPort,
+  ) => Promise<RealJudge>;
+  /**
+   * Replaces discovery's re-scan (`DiscoveryRescan`) handed to the real Judge. Without it the
+   * re-scan is built from the intake settings, so it exists only when intake is real too.
+   */
+  rescan?: RescanPort;
   log?: (message: string) => void;
 }
 
@@ -119,6 +128,18 @@ export async function prepareCores(
     discover = components.discover ?? attempt('discovery', () => buildDiscover(s, env));
   }
 
+  // The real Judge's re-scan (L1-17): the intake scanner setup, re-run on the patched tree.
+  let rescan: RescanPort | undefined;
+  if (config.judge === 'real' && !components.judge) {
+    rescan =
+      components.rescan ??
+      (config.intakeSettings
+        ? attempt('the re-scan', () =>
+            buildRescan(requireSettings(config.intakeSettings, 'intake')),
+          )
+        : undefined);
+  }
+
   let trialParts:
     { model: ModelPort; modelTable: ModelTable; killSwitch: () => boolean } | null | undefined =
     null;
@@ -154,6 +175,7 @@ export async function prepareCores(
       realJudge = await build(
         requireSettings(config.judgeSettings, 'judge'),
         components.judgeProbe,
+        rescan,
       );
       judge = realJudge.judge;
     }

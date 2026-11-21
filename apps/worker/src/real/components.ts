@@ -3,9 +3,15 @@
  * (or Lane 1's discovery), constructed with the settings its own CLAUDE.md asks for.
  */
 import { join } from 'node:path';
-import type { ModelPort, ToolRunnerPort } from '@affidavit/contracts';
+import type { ModelPort, RescanPort, ToolRunnerPort } from '@affidavit/contracts';
 import { corpus } from '@affidavit/corpus';
-import { arraignConfigFrom, discoverCase, loadToolManifest, repoRoot } from '@affidavit/discovery';
+import {
+  DiscoveryRescan,
+  arraignConfigFrom,
+  discoverCase,
+  loadToolManifest,
+  repoRoot,
+} from '@affidavit/discovery';
 import { FsEvidenceStore } from '@affidavit/evidence';
 import {
   createRealJudge,
@@ -54,11 +60,20 @@ export function buildDiscover(s: IntakeSettings, env: Env, runner?: ToolRunnerPo
 }
 
 /**
+ * Lane 1's `RescanPort` for the real Judge's `verifyPatch` (L1-17): the same scanner runner, rules
+ * and work root as intake, so the patched tree is scanned exactly as the vulnerable one was.
+ */
+export function buildRescan(s: IntakeSettings, runner?: ToolRunnerPort): RescanPort {
+  return new DiscoveryRescan({ runner: runner ?? buildToolRunner(s), workRoot: s.workRoot });
+}
+
+/**
  * Maps the worker's Judge settings onto Lane 2's `RealJudgeConfig` (field names in
  * docs/lanes/lane2/real-judge-host.md). Builds only plain objects: the evidence store and the
  * signer client open nothing until used. NodeGoat's trees and bundle are keyed by the corpus pin.
+ * Without `rescan`, verifyPatch fails closed and createRealJudge reports it as a note.
  */
-export function realJudgeConfig(s: JudgeSettings): RealJudgeConfig {
+export function realJudgeConfig(s: JudgeSettings, rescan?: RescanPort): RealJudgeConfig {
   const nodegoat = corpus.apps.find((a) => a.id === 'nodegoat');
   const trees: SourceDirectory[] = [];
   if (nodegoat && s.nodegoatDir !== null) {
@@ -101,13 +116,17 @@ export function realJudgeConfig(s: JudgeSettings): RealJudgeConfig {
     dependencyBundles: bundles,
     sweepOrphans: s.sweepOrphans,
     ...(s.leaseDir === null ? {} : { leaseDir: s.leaseDir }),
-    // No RescanPort yet: verifyPatch fails closed and createRealJudge reports it as a note.
+    ...(rescan === undefined ? {} : { rescan }),
   };
 }
 
 /** Lane 2's real Judge (CR-11). Its own startup check runs first and lists what is missing. */
-export function buildJudge(s: JudgeSettings, probe?: RealJudgeHostProbe): Promise<RealJudge> {
-  return createRealJudge(realJudgeConfig(s), probe === undefined ? {} : { probe });
+export function buildJudge(
+  s: JudgeSettings,
+  probe?: RealJudgeHostProbe,
+  rescan?: RescanPort,
+): Promise<RealJudge> {
+  return createRealJudge(realJudgeConfig(s, rescan), probe === undefined ? {} : { probe });
 }
 /**
  * `createModelPortFromEnv` from @affidavit/trial: mode, model table and timeout fail at startup.

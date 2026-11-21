@@ -5,3 +5,4 @@ export * from './map/index.js';
 export * from './arraign/index.js';
 export * from './casefile/index.js';
 export * from './pipeline/index.js';
+export * from './rescan/index.js';

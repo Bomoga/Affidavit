@@ -30,7 +30,7 @@ import {
   type OpenedBundle,
 } from '../bundle/open.js';
 import type { BundleSection } from '../bundle/plan.js';
-import { pruneExcludedDev, type ExcludedDevPackage } from '../bundle/prune.js';
+import { pruneExcludedDev, pruneOsSkipped, type ExcludedDevPackage } from '../bundle/prune.js';
 
 const exec = promisify(execFile);
 
@@ -195,6 +195,19 @@ export async function applyDevExclusions(
   if (!pruned.ok) throw new Error(pruned.reason);
   await writeFile(lockPath, pruned.lockText);
   await writeFile(pkgPath, pruned.pkgText);
+  return pruned.removed;
+}
+
+/**
+ * Drops optional packages whose `os` rules out Linux from a staged tree's package-lock.json, the
+ * same ones the bundle builder skipped, so an npm 6 base does not ask for them offline. Returns
+ * the lockfile paths removed; throws when the lockfile cannot be read.
+ */
+export async function applyOsSkips(tree: string): Promise<string[]> {
+  const lockPath = join(tree, 'package-lock.json');
+  const pruned = pruneOsSkipped(await readFile(lockPath, 'utf8'));
+  if (!pruned.ok) throw new Error(pruned.reason);
+  if (pruned.removed.length > 0) await writeFile(lockPath, pruned.lockText);
   return pruned.removed;
 }
 
@@ -381,6 +394,13 @@ async function buildIn(
     if (bundle !== undefined) {
       const sections = recipe.install?.sections ?? [];
       const packages = await materializeNpmCache(bundle, sections, cacheDir);
+      // The bundle leaves out optional packages that do not run on Linux; npm 6 would still ask
+      // for them, so the staged lockfile drops them the same way (pruneOsSkipped).
+      try {
+        await applyOsSkips(tree);
+      } catch (err) {
+        return { ok: false, unsupported: true, step: 'recipe', reason: (err as Error).message };
+      }
       const excludedDev = recipe.install?.excludedDev ?? [];
       if (excludedDev.length > 0) {
         try {

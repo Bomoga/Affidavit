@@ -1,4 +1,4 @@
-# Real wiring runbook (L1-10b, L1-10c)
+# Real wiring runbook (L1-10b, L1-10c, L1-17)
 
 How to run `apps/worker` with real stages: real discovery for intake, map and arraign, the real
 trial orchestrator on the real model port, and the real Judge on the gVisor witness jail. The
@@ -11,7 +11,7 @@ placeholder. Never put a real secret in this file, a commit, a shell history fil
 | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `AFFIDAVIT_INTAKE_IMPL=real` | intake, map and arraign run `discoverCase` (`packages/discovery/src/pipeline`) on the case's pinned repo and commit, and refuse to go on unless it reproduces the stored case file.                                                                                                                     |
 | `AFFIDAVIT_TRIAL_IMPL=real`  | defense, prosecution, remedy and verify run `@affidavit/trial`'s `Orchestrator` and handlers on `createModelPortFromEnv`. The jury must be off (no jury handler yet, L3-11).                                                                                                                            |
-| `AFFIDAVIT_JUDGE_IMPL=real`  | the Judge is Lane 2's `createRealJudge` (`packages/judge/src/jail/real.ts`): `Judge` on the gVisor `JailExecutor`, `CaseTargets` booting each case's vulnerable and safe variants, the jailed patch workbench, `FsEvidenceStore` and `SignerClient`. Host steps: `docs/lanes/lane2/real-judge-host.md`. |
+| `AFFIDAVIT_JUDGE_IMPL=real`  | the Judge is Lane 2's `createRealJudge` (`packages/judge/src/jail/real.ts`): `Judge` on the gVisor `JailExecutor`, `CaseTargets` booting each case's vulnerable and safe variants, the jailed patch workbench, `FsEvidenceStore` and `SignerClient`; with intake also `real`, discovery's re-scan (`DiscoveryRescan`) as its `RescanPort`. Host steps: `docs/lanes/lane2/real-judge-host.md`. |
 
 Each switch is independent. Unset or `fake` keeps the scripted fake for that part.
 
@@ -156,7 +156,7 @@ The only secret input is `ANTHROPIC_API_KEY`. The database passwords are generat
 These are outside this lane's packages or need the lead; each is tracked in `contract-requests.md`.
 
 - Targets now boot per case (`CaseTargets`, #61); a boot failure is a failed Defense attempt and then a review flag, never a dismissal. Booted targets are released when a trial stage lands the case in a terminal stage and on shutdown; a case flagged for review keeps its targets until the worker stops (no hook from the review flag yet). Targets live in process memory, so a restart boots them again.
-- `verifyPatch` needs Lane 1's `RescanPort`, which does not exist yet (only `FakeRescan`): without it `verifyPatch` fails closed, so Remedy cannot be verified and the case is flagged for review. Startup logs this as a `real Judge:` note.
+- `verifyPatch` gets Lane 1's re-scan (`DiscoveryRescan`, L1-17) only when intake is real as well: it reuses the intake tool runner (`AFFIDAVIT_TOOLRUNNER`), timeout and work root. With `AFFIDAVIT_INTAKE_IMPL` unset or `fake` there is no re-scan, `verifyPatch` fails closed, Remedy cannot be verified and the case is flagged for review; startup logs this as a `real Judge:` note. The re-scan is clean only when the case's Semgrep rule was loaded and no longer fires anywhere in the case's file of the patched tree, that file is plain text with its exact name, and the scan reported no coverage loss (`packages/discovery/CLAUDE.md`, "Re-scan"). The coverage check is global: Semgrep's notifications carry no reliable file path, so a timeout or parse error in any file of the patched tree makes the re-scan not clean and the case goes to review. How often that happens on real repositories is unmeasured ([metric]).
 - No stage seals an evidence bundle; `createRealJudge` holds the evidence store and signer client for it (CR-11, second half).
 - No single-stage entry in the trial package (CR-7). The worker runs `Orchestrator.run` per stage job and stops it after one transition. The trial workspace (admitted witness, patch) and the cost ledger are in process memory, so a worker restart mid-trial fails the next stage and flags it for review.
 - No jury handler (L3-11), so the jury must be disabled.
