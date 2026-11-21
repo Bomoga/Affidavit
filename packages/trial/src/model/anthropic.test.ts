@@ -1027,6 +1027,23 @@ describe('agent submissions are never rewritten', () => {
     });
   }
 
+  it('refuses to record, with a generic message, when the credential scan runs out of budget', async () => {
+    const dir = tmp();
+    let t = 0;
+    const store = new FileRecordingStore(dir, { scanBudgetMs: 50, now: () => (t += 100) });
+    const req = requestFor('defense', 'budget');
+    const err = await store
+      .write(
+        req,
+        { outcome: 'submitted', submission: { template: 'x'.repeat(300 * 1024) }, cost },
+        [CANARY_KEY],
+      )
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ModelCallError);
+    expect((err as Error).message).toMatch(/could not be scanned/);
+    expect(readdirSync(dir, { recursive: true })).toEqual([]);
+  });
+
   it('records ordinary code and short values without refusing', async () => {
     const dir = tmp();
     const store = new FileRecordingStore(dir);

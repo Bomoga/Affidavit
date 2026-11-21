@@ -1,78 +1,153 @@
 /**
- * Secret scrubbing for anything the model port logs or throws, and for every recorded field
- * except the agent submission (see `containsSecret`).
+ * Secret scrubbing for anything the model port logs or throws, and the credential check that
+ * decides whether a submission may be recorded (`detectCredential`). One pattern set serves both.
  *
- * The configured key is removed by value. Anything shaped like an Anthropic key, and the value of
- * any header, assignment, bearer token, or URL parameter that carries a credential, is removed by
- * pattern too, so a key that reached the text some other way (an echoed header, an error body, a
- * request URL) does not survive either.
+ * The configured key is removed by value. Anything shaped like a known credential (Anthropic,
+ * OpenAI, AWS, GitHub, Slack, Stripe, Google and npm tokens, JWTs, PEM private keys, credentials
+ * in a URL, bearer and key headers, and password, secret or token assignments with a literal
+ * value) is removed by pattern too.
+ *
+ * The text scanned can be shaped by untrusted repo content, so every pattern is linear: each
+ * starts at a literal prefix, every repetition is bounded, no two unbounded quantifiers sit next
+ * to each other, and a body that must be followed by a suffix is matched atomically (lookahead
+ * plus backreference) so a failed match never backtracks through it. On top of that, text over
+ * `MAX_REDACT_CHARS` is never scanned in one run, and every scan has a work budget that fails
+ * closed: logs and errors get `OVERSIZED`, and a recording is refused.
  *
  * Text is always redacted whole before it is shortened. Clipping first could cut a key so that
  * the part left behind no longer matches anything and leaks as a fragment.
  */
 
 export const REDACTED = '[redacted]';
+/** What a log line or error message becomes when it is too large or too slow to scan. */
+export const OVERSIZED = '[redacted: oversized]';
+/** Longest text `redact` scans; anything longer is replaced by `OVERSIZED`. */
+export const MAX_REDACT_CHARS = 256 * 1024;
+/** `detectCredential` scans longer strings in windows of this size... */
+export const SCAN_WINDOW_CHARS = 64 * 1024;
+/** ...overlapping by this much, more than the longest bounded match below. */
+export const SCAN_OVERLAP_CHARS = 8 * 1024;
+/** Default work budget for one `redact` or `detectCredential` call. */
+export const DEFAULT_SCAN_BUDGET_MS = 2_000;
 
-/** Characters a credential value runs to, in headers, JSON, and assignments. */
-const VALUE = String.raw`[^\s"',;&}\]]+`;
+export interface ScanBudget {
+  budgetMs?: number;
+  now?: () => number;
+}
 
-const PATTERNS: readonly [RegExp, string][] = [
-  // Anthropic-shaped keys anywhere.
-  [/sk-ant-[A-Za-z0-9_-]{4,}/g, REDACTED],
-  // Authorization headers and assignments, with or without a scheme.
-  [
-    new RegExp(String.raw`(authorization["']?\s*[:=]\s*["']?(?:bearer|basic)?\s*)${VALUE}`, 'gi'),
-    `$1${REDACTED}`,
-  ],
-  // Key and token headers or assignments: x-api-key, ANTHROPIC_API_KEY, api_key, access_token.
-  [
-    new RegExp(
-      String.raw`((?:x-api-key|api[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token)["']?\s*[:=]\s*["']?)${VALUE}`,
-      'gi',
-    ),
-    `$1${REDACTED}`,
-  ],
-  // A bare bearer token.
-  [/(\bbearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, `$1${REDACTED}`],
-  // Credential-looking URL query parameters.
-  [/([?&](?:key|token|auth|sig|signature)=)[^&\s"'#]+/gi, `$1${REDACTED}`],
-  // PEM private key blocks, whole (or from the header on, if the block is cut).
-  [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g, REDACTED],
+/** A literal credential body in a header or bearer token: never `$VAR`, a quote, or code. */
+const TOKEN = String.raw`[A-Za-z0-9._~+/=-]{8,1024}`;
+const KEYS = String.raw`(?:password|passwd|secret|token|api[_-]?key|authorization)`;
+/** Characters an unquoted literal value runs to. Stops at code punctuation. */
+const UNQUOTED = String.raw`[^\s"'\x60,;(){}\[\]<>=:]`;
+
+interface Pattern {
+  re: RegExp;
+  replacement: string;
+}
+
+const p = (source: string, flags: string, replacement = REDACTED): Pattern => ({
+  re: new RegExp(source, `g${flags}`),
+  replacement,
+});
+
+const PATTERNS: readonly Pattern[] = [
+  // Anthropic and OpenAI keys.
+  p(String.raw`sk-ant-[A-Za-z0-9_-]{4,512}`, ''),
+  p(String.raw`\bsk-(?:proj-)?[A-Za-z0-9_-]{20,512}`, ''),
   // AWS access key ids, and secret access keys next to the word aws.
-  [/\b(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA|AIPA)[A-Z0-9]{16}\b/g, REDACTED],
-  [/(aws[\w-]{0,30}["']?\s*[:=]\s*["']?)[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+])/gi, `$1${REDACTED}`],
-  // GitHub, Slack, Stripe, Google and npm tokens.
-  [/\b(?:ghp_|gho_|ghu_|ghs_|ghr_|github_pat_)[A-Za-z0-9_]{20,}/g, REDACTED],
-  [/\bxox[abprs]-[A-Za-z0-9-]{10,}/g, REDACTED],
-  [/\b(?:sk|rk)_live_[A-Za-z0-9]{10,}/g, REDACTED],
-  [/\bAIza[0-9A-Za-z_-]{35}/g, REDACTED],
-  [/\bnpm_[A-Za-z0-9]{36}/g, REDACTED],
-  // A JWT anywhere (header.payload.signature).
-  [/\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+/g, REDACTED],
-  // Credentials in a URL's userinfo: scheme://user:pass@host.
-  [/(\b[a-z][a-z0-9+.-]*:\/\/[^\s/:@]+:)[^\s/@]+(?=@)/gi, `$1${REDACTED}`],
-  // Password, secret, token, api key or authorization assigned a literal of 8+ characters:
-  // quoted (`password = "..."`, `"client_secret": "..."`), or unquoted with no spaces around
-  // `=` (`password=...` in config and query strings). Code such as
-  // `password = req.body.password` or `token = getToken()` has no literal and is left alone.
-  [
-    /((?:password|passwd|secret|token|api[_-]?key|authorization)["']?\s*[:=]\s*)(["'`])[^"'`\n]{8,}?\2/gi,
-    `$1$2${REDACTED}$2`,
-  ],
-  [
-    /((?:password|passwd|secret|token|api[_-]?key|authorization)=)(?![\w$]+(?:\.[\w$]+)+(?![\w$]))(?![\w$.]+\()[^\s"'`&;,)}\]]{8,}/gi,
+  p(String.raw`\b(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA|AIPA)[A-Z0-9]{16}\b`, ''),
+  p(
+    String.raw`(\baws[A-Za-z0-9_-]{0,30}["']?[ \t]{0,16}[:=][ \t]{0,16}["']?)[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+])`,
+    'i',
     `$1${REDACTED}`,
-  ],
+  ),
+  // GitHub, Slack, Stripe, Google and npm tokens.
+  p(String.raw`\b(?:gh[pousr]_[A-Za-z0-9_]{20,255}|github_pat_[A-Za-z0-9_]{20,255})`, ''),
+  p(String.raw`\b(?:xox[abprs]|xapp)-[A-Za-z0-9-]{10,255}`, ''),
+  p(
+    String.raw`(hooks\.slack\.com/(?:services|workflows|triggers)/)[A-Za-z0-9_/-]{8,255}`,
+    'i',
+    `$1${REDACTED}`,
+  ),
+  p(String.raw`\b(?:sk_live|sk_test|rk_live|rk_test|pk_live)_[A-Za-z0-9]{10,255}`, ''),
+  p(String.raw`\bAIza[0-9A-Za-z_-]{35}`, ''),
+  p(String.raw`\bGOCSPX-[A-Za-z0-9_-]{20,255}`, ''),
+  p(String.raw`\bnpm_[A-Za-z0-9]{36}`, ''),
+  // A JWT anywhere (header.payload.signature); each body matched atomically.
+  p(
+    String.raw`\beyJ(?=([A-Za-z0-9_-]{8,256}))\1\.eyJ(?=([A-Za-z0-9_-]{8,4096}))\2\.[A-Za-z0-9_-]{0,1024}`,
+    '',
+  ),
+  // PEM private key blocks, whole, or the header and what follows if the block is cut.
+  p(
+    String.raw`-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----(?:[\s\S]{0,8192}?-----END [A-Z ]{0,40}PRIVATE KEY-----|[\s\S]{0,8192})`,
+    '',
+  ),
+  // Credentials in a URL's userinfo: scheme://user:pass@host. Anchored on the literal `://`.
+  p(String.raw`(://[^\s/:@]{1,128}:)(?=([^\s/@]{1,256}))\2(?=@)`, '', `$1${REDACTED}`),
+  // Authorization headers and assignments, with or without a scheme, with a literal value.
+  p(
+    String.raw`(\bauthorization["']?[ \t]{0,16}[:=][ \t]{0,16}["']?(?:(?:bearer|basic|token)[ \t]{1,16})?)${TOKEN}`,
+    'i',
+    `$1${REDACTED}`,
+  ),
+  // Key and token headers or assignments: x-api-key, ANTHROPIC_API_KEY, api_key, access_token.
+  p(
+    String.raw`((?:x-api-key|api[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token)["']?[ \t]{0,16}[:=][ \t]{0,16}["']?)${TOKEN}`,
+    'i',
+    `$1${REDACTED}`,
+  ),
+  // A bare bearer token with a literal value (not `$TOKEN`, not `' + token`).
+  p(String.raw`(\bbearer[ \t]{1,16})${TOKEN}`, 'i', `$1${REDACTED}`),
+  // Credential-looking URL query parameters (not `{{placeholders}}` or `$vars`).
+  p(
+    String.raw`([?&](?:key|token|auth|sig|signature)=)[^&\s"'#$<>{}]{1,1024}`,
+    'i',
+    `$1${REDACTED}`,
+  ),
+  // Password, secret, token, api key or authorization assigned a quoted literal of 8+ characters.
+  p(
+    String.raw`(${KEYS}["']?[ \t]{0,16}[:=][ \t]{0,16})(["'\x60])[^"'\x60\n$]{8,256}\2`,
+    'i',
+    `$1$2${REDACTED}$2`,
+  ),
+  // ...or an unquoted literal of 6+ characters that holds a digit or symbol, is not a `$var`,
+  // and is not a member expression or call: `password: hunter22` and `PASSWORD = s3cr3t!` are
+  // caught, `password = req.body.password` and `token = getToken()` are not.
+  p(
+    String.raw`(${KEYS}["']?[ \t]{0,16}[:=][ \t]{0,16})(?![$])(?![A-Za-z_$][\w$]{0,64}(?:\.[\w$]{1,64}){1,16}(?![\w$]))(?=${UNQUOTED}{0,255}[0-9!@#%^*+/~-])${UNQUOTED}{6,256}`,
+    'i',
+    `$1${REDACTED}`,
+  ),
 ];
 
-export function redact(text: string, secrets: readonly (string | undefined)[] = []): string {
+/** The same patterns without the global flag, for a stateless `test`. */
+const DETECTORS: readonly RegExp[] = PATTERNS.map(
+  ({ re }) => new RegExp(re.source, re.flags.replace('g', '')),
+);
+
+const clock = (b: ScanBudget) => b.now ?? (() => performance.now());
+
+export function redact(
+  text: string,
+  secrets: readonly (string | undefined)[] = [],
+  budget: ScanBudget = {},
+): string {
+  if (text.length > MAX_REDACT_CHARS) return OVERSIZED;
+  const now = clock(budget);
+  const limit = budget.budgetMs ?? DEFAULT_SCAN_BUDGET_MS;
+  const started = now();
   let out = text;
   // Longest first, so a secret that contains another is removed whole.
   const ordered = secrets
     .filter((s): s is string => s !== undefined && s.length > 0)
     .sort((a, b) => b.length - a.length);
   for (const s of ordered) out = out.split(s).join(REDACTED);
-  for (const [pattern, replacement] of PATTERNS) out = out.replace(pattern, replacement);
+  for (const { re, replacement } of PATTERNS) {
+    out = out.replace(re, replacement);
+    if (now() - started > limit) return OVERSIZED;
+  }
   return out;
 }
 
@@ -100,11 +175,52 @@ export function redactDeep(value: unknown, secrets: readonly (string | undefined
   return value;
 }
 
+export type CredentialScan = 'clean' | 'credential' | 'over-budget';
+
+/**
+ * Whether any string or key in a JSON-like value looks like a credential, by the same patterns
+ * `redact` uses. Strings over `MAX_REDACT_CHARS` are scanned in overlapping windows, never in one
+ * regex run. Running past the work budget returns `over-budget`, which callers treat as a
+ * refusal.
+ */
+export function detectCredential(value: unknown, budget: ScanBudget = {}): CredentialScan {
+  const now = clock(budget);
+  const limit = budget.budgetMs ?? DEFAULT_SCAN_BUDGET_MS;
+  const started = now();
+  const scan = (text: string): CredentialScan => {
+    const step = SCAN_WINDOW_CHARS - SCAN_OVERLAP_CHARS;
+    const whole = text.length <= MAX_REDACT_CHARS;
+    for (let at = 0; at < text.length || at === 0; at += step) {
+      const window = whole ? text : text.slice(at, at + SCAN_WINDOW_CHARS);
+      for (const re of DETECTORS) {
+        if (re.test(window)) return 'credential';
+        if (now() - started > limit) return 'over-budget';
+      }
+      if (whole || at + SCAN_WINDOW_CHARS >= text.length) break;
+    }
+    return 'clean';
+  };
+  const walk = (v: unknown): CredentialScan => {
+    if (typeof v === 'string') return scan(v);
+    const items: unknown[] = Array.isArray(v)
+      ? v
+      : v !== null && typeof v === 'object'
+        ? Object.entries(v as Record<string, unknown>).flat()
+        : [];
+    for (const item of items) {
+      const r = walk(item);
+      if (r !== 'clean') return r;
+    }
+    return 'clean';
+  };
+  return walk(value);
+}
+
 /**
  * True when any string or key in a JSON-like value contains one of the exact secret values.
- * This is the only check applied to an agent submission: submissions are never rewritten, since
- * the Judge must run exactly what the agent sent, so pattern-shaped text (a bearer token or a
- * `?token=` parameter in a witness) passes through untouched.
+ * This is the only check applied to a live agent submission: submissions are never rewritten,
+ * since the Judge must run exactly what the agent sent, so pattern-shaped text (a bearer token or
+ * a `?token=` parameter in a witness) passes through untouched.
  */
 export function containsSecret(value: unknown, secrets: readonly (string | undefined)[]): boolean {
   const live = secrets.filter((s): s is string => s !== undefined && s.length > 0);

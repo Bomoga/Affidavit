@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import { REDACTED, clipRedacted, describeThrown, redact, redactDeep } from './redact.js';
-import { CANARY_KEY, CREDENTIAL_SAMPLES, NOT_CREDENTIALS } from './test-stubs.js';
+import {
+  MAX_REDACT_CHARS,
+  OVERSIZED,
+  REDACTED,
+  clipRedacted,
+  describeThrown,
+  detectCredential,
+  redact,
+  redactDeep,
+} from './redact.js';
+import { CANARY_KEY, CREDENTIAL_SAMPLES, HOSTILE_INPUTS, NOT_CREDENTIALS } from './test-stubs.js';
 
 describe('third-party credential forms', () => {
   for (const sample of CREDENTIAL_SAMPLES) {
@@ -8,14 +17,59 @@ describe('third-party credential forms', () => {
       const out = redact(sample.text);
       expect(out).not.toContain(sample.value);
       expect(out).toContain(REDACTED);
+      expect(detectCredential({ template: sample.text })).toBe('credential');
     });
   }
 
   for (const text of NOT_CREDENTIALS) {
     it(`leaves ordinary text alone: ${text}`, () => {
       expect(redact(text)).toBe(text);
+      expect(detectCredential({ template: text })).toBe('clean');
     });
   }
+});
+
+describe('linear-time scanning of hostile input', () => {
+  for (const { kind, text } of HOSTILE_INPUTS) {
+    it(`detects on 1 MB of ${kind} in under a second`, () => {
+      const t0 = performance.now();
+      const verdict = detectCredential({ template: text });
+      expect(performance.now() - t0, kind).toBeLessThan(1000);
+      expect(['clean', 'credential']).toContain(verdict);
+    });
+
+    it(`redacts the largest scannable slice of ${kind} in under a second`, () => {
+      const slice = text.slice(0, MAX_REDACT_CHARS);
+      const t0 = performance.now();
+      redact(slice);
+      expect(performance.now() - t0, kind).toBeLessThan(1000);
+    });
+  }
+
+  it('replaces text over the redaction cap with a fixed marker instead of scanning it', () => {
+    const big = `${'x'.repeat(MAX_REDACT_CHARS)}${CANARY_KEY}`;
+    expect(redact(big)).toBe(OVERSIZED);
+    expect(clipRedacted(big, [])).toBe(OVERSIZED);
+  });
+
+  it('finds a credential deep inside a 1 MB string, across window boundaries', () => {
+    const value = CREDENTIAL_SAMPLES[0]!.text;
+    for (const at of [0, 64 * 1024 - 10, 200 * 1024 + 3, 1024 * 1024 - value.length]) {
+      const text = `${'x '.repeat(at / 2)}${' '.repeat(at % 2)}${value}`.padEnd(1024 * 1024, ' ');
+      expect(detectCredential({ t: text }), `at ${at}`).toBe('credential');
+    }
+  });
+
+  it('fails closed when the scan exceeds its work budget', () => {
+    let t = 0;
+    const now = () => (t += 100);
+    expect(detectCredential({ a: 'x'.repeat(300 * 1024) }, { budgetMs: 150, now })).toBe(
+      'over-budget',
+    );
+    let t2 = 0;
+    const slow = () => (t2 += 10_000);
+    expect(redact('some text', [], { budgetMs: 1, now: slow })).toBe(OVERSIZED);
+  });
 });
 
 /** Every substring of the key of this length or more counts as a leak. */

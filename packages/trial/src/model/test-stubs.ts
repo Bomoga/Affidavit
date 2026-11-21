@@ -56,6 +56,52 @@ export const CREDENTIAL_SAMPLES: readonly { kind: string; text: string; value: s
     s('secret json', '{"client_secret": "', 'q9w8e7r6t5y4u3i2', '"}'),
     s('passwd yaml', "passwd: '", 'pa55w0rd-long', "'"),
     s('authorization assignment', 'authorization=', 'Zm9vOmJhcmJhenF1eA'),
+    s('slack app token', 'x ', 'xa' + 'pp-' + '1-A0123456789-0123456789012-abcdef'),
+    s(
+      'slack webhook',
+      'POST https://hooks.slack' + '.com/services/',
+      'T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX',
+    ),
+    s('stripe test secret', 'x ', 'sk' + '_test_' + '51H8abcdefghijklmnopqrstu'),
+    s('stripe test restricted', 'x ', 'rk' + '_test_' + '51H8abcdefghijklmnopqrstu'),
+    s('stripe live publishable', 'x ', 'pk' + '_live_' + '51H8abcdefghijklmnopqrstu'),
+    s('google oauth client secret', 'x ', 'GOC' + 'SPX-' + 'AbCdEfGhIjKlMnOpQrStUvWxYz12'),
+    s('openai project key', 'x ', 'sk' + '-proj-' + 'AbCdEfGhIjKlMnOpQrStUvWxYz0123456789'),
+    s('openai key', 'x ', 'sk' + '-' + 'AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdefghij'),
+    s('unquoted yaml password', 'password: ', 'hunter22'),
+    s('spaced uppercase password', 'PASSWORD = ', 's3cr3t!'),
+  ];
+})();
+
+/** One MB inputs built to make a backtracking pattern blow up. Every scan must stay linear. */
+export const HOSTILE_INPUTS: readonly { kind: string; text: string }[] = (() => {
+  const MB = 1024 * 1024;
+  const fill = (unit: string, prefix = '') =>
+    (prefix + unit.repeat(Math.ceil(MB / unit.length))).slice(0, MB);
+  return [
+    { kind: 'repeated eyJ.', text: fill('eyJ.') },
+    { kind: 'repeated eyJ-', text: fill('eyJ-') },
+    { kind: 'repeated half JWT', text: fill('eyJabcdefgh.eyJ') },
+    { kind: 'repeated xoxb-', text: fill('xo' + 'xb-') },
+    { kind: 'password=a.a.a.', text: fill('a.', 'password=') },
+    { kind: 'repeated password=', text: fill('password=') },
+    { kind: 'repeated password: ', text: fill('password: ') },
+    { kind: 'authorization: and spaces', text: fill(' ', 'authorization:') },
+    { kind: 'authorization: and tabs', text: fill('\t', 'Authorization: Bearer') },
+    { kind: 'repeated AKIA', text: fill('AK' + 'IA') },
+    { kind: 'repeated -----BEGIN ', text: fill('-----BEGIN ') },
+    { kind: 'repeated PEM header', text: fill('-----BEGIN ' + 'RSA PRIVATE KEY-----') },
+    { kind: 'base64 run', text: fill('QUJDREVGR0hJSktM+/') },
+    { kind: 'letters run', text: fill('a') },
+    { kind: 'repeated ://', text: fill('://') },
+    { kind: 'repeated a://u:', text: fill('a://u:') },
+    { kind: 'repeated Bearer ', text: fill('Bearer ') },
+    { kind: 'repeated aws=', text: fill('aws=') },
+    { kind: 'repeated sk-', text: fill('sk-') },
+    { kind: 'repeated ghp_', text: fill('gh' + 'p_') },
+    { kind: 'repeated ?token=', text: fill('?token=') },
+    { kind: 'repeated slack hook path', text: fill('hooks.slack' + '.com/services/') },
+    { kind: 'repeated secret="', text: fill('secret="') },
   ];
 })();
 
@@ -65,8 +111,16 @@ export const NOT_CREDENTIALS: readonly string[] = [
   'if (user.password === password) return token;',
   'const token = getToken(req);',
   'secret = process.env.SECRET',
-  'password=abc123',
+  'password=abc12',
   "const password = 'short';",
+  'const password = userPassword;',
+  'password: string;',
+  'curl -H "Authorization: Bearer $TOKEN" https://api.example.com',
+  "headers.Authorization = 'Bearer ' + token;",
+  'const password = "${PASSWORD}";',
+  'GET /items?token={{token}} HTTP/1.1',
+  'password = req.body.password',
+  'PASSWORD = process.env.DB_PASSWORD',
   'GET /login?user={{u}}&next=/home HTTP/1.1',
   'https://example.com/path@section',
 ];
