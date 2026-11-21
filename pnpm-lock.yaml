@@ -66,6 +66,16 @@ importers:
       graphile-worker:
         specifier: 0.18.0
         version: 0.18.0(supports-color@7.2.0)(typescript@6.0.3)
+    devDependencies:
+      '@affidavit/testing':
+        specifier: workspace:*
+        version: link:../../packages/testing
+      '@types/pg':
+        specifier: 8.23.1
+        version: 8.23.1
+      pg:
+        specifier: 8.23.1
+        version: 8.23.1
 
   apps/cli:
     dependencies:
