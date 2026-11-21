@@ -6,7 +6,7 @@
  * before it is returned.
  */
 import { constants } from 'node:fs';
-import { open } from 'node:fs/promises';
+import { open, realpath } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import {
   BootHints,
@@ -177,9 +177,20 @@ async function readWorkspaceFile(root: string, file: string): Promise<string | u
   const full = resolve(base, file);
   const rel = relative(base, full);
   if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) return undefined;
+  // O_NOFOLLOW covers only the last component and does not exist on Windows, so the real path
+  // (links and junctions in any component resolved) must still be inside the real workspace.
+  let real: string;
+  try {
+    const realBase = await realpath(base);
+    real = await realpath(join(base, rel));
+    const realRel = relative(realBase, real);
+    if (realRel === '' || realRel.startsWith('..') || isAbsolute(realRel)) return undefined;
+  } catch {
+    return undefined;
+  }
   let handle;
   try {
-    handle = await open(join(base, rel), constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    handle = await open(real, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   } catch {
     return undefined;
   }
@@ -234,7 +245,7 @@ export async function assembleCaseFile(input: AssembleInput): Promise<AssembleRe
           ? { text: undefined, commentsRemoved: 0, proseRemoved: 0 }
           : await cleanSource(w.file, text);
       cleaned.set(w.file, clean);
-      if (clean.text === undefined) withheld.push(w.file);
+      if (clean.text === undefined) withheld.push(safeName('file', w.file));
     }
     slices.push(sliceOf(safeName('file', w.file), clean, w, { redact: input.redact }));
   }

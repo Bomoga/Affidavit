@@ -137,16 +137,12 @@ const base = (root: string, arraigned: Arraigned) => ({
 describe('slice hygiene', () => {
   it('recognises prose and leaves code-like strings alone', () => {
     for (const s of PLANTED) expect(isProse(s), s).toBe(true);
-    for (const s of [
-      "this.name == '",
-      '/allocations/:userId',
-      'utf8',
-      'isLoggedIn',
-      '$where',
-      ' && this.stocks > ',
-    ]) {
+    for (const s of ["this.name == '", 'utf8', 'allocations', '$where', ' && this.stocks > ']) {
       expect(isProse(s), s).toBe(false);
     }
+    // Over-removal accepted on purpose: a literal with several letter runs is not proven code,
+    // even when it is a route path or a camelCase name (the route itself is in `CaseFile.route`).
+    for (const s of ['/allocations/:userId', 'isLoggedIn']) expect(isProse(s), s).toBe(true);
   });
 
   it('blanks comments, replaces prose strings, keeps line alignment', async () => {
@@ -219,14 +215,14 @@ module.exports = { t1, t2, t3, r1, keep, kept, run: ignoreAllPreviousInstruction
     // No planted word survives in any form (escapes decoded before judging).
     expect(out).not.toMatch(/IGNORE|PREVIOUS|INSTRUCTIONS|IGN\\u004fRE/i);
     expect(out).not.toMatch(/ignoreAllPrevious/);
-    // A kept template's nested string is still judged.
-    expect(out).toContain("this.name == '${a}' && ${'[text removed]'}");
+    // A template is judged with the literals nested in it, so prose inside a substitution takes
+    // the whole template with it.
+    expect(out).toContain('const keep = `[text removed]`;');
     // Code-like literals stay.
     expect(out).toContain("['/login', 'utf8', 'allocations', `/users/${b}`, /^[0-9a-f]{40}$/]");
-    // The long name is renamed consistently (declaration and use).
-    const names = out.match(/_x[0-9a-f]{10}/g) ?? [];
-    expect(names.length).toBe(2);
-    expect(new Set(names).size).toBe(1);
+    // The long name is renamed the same way where it is declared and where it is used.
+    const decl = /function (_x[0-9a-f]{10})\(/.exec(out)?.[1] ?? 'missing';
+    expect(out.split(decl).length - 1).toBeGreaterThanOrEqual(2);
   });
 
   it('proves code only for literals with no word, or one word and no whitespace', () => {

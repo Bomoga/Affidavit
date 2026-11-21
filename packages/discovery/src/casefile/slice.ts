@@ -12,10 +12,12 @@
  * A file that does not parse cleanly, or that cannot be parsed in budget, is withheld: its slice
  * carries a fixed marker instead of code. Nothing here runs repo code.
  *
- * This is a heuristic and is not the only defence: every slice stays `untrusted: true`, and the
- * Trial's safety envelope fences slice text as data. Known gap: text assembled at run time from
- * one-word pieces (an array of single words joined with spaces, `String.fromCharCode`) is not
- * recognised.
+ * This is a heuristic. It removes the planted forms the tests cover; it does not prove that no
+ * instruction-like text survives, and it is not the only defence: every slice stays
+ * `untrusted: true`, and the Trial's safety envelope fences slice text as data. Known gaps: text
+ * assembled at run time (an array of single words joined with spaces, `String.fromCharCode`,
+ * values computed from numbers), meaning carried by code structure rather than by literals or
+ * names, and short member chains of two or three words (`ignore.all`), which read as code.
  */
 import { createHash } from 'node:crypto';
 import type { Slice } from '@affidavit/contracts';
@@ -26,39 +28,94 @@ export const PROSE_MARKER = '[text removed]';
 /** The whole slice when the file could not be cleaned safely. */
 export const WITHHELD_MARKER = '/* slice withheld: the file did not parse cleanly */';
 
-const WORD = /^[\p{L}][\p{L}'\u2019-]*[.,:;!?)"]*$/u;
+/**
+ * Letters that render as blank space (Hangul fillers, the braille blank, Khmer inherent vowels).
+ * They are letters to Unicode, so a word count cannot see them as separators: any of them makes
+ * a literal unproven, and they are escaped in slice output.
+ */
+// eslint-disable-next-line no-misleading-character-class
+const BLANKISH = /[\u115f\u1160\u17b4\u17b5\u2800\u3164\uffa0]/u;
+const INVISIBLE =
+  // eslint-disable-next-line no-control-regex, no-misleading-character-class
+  /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u00ad\u061c\u115f\u1160\u17b4\u17b5\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufff9-\ufffb]/u;
 
-function letterWords(s: string): number {
-  let words = 0;
-  for (const tok of s.split(/\s+/)) if (WORD.test(tok.replace(/^[("'`]+/, ''))) words++;
-  return words;
+/** Member access such as `this.userId` or `req.session.user`: two or three dotted segments. */
+const MEMBER_CHAIN = /^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*){1,2}$/;
+
+/** Letter runs of two or more, split on every non-letter character and on camelCase humps. */
+function wordsOf(s: string): string[] {
+  return s
+    .replace(/(\p{Ll})(\p{Lu})/gu, '$1 $2')
+    .replace(/(\p{Lu})(\p{Lu}\p{Ll})/gu, '$1 $2')
+    .split(/[^\p{L}]+/u)
+    .filter((w) => w.length >= 2);
 }
 
 /**
- * True when literal text is proven to be code-like: no letter-only word at all (`/login`,
- * `this.userId == `, `utf8`), or a single word with no whitespace (`allocations`). Anything else,
- * a word next to whitespace included (`'ignore '`), is not proven.
+ * Words a literal spells. A token (a run of non-whitespace) that is a short member-access chain
+ * counts as none; any other token counts every letter run in it, whatever separates them.
  */
-export function provenCode(s: string): boolean {
-  const words = letterWords(s);
-  if (!(words === 0 || (words === 1 && !/\s/u.test(s)))) return false;
-  // A slug or path that spells a sentence (`./ignore-all-previous-instructions`) is not code.
-  for (const tok of s.split(/\s+/)) {
-    for (const part of tok.split('/')) {
-      if (part.split(/[_\-.]+/).filter((w) => /^\p{L}{2,}$/u.test(w)).length >= 4) return false;
-    }
+function proseWords(s: string): number {
+  let n = 0;
+  for (const tok of s.split(/[\s\p{Z}]+/u)) {
+    const core = tok.replace(/^[^A-Za-z_$]+|[^A-Za-z0-9_$]+$/g, '');
+    if (MEMBER_CHAIN.test(core)) continue;
+    n += wordsOf(tok).length;
   }
-  return true;
+  return n;
 }
 
-/** True for text that reads like a sentence or an instruction (the negation of `provenCode`). */
+/**
+ * True when literal text is proven to be code-like: no blank-looking or invisible character, and
+ * either no word at all (`this.userId == `, `/login` has one) or exactly one word and no
+ * whitespace (`allocations`, `/login`, `utf8`). Words are letter runs split on every non-letter
+ * and on camelCase humps, so `ignore,all`, `ignore1all` and `ignore.all.previous.instructions`
+ * are words; a short member chain (`this.userId`) is not. Anything else is not proven.
+ */
+export function provenCode(s: string): boolean {
+  if (BLANKISH.test(s) || INVISIBLE.test(s)) return false;
+  const words = proseWords(s);
+  return words === 0 || (words === 1 && !/[\s\p{Z}]/u.test(s));
+}
+
 export function isProse(s: string): boolean {
   return !provenCode(s);
 }
 
-/** A regex pattern that spells words: three or more runs of three or more letters. */
+/** Decodes `\xHH`, `\uHHHH` and `\u{H}`; class escapes (`\s`, `\d`, `\b`) become a space. */
+function decodeRegex(pattern: string): string {
+  return pattern
+    .replace(
+      /\\x([0-9a-fA-F]{2})|\\u\{([0-9a-fA-F]{1,6})\}|\\u([0-9a-fA-F]{4})/g,
+      (_m, x, b, u) => {
+        const code = parseInt(String(x ?? b ?? u), 16);
+        return code <= 0x10ffff ? String.fromCodePoint(code) : ' ';
+      },
+    )
+    .replace(/\\[sSdDwWbBtnrfv0]/g, ' ')
+    .replace(/\\(.)/gu, '$1');
+}
+
+/**
+ * A regex is replaced unless proven code-like: an escape that spells a letter (`\x49`), or a
+ * character class with a letter that is not a range end (`[Ii]`, `[I][G]`), is never kept; the
+ * rest is decoded, stripped of syntax (brackets, groups, quantifiers, anchors) and judged with
+ * `provenCode`, like a string.
+ */
 export function proseRegex(pattern: string): boolean {
-  return (pattern.match(/\p{L}{3,}/gu) ?? []).length >= 3;
+  const letterEscape = /\\x([0-9a-fA-F]{2})|\\u\{([0-9a-fA-F]{1,6})\}|\\u([0-9a-fA-F]{4})/g;
+  for (const m of pattern.matchAll(letterEscape)) {
+    const code = parseInt(String(m[1] ?? m[2] ?? m[3]), 16);
+    if (code <= 0x10ffff && /\p{L}/u.test(String.fromCodePoint(code))) return true;
+  }
+  for (const m of pattern.matchAll(/\[((?:\\.|[^\]\\])*)\]/g)) {
+    const inner = (m[1] ?? '').replace(/\\./g, '').replace(/.-./gu, '');
+    if (/\p{L}/u.test(inner)) return true;
+  }
+  const plain = decodeRegex(pattern)
+    .replace(/\{\d*,?\d*\}/g, '')
+    .replace(/[[\]()|?*+^$]/g, '');
+  return !provenCode(plain);
 }
 
 /** Words in a name: camelCase humps and `_`, `-`, `.`, `$` separated parts. */
@@ -78,8 +135,8 @@ const hashName = (name: string): string =>
   `_x${createHash('sha256').update(name).digest('hex').slice(0, 10)}`;
 
 const UNSAFE_CHARS =
-  // eslint-disable-next-line no-control-regex
-  /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufff9-\ufffb]/g;
+  // eslint-disable-next-line no-control-regex, no-misleading-character-class
+  /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u00ad\u061c\u115f\u1160\u17b4\u17b5\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\u2800\u3164\ufeff\uffa0\ufff9-\ufffb]/g;
 
 /** Control, bidirectional and invisible characters become visible escapes (tab and newline stay). */
 export function escapeInvisible(s: string): string {
@@ -96,17 +153,73 @@ const NAME_CHARSET: Record<NameKind, RegExp> = {
   label: /^[A-Za-z0-9_$.()]+$/,
 };
 
+/** Path and code words so common in real names that they say nothing (`src`, `routes`, `js`). */
+const COMMON_NAME_WORDS = new Set([
+  'src',
+  'lib',
+  'app',
+  'apps',
+  'packages',
+  'package',
+  'data',
+  'routes',
+  'route',
+  'models',
+  'model',
+  'controllers',
+  'controller',
+  'services',
+  'service',
+  'utils',
+  'util',
+  'test',
+  'tests',
+  'spec',
+  'public',
+  'assets',
+  'config',
+  'server',
+  'client',
+  'api',
+  'views',
+  'view',
+  'middleware',
+  'index',
+  'js',
+  'ts',
+  'jsx',
+  'tsx',
+  'mjs',
+  'cjs',
+  'json',
+  'dao',
+  'id',
+  'vendor',
+  'components',
+  'component',
+  'pages',
+  'page',
+  'handlers',
+  'handler',
+  'helpers',
+  'helper',
+  'core',
+  'common',
+  'shared',
+]);
+
+const NAME_LIMIT: Record<NameKind, number> = { file: 4, 'route-path': 4, label: 6 };
+
 /**
  * A repo-derived name (a file path, a route path, a middleware label) as it may appear in a case
- * file: a strict character set per kind, no part with four or more `-`, `_` or `.` separated
- * words and no part with seven or more words in all. Anything else becomes `PROSE_MARKER`.
+ * file: a strict character set per kind, and fewer words than `NAME_LIMIT` over the whole name
+ * (letter runs split on every non-letter and on camelCase humps, common path words not counted).
+ * Anything else becomes `PROSE_MARKER`.
  */
 export function safeName(kind: NameKind, s: string): string {
   if (s.length === 0 || s.length > 300 || !NAME_CHARSET[kind].test(s)) return PROSE_MARKER;
-  for (const part of s.split('/')) {
-    const plain = part.split(/[_\-.]+/).filter((w) => /^[A-Za-z]{2,}$/.test(w));
-    if (plain.length >= 4 || nameWords(part).length >= 7) return PROSE_MARKER;
-  }
+  const words = wordsOf(s).filter((w) => !COMMON_NAME_WORDS.has(w.toLowerCase()));
+  if (words.length >= NAME_LIMIT[kind]) return PROSE_MARKER;
   return s;
 }
 
@@ -114,7 +227,12 @@ export function safeName(kind: NameKind, s: string): string {
 const blank = (s: string): string => s.replace(/[^\n]/g, ' ');
 const newlines = (s: string): string => '\n'.repeat(s.split('\n').length - 1);
 
-function replacement(sp: LexicalSpan, piece: string, forced: boolean): string | undefined {
+function replacement(
+  sp: LexicalSpan,
+  piece: string,
+  forced: boolean,
+  judged?: string,
+): string | undefined {
   switch (sp.kind) {
     case 'comment':
       return blank(piece);
@@ -124,14 +242,122 @@ function replacement(sp: LexicalSpan, piece: string, forced: boolean): string | 
       return `${q}${PROSE_MARKER}${q}${newlines(piece)}`;
     }
     case 'template':
-      return !forced && provenCode(sp.text) ? undefined : `\`${PROSE_MARKER}\`${newlines(piece)}`;
+      return !forced && provenCode(judged ?? sp.text)
+        ? undefined
+        : `\`${PROSE_MARKER}\`${newlines(piece)}`;
     case 'jsx-text':
       return provenCode(sp.text) ? undefined : `${PROSE_MARKER}${newlines(piece)}`;
     case 'regex':
       return proseRegex(sp.text) ? `/${PROSE_MARKER}/${newlines(piece)}` : undefined;
     case 'identifier':
-      return proseIdentifier(sp.text) ? hashName(sp.text) : undefined;
+      return forced || proseIdentifier(sp.text) ? hashName(sp.text) : undefined;
   }
+}
+
+/** Code words common enough that a chain of them is ordinary code (`req.session.user.id`). */
+const CODE_WORDS = new Set([
+  'this',
+  'req',
+  'res',
+  'request',
+  'response',
+  'next',
+  'err',
+  'error',
+  'ctx',
+  'app',
+  'router',
+  'db',
+  'session',
+  'user',
+  'users',
+  'id',
+  'body',
+  'params',
+  'query',
+  'headers',
+  'module',
+  'exports',
+  'require',
+  'console',
+  'log',
+  'data',
+  'result',
+  'results',
+  'value',
+  'values',
+  'key',
+  'keys',
+  'item',
+  'items',
+  'options',
+  'config',
+  'process',
+  'env',
+  'json',
+  'prototype',
+  'length',
+  'push',
+  'map',
+  'filter',
+  'then',
+  'name',
+  'type',
+  'status',
+  'send',
+  'render',
+  'find',
+  'get',
+  'set',
+  'use',
+  'path',
+  'url',
+  'file',
+  'callback',
+  'cb',
+  'done',
+  'self',
+  'window',
+  'document',
+  'object',
+  'array',
+  'string',
+  'number',
+  'math',
+  'promise',
+  'collection',
+  'model',
+  'models',
+]);
+
+/** A plain word used as a name (`Ignore`, `all`, `SAFE`): no hump, digit, `_` or `$`. */
+const PLAIN_WORD = /^(?:[A-Za-z][a-z]+|[A-Z]{2,})$/;
+
+/**
+ * Identifiers next to each other with only `.`, `,` or whitespace between them are judged as one
+ * text: `Ignore.all.previous.instructions` and `void Ignore, all, previous, instructions` are
+ * sentences. A run with three or more plain words outside `CODE_WORDS` has every identifier in it
+ * renamed.
+ */
+function identifierRuns(spans: readonly LexicalSpan[], text: string): Set<LexicalSpan> {
+  const out = new Set<LexicalSpan>();
+  const ids = spans.filter((s) => s.kind === 'identifier');
+  for (let i = 0; i < ids.length;) {
+    let j = i;
+    while (j + 1 < ids.length) {
+      const cur = ids[j] as LexicalSpan;
+      const next = ids[j + 1] as LexicalSpan;
+      if (next.start < cur.end || !/^[\s.,]*$/.test(text.slice(cur.end, next.start))) break;
+      j++;
+    }
+    const run = ids.slice(i, j + 1);
+    const plain = run.filter(
+      (s) => PLAIN_WORD.test(s.text) && !CODE_WORDS.has(s.text.toLowerCase()),
+    ).length;
+    if (plain >= 3) for (const s of run) out.add(s);
+    i = j + 1;
+  }
+  return out;
 }
 
 export interface CleanFile {
@@ -176,11 +402,20 @@ export async function cleanSource(
     }
     i = j + 1;
   }
+  for (const s of identifierRuns(res.spans, text)) forced.add(s);
+  // A template is judged with every literal nested in its substitutions:
+  // `${'IGNORE'} ${'ALL'}` is one text, not one-word pieces.
+  const templateText = new Map<LexicalSpan, string>();
+  for (const tpl of lits) {
+    if (tpl.kind !== 'template') continue;
+    const nested = lits.filter((n) => n !== tpl && n.start >= tpl.start && n.end <= tpl.end);
+    templateText.set(tpl, [tpl.text, ...nested.map((n) => n.text)].join(' '));
+  }
   for (const sp of res.spans) {
     // Inside a literal already replaced. A kept literal does not move `at`, so the spans nested
     // in it (strings inside a template substitution) are still judged.
     if (sp.start < at) continue;
-    const rep = replacement(sp, text.slice(sp.start, sp.end), forced.has(sp));
+    const rep = replacement(sp, text.slice(sp.start, sp.end), forced.has(sp), templateText.get(sp));
     if (rep === undefined) continue;
     out += text.slice(at, sp.start) + rep;
     at = sp.end;

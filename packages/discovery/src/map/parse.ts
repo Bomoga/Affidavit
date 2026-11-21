@@ -163,7 +163,7 @@ export interface LexicalSpan {
   end: number;
   /**
    * What the literal says: for a string or template, its fragments with escape sequences decoded
-   * (a template substitution counts as a space); a regex's pattern; JSX text; an identifier's name.
+   * (a template substitution counts as the digit 0, a word break that is not whitespace); a regex's pattern; JSX text; an identifier's name.
    * Empty for a comment.
    */
   text: string;
@@ -198,14 +198,14 @@ interface NodeLike {
   children: (NodeLike | null)[];
 }
 
-/** Decoded content of a string or template node: fragments and escapes, a space per substitution. */
+/** Decoded content of a string or template node: fragments and escapes, a `0` per substitution. */
 function literalText(node: NodeLike): string {
   let out = '';
   for (const c of node.children) {
     if (!c) continue;
     if (c.type === 'string_fragment' || c.type === 'jsx_text') out += c.text;
     else if (c.type === 'escape_sequence') out += decodeEscape(c.text);
-    else if (c.type === 'template_substitution') out += ' ';
+    else if (c.type === 'template_substitution') out += '0';
   }
   return out;
 }
