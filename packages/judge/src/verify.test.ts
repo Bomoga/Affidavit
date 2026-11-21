@@ -51,13 +51,14 @@ function setup(
   answer: (req: ExecutionRequest) => RawAttempt = fixedByPatch,
   wb: ConstructorParameters<typeof ScriptedWorkbench>[0] = {},
   rescanClean = true,
+  w: Witness = witness(),
 ) {
   const exec = new ScriptedExecutor(answer);
   const workbench = new ScriptedWorkbench(wb);
   const rescan = new RecordingRescan(rescanClean);
   const judge = new Judge(exec, DEFAULT_POLICY, { workbench, rescan });
   const verify = (patch: PatchExhibit = patchExhibit(), counters: Exhibit[] = [counterexample()]) =>
-    judge.verifyPatch(gateCaseFile(), patch, witness(), counters);
+    judge.verifyPatch(gateCaseFile(), patch, w, counters);
   return { exec, workbench, rescan, verify };
 }
 
@@ -483,6 +484,24 @@ describe('Judge.verifyPatch', () => {
       ])('does not reject a short value that only appears inside %s', async (_, lines) => {
         expect((await run(['id'], lines)).rejectedBy).toBeUndefined();
       });
+
+      it.each([
+        // The counterexample reuses family values only (an index pick): nothing new to check.
+        [[1, 2], [1], `            if (rows.length !== 1) return deny();`],
+        [[0, 1], [0], `            const first = rows[0];`],
+      ])(
+        'checks only values the family does not already have (family %j, header %j)',
+        async (family, chosen, line) => {
+          const fam: ParamSpace = [{ name: 'threshold', values: family }];
+          const flips = (req: ExecutionRequest) =>
+            raw(req.params[0]!.values.map(() => req.variant === 'vulnerable'));
+          const { verify } = setup(flips, {}, true, { ...witness(), params: fam });
+          const r = await verify(patchExhibit(addLines([line])), [
+            counterexample({}, [{ name: 'threshold', values: chosen }]),
+          ]);
+          expect(r.rejectedBy).toBeUndefined();
+        },
+      );
 
       it('does not reject a number that only appears inside a longer number', async () => {
         expect(
