@@ -129,6 +129,11 @@ witness<{ pair: { attacker: { userName: string; password: string }; victim: { us
  * Positive control for the `$where` safe variant: the same login and the same allocations request
  * as the injection witness, with a threshold the safe code accepts. It must pass on both variants:
  * user1 logs in (302) and sees their own allocations page, so the seed and session work.
+ * NodeGoat seeds each user's `stocks` at random from 1 to 40 (`artifacts/db-reset.js`), so only a
+ * threshold below 1 shows the allocation on every boot, and the safe fix accepts 0 to 99 only: the
+ * one threshold both variants always accept is 0, written three ways that parseInt reads as 0.
+ * The earlier values 50 and 99 failed on both variants on the sandbox host (2026-11-21), because
+ * no allocation was above them.
  */
 const BENIGN_WHERE = `import { expect } from 'vitest';
 import { witness } from '@affidavit/witness';
@@ -148,7 +153,7 @@ witness<{ threshold: string }>(async ({ threshold }, { target }) => {
   expect(await res.text()).toContain('Asset Allocations for John Doe');
 });
 `;
-const BENIGN_PARAMS: ParamSpace = [{ name: 'threshold', values: ['0', '50', '99'] }];
+const BENIGN_PARAMS: ParamSpace = [{ name: 'threshold', values: ['0', '00', '0.5'] }];
 
 /** A real `git diff` of one file changed from `from` to `to`, made with the host's git. */
 function realDiff(file: string, from: string, to: string): string {
@@ -471,10 +476,11 @@ describe.skipIf(SKIP_REASON !== null)(
           w,
           [],
         );
-        // It applied, built and booted; only the family stayed vulnerable.
+        // It applied, built and booted; only the family stayed vulnerable. NodeGoat's suite builds
+        // from the dev bundle and passes vacuously, so the rejection rests on the family alone.
         expect(r).toMatchObject({
           familyFlipped: false,
-          suitePassed: false,
+          suitePassed: true,
           rejectedBy: 'differential',
         });
       });

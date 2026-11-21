@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { planLockfile } from './plan.js';
 
 /**
  * A dev package left out of a bundle on purpose, after human review: the target's test suite does
@@ -245,6 +246,75 @@ export function pruneExcludedDev(
     ok: true,
     lockText: `${JSON.stringify(lock, null, 2)}\n`,
     pkgText: `${JSON.stringify(pkg, null, 2)}\n`,
+    removed: [...removed].sort(),
+  };
+}
+
+export type OsPruneRead =
+  { ok: true; lockText: string; removed: string[] } | { ok: false; reason: string };
+
+/**
+ * Removes the optional packages whose `os` rules out Linux (and their subtrees) from a v2 or v3
+ * package-lock.json, by exactly the rule the bundle builder used to leave them out
+ * (`planLockfile(...).skipped`), so the bundle and the install never disagree. npm 7 and later
+ * skip such a package from the `packages` section without fetching it, but npm 6 (the npm of an
+ * older base such as `node:12`) reads only the v1 `dependencies` tree, which has no `os`, and asks
+ * for the tarball: offline, that fails the install (NodeGoat's `fsevents`). The v1 tree loses the
+ * same nodes, and every v1 `requires` entry that resolved to a removed node loses that name.
+ * Nothing that runs on Linux is removed. A lockfile with nothing to skip comes back unchanged.
+ */
+export function pruneOsSkipped(lockText: string): OsPruneRead {
+  const plan = planLockfile(lockText);
+  if (!plan.ok) return plan;
+  if (plan.plan.skipped.length === 0) return { ok: true, lockText, removed: [] };
+  const lock = JSON.parse(lockText) as unknown;
+  if (!isObj(lock) || !isObj(lock.packages)) {
+    return { ok: false, reason: 'an os-skipped package needs a v2 or v3 lockfile (with packages)' };
+  }
+  const packages = lock.packages;
+  const original: Obj = { ...packages };
+  const removed = new Set<string>();
+  for (const { path } of plan.plan.skipped) {
+    for (const p of Object.keys(packages)) {
+      if (p === path || p.startsWith(`${path}/`)) {
+        removed.add(p);
+        delete packages[p];
+      }
+    }
+  }
+  // Node resolution over the lockfile as written: nearest node_modules upwards.
+  const resolve = (from: string, name: string): string | null => {
+    let base = from;
+    for (;;) {
+      const candidate = base === '' ? `node_modules/${name}` : `${base}/node_modules/${name}`;
+      if (candidate in original) return candidate;
+      if (base === '') return null;
+      const i = base.lastIndexOf('/node_modules/');
+      base = i === -1 ? '' : base.slice(0, i);
+    }
+  };
+  const pruneTree = (deps: unknown, prefix: string): void => {
+    if (!isObj(deps)) return;
+    for (const [name, e] of Object.entries(deps)) {
+      const path = `${prefix}node_modules/${name}`;
+      if (removed.has(path)) {
+        delete deps[name];
+        continue;
+      }
+      if (!isObj(e)) continue;
+      if (isObj(e.requires)) {
+        for (const req of Object.keys(e.requires)) {
+          const to = resolve(path, req);
+          if (to !== null && removed.has(to)) delete e.requires[req];
+        }
+      }
+      pruneTree(e.dependencies, `${path}/`);
+    }
+  };
+  pruneTree(lock.dependencies, '');
+  return {
+    ok: true,
+    lockText: `${JSON.stringify(lock, null, 2)}\n`,
     removed: [...removed].sort(),
   };
 }
