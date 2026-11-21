@@ -21,6 +21,7 @@ export type ErrorCode =
   | 'too-many-streams'
   | 'bad-signature'
   | 'oauth-failed'
+  | 'sessions-full'
   | 'intake-not-implemented'
   | 'not-implemented'
   | 'webhooks-disabled'

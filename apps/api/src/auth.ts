@@ -6,6 +6,8 @@ import {
   MemorySessionStore,
   SESSION_ABSOLUTE_TTL_MS,
   SESSION_ID_RE,
+  SESSION_RETRY_AFTER_S,
+  SessionCapacityError,
   type SessionStore,
 } from './session-store.js';
 
@@ -175,6 +177,15 @@ export function githubAuth(config: GithubAuthConfig, deps: GithubAuthDeps = {}):
   }
 
   function register(app: FastifyInstance): void {
+    // Expired sessions also free capacity on a timer, not only when touched or at the cap.
+    if (sessions instanceof MemorySessionStore) {
+      const timer = setInterval(() => sessions.sweep(now()), 5 * 60 * 1000);
+      timer.unref();
+      app.addHook('onClose', (_app, done) => {
+        clearInterval(timer);
+        done();
+      });
+    }
     const authLimit = { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } };
 
     app.get('/auth/github/login', authLimit, (_req, reply) => {
@@ -195,7 +206,9 @@ export function githubAuth(config: GithubAuthConfig, deps: GithubAuthDeps = {}):
       return reply.redirect(u.toString(), 302);
     });
 
-    app.get('/auth/github/callback', authLimit, async (req, reply) => {
+    // Each successful callback creates a session: limited per IP on top of the global limit.
+    const callbackLimit = { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } };
+    app.get('/auth/github/callback', callbackLimit, async (req, reply) => {
       const q = req.query as Record<string, unknown>;
       const code = q['code'];
       const state = q['state'];
@@ -222,7 +235,15 @@ export function githubAuth(config: GithubAuthConfig, deps: GithubAuthDeps = {}):
       if (!user) return sendError(reply, 502, 'oauth-failed');
       const tenantId = githubTenantId(user.id);
       const subject = String(user.id);
-      const sid = await sessions.create(tenantId, subject, now());
+      let sid: string;
+      try {
+        sid = await sessions.create(tenantId, subject, now());
+      } catch (err) {
+        if (!(err instanceof SessionCapacityError)) throw err;
+        // Full of live sessions: refuse this sign-in rather than log anybody else out.
+        reply.header('retry-after', String(SESSION_RETRY_AFTER_S));
+        return sendError(reply, 503, 'sessions-full');
+      }
       const session = encodeSession({ v: 2, i: sid, t: tenantId, s: subject });
       reply.setCookie(SESSION_COOKIE, session, {
         signed: true,
