@@ -2,11 +2,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import {
-  SEMGREP_FALLBACK_TMP,
-  SEMGREP_TMPDIR_WRAPPER,
-  buildInvocation,
-} from './invocations.js';
+import { SEMGREP_FALLBACK_TMP, SEMGREP_TMPDIR_WRAPPER, buildInvocation } from './invocations.js';
 import {
   ToolDisabledError,
   ToolOptionError,

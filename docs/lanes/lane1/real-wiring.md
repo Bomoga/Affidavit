@@ -67,7 +67,7 @@ Required means required when the switch in the "For" column is `real`.
 | Name                                  | Purpose                                                                                                                                                                                                                     | Required | Example placeholder                                          |
 | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- | ------------------------------------------------------------ |
 | `AFFIDAVIT_INTAKE_WORK_ROOT`          | absolute, existing directory for per-run discovery workspaces (each run gets its own and removes it)                                                                                                                        | yes      | `/srv/affidavit/intake`                                      |
-| `AFFIDAVIT_REPO_SOURCES`              | JSON object from repository id to clone URL or local path; ids are logged, sources never are                                                                                                                                | yes      | `{"OWASP/NodeGoat":"https://github.com/OWASP/NodeGoat.git"}` |
+| `AFFIDAVIT_REPO_SOURCES`              | JSON object from repository id (the corpus id for a corpus app) to clone URL or local path; ids are logged, sources never are                                                                                               | yes      | `{"repo-nodegoat":"https://github.com/OWASP/NodeGoat.git"}`  |
 | `AFFIDAVIT_INTAKE_ALLOW_LOCAL_SOURCE` | `true` lets a source be a local path (testing)                                                                                                                                                                              | no       | `false`                                                      |
 | `AFFIDAVIT_TOOLRUNNER`                | `gvisor` (Lane 2 `GvisorToolRunner`, the default when unset) or `docker` (plain local Docker: only when set by name, and startup logs a warning that scanners run on untrusted repository content without gVisor isolation) | no       | `gvisor`                                                     |
 | `AFFIDAVIT_TOOL_TIMEOUT_MS`           | per scanner run (default 600000)                                                                                                                                                                                            | no       | `600000`                                                     |
@@ -129,6 +129,17 @@ Checked at startup; each line is one possible `PrerequisiteError` entry.
 - The NodeGoat trees exist, when set. The Judge part of the list is Lane 2's `checkRealJudgePrerequisites`, run on the same config `createRealJudge` gets, so one error lists everything.
 - The NodeGoat bundle tar is a regular file (not a directory, not a symlink), when `AFFIDAVIT_NODEGOAT_BUNDLE` is set. Its sha256 is checked by the Judge, not at startup.
 
+### WSL2 host
+
+A dry run (intake, map and arraign real, trial halting with `model-unconfigured`) has been run on WSL2 Ubuntu. What that needs:
+
+- Docker Engine installed inside the distro, with the user in the `docker` group (Docker Desktop's WSL integration was not tried).
+- gVisor from `docker/sandbox/install-gvisor.sh`, which needs the `zstd` and `acl` packages first (`sudo apt-get install zstd acl`), then `setup-runsc-audit.sh`.
+- Linux Node and Linux pnpm in the distro; a Windows `pnpm` on the `PATH` does not work there.
+- The repo cloned under the Linux home (`~/Affidavit`), not under `/mnt/c`: the Windows mount has no POSIX modes or ownership, which the jail's mounts depend on.
+
+Scanners run as nobody (uid 65534) in the jail. Discovery sets every mode the jail needs itself (`docker/tools/README.md`, "Modes"), so the worker's umask does not matter; the repo checkout's `packages/discovery/rules` and `docker/tools/config` must be world-readable (a clone made under umask 022 is).
+
 ## To run a real case
 
 The only secret input is `ANTHROPIC_API_KEY`. The database passwords are generated fresh for the run.
@@ -141,7 +152,7 @@ The only secret input is `ANTHROPIC_API_KEY`. The database passwords are generat
 6. Start `apps/signer` and set `AFFIDAVIT_SIGNER_SOCKET`.
 7. Export the variables above, with `AFFIDAVIT_JURY_ENABLED=false`, and `export ANTHROPIC_API_KEY="<from the secrets store>"` in that shell only.
 8. Start the worker (`node --import tsx apps/worker/src/main.ts`). It refuses with a list if anything is missing.
-9. Open a case: `pnpm --filter @affidavit/worker open-case -- --tenant <tenant> --repo <repo id> --commit <40 hex>`. It runs the same discovery as intake. The trial candidate (the one named with `--candidate`, or the highest-ranked) is opened and queued. Every F3 hold of the scan (a dismissal rule matched at or above the escalation floor) is opened as a case of its own, `<case id>-hold-<digest>`, and flagged for a person: a `review_flags` row with reason `f3-hold` and arraignment's route (`person`, or `person-or-trial`: a person or a second Defense attempt) in its detail, no stage job, never dismissed. A dismissal or an unsupported repository opens no trial case and is printed. Find the holds with `select case_id, detail from review_flags where reason = 'f3-hold'`.
+9. Open a case, from `apps/worker` in a shell with the same variables: `node --import tsx src/open-case.ts --tenant <tenant> --repo <repo id> --commit <40 hex>`. For NodeGoat that is `--repo repo-nodegoat --commit c5cb68a7084e4ae7dcc60e6a98768720a81841e8`. The repo id must be the corpus id (`repo-nodegoat`, from `packages/corpus/data/nodegoat/app.json`), and `AFFIDAVIT_REPO_SOURCES` must have a key with exactly that id: the GitHub name (`OWASP/NodeGoat`) matches no corpus entry, so the case file gets no boot hints and open-case stops with "no boot hints". It runs the same discovery as intake. The trial candidate (the one named with `--candidate`, or the highest-ranked) is opened and queued. Every F3 hold of the scan (a dismissal rule matched at or above the escalation floor) is opened as a case of its own, `<case id>-hold-<digest>`, and flagged for a person: a `review_flags` row with reason `f3-hold` and arraignment's route (`person`, or `person-or-trial`: a person or a second Defense attempt) in its detail, no stage job, never dismissed. A dismissal or an unsupported repository opens no trial case and is printed. Find the holds with `select case_id, detail from review_flags where reason = 'f3-hold'`.
 10. Follow the case with `affidavit` (apps/cli) or the `events` table.
 
 ## What happens when something is refused

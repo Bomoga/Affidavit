@@ -294,7 +294,9 @@ describe.skipIf(!enabled)('tool images, offline', () => {
     const o = s.options(tool);
     const inv = buildInvocation(manifest, tool, o);
     await prepareScratch(o.scratchDir, inv.scratchSubdirs);
-    await prepareOutput(o.outputDir);
+    // The report file is pre-created as runTool does: /out is 0755, and the container's root has
+    // no CAP_DAC_OVERRIDE, so it can write only the 0666 report file there.
+    await prepareOutput(o.outputDir, inv.outputFile);
     // Deliberately bypasses runTool's snapshot gate to see what the flags alone achieve.
     const res = await s.runner.run(inv.image, inv.args, inv.mounts);
     expect(isOkExit(manifest, tool, res.exitCode), `${tool} exit ${res.exitCode}`).toBe(true);
