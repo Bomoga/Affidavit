@@ -10,3 +10,4 @@ export * from './containment/record.js';
 export * from './gvisor/cidr.js';
 export * from './gvisor/network.js';
 export * from './boot/index.js';
+export * from './bundle/index.js';
