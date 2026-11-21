@@ -1,0 +1,25 @@
+[
+  {
+    "schemaVersion": 1,
+    "id": "exhibit-witness-001",
+    "caseId": "case-nodegoat-sqli-001",
+    "author": "defense",
+    "code": "/* witness recorded from run [id] */",
+    "sha256": "cb86ae6f823360c3c478f1169aff4a637241f0ecf682add921f5e3aa99e44dd9",
+    "kind": "witness"
+  },
+  {
+    "schemaVersion": 1,
+    "id": "exhibit-patch-001",
+    "caseId": "case-nodegoat-sqli-001",
+    "author": "remedy",
+    "code": "/* patch recorded from run [id] */",
+    "sha256": "88a78304d7ced6158adb1bad2529b05b35dd9c1daf664856badb0a7d933dc62d",
+    "kind": "patch",
+    "diff": "diff --git a/app/data/allocations-dao.js b/app/data/allocations-dao.js\n--- a/app/data/allocations-dao.js\n+++ b/app/data/allocations-dao.js\n@@ -12,6 +12,6 @@ function AllocationsDAO(db) {\n   // Synthetic fixture patch [id], not recorded from a run.\n   this.getByUserId = (userId, threshold, callback) => {\n-    const sql = \"SELECT * FROM allocations WHERE userId = \" + userId + \" AND stocks > \" + threshold;\n-    db.query(sql, callback);\n+    const sql = \"SELECT * FROM allocations WHERE userId = ? AND stocks > ?\";\n+    db.query(sql, [userId, threshold], callback);\n   };\n }\n",
+    "filesTouched": [
+      "app/data/allocations-dao.js"
+    ],
+    "linesChanged": 4
+  }
+]
