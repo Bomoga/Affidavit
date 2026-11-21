@@ -138,6 +138,31 @@ describe('B: a negative control matches only its own tree, rule and class', () =
     expect(r.dismissed[0]?.detail).toContain('nc-1');
   });
 
+  it('when two controls match, the choice does not depend on their order', () => {
+    const a = control({ id: 'nc-b' });
+    const b = control({ id: 'nc-a', range: { startLine: 75, endLine: 80 } });
+    const once = (ncs: KnownNegativeControl[]) =>
+      arraign({
+        candidates: [c],
+        reachability: [reach(c.id, 'unknown')],
+        negativeControls: ncs,
+        tree: patched,
+        config: { escalationFloor: 0.99, dismissBelow: 0 },
+      });
+    expect(once([a, b])).toEqual(once([b, a]));
+    expect(once([a, b]).dismissed[0]?.detail).toContain('nc-a');
+  });
+
+  it('two reachability answers for one candidate are refused, not resolved by order', () => {
+    expect(() =>
+      arraign({
+        candidates: [c],
+        reachability: [reach(c.id, 'unknown'), reach(c.id, 'unreachable')],
+        config: { escalationFloor: 0.99, dismissBelow: 0 },
+      }),
+    ).toThrow(/duplicate reachability/);
+  });
+
   it('negative controls without the scanned tree are refused', () => {
     expect(() => run(undefined, control())).toThrow(/tree/);
   });
