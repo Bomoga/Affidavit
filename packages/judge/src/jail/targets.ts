@@ -1,17 +1,13 @@
-import { createHash } from 'node:crypto';
-import { lstat, readFile, readdir, readlink } from 'node:fs/promises';
-import { join } from 'node:path';
 import { CaseFile } from '@affidavit/contracts';
 import type { TargetRef, TargetVariant } from '@affidavit/contracts';
 import {
-  BUILT_TREE_CAPS,
-  SKIPPED,
   bootTarget,
   buildTarget,
   createCaseNetwork,
+  fingerprintStageTree,
   removeCaseNetwork,
-  sweepCaseResources,
-  type TreeCaps,
+  caseNetworkOfRun,
+  listCaseNetworkRuns,
   type BootOutcome,
   type BootRecipe,
   type BuildOptions,
@@ -22,6 +18,13 @@ import {
 import { canonicalJson } from '../canonical.js';
 import type { EvidenceVariant, ExecutionRequest } from '../executor.js';
 import { BootedTargets, type BootedTarget } from './booted.js';
+import {
+  pidAlive,
+  sweepOrphanedRuns,
+  type LeaseHandle,
+  type RunLedger,
+  type SweepOutcome,
+} from './lease.js';
 import type { TargetEndpoint, TargetProvider } from './executor.js';
 
 /**
@@ -100,8 +103,8 @@ export interface TargetBootDeps {
   removeCaseNetwork(net: CaseNetwork): Promise<void>;
   /** A content hash of a source tree (`fingerprintSourceTree`). */
   fingerprintTree(dir: string): Promise<string>;
-  /** Removes every labelled container and case network left by an earlier run (`sweepCaseResources`). */
-  sweepOrphans(): Promise<{ containers: number; networks: number }>;
+  /** Run ids of every labelled case network on the host (`listCaseNetworkRuns`), for the sweep. */
+  listCaseRuns(): Promise<string[]>;
 }
 
 export const SANDBOX_BOOT: TargetBootDeps = {
@@ -110,49 +113,16 @@ export const SANDBOX_BOOT: TargetBootDeps = {
   bootTarget,
   removeCaseNetwork,
   fingerprintTree: (dir) => fingerprintSourceTree(dir),
-  sweepOrphans: sweepCaseResources,
+  listCaseRuns: listCaseNetworkRuns,
 };
 
 /**
- * SHA-256 over a source tree as the build would stage it: every regular file's relative path and
- * bytes, and every symlink's path and target text (never followed), in sorted order, skipping what
- * staging skips (`SKIPPED`: `.git`, `node_modules`, `.env*`, `.npmrc`). Two trees with the same
- * fingerprint stage to the same build context, so a safe variant equal to its vulnerable tree is
- * caught before anything is built. Read only, `lstat` only. Throws past `BUILT_TREE_CAPS`.
+ * Fingerprint of a source tree as the build stages it (`fingerprintStageTree`, the same walker
+ * as `stageTree`: directories and regular files with their exec bit, minus skipped names; links
+ * left out). Two trees with the same fingerprint stage to the same build context, so a safe variant
+ * equal to its vulnerable tree is caught before anything is built.
  */
-export async function fingerprintSourceTree(
-  root: string,
-  caps: Readonly<TreeCaps> = BUILT_TREE_CAPS,
-): Promise<string> {
-  const hash = createHash('sha256');
-  let entries = 0;
-  let bytes = 0;
-  const walk = async (rel: string): Promise<void> => {
-    const names = (await readdir(join(root, rel))).sort();
-    for (const name of names) {
-      if (SKIPPED(name)) continue;
-      const r = rel === '' ? name : `${rel}/${name}`;
-      const p = join(root, r);
-      const st = await lstat(p);
-      if (++entries > caps.maxEntries) throw new Error('source tree has too many entries');
-      if (st.isDirectory()) {
-        hash.update(`d\0${r}\0`);
-        await walk(r);
-      } else if (st.isFile()) {
-        bytes += st.size;
-        if (bytes > caps.maxBytes) throw new Error('source tree is too large');
-        hash.update(`f\0${r}\0${st.size}\0`);
-        hash.update(await readFile(p));
-      } else if (st.isSymbolicLink()) {
-        hash.update(`l\0${r}\0${await readlink(p)}\0`);
-      } else {
-        hash.update(`o\0${r}\0`);
-      }
-    }
-  };
-  await walk('');
-  return hash.digest('hex');
-}
+export const fingerprintSourceTree = (dir: string): Promise<string> => fingerprintStageTree(dir);
 
 /**
  * Why a case's targets could not be booted. `unsupported`: outside what the MVP can boot without
@@ -213,6 +183,11 @@ export interface CaseTargetsOptions {
   /** The pinned dependency bundle for a case (`pinnedDependencyBundle`), if it has one. */
   dependencyBundle?: (caseFile: CaseFile) => DependencyBundleRef | undefined;
   deps?: TargetBootDeps;
+  /**
+   * The worker's lease (`WorkerLease`): every case network is recorded before anything runs on it
+   * and forgotten once removed, so another worker's startup sweep never removes a live target.
+   */
+  lease?: RunLedger;
 }
 
 interface Session {
@@ -430,12 +405,21 @@ export class CaseTargets implements TargetProvider {
   }
 
   /**
-   * Removes every labelled container and case network an earlier worker process left (it died
-   * mid-case, so nothing released them). Call once at startup, before any case is booted, on a
-   * host where this process is the only Affidavit user of Docker.
+   * Startup sweep (`sweepOrphanedRuns`): removes the case networks, and every container on them, of
+   * workers whose lease shows they are dead. A run no lease claims, or whose owner may be alive,
+   * is never removed. Off unless the composition root asks for it.
    */
-  sweepOrphans(): Promise<{ containers: number; networks: number }> {
-    return this.#deps.sweepOrphans();
+  sweepOrphans(
+    leaseDir: string,
+    owner: Pick<LeaseHandle, 'ownerId' | 'hostname'>,
+    opts: { isAlive?: (pid: number) => boolean; warn?: (m: string) => void } = {},
+  ): Promise<SweepOutcome> {
+    return sweepOrphanedRuns(leaseDir, owner, {
+      listRuns: () => this.#deps.listCaseRuns(),
+      removeRun: (runId) => this.#deps.removeCaseNetwork(caseNetworkOfRun(runId)),
+      isAlive: opts.isAlive ?? pidAlive,
+      warn: opts.warn ?? ((m) => process.emitWarning(m)),
+    });
   }
 
   async #removeAll(nets: readonly CaseNetwork[]): Promise<{ left: CaseNetwork[]; first?: Error }> {
@@ -444,6 +428,7 @@ export class CaseTargets implements TargetProvider {
     for (const net of nets) {
       try {
         await this.#deps.removeCaseNetwork(net);
+        await this.#opts.lease?.removeRun(net.runId).catch(() => undefined);
       } catch (err) {
         left.push(net);
         first ??= err instanceof Error ? err : new Error(message(err));
@@ -667,6 +652,12 @@ export class CaseTargets implements TargetProvider {
           return await teardown(fail('boot-failed', v, 'network', `case network: ${message(err)}`));
         }
         nets.push(net);
+        // Recorded before anything runs on it; a lease that cannot be written is a failed boot.
+        try {
+          await this.#opts.lease?.addRun(net.runId);
+        } catch (err) {
+          return await teardown(fail('boot-failed', v, 'network', `worker lease: ${message(err)}`));
+        }
         let boot: BootOutcome;
         try {
           boot = await this.#deps.bootTarget(net, b.imageId, b.recipe);

@@ -1,5 +1,5 @@
 import { readFile, realpath, stat } from 'node:fs/promises';
-import { isAbsolute, relative, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type {
   CaseFile,
   EvidenceStore,
@@ -26,6 +26,7 @@ import { DEFAULT_POLICY, type JudgePolicy } from '../rules.js';
 import { JailExecutor } from './executor.js';
 import { localImagePresent } from './harness.js';
 import { CaseTargets, type SourceResolver, type TargetBootDeps } from './targets.js';
+import { WorkerLease, type LeaseHandle } from './lease.js';
 import { JailedPatchWorkbench } from './workbench.js';
 
 /** A pinned dependency bundle the real Judge may build a repository's targets with. */
@@ -71,10 +72,14 @@ export interface RealJudgeConfig {
   /** Docker daemon config that registers the gVisor runtimes (default `/etc/docker/daemon.json`). */
   dockerDaemonConfig?: string;
   /**
-   * Remove every labelled container and case network a previous worker run left, at startup
-   * (default true). Turn off only on a host shared with another live Affidavit process.
+   * At startup, remove the case networks (and their containers) of workers proven dead: a lease
+   * in `leaseDir` on this host name whose pid no longer exists. Default false; the worker turns it
+   * on when `AFFIDAVIT_SWEEP_ORPHANS=1`. A live worker's runs, another host's runs and runs no
+   * lease claims are never removed.
    */
   sweepOrphans?: boolean;
+  /** Directory of worker lease files shared by every worker on this host (default `<workRoot>/leases`). */
+  leaseDir?: string;
 }
 
 /** Host facts the startup check reads; injectable so the check is tested without a host. */
@@ -154,7 +159,11 @@ const fold = (platform: NodeJS.Platform, p: string): string =>
 
 function inside(child: string, parent: string, platform: NodeJS.Platform): boolean {
   const rel = relative(fold(platform, parent), fold(platform, child));
-  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+  if (rel === '') return true;
+  // Outside only when the first segment is exactly `..` or the result is absolute (another drive
+  // on Windows); a child named `..evidence` is inside.
+  const outside = rel === '..' || rel.startsWith(`..${sep}`) || rel.startsWith('../');
+  return !outside && !isAbsolute(rel);
 }
 
 /** Replaces every configured path in a message with its name, so no host value is echoed. */
@@ -442,12 +451,22 @@ export interface RealJudge {
  */
 export async function createRealJudge(
   config: RealJudgeConfig,
-  opts: { probe?: RealJudgeHostProbe; deps?: TargetBootDeps } = {},
+  opts: { probe?: RealJudgeHostProbe; deps?: TargetBootDeps; lease?: LeaseHandle } = {},
 ): Promise<RealJudge> {
   const report = await checkRealJudgePrerequisites(config, opts.probe);
   if (report.problems.length > 0) throw new RealJudgePrerequisiteError(report.problems);
 
+  const leaseDir = config.leaseDir ?? join(config.workRoot, 'leases');
+  let lease: LeaseHandle;
+  try {
+    lease = opts.lease ?? (await WorkerLease.acquire(leaseDir));
+  } catch (err) {
+    throw new RealJudgePrerequisiteError([
+      `the worker lease cannot be written in leaseDir: ${(err as Error).message.slice(0, 300)}`,
+    ]);
+  }
   const targets = new CaseTargets({
+    lease,
     workRoot: config.workRoot,
     sources: config.sources,
     // The bundle is pinned to the vulnerable commit; the safe tree is built with the same one,
@@ -456,12 +475,14 @@ export async function createRealJudge(
       report.bundles.find((b) => b.repo === cf.target.repo && b.commit === cf.target.commit)?.ref,
     ...(opts.deps === undefined ? {} : { deps: opts.deps }),
   });
-  if (config.sweepOrphans !== false) {
+  // Off by default: a sweep removes only runs whose lease proves a dead owner on this host.
+  if (config.sweepOrphans === true) {
     try {
-      await targets.sweepOrphans();
+      await targets.sweepOrphans(leaseDir, lease);
     } catch (err) {
+      await lease.close().catch(() => undefined);
       throw new RealJudgePrerequisiteError([
-        `the startup sweep of labelled containers and networks from a previous run failed: ${(err as Error).message.slice(0, 300)}`,
+        `the startup sweep of case networks left by dead workers failed: ${(err as Error).message.slice(0, 300)}`,
       ]);
     }
   }
@@ -490,6 +511,11 @@ export async function createRealJudge(
     signer: config.signer,
     notes: report.notes,
     release: (caseId) => targets.release(caseId),
-    close: () => targets.close(),
+    // The lease is deleted only after every case network is gone, so a failed teardown stays
+    // claimed by this (then dead) worker and a later sweep can remove it.
+    close: async () => {
+      await targets.close();
+      await lease.close();
+    },
   };
 }

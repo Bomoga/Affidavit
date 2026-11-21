@@ -14,6 +14,7 @@ import type { ExecutionRequest, RawAttempt } from '../executor.js';
 import { Judge } from '../judge.js';
 import { DEFAULT_POLICY } from '../rules.js';
 import { gateCaseFile, gateWitness, raw, ScriptedExecutor } from '../test-helpers.js';
+import { WorkerLease } from './lease.js';
 import { CaseBoundJudge } from './real.js';
 import {
   CaseBootError,
@@ -112,9 +113,9 @@ function fakeDeps(o: FakeOpts = {}) {
     fingerprintTree(dir) {
       return o.fingerprint ? o.fingerprint(dir) : Promise.resolve(`tree:${dir}`);
     },
-    sweepOrphans() {
-      log.push('sweep');
-      return Promise.resolve({ containers: 0, networks: 0 });
+    listCaseRuns() {
+      log.push('list');
+      return Promise.resolve([...alive].map((n) => n.slice('affidavit-net-'.length)));
     },
   };
   return { deps, log, alive, buildOpts };
@@ -605,10 +606,100 @@ describe('sessions after a failed teardown (review of #61)', () => {
     expect(targets.caseIds).toEqual([]);
   });
 
-  it('sweepOrphans delegates to the sandbox sweep', async () => {
-    const { targets, log } = provider();
-    expect(await targets.sweepOrphans()).toEqual({ containers: 0, networks: 0 });
-    expect(log).toEqual(['sweep']);
+  describe('worker lease', () => {
+    const hexNet = (n: number): Promise<CaseNetwork> => {
+      const runId = n.toString(16).padStart(16, '0');
+      return Promise.resolve({ name: `affidavit-net-${runId}`, runId, subnet: '' });
+    };
+    const ledger = (fail = false) => {
+      const l = {
+        runs: [] as string[],
+        addRun: (r: string) => {
+          if (fail) return Promise.reject(new Error('disk full'));
+          l.runs.push(r);
+          return Promise.resolve();
+        },
+        removeRun: (r: string) => {
+          l.runs = l.runs.filter((x) => x !== r);
+          return Promise.resolve();
+        },
+      };
+      return l;
+    };
+
+    it('records each case network before booting on it, and forgets it once removed', async () => {
+      const f = fakeDeps({ createNetwork: hexNet });
+      const lease = ledger();
+      const resolved = new CaseTargets({
+        workRoot: '/work',
+        sources: (_cf, v) => Promise.resolve({ ok: true, dir: v === 'safe' ? SAFE_DIR : VULN_DIR }),
+        deps: f.deps,
+        lease,
+      });
+      const cf = caseFile();
+      expect(await resolved.boot(cf)).toMatchObject({ ok: true });
+      expect(lease.runs).toEqual(['0000000000000001', '0000000000000002']);
+      await resolved.release(cf.id);
+      expect(lease.runs).toEqual([]);
+    });
+
+    it('a lease that cannot be written is a boot failure that tears down the network', async () => {
+      const f = fakeDeps({ createNetwork: hexNet });
+      const targets = new CaseTargets({
+        workRoot: '/work',
+        sources: (_cf, v) => Promise.resolve({ ok: true, dir: v === 'safe' ? SAFE_DIR : VULN_DIR }),
+        deps: f.deps,
+        lease: ledger(true),
+      });
+      expect(await targets.boot(caseFile())).toMatchObject({
+        ok: false,
+        kind: 'boot-failed',
+        step: 'network',
+        reason: expect.stringMatching(/worker lease: disk full/) as unknown,
+      });
+      expect(f.log.some((l) => l.startsWith('boot '))).toBe(false);
+      expect(f.alive.size).toBe(0);
+    });
+
+    it('sweepOrphans removes only a dead owner run and never a live or unclaimed one', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'affidavit-targets-lease-'));
+      try {
+        const f = fakeDeps({ createNetwork: hexNet });
+        // Three labelled networks on the host: run 1 (dead owner), 2 (live owner), 3 (no lease).
+        for (let i = 0; i < 3; i++) await f.deps.createCaseNetwork();
+        const mine = await WorkerLease.acquire(dir, { hostname: 'h', heartbeatMs: 0 });
+        const dead = await WorkerLease.acquire(dir, {
+          hostname: 'h',
+          pid: 2 ** 30,
+          heartbeatMs: 0,
+        });
+        await dead.addRun('0000000000000001');
+        const live = await WorkerLease.acquire(dir, {
+          hostname: 'h',
+          pid: process.pid,
+          heartbeatMs: 0,
+        });
+        await live.addRun('0000000000000002');
+        const targets = new CaseTargets({
+          workRoot: '/work',
+          sources: directorySources([]),
+          deps: f.deps,
+          lease: mine,
+        });
+        const out = await targets.sweepOrphans(dir, mine, { warn: () => undefined });
+        expect(out.removed).toEqual(['0000000000000001']);
+        expect(out.kept).toEqual(['0000000000000002']);
+        expect(out.unknown).toEqual(['0000000000000003']);
+        expect([...f.alive].sort()).toEqual([
+          'affidavit-net-0000000000000002',
+          'affidavit-net-0000000000000003',
+        ]);
+        await live.close();
+        await mine.close();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 });
 

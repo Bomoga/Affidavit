@@ -1,5 +1,9 @@
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { EvidenceStore, SignerPort } from '@affidavit/contracts';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { LEASE_SCHEMA } from './lease.js';
 import { gateCaseFile, gateWitness, GATE_PATCH_DIFF, patchExhibit } from '../test-helpers.js';
 import {
   checkRealJudgePrerequisites,
@@ -183,6 +187,30 @@ describe('checkRealJudgePrerequisites', () => {
       noSecrets(r.problems);
     });
 
+    const rootedAt = (workRoot: string, evidenceRoot: string) => {
+      const evidence: EvidenceStore & { root: string } = { ...store, root: evidenceRoot };
+      return config({ workRoot, evidenceRoot, evidence });
+    };
+
+    it('a directory literally named `..evidence` under the work root is inside it', async () => {
+      const r = await checkRealJudgePrerequisites(
+        rootedAt('/data', '/data/..evidence'),
+        goodProbe(),
+      );
+      expect(r.problems.join('\n')).toMatch(/must not contain one another/);
+    });
+
+    it('siblings and other drives are not contained', async () => {
+      for (const [w, e] of [
+        ['/data/work', '/data/work-evidence'],
+        ['/data/..work', '/data/evidence'],
+        ['C:/data', 'D:/data/evidence'],
+      ] as const) {
+        const r = await checkRealJudgePrerequisites(rootedAt(w, e), goodProbe());
+        expect(r.problems.join('\n')).not.toMatch(/must not contain one another/);
+      }
+    });
+
     it('refuses an evidence store that resolves inside the work root, or to the same directory', async () => {
       for (const target of [`${WORK}/ev`, WORK]) {
         const r = await checkRealJudgePrerequisites(
@@ -236,35 +264,119 @@ describe('checkRealJudgePrerequisites', () => {
 });
 
 describe('createRealJudge', () => {
-  let sweeps = 0;
+  let listed = 0;
   const nothingStarts: TargetBootDeps = {
     buildTarget: () => Promise.reject(new Error('must not build')),
     createCaseNetwork: () => Promise.reject(new Error('must not start')),
     bootTarget: () => Promise.reject(new Error('must not start')),
     removeCaseNetwork: () => Promise.resolve(),
     fingerprintTree: (d) => Promise.resolve(d),
-    sweepOrphans: () => {
-      sweeps++;
-      return Promise.resolve({ containers: 0, networks: 0 });
+    listCaseRuns: () => {
+      listed++;
+      return Promise.resolve([]);
     },
   };
+  /** An in-memory lease, so no test writes under the fake work root. */
+  const memLease = () => {
+    const l = {
+      ownerId: 'test-owner',
+      hostname: 'test-host',
+      runs: [] as string[],
+      closed: 0,
+      addRun: (r: string) => {
+        l.runs.push(r);
+        return Promise.resolve();
+      },
+      removeRun: (r: string) => {
+        l.runs = l.runs.filter((x) => x !== r);
+        return Promise.resolve();
+      },
+      close: () => {
+        l.closed++;
+        return Promise.resolve();
+      },
+    };
+    return l;
+  };
+  let leaseDir = '';
+  beforeEach(() => {
+    leaseDir = mkdtempSync(join(tmpdir(), 'affidavit-real-lease-'));
+  });
+  afterEach(() => {
+    rmSync(leaseDir, { recursive: true, force: true });
+  });
 
   it('throws a RealJudgePrerequisiteError before anything is built', async () => {
-    const err = await createRealJudge(config(), {
+    const before = listed;
+    const lease = memLease();
+    const err = await createRealJudge(config({ sweepOrphans: true }), {
       probe: goodProbe({ isSocket: () => Promise.resolve(false) }),
       deps: nothingStarts,
+      lease,
     }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(RealJudgePrerequisiteError);
     expect((err as Error).message).toMatch(/signerSocket/);
     noSecrets([(err as Error).message]);
-    expect(sweeps).toBe(0);
+    expect(listed).toBe(before);
   });
 
-  it('sweeps orphans of a previous worker run at startup, after the check passes', async () => {
-    const before = sweeps;
-    const real = await createRealJudge(config(), { probe: goodProbe(), deps: nothingStarts });
-    expect(sweeps).toBe(before + 1);
+  it('does not sweep by default, and closes its lease after the targets on close', async () => {
+    const before = listed;
+    const lease = memLease();
+    const real = await createRealJudge(config(), {
+      probe: goodProbe(),
+      deps: nothingStarts,
+      lease,
+    });
+    expect(listed).toBe(before);
+    expect(lease.closed).toBe(0);
     await real.close();
+    expect(lease.closed).toBe(1);
+  });
+
+  it('with sweepOrphans, sweeps only runs a dead lease on this host proves orphaned', async () => {
+    const live = 'a'.repeat(16);
+    const dead = 'b'.repeat(16);
+    const stray = 'c'.repeat(16);
+    const mk = (pid: number, runIds: string[]) =>
+      JSON.stringify({
+        schema: LEASE_SCHEMA,
+        ownerId: `o${pid}`,
+        hostname: 'test-host',
+        pid,
+        startedAt: 0,
+        heartbeatAt: Date.now(),
+        runIds,
+      });
+    writeFileSync(join(leaseDir, 'live.json'), mk(process.pid, [live]));
+    // A pid far above any default pid_max is never a live process.
+    writeFileSync(join(leaseDir, 'dead.json'), mk(2 ** 30, [dead]));
+    const removed: string[] = [];
+    const deps: TargetBootDeps = {
+      ...nothingStarts,
+      listCaseRuns: () => Promise.resolve([live, dead, stray]),
+      removeCaseNetwork: (net) => {
+        removed.push(net.runId);
+        return Promise.resolve();
+      },
+    };
+    const real = await createRealJudge(config({ sweepOrphans: true, leaseDir }), {
+      probe: goodProbe(),
+      deps,
+      lease: memLease(),
+    });
+    expect(removed).toEqual([dead]);
+    await real.close();
+  });
+
+  it('acquires a lease file in leaseDir and deletes it on close', async () => {
+    const real = await createRealJudge(config({ leaseDir }), {
+      probe: goodProbe(),
+      deps: nothingStarts,
+    });
+    expect(readdirSync(leaseDir)).toHaveLength(1);
+    await real.close();
+    expect(readdirSync(leaseDir)).toEqual([]);
   });
 
   it('assembles the Judge on the case targets and hands the case bundle to the builds', async () => {
@@ -281,7 +393,7 @@ describe('createRealJudge', () => {
         });
       },
     };
-    const real = await createRealJudge(config(), { probe: goodProbe(), deps });
+    const real = await createRealJudge(config(), { probe: goodProbe(), deps, lease: memLease() });
     expect(real.evidence).toBe(store);
     expect(real.signer).toBe(signer);
     const cf = gateCaseFile();
@@ -340,9 +452,13 @@ describe('createRealJudge', () => {
         }),
       removeCaseNetwork: () => Promise.resolve(),
       fingerprintTree: (d) => Promise.resolve(d),
-      sweepOrphans: () => Promise.resolve({ containers: 0, networks: 0 }),
+      listCaseRuns: () => Promise.resolve([]),
     };
-    const real = await createRealJudge(noRescan, { probe: goodProbe(), deps });
+    const real = await createRealJudge(noRescan, {
+      probe: goodProbe(),
+      deps,
+      lease: memLease(),
+    });
     expect(real.notes.join('\n')).toMatch(/RescanPort/);
     const cf = gateCaseFile();
     await expect(
