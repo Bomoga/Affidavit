@@ -417,3 +417,48 @@ describe('output size policy', () => {
     );
   });
 });
+
+describe('Judge egress log (L2-11)', () => {
+  const event = {
+    syscall: 'connect',
+    family: 'ipv4',
+    address: '1.1.1.1',
+    port: 443,
+    outcome: 'blocked',
+    errno: 101,
+    dns: false,
+  } as const;
+
+  it('hands the recorder every attempt of every run, tagged with the run, once per exhibit', async () => {
+    const exec = new ScriptedExecutor((req) => ({
+      ...differentialTarget(3)(req),
+      ...(req.variant === 'safe' && req.attempt === 2
+        ? { egressAttempts: 1, egress: [event] }
+        : {}),
+    }));
+    const calls: [string, unknown[]][] = [];
+    const judge = new Judge(exec, DEFAULT_POLICY, undefined, {
+      record: (id, entries) => calls.push([id, [...entries]]),
+    });
+    const result = await judge.runWitness(gateCaseFile(), gateWitness(), ['vulnerable']);
+    expect(result.rejectedBy).toBe('no-egress');
+    expect(calls).toEqual([
+      [witnessExhibitId(gateWitness()), [{ ...event, variant: 'safe', attempt: 2 }]],
+    ]);
+  });
+
+  it('records an empty log for a clean exhibit, and nothing for one refused before running', async () => {
+    const calls: [string, number][] = [];
+    const judge = new Judge(
+      new ScriptedExecutor(differentialTarget(3)),
+      DEFAULT_POLICY,
+      undefined,
+      {
+        record: (id, entries) => calls.push([id, entries.length]),
+      },
+    );
+    await judge.runWitness(gateCaseFile(), gateWitness(), ['vulnerable']);
+    await judge.runCounterexample(gateCaseFile(), gateWitness(), counterexample({ kind: 'patch' }));
+    expect(calls).toEqual([[witnessExhibitId(gateWitness()), 0]]);
+  });
+});

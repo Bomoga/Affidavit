@@ -864,3 +864,37 @@ describe('Judge.verifyPatch', () => {
     expect(r.familyFlipped).toBe(true);
   });
 });
+
+describe('verifyPatch egress log (L2-11)', () => {
+  it('records one log for the patch, covering the family and counterexample runs', async () => {
+    const event = {
+      syscall: 'sendto',
+      family: 'ipv4',
+      address: '127.0.0.11',
+      port: 53,
+      outcome: 'sent',
+      errno: null,
+      dns: true,
+    } as const;
+    const exec = new ScriptedExecutor((req) => ({
+      ...fixedByPatch(req),
+      ...(req.variant === 'patched' && req.attempt === 1
+        ? { egressAttempts: 1, egress: [event] }
+        : {}),
+    }));
+    const calls: [string, unknown[]][] = [];
+    const judge = new Judge(
+      exec,
+      DEFAULT_POLICY,
+      { workbench: new ScriptedWorkbench({}), rescan: new RecordingRescan(true) },
+      { record: (id, entries) => calls.push([id, [...entries]]) },
+    );
+    await judge.verifyPatch(gateCaseFile(), patchExhibit(), witness(), [counterexample()]);
+    expect(calls.map(([id]) => id)).toEqual([PATCH_ID]);
+    // Family on patched attempt 1, then the counterexample's own patched attempt 1.
+    expect(calls[0]?.[1]).toEqual([
+      { ...event, variant: 'patched', attempt: 1 },
+      { ...event, variant: 'patched', attempt: 1 },
+    ]);
+  });
+});

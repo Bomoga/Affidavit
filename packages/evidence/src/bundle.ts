@@ -25,6 +25,28 @@ export const CASEFILE_ENTRY_ID = 'casefile';
 /** Exhibit ids become file names, so they must be safe ones. Minted ids always are. */
 const FILE_SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 
+/** Most egress entries one record may carry (50 per run, many runs for a patch). */
+export const MAX_EGRESS_ENTRIES = 4096;
+
+/**
+ * One attempt to reach outside the jail during one run of the exhibit (L2-11), as the Judge's
+ * `EgressRecorder` hands it over: what gVisor recorded, never the jailed command's name. A record,
+ * not a rule: admissibility comes from `result.egressAttempts` and the trace check.
+ */
+export const EgressEntry = z.object({
+  variant: z.enum(['vulnerable', 'safe', 'patched']),
+  attempt: z.union([z.literal(1), z.literal(2), z.literal(3)]),
+  syscall: z.enum(['connect', 'sendto', 'sendmsg', 'sendmmsg']),
+  family: z.enum(['ipv4', 'ipv6']),
+  address: z.string().min(1).max(45),
+  port: z.int().min(0).max(65535).nullable(),
+  outcome: z.enum(['blocked', 'sent']),
+  errno: z.int().min(1).nullable(),
+  dns: z.boolean(),
+});
+export type EgressEntry = z.infer<typeof EgressEntry>;
+const EgressLog = z.array(EgressEntry).max(MAX_EGRESS_ENTRIES).optional();
+
 /**
  * One exhibit as the Judge saw it: what was submitted, exactly as submitted (it may be malformed,
  * and replay must reach the same rejection), and the result the Judge recorded. A counterexample
@@ -35,6 +57,8 @@ export const WitnessRecord = z.object({
   kind: z.literal('witness'),
   witness: z.json(),
   result: ExhibitResult,
+  /** Absent in bundles built before L2-11 or without a recorder; `[]` means nothing tried. */
+  egress: EgressLog,
 });
 export const CounterexampleRecord = z.object({
   schemaVersion: z.literal(1),
@@ -42,6 +66,8 @@ export const CounterexampleRecord = z.object({
   witnessExhibitId: ExhibitId,
   counterexample: z.json(),
   result: ExhibitResult,
+  /** Absent in bundles built before L2-11 or without a recorder; `[]` means nothing tried. */
+  egress: EgressLog,
 });
 export const PatchRecord = z.object({
   schemaVersion: z.literal(1),
@@ -50,6 +76,8 @@ export const PatchRecord = z.object({
   counterexampleExhibitIds: z.array(ExhibitId),
   patch: z.json(),
   result: VerifyResult,
+  /** Absent in bundles built before L2-11 or without a recorder; `[]` means nothing tried. */
+  egress: EgressLog,
 });
 export const ExhibitRecord = z.discriminatedUnion('kind', [
   WitnessRecord,
@@ -124,6 +152,21 @@ function pinnedDigests(cf: CaseFile): Partial<Record<TargetVariant, ImageDigest>
   return out;
 }
 
+/**
+ * An egress log must fit its record: no more entries than the result counted (a witness or
+ * counterexample), and only variants that kind of exhibit runs on.
+ */
+function checkEgressLog(id: string, r: ExhibitRecord): void {
+  if (r.egress === undefined) return;
+  const allowed = r.kind === 'patch' ? ['vulnerable', 'patched'] : ['vulnerable', 'safe'];
+  if (r.egress.some((e) => !allowed.includes(e.variant))) {
+    throw new BundleIntegrityError(id, 'egress log names a variant this exhibit never runs on');
+  }
+  if (r.kind !== 'patch' && r.egress.length > r.result.egressAttempts) {
+    throw new BundleIntegrityError(id, 'egress log lists more attempts than the result counted');
+  }
+}
+
 /** Checks that every reference between records resolves to the right kind of record. */
 function checkReferences(records: ReadonlyMap<string, ExhibitRecord>): void {
   const expectKind = (from: string, id: string, kind: ExhibitRecord['kind']) => {
@@ -135,6 +178,7 @@ function checkReferences(records: ReadonlyMap<string, ExhibitRecord>): void {
     }
   };
   for (const [id, r] of records) {
+    checkEgressLog(id, r);
     if (r.kind === 'counterexample') expectKind(id, r.witnessExhibitId, 'witness');
     if (r.kind === 'patch') {
       expectKind(id, r.witnessExhibitId, 'witness');

@@ -146,6 +146,7 @@ async function collectTrace(root: string, id: string, maxBytes: number): Promise
 /** Observations for a run whose trace passed its cap: it cannot be shown to be clean. */
 const OVERFLOWED: TraceObservations = {
   egressAttempts: 0,
+  egress: [],
   deniedReads: 0,
   deniedWrites: 0,
   pidsLimitHit: false,
@@ -155,6 +156,7 @@ const OVERFLOWED: TraceObservations = {
 
 const UNTRACED: TraceObservations = {
   egressAttempts: 0,
+  egress: [],
   deniedReads: 0,
   deniedWrites: 0,
   pidsLimitHit: false,

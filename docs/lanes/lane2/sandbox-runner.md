@@ -96,6 +96,12 @@ gVisor cannot start under an SELinux process label (`SELinux is not supported: s
 | `pidsLimitHit`                | A fork or clone refused with `EAGAIN`, or gVisor's warning that the host refused it a process (below)                                                                                                    |
 | `oomKilled`, `timedOut`       | Docker's container state and the runner's own timer                                                                                                                                                      |
 
+### Egress log (L2-11)
+
+Besides the count, `parseTrace` lists the first 50 egress attempts of a run (`trace.egress`, `MAX_EGRESS_EVENTS`) in trace order: syscall, address family, destination address and port, `blocked` (the syscall failed, with its errno) or `sent` (it returned success, for example a UDP send to the embedded resolver), and `dns` for Docker's embedded resolver on 127.0.0.11. Only what gVisor renders itself is kept, never the command name or a path, which the jailed process controls; an entry is listed only when its address is a well-formed IP address, though every attempt is still counted. `egressAttempts` and the trace check decide `no-egress`; the log is a record for the evidence bundle and never changes a verdict.
+
+The Judge hands each judged exhibit's log, tagged with variant and attempt, to an optional `EgressRecorder` (`new Judge(executor, policy, verify, recorder)`, or `egressRecorder` in `createRealJudge`), and the caller files it in the exhibit's bundle record (`docs/lanes/lane2/evidence-bundles.md`).
+
 The runner throws, rather than reporting a clean run, when Docker or the runtime is missing, the trace is missing or empty, or a container or volume is left behind. The trace file is deleted after reading.
 
 ### No volumes

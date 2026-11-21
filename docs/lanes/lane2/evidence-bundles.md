@@ -38,6 +38,14 @@ vulnerable commit plus the patch.
 { schemaVersion: 1, kind: 'patch',          witnessExhibitId, counterexampleExhibitIds, patch, result: VerifyResult }
 ```
 
+Each record may also carry `egress`, its egress log (L2-11): one entry per attempt to reach
+outside the jail during its runs, with the run's variant and attempt, the syscall, destination
+address and port, `blocked` or `sent`, the errno, and whether it went to Docker's DNS resolver. It
+is inside the exhibit file, so the exhibit digest and the signed manifest cover it. Absent means
+no log was recorded (bundles from before L2-11, or a Judge without a recorder); `[]` means nothing
+tried to leave. Replay ignores it: it compares outcomes, and the count in the result already
+decides `no-egress`.
+
 The submission is stored exactly as submitted, even when malformed, so replay reaches the same
 `schema` rejection. A counterexample and a patch name the witness exhibit they ran against, so
 replay calls the Judge the same way. The record is filed under the id in its result
@@ -66,6 +74,8 @@ Before anything runs, and failing with `BundleIntegrityError` naming the exhibit
    present, equal the manifest's. Replay uses the manifest's digests.
 7. Each record holds the result for its own id, every reference resolves to a record of the right
    kind, `results` lists every record exactly once, and every exhibit the verdict cites is present.
+   An egress log names only variants its kind of exhibit runs on, and a witness or counterexample
+   log lists no more attempts than its result counted.
 
 Changing any byte of an exhibit fails step 4 with that exhibit's id. Rewriting a record and its
 manifest digest together fails at step 1 when the bundle digest is checked, and from L2-09 the

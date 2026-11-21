@@ -269,3 +269,57 @@ describe('storeBundle and loadBundle', () => {
     expect(await loadBundle(store, '0'.repeat(64))).toBeNull();
   });
 });
+
+describe('egress log in exhibit records (L2-11)', () => {
+  const entry = {
+    variant: 'safe',
+    attempt: 2,
+    syscall: 'connect',
+    family: 'ipv4',
+    address: '1.1.1.1',
+    port: 443,
+    outcome: 'blocked',
+    errno: 101,
+    dns: false,
+  } as const;
+  const withLog = (egress: unknown[], count = 1) => {
+    const [w, ...rest] = records();
+    return bundleInput({
+      exhibits: [
+        { ...w!, egress, result: { ...w!.result, egressAttempts: count } } as (typeof rest)[0],
+        ...rest,
+      ],
+    });
+  };
+
+  it('carries the log inside the exhibit, under its digest, and reads it back', async () => {
+    const { bytes } = await buildBundle(withLog([entry]));
+    const opened = await openBundle(bytes);
+    expect(opened.exhibits.get('exhibit-witness-001')?.egress).toEqual([entry]);
+    const changed = await tamper(bytes, (files) => {
+      const name = 'exhibits/exhibit-witness-001.json';
+      files.set(
+        name,
+        Buffer.from(Buffer.from(files.get(name)!).toString().replace('1.1.1.1', '9.9.9.9')),
+      );
+    });
+    await expect(openBundle(changed)).rejects.toThrow(/exhibit-witness-001/);
+  });
+
+  it('keeps bundles without a log valid, and an empty log means nothing tried', async () => {
+    const { bytes } = await buildBundle(bundleInput());
+    expect((await openBundle(bytes)).exhibits.get('exhibit-witness-001')?.egress).toBeUndefined();
+    const empty = await buildBundle(withLog([], 0));
+    expect((await openBundle(empty.bytes)).exhibits.get('exhibit-witness-001')?.egress).toEqual([]);
+  });
+
+  it('refuses a log that does not fit its record', async () => {
+    await expect(buildBundle(withLog([entry, entry], 1))).rejects.toThrow(
+      /more attempts than the result counted/,
+    );
+    await expect(buildBundle(withLog([{ ...entry, variant: 'patched' }]))).rejects.toThrow(
+      /variant this exhibit never runs on/,
+    );
+    await expect(buildBundle(withLog([{ ...entry, port: 70000 }]))).rejects.toThrow();
+  });
+});

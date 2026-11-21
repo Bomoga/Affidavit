@@ -1,4 +1,5 @@
 import type { CaseFile, ParamSpace, TargetRef } from '@affidavit/contracts';
+import type { EgressEvent } from '@affidavit/sandbox';
 
 export type Attempt = 1 | 2 | 3;
 
@@ -45,6 +46,11 @@ export interface RawAttempt {
    * packages/sandbox/src/gvisor/trace.ts), so `egressAttempts` cannot be trusted for this run.
    */
   traceTampered: boolean;
+  /**
+   * The egress attempts gVisor recorded, at most the first 50 (`MAX_EGRESS_EVENTS`); every one
+   * is still counted in `egressAttempts`. Optional: an executor without a trace lists none.
+   */
+  egress?: readonly EgressEvent[];
   /** Raw bytes of the result artifact (see artifact.ts), or null when the runner wrote none. */
   artifact: string | null;
 }

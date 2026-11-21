@@ -72,6 +72,7 @@ export class JailExecutor implements WitnessExecutor {
       stderr: capUtf8(jailed.stderr, req.maxOutputBytes),
       egressAttempts: jailed.trace.egressAttempts,
       traceTampered: jailed.trace.tampered,
+      egress: jailed.trace.egress,
       artifact,
     };
   }

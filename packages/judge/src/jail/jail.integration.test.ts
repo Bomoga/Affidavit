@@ -16,7 +16,7 @@ import { Exhibit, Witness, type ParamSpace } from '@affidavit/contracts';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { ExecutionRequest } from '../executor.js';
 import { counterexampleParamsHeader } from '../counterexample.js';
-import { Judge, counterexampleExhibitId, patchExhibitId } from '../judge.js';
+import { Judge, counterexampleExhibitId, patchExhibitId, type EgressEntry } from '../judge.js';
 import { DEFAULT_POLICY } from '../rules.js';
 import {
   GATE_PATCH_DIFF,
@@ -106,8 +106,12 @@ describe.runIf(onSandboxHost)('witness jail on a sandbox host', { timeout: 300_0
     targets: { endpoint: (req) => Promise.resolve(endpoints.get(stubFor(req)) ?? null) },
     ...over,
   });
+  /** Egress logs the Judge recorded, by exhibit id (L2-11). */
+  const egressLogs = new Map<string, readonly EgressEntry[]>();
   const judge = (over: Partial<JailExecutorOptions> = {}) =>
-    new Judge(new JailExecutor(executorOpts(over)), POLICY);
+    new Judge(new JailExecutor(executorOpts(over)), POLICY, undefined, {
+      record: (id, entries) => egressLogs.set(id, entries),
+    });
   const run = (template: string, params?: ParamSpace) =>
     judge().runWitness(gateCaseFile(), witness(template, params), ['vulnerable']);
 
@@ -327,6 +331,11 @@ describe.runIf(onSandboxHost)('witness jail on a sandbox host', { timeout: 300_0
     );
     expect(r).toMatchObject({ admissible: false, rejectedBy: 'no-egress' });
     expect(r.egressAttempts).toBeGreaterThan(0);
+    // The log names the resolver and port, and flags it as DNS.
+    const log = egressLogs.get(r.exhibitId) ?? [];
+    expect(log.length).toBeGreaterThan(0);
+    expect(log.length).toBeLessThanOrEqual(r.egressAttempts);
+    expect(log.some((e) => e.dns && e.address.endsWith('127.0.0.11') && e.port === 53)).toBe(true);
   });
 
   it('rejects a witness that passes on both variants (differential)', async () => {
@@ -348,6 +357,14 @@ describe.runIf(onSandboxHost)('witness jail on a sandbox host', { timeout: 300_0
     );
     expect(r).toMatchObject({ admissible: false, rejectedBy: 'no-egress' });
     expect(r.egressAttempts).toBeGreaterThan(0);
+    // Every run tried, and each try is listed with where it went and how it ended.
+    const log = egressLogs.get(r.exhibitId) ?? [];
+    const hit = log.filter((e) => e.address === '1.1.1.1' && e.port === 80);
+    expect(new Set(hit.map((e) => `${e.variant}:${e.attempt}`))).toEqual(
+      new Set(['vulnerable:1', 'vulnerable:2', 'vulnerable:3', 'safe:1', 'safe:2', 'safe:3']),
+    );
+    expect(hit.every((e) => e.syscall === 'connect' && e.outcome === 'blocked')).toBe(true);
+    expect(JSON.stringify(log)).not.toMatch(/node|vitest/);
   });
 
   it('rejects a witness that floods the trace past its cap, without crashing', async () => {

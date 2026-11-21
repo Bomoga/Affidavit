@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseTrace } from './trace.js';
+import { MAX_EGRESS_EVENTS, isIpAddress, parseTrace } from './trace.js';
 
 // Lines in the exact shape gVisor's strace writes (captured from runsc release-20261109.0).
 const P = 'I1114 02:07:19.833280       1 strace.go:606] [   3:   3] node';
@@ -160,12 +160,104 @@ describe('parseTrace: processes', () => {
   });
 });
 
+describe('parseTrace: egress log', () => {
+  it('lists each attempt with what gVisor rendered, never the command name', () => {
+    const local = { sensitivePaths: [], localNetworks: ['172.18.0.0/16'] };
+    const t = parseTrace(
+      [
+        exit(connect('AF_INET', '1.1.1.1'), ENETUNREACH),
+        exit(connect('AF_INET', '172.18.0.2', 4000), OK),
+        exit(connect('AF_INET6', '2606:4700:4700::1111', 80), ENETUNREACH),
+        exit(
+          'sendto(0x15 socket:[4], 0x7f00 "q", 0x1, 0x0, 0x7f10 {Family: AF_INET, Addr: 127.0.0.11, Port: 53}, 0x10)',
+          '1 (0x1)',
+        ),
+      ].join('\n'),
+      local,
+    );
+    expect(t.egressAttempts).toBe(3);
+    expect(t.egress).toEqual([
+      {
+        syscall: 'connect',
+        family: 'ipv4',
+        address: '1.1.1.1',
+        port: 443,
+        outcome: 'blocked',
+        errno: 101,
+        dns: false,
+      },
+      {
+        syscall: 'connect',
+        family: 'ipv6',
+        address: '2606:4700:4700::1111',
+        port: 80,
+        outcome: 'blocked',
+        errno: 101,
+        dns: false,
+      },
+      {
+        syscall: 'sendto',
+        family: 'ipv4',
+        address: '127.0.0.11',
+        port: 53,
+        outcome: 'sent',
+        errno: null,
+        dns: true,
+      },
+    ]);
+    expect(JSON.stringify(t.egress)).not.toContain('node');
+  });
+
+  it(`keeps the first ${MAX_EGRESS_EVENTS} and still counts every attempt`, () => {
+    const lines = Array.from({ length: MAX_EGRESS_EVENTS + 7 }, (_, i) =>
+      exit(connect('AF_INET', `10.0.0.${i}`), ENETUNREACH),
+    );
+    const t = parse(...lines);
+    expect(t.egressAttempts).toBe(MAX_EGRESS_EVENTS + 7);
+    expect(t.egress).toHaveLength(MAX_EGRESS_EVENTS);
+    expect(t.egress[0]?.address).toBe('10.0.0.0');
+  });
+
+  it('counts but does not list an address that is not an IP address', () => {
+    const t = parse(exit(connect('AF_INET6', 'zz::not-an-ip'), ENETUNREACH));
+    expect(t.egressAttempts).toBe(1);
+    expect(t.egress).toEqual([]);
+  });
+});
+
+describe('isIpAddress', () => {
+  it.each([
+    '1.1.1.1',
+    '0.0.0.0',
+    '255.255.255.255',
+    '::1',
+    '::',
+    '2606:4700:4700::1111',
+    '::ffff:127.0.0.11',
+    '1:2:3:4:5:6:7:8',
+    'fe80::1:2',
+  ])('accepts %s', (a) => expect(isIpAddress(a)).toBe(true));
+  it.each([
+    '256.1.1.1',
+    '1.1.1',
+    '01.1.1.1',
+    '1::2::3',
+    '1:2:3:4:5:6:7:8:9',
+    '12345::',
+    'zz::1',
+    '::ffff:1.2.3',
+    'x',
+    '',
+  ])('refuses %s', (a) => expect(isIpAddress(a)).toBe(false));
+});
+
 describe('parseTrace: robustness', () => {
   it('ignores lines without gVisor log prefix, so jailed output cannot forge attempts', () => {
     const forged = `[   3:   3] node X ${connect('AF_INET', '1.1.1.1')} = ${ENETUNREACH}`;
     const t = parse(forged, `junk ${exit(connect('AF_INET', '1.1.1.1'), ENETUNREACH)}`);
     expect(t).toEqual({
       egressAttempts: 0,
+      egress: [],
       deniedReads: 0,
       deniedWrites: 0,
       pidsLimitHit: false,
