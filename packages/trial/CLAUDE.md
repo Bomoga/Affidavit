@@ -36,9 +36,38 @@ Run from this directory, or add `--filter @affidavit/trial` from the repo root.
 
 The agent submits `{ choices: [{ name, indices?, values? }] }`, never code. A counterexample is sent to the Judge only if every chosen name is declared by the Defense witness family and chosen once, indices are in range, new values are JSON of a kind the family already uses for that parameter and at most 1024 characters, and the product of the resulting space is at most 64 (placeholders; `DEFAULT_PARAM_LIMITS`). Anything else is recorded as `exhibit-inadmissible` with rule `schema` and not run. Prose with no choices fails the same way. See `counterexample.ts`. CR-T8 and CR-T9 list the contract gaps.
 
+## Real model port (L3-15)
+
+`src/model/` holds `AnthropicModelPort`, the real `ModelPort` on `@anthropic-ai/claude-agent-sdk` 0.3.318. Full guide: `docs/lanes/lane3/model-port.md`.
+
+To turn it on (the composition root in apps/worker still has to call `createModelPortFromEnv`; that wiring is Lane 1's):
+
+```sh
+# >>> API KEY GOES HERE, from the shared secrets store. Never commit it or write it to a file in the repo. <<<
+export ANTHROPIC_API_KEY="<from the secrets store>"
+export AFFIDAVIT_TRIAL_IMPL=real
+export AFFIDAVIT_MODEL_MODE=live   # or record, or replay (no key needed)
+# record also needs an explicit output dir; there is no default:
+# export AFFIDAVIT_RECORD_DIR=fixtures/models
+```
+
+Record and replay start only when `AFFIDAVIT_ENV` is `development` or `test` (trimmed, any case); unset or anything else means live only. Record refuses a submission holding credential-shaped text unless `AFFIDAVIT_RECORD_ALLOW_SECRETS=1`; a recording marked `redacted: true` is never replayed to the Judge. The worker image must contain no Claude Code managed-settings file: `settingSources: []` still reads it.
+
+**Set a monthly spend limit on the key in the Anthropic Console before the first run.** The per-case budget is a second guard, not the only one. Optional: `AFFIDAVIT_MODEL_TIMEOUT_MS`, `AFFIDAVIT_MODEL_FIXTURES_DIR`, `AFFIDAVIT_MODEL_CONFIG`, and one `ANTHROPIC_MODEL_<PROMPT>` per prompt id (see the guide).
+
+Invariants, each covered by a test in `src/model/anthropic.test.ts` with a stubbed transport (no test touches the network):
+
+- `allowedTools` is exactly the role's submit tools; `tools: []`, `permissionMode: 'dontAsk'`, no other MCP config, no setting sources, empty throwaway cwd and home.
+- The key is read from `ANTHROPIC_API_KEY` on each call and never appears in an error, log, result, event, or recording.
+- A missing key throws `ModelUnconfiguredError` from `preflight`, before the orchestrator charges; the run halts with reason `model-unconfigured`.
+- Unknown model ids, a model that does not match the table, or a system prompt that is not the packaged one fail closed before any call.
+- Submit tools are `alwaysLoad`, and their advertised schemas accept any JSON per field, so a validating runtime cannot bounce a call.
+- The first submission is captured raw and ends the turn (PreToolUse, PostToolUseFailure or PostToolUse, whichever the runtime reaches); a malformed one becomes `exhibit-inadmissible`, never a silent retry.
+- Submissions are never rewritten or pattern-redacted. One containing the exact key value throws `ModelCallError` and is not recorded.
+- Provider failures (timeout, abort, hung or broken stream, no result, any assistant `error` code other than `authentication_failed`) throw `ModelCallError` unless the agent already submitted; only an agent that used its turns is `turn-cap`. An outage cannot dismiss a candidate.
+
 ## Intended libraries (notes for later, not installed yet)
 
-- Claude Agent SDK
 - Graphile Worker
 - @affidavit/contracts and @affidavit/judge (workspace deps)
 
