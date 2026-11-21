@@ -109,8 +109,8 @@ export function numstatMismatch(numstat: string, diff: ParsedDiff): string | nul
  *   files), with the command from the case's boot recipe, never from the patched manifest.
  *   When the vulnerable commit's own suite cannot be built in the sandbox (decided from the
  *   vulnerable commit, so a patch cannot make its suite unavailable), it returns
- *   `{ unavailable: reason }` instead; the Judge reports that and does not hold it against the
- *   patch.
+ *   `{ unavailable: reason }` instead; the Judge reports that and rejects the patch with
+ *   `suite-fails` (fail closed, lead decision 2026-11-20).
  * - `runAddedTests` runs the patch's own test files (`PatchPlan.tests`) on top of that build, in a
  *   separate run. A failure counts against the patch; a pass is never required. It returns null
  *   when the plan has no test files or the workbench does not run them.

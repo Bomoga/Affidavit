@@ -209,8 +209,9 @@ export class Judge implements JudgePort {
    * flag is false.
    *
    * A suite the workbench reports unavailable (the vulnerable commit's own suite cannot be built
-   * in the sandbox) is not a rejection, but `suitePassed` stays false; `verifyPatchReport` says
-   * why. Contracts v1.0 have no field for it.
+   * in the sandbox) fails closed: `suitePassed` is false and the patch is rejected with
+   * `suite-fails`, the closest existing rule (lead decision 2026-11-20, PR #46). It is never a
+   * pass. `verifyPatchReport` gives the reason; contracts have no field for it.
    */
   async verifyPatch(
     caseFile: CaseFile,
@@ -333,15 +334,17 @@ export class Judge implements JudgePort {
       );
       // The vulnerable commit's own suite, on the same build the witness ran against. The
       // patch's own tests are an extra check: a failure counts, a pass is never required.
-      // A suite that cannot be built in the sandbox is reported, not held against the patch
-      // (the workbench decides that from the vulnerable commit, never from the patched one).
+      // A suite that cannot be built in the sandbox fails closed: the patch is rejected with
+      // `suite-fails` (lead decision 2026-11-20, PR #46), and `verifyPatchReport` says why.
       const ownSuite = await deps.workbench.runSuite(cf, prepared);
       const addedTests =
         plan.tests.files.length === 0 ? null : await deps.workbench.runAddedTests(cf, prepared);
       const ownPassed = 'passed' in ownSuite && ownSuite.passed === true;
       const suite = {
         passed: ownPassed && addedTests?.passed !== false,
-        rejects: ('passed' in ownSuite && !ownPassed) || addedTests?.passed === false,
+        // Anything short of the own suite passing and no added test failing rejects, including
+        // an unavailable suite.
+        rejects: !ownPassed || addedTests?.passed === false,
       };
       const suiteStatus: SuiteStatus =
         'unavailable' in ownSuite

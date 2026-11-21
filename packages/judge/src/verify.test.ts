@@ -255,7 +255,9 @@ describe('Judge.verifyPatch', () => {
     });
   });
 
-  it('reports an unavailable suite without holding it against the patch', async () => {
+  it('rejects a patch whose suite is unavailable with suite-fails (fail closed)', async () => {
+    // Lead decision 2026-11-20 (PR #46): a suite that cannot run is never a pass. The earlier
+    // version of this test asserted no rejection; that was fail-open.
     const reason = 'the suite cannot be built: node_modules/x resolves outside the npm registry';
     const { workbench } = setup(fixedByPatch, { suiteUnavailable: reason });
     const judge = new Judge(new ScriptedExecutor(fixedByPatch), DEFAULT_POLICY, {
@@ -264,12 +266,30 @@ describe('Judge.verifyPatch', () => {
     });
     const report = await judge.verifyPatchReport(gateCaseFile(), patchExhibit(), witness(), []);
     expect(report.suite).toEqual({ state: 'unavailable', reason });
-    // Never reported as passed, and no rejection for it.
-    expect(report.result).toMatchObject({ familyFlipped: true, suitePassed: false });
-    expect(report.result.rejectedBy).toBeUndefined();
+    expect(report.result).toMatchObject({
+      familyFlipped: true,
+      suitePassed: false,
+      rejectedBy: 'suite-fails',
+    });
     expect(await judge.verifyPatch(gateCaseFile(), patchExhibit(), witness(), [])).toEqual(
       report.result,
     );
+  });
+
+  it('names the family rule first when the family does not flip and the suite is unavailable', async () => {
+    const { verify } = setup(
+      (req) => raw(PAYLOADS.map((_, i) => req.variant === 'vulnerable' || i === 2)),
+      { suiteUnavailable: 'no suite' },
+    );
+    expect(await verify()).toMatchObject({ familyFlipped: false, rejectedBy: 'differential' });
+  });
+
+  it('never accepts a patch whose suite is unavailable, whatever else holds', async () => {
+    // Every other check passes: family flips, no counterexample survives, re-scan clean.
+    const { verify } = setup(fixedByPatch, { suiteUnavailable: 'no suite' });
+    const r = await verify(patchExhibit(), []);
+    expect(r).toMatchObject({ familyFlipped: true, rescanClean: true, counterexamples: [] });
+    expect(r.rejectedBy).toBe('suite-fails');
   });
 
   it('still rejects failing patch tests when the suite is unavailable', async () => {
