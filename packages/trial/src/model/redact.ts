@@ -80,6 +80,13 @@ const HEADER_RUN = String.raw`(?=((?:[A-Za-z0-9_]|-(?!eyJ))*))\1`;
  * client_secret); a bounded suffix covers SECRET_KEY_BASE, secretKey and private_key_id.
  */
 const KEYS = String.raw`(?:(?:password|passwd|secret|token|api[_-]?key|authorization|(?:private|signing|encryption|secret|master|session|jwt|auth|access|refresh|client|webhook)[_-]?(?:key|secret|token|password))[\w.-]{0,32})`;
+/**
+ * Count-like names whose all-digit value is a number, not a secret (`max_tokens: 100000`). Only
+ * these names exempt an all-digit value; `password=12345678` is still a credential.
+ */
+const COUNT_LIKE = String.raw`(?:tokens|_count|_limit|_size|_length|_ms|_seconds|(?<![A-Za-z0-9])(?:port|timeout|retries|ttl))`;
+/** Short credential names (pin, otp, pwd, key) flagged when assigned 6+ digits. */
+const NUMERIC_KEYS = String.raw`(?<![A-Za-z0-9])(?:password|passwd|pwd|secret|api[_-]?key|token|key|pin|otp|auth)`;
 /** Characters an unquoted literal value runs to. Stops at code punctuation. */
 const UNQUOTED = String.raw`[^\s"'\x60,;(){}\[\]<>=:]`;
 
@@ -204,7 +211,14 @@ const PATTERNS: readonly Pattern[] = [
   // and is not a member expression or call: `password: hunter22` and `PASSWORD = s3cr3t!` are
   // caught, `password = req.body.password`, `token = getToken()` and `max_tokens: 100000` are not.
   p(
-    String.raw`(${KEYS}["']?[ \t]{0,16}[:=][ \t]{0,16})(?![$])(?![0-9]{1,256}(?!${UNQUOTED}))(?![A-Za-z_$][\w$]{0,64}(?:\.[\w$]{1,64}){1,16}(?![\w$]))(?=${UNQUOTED}{0,255}[0-9!@#%^*+/~-])${UNQUOTED}{6,256}`,
+    String.raw`(${KEYS}["']?[ \t]{0,16}[:=][ \t]{0,16})(?![$])(?:(?<!${COUNT_LIKE}["']?[ \t]{0,16}[:=][ \t]{0,16})|(?![0-9]{1,256}(?!${UNQUOTED})))(?![A-Za-z_$][\w$]{0,64}(?:\.[\w$]{1,64}){1,16}(?![\w$]))(?=${UNQUOTED}{0,255}[0-9!@#%^*+/~-])${UNQUOTED}{6,256}`,
+    'i',
+    `$1${REDACTED}`,
+  ),
+  // A credential name immediately before the separator (so `tokens` and `token_count` never
+  // match) assigned 6+ digits, quoted or not: `password=12345678`, `PIN: "123456"`.
+  p(
+    String.raw`(${NUMERIC_KEYS}["']?[ \t]{0,16}[:=][ \t]{0,16}["'\x60]?)[0-9]{6,256}(?![0-9])`,
     'i',
     `$1${REDACTED}`,
   ),
