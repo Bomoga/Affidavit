@@ -66,3 +66,15 @@ Proposals only. Nothing here changes `packages/contracts`; per implementation-pl
 - **Need:** contracts v1.0 says only that `seq` is "monotonic per case" and that "SSE resumes from the last seq seen". It does not say how the client sends that position (the `Last-Event-ID` header, a query parameter such as `?after=`, or both), what the SSE `id:` field carries, or whether seqs are contiguous per case. The web client needs all three to resume and to tell a gap from a normal jump.
 - **Proposal (documentation, or additive on `ApiRoutes.caseEvents`):** state that each message sets `id:` to the event `seq`, that the server honours `Last-Event-ID` (and optionally a named query parameter) by sending only seqs greater than it, and that seqs are contiguous per case starting at 0.
 - **Meanwhile:** `apps/web` has no default wire format. `createSseTransport` takes an optional `applyResume(request, afterSeq)` hook. Without it every reconnect replays from the start and the client drops seqs it already applied, so the docket stays correct but each reconnect re-sends the whole stream. The client treats a seq that is not exactly last+1 (or a first event that is not 0) as a gap and reconnects from the last applied seq. If the server may legitimately skip seqs, that rule needs to change.
+
+## CR-T11: a fixture schema for recorded model outputs (L3-15)
+
+- **Need:** record mode writes `fixtures/models/<prompt id>/<input sha256>.json`. The fixture check in `packages/testing` (`fixtures.test.ts`) fails any fixture path it has no schema for, so the first recording committed under `fixtures/models/` turns that suite red.
+- **Proposal (lead, additive):** a `ModelRecording` schema in contracts (`schemaVersion: 1`, `promptId: PromptId`, `promptVersion`, `model`, `inputSha256`, `userSha256`, `result: { outcome, submission?, cost: StageCost }`), mapped to `models/` in `schemaForFixture`.
+- **Meanwhile:** the shape is defined and checked on read in `packages/trial/src/model/recordings.ts`. No recordings are committed in this PR.
+
+## CR-T12: say why a case halted (L3-15, not blocking)
+
+- **Need:** a case now halts for two reasons, `kill-switch` and `model-unconfigured` (no API key, checked before any charge). Neither leaves an event, so the live UI cannot tell an operator why a case stopped. `ModelPort` also has no way to refuse a call before the orchestrator charges for it.
+- **Proposal (additive):** a `halted` `TrialEventType` with `{ reason: 'kill-switch' | 'model-unconfigured' }`, and an optional `preflight(req): Promise<void>` on `ModelPort`.
+- **Meanwhile:** the halt reason is only in `RunOutcome` (`HaltReason` in `packages/trial`). The real port has `preflight` as a Lane 3 extension (`PreflightModelPort`); the orchestrator calls it when present, so fakes without it are unchanged.

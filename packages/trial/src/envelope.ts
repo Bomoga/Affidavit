@@ -28,7 +28,8 @@ const BALLOT_SYSTEM_FIELDS = {
   mandate: true,
   inputVariant: true,
 } as const;
-const BALLOT_OPTIONS = Ballot.options.map((o) => o.omit(BALLOT_SYSTEM_FIELDS));
+/** One agent-submittable shape per ballot question. Also the source of the submit_ballot tool schema. */
+export const BALLOT_OPTIONS = Ballot.options.map((o) => o.omit(BALLOT_SYSTEM_FIELDS));
 export type BallotSubmission = ReturnType<(typeof BALLOT_OPTIONS)[number]['parse']>;
 
 export type SubmissionCheck<T> = { ok: true; value: T } | { ok: false; errors: string[] };
