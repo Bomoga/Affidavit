@@ -1,6 +1,7 @@
 import { chmod, lstat, mkdir, open, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Redaction } from '@affidavit/contracts';
+import { FONT_HEAD_BYTES, fontFormatOf } from '../tools/fonts.js';
 import { signatureClass } from '../tools/unscannable.js';
 import { listDir } from '../tools/walk.js';
 import { entriesOf, holdsUtf16, redactBuffer, type SecretRedactor } from './redactor.js';
@@ -45,6 +46,27 @@ async function isMediaFile(abs: string): Promise<boolean> {
     const buf = Buffer.alloc(HEAD_BYTES);
     const { bytesRead } = await fh.read(buf, 0, HEAD_BYTES, 0);
     return signatureClass(buf.subarray(0, bytesRead)) === 'media';
+  } finally {
+    await fh.close();
+  }
+}
+
+/**
+ * True when the file is a font whose structure checks out (tools/fonts.ts, the same check that
+ * classes a file `binary-font` for the scan). Judged on the bytes and the extension.
+ */
+export async function isFontFile(abs: string, name: string): Promise<boolean> {
+  let fh;
+  try {
+    fh = await open(abs, 'r');
+  } catch {
+    return false; // unreadable: the later steps fail on it as before
+  }
+  try {
+    const size = (await fh.stat()).size;
+    const buf = Buffer.alloc(Math.min(size, FONT_HEAD_BYTES));
+    const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+    return fontFormatOf(name, buf.subarray(0, bytesRead), size) !== undefined;
   } finally {
     await fh.close();
   }
@@ -96,6 +118,11 @@ export async function buildWorkspace(
       // Before the map's own reasons: whatever else is true of a media file, it does not leave.
       if (e.isFile && (await isMediaFile(join(src, e.name)))) {
         skip(childRel, 'media-file');
+        continue;
+      }
+      // Fonts the same way: the scanner skips them, so they never leave.
+      if (e.isFile && (await isFontFile(join(src, e.name), e.name))) {
+        skip(childRel, 'font-file');
         continue;
       }
       const reason = mustExclude.get(childRel);

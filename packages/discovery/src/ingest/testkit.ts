@@ -156,6 +156,11 @@ interface FakeOptions {
   extra?: RegExp | undefined;
   /** Throws instead of running. */
   fail?: Error | undefined;
+  /**
+   * Emulates gitleaks' chunk cuts at their worst: a file over this many bytes is read in hard,
+   * non-overlapping chunks of this size, so a key that straddles a cut is NOT reported.
+   */
+  chunkBytes?: number | undefined;
 }
 
 const KEY = /AFFIDAVIT_FAKE_KEY_[0-9A-F]{16}/g;
@@ -183,11 +188,20 @@ export function fakeGitleaks(opts: FakeOptions = {}): ToolRunnerPort {
           if (opts.onlyFiles && !opts.onlyFiles(r)) continue;
           const text = readFileSync(join(src, r)).toString('latin1');
           const lines = text.split('\n');
+          const chunk = opts.chunkBytes;
+          let lineStart = 0;
           lines.forEach((line, i) => {
+            const at = lineStart;
+            lineStart += line.length + 1;
             for (const m of [
               ...line.matchAll(KEY),
               ...(opts.extra ? line.matchAll(opts.extra) : []),
             ]) {
+              if (chunk !== undefined && text.length > chunk) {
+                const from = at + m.index;
+                const to = from + m[0].length - 1;
+                if (Math.floor(from / chunk) !== Math.floor(to / chunk)) continue; // cut through
+              }
               const shift = i === 0 ? 1 : 2;
               results.push({
                 ruleId: 'affidavit-fake-fixture-key',
