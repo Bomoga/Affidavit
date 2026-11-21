@@ -312,6 +312,15 @@ export function scanYamlKeys(text: string): KeyScan {
       else if (v.line > colon.line) {
         empty = v.col < t.col || (v.col === t.col && !(v.kind === 'ind' && v.text === '-'));
       } else empty = false;
+      // A value written on the key's line (`null`, `~`, `[]`, `{}`) is empty only if what follows
+      // starts a new line at or left of the key's column. A deeper next line would continue it
+      // (`env_file: null` then `  /etc/shadow` is one plain scalar to YAML), so refuse that.
+      if (empty && t.flow === 0 && v !== undefined && v.line === colon.line) {
+        const after = toks[idx + (v.kind === 'ind' ? 4 : 3)];
+        if (after !== undefined && after.line > v.endLine && after.col > t.col) {
+          refuse('an empty value continued on a deeper line');
+        }
+      }
       keys.push({ name: t.text, empty, line: t.line + 1 });
     });
     // A plain scalar whose text reads `<key>:<value>` (no space) is one scalar to YAML, but a

@@ -45,6 +45,32 @@ describe('scanYamlKeys refuses what it does not fully understand', () => {
     ['a line separator', 'services:\n  web:\n    image: node\u2028env_file: /etc/shadow\n'],
     ['a paragraph separator', 'services:\n  web:\n    image: node\u2029env_file: /etc/shadow\n'],
     ['a bare carriage return inside a block scalar', 'a: |\n  x\ry: 1\n'],
+    // `env_file: null` then a deeper line is one multi-line plain scalar to YAML
+    // ("null /../../etc/shadow"), not an empty value (reproduced against Compose v5.5.1).
+    [
+      'a null value continued on a deeper line',
+      'services:\n  web:\n    build: .\n    env_file: null\n      /../../../../etc/shadow\n',
+    ],
+    [
+      'a ~ value continued on a deeper line',
+      'services:\n  web:\n    build: .\n    env_file: ~\n      /../../../../etc/shadow\n',
+    ],
+    [
+      'a null label_file continued on a deeper line',
+      'services:\n  web:\n    build: .\n    label_file: null\n      /etc/hosts\n',
+    ],
+    [
+      'a null value with a comment, then a deeper line',
+      'services:\n  web:\n    build: .\n    env_file: null # none\n      /../../etc/shadow\n',
+    ],
+    [
+      'a null value continued on a tab-indented line',
+      'services:\n  web:\n    build: .\n    env_file: null\n\t/../../etc/shadow\n',
+    ],
+    [
+      'an empty flow value followed by a deeper line',
+      'services:\n  web:\n    build: .\n    env_file: []\n      /../../etc/shadow\n',
+    ],
   ])('%s', (_, text) => {
     expect(scanYamlKeys(text).ok).toBe(false);
     expect(precheckCompose(text)).not.toBeNull();
