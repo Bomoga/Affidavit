@@ -13,7 +13,7 @@ import {
   type ExhibitId,
   type ModelPort,
   type Role,
-  type StageCost,
+  StageCost,
 } from '@affidavit/contracts';
 import { digestOf } from './canonical.js';
 import type { SubmissionSpec } from './envelope.js';
@@ -216,6 +216,15 @@ type StageRun = StageResult | { kind: 'halted'; reason: HaltReason };
 
 function isTerminal(stage: CaseStage): boolean {
   return TERMINAL_STAGES.includes(stage);
+}
+
+/** A port-reported cost the orchestrator may trust: schema-valid, finite and non-negative. */
+function validCost(cost: unknown): StageCost | undefined {
+  const parsed = StageCost.safeParse(cost);
+  if (!parsed.success) return undefined;
+  const c = parsed.data;
+  const nums = [c.inputTokens, c.outputTokens, c.usd, c.wallMs];
+  return nums.every((n) => Number.isFinite(n) && n >= 0) ? c : undefined;
 }
 
 function overdrawn(b: BudgetState): boolean {
@@ -463,7 +472,7 @@ export class Orchestrator {
     try {
       result = await model.runTurn(turn);
     } catch (err) {
-      await this.settleFailedCall(
+      const replacement = await this.settleFailedCall(
         caseId,
         stage,
         attempt,
@@ -472,7 +481,7 @@ export class Orchestrator {
         err,
         started,
       );
-      throw err;
+      throw replacement ?? err;
     }
     const actual: StageCost = {
       ...result.cost,
@@ -510,7 +519,13 @@ export class Orchestrator {
    * (`ModelCallError.cost`), that figure goes in the ledger, so the verdict reports what calls
    * cost rather than what was reserved, and the unspent part of the charge is given back through
    * `settlement` when one is wired. When the spend is unknown (a timeout, an abort, a broken
-   * stream, any other error), nothing changes: the whole charge stands.
+   * stream, any other error, or a reported cost that is not a valid `StageCost` with finite,
+   * non-negative numbers), nothing changes: the whole charge stands.
+   *
+   * Returns the error the call should end with instead of the original: only a
+   * `BudgetExhaustedError` when the overage charge overdraws the case, as on the success path.
+   * A failure while settling never replaces the call's own error; it is attached to it as
+   * `settlementError`, and the charge stays (over-counting, never under-counting).
    */
   private async settleFailedCall(
     caseId: CaseId,
@@ -520,47 +535,56 @@ export class Orchestrator {
     reservationSeq: number,
     err: unknown,
     started: number,
-  ): Promise<void> {
-    if (!(err instanceof ModelCallError) || err.cost === undefined) return;
-    const now = this.deps.config.now ?? Date.now;
-    const actual: StageCost = {
-      ...err.cost,
-      stage,
-      attempt,
-      wallMs: err.cost.wallMs || Math.max(0, now() - started),
-    };
-    this.ledger(caseId).push(actual);
-    // A failed call that spent more than its charge is charged the difference, as on success.
-    const overage: StageCost = {
-      stage,
-      attempt,
-      inputTokens: Math.max(0, actual.inputTokens - reservation.inputTokens),
-      outputTokens: Math.max(0, actual.outputTokens - reservation.outputTokens),
-      usd: Math.max(0, Math.round((actual.usd - reservation.usd) * 1e6) / 1e6),
-      wallMs: 0,
-    };
-    if (overage.inputTokens > 0 || overage.outputTokens > 0 || overage.usd > 0) {
-      const after = await this.deps.store.chargeBudget(caseId, overage);
-      const role = MODEL_ROLE_FOR_STAGE[stage] ?? EVENT_ACTOR_FOR_STAGE[stage];
-      await this.emit(caseId, stage, 'cost-charged', { cost: overage, remaining: after }, role);
-    }
-    const settlement = this.deps.settlement;
-    if (settlement === undefined) return;
-    const refund: StageCost = {
-      stage,
-      attempt,
-      inputTokens: Math.max(0, reservation.inputTokens - actual.inputTokens),
-      outputTokens: Math.max(0, reservation.outputTokens - actual.outputTokens),
-      usd: Math.max(0, Math.round((reservation.usd - actual.usd) * 1e6) / 1e6),
-      wallMs: 0,
-    };
-    if (refund.inputTokens === 0 && refund.outputTokens === 0 && refund.usd === 0) return;
+  ): Promise<Error | undefined> {
+    if (!(err instanceof ModelCallError)) return undefined;
+    const reported = validCost(err.cost);
+    if (reported === undefined) return undefined;
     try {
+      const now = this.deps.config.now ?? Date.now;
+      const actual: StageCost = {
+        ...reported,
+        stage,
+        attempt,
+        wallMs: reported.wallMs || Math.max(0, now() - started),
+      };
+      this.ledger(caseId).push(actual);
+      // A failed call that spent more than its charge is charged the difference, as on success.
+      const overage: StageCost = {
+        stage,
+        attempt,
+        inputTokens: Math.max(0, actual.inputTokens - reservation.inputTokens),
+        outputTokens: Math.max(0, actual.outputTokens - reservation.outputTokens),
+        usd: Math.max(0, Math.round((actual.usd - reservation.usd) * 1e6) / 1e6),
+        wallMs: 0,
+      };
+      if (overage.inputTokens > 0 || overage.outputTokens > 0 || overage.usd > 0) {
+        const after = await this.deps.store.chargeBudget(caseId, overage);
+        const role = MODEL_ROLE_FOR_STAGE[stage] ?? EVENT_ACTOR_FOR_STAGE[stage];
+        await this.emit(caseId, stage, 'cost-charged', { cost: overage, remaining: after }, role);
+        if (overdrawn(after)) {
+          return new BudgetExhaustedError(`the model overspent its turn budget in ${stage}`);
+        }
+        // Spent more than the charge: nothing to give back.
+        return undefined;
+      }
+      const settlement = this.deps.settlement;
+      if (settlement === undefined) return undefined;
+      const refund: StageCost = {
+        stage,
+        attempt,
+        inputTokens: Math.max(0, reservation.inputTokens - actual.inputTokens),
+        outputTokens: Math.max(0, reservation.outputTokens - actual.outputTokens),
+        usd: Math.max(0, Math.round((reservation.usd - actual.usd) * 1e6) / 1e6),
+        wallMs: 0,
+      };
+      if (refund.inputTokens === 0 && refund.outputTokens === 0 && refund.usd === 0) {
+        return undefined;
+      }
       await settlement.release(caseId, refund, reservationSeq);
-    } catch {
-      // A refund that cannot be written leaves the whole charge in place: the budget over-counts
-      // and never under-counts. The call's own error is the one the job reports.
+    } catch (settleErr) {
+      err.settlementError = settleErr;
     }
+    return undefined;
   }
 
   private async escalate(

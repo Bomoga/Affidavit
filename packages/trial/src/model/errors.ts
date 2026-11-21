@@ -46,6 +46,11 @@ export class ModelCallError extends Error {
   readonly cost: StageCost | undefined;
   /** The sanitized provider failure, when there was one. Already in `message`. */
   readonly provider: ProviderFailure | undefined;
+  /**
+   * Set by the orchestrator when settling the call's up-front charge failed. Secondary: the call
+   * error is still the one reported, and the charge stays in place.
+   */
+  settlementError: unknown;
 
   constructor(message: string, extra: { cost?: StageCost; provider?: ProviderFailure } = {}) {
     super(message);

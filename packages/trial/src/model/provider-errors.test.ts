@@ -2,9 +2,14 @@
 // credential-shaped text, or case content, and a failed call must not be charged the turn cap
 // when the runtime reported what it actually spent. Every test uses a stubbed transport.
 import { describe, expect, it } from 'vitest';
-import { type StageCost } from '@affidavit/contracts';
+import { type Budget, type CaseId, type ModelPort, type StageCost } from '@affidavit/contracts';
 import { FakeEventSink } from '@affidavit/testing';
-import { Orchestrator, type BudgetSettlement, type StageHandler } from '../orchestrator.js';
+import {
+  BudgetExhaustedError,
+  Orchestrator,
+  type BudgetSettlement,
+  type StageHandler,
+} from '../orchestrator.js';
 import {
   BIG_BUDGET,
   LoggingCaseStore,
@@ -14,7 +19,12 @@ import {
   makeCaseFile,
   openAt,
 } from '../test-support.js';
-import { AnthropicModelPort, PROVIDER_MESSAGE_MAX, type ModelLogEntry } from './anthropic.js';
+import {
+  AnthropicModelPort,
+  PROVIDER_MESSAGE_MAX,
+  PROVIDER_MESSAGE_WITHHELD,
+  type ModelLogEntry,
+} from './anthropic.js';
 import { ModelCallError, ModelUnconfiguredError } from './errors.js';
 import { DEFAULT_MODEL_TABLE } from './models.js';
 import {
@@ -66,17 +76,15 @@ async function failure(port: AnthropicModelPort, user?: string): Promise<ModelCa
 }
 
 describe('provider error detail', () => {
-  it('carries the HTTP status, the error class and the provider message', async () => {
+  it('carries the HTTP status, the error class and a known-safe message', async () => {
     const { port, logs } = makePort(apiError(PROVIDER_400, { status: 400 }));
     const err = await failure(port);
     expect(err.message).toContain('provider error invalid_request');
     expect(err.message).toContain('HTTP 400');
-    expect(err.message).toContain('invalid_request_error');
-    expect(err.message).toContain('tools.0.custom.input_schema: JSON schema is invalid');
     expect(err.provider).toEqual({
       errorClass: 'invalid_request',
       status: 400,
-      message: PROVIDER_400,
+      message: 'invalid_request_error; tools.0.custom.input_schema: JSON schema is invalid',
     });
     // The same line reaches the port log, so a worker that logs either sees the cause.
     expect(
@@ -91,51 +99,111 @@ describe('provider error detail', () => {
       yield result('success', { isError: true, usd: 0, text: PROVIDER_400, apiErrorStatus: 400 });
     });
     const err = await failure(port);
-    expect(err.provider?.message).toBe(PROVIDER_400);
+    expect(err.provider?.message).toContain('tools.0.custom.input_schema: JSON schema is invalid');
     expect(err.provider?.status).toBe(400);
   });
 
-  it('redacts a key-shaped value and the real key in the provider message', async () => {
+  for (const [text, shown] of [
+    ['Invalid API key · Fix external API key', 'Invalid API key'],
+    ['API Error: 400 Your organization has been disabled.', 'organization has been disabled'],
+    [
+      'API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 210345 tokens > 200000 maximum"}}',
+      'invalid_request_error; prompt is too long: 210345 tokens > 200000 maximum',
+    ],
+    [
+      'API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"tool_choice: type \\"tool\\" and \\"any\\" are not supported for this model."}}',
+      'invalid_request_error; tool_choice: type "tool" and "any" are not supported',
+    ],
+    ['API Error: 404 model: claude-opus-5-5', 'model: claude-opus-5-5'],
+    ['API Error: 400 temperature is not supported on this model', 'temperature: not supported'],
+    [
+      'API Error: 400 messages.0.content.0.text: Field required',
+      'messages.0.content.0.text: Field required',
+    ],
+  ] as const) {
+    it(`shows the known-safe shape of "${shown}"`, async () => {
+      const { port } = makePort(apiError(text, { status: 400 }));
+      expect((await failure(port)).provider?.message).toBe(shown);
+    });
+  }
+
+  it('withholds provider text that matches no known-safe shape', async () => {
+    const { port } = makePort(apiError('API Error: 400 something new went wrong', { status: 400 }));
+    const err = await failure(port);
+    expect(err.provider?.message).toBe(PROVIDER_MESSAGE_WITHHELD);
+    expect(err.message).toContain('HTTP 400');
+    expect(err.message).not.toContain('something new');
+  });
+
+  const SLICE = 'db.query("SELECT * FROM users WHERE id=" + req.query.id) // TOKEN=hunter2hunter2';
+  const ECHOES: readonly [string, string][] = [
+    ['verbatim', SLICE],
+    ['JSON-escaped', JSON.stringify(SLICE)],
+    ['unicode-escaped', SLICE.replace(/[a-z]/g, (c) => `\\u00${c.charCodeAt(0).toString(16)}`)],
+    ['case-changed', SLICE.toUpperCase()],
+    ['whitespace-collapsed', SLICE.replace(/\s+/g, '')],
+    ['short fragments', 'id=" + req.q ... ry.id) //'],
+  ];
+  for (const [kind, echo] of ECHOES) {
+    it(`withholds a provider message echoing a code slice, ${kind}`, async () => {
+      const text = `API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":${JSON.stringify(`could not process ${echo}`)}}}`;
+      const { port, logs } = makePort(apiError(text, { status: 400 }));
+      const err = await failure(port, SLICE);
+      const all = [err.message, JSON.stringify(err.provider), ...logs.map((l) => l.message)].join(
+        '\n',
+      );
+      expect(all).not.toMatch(/select|users|req\.query|hunter2|query/i);
+      expect(err.provider?.message).toBe(`invalid_request_error; ${PROVIDER_MESSAGE_WITHHELD}`);
+    });
+  }
+
+  it('a safe template mixed with echoed content shows only the template', async () => {
+    const text = `API Error: 400 messages.0.content.0.text: unexpected ${SLICE}`;
+    const { port } = makePort(apiError(text, { status: 400 }));
+    const err = await failure(port, SLICE);
+    expect(err.provider?.message).toBe('messages.0.content.0.text: (reason withheld)');
+    expect(err.message).not.toMatch(/SELECT|users|hunter2/);
+  });
+
+  it('a path made of names outside the request vocabulary is not shown', async () => {
+    const text = 'API Error: 400 messages.password_reset_token: bad';
+    const { port } = makePort(apiError(text));
+    const err = await failure(port);
+    expect(err.message).not.toContain('password_reset');
+    expect(err.provider?.message).toBe(PROVIDER_MESSAGE_WITHHELD);
+  });
+
+  it('a fake key in a safe-shaped message is never shown', async () => {
     const text = `Invalid X-Api-Key header value: sk-ant-FAKE-abcdef0123456789. Was ${CANARY_KEY}`;
     const { port, logs } = makePort(apiError(text, { status: 400 }));
     const err = await failure(port);
     const all = [err.message, JSON.stringify(err.provider), ...logs.map((l) => l.message)].join(
       '\n',
     );
-    expect(all).not.toContain('sk-ant-FAKE');
-    expect(all).not.toContain('FAKE-abcdef');
+    expect(all).not.toContain('sk-ant');
+    expect(all).not.toContain('FAKE');
     expect(all).not.toContain('CANARY');
-    expect(all).toContain('[redacted]');
-    expect(all).toContain('Invalid X-Api-Key header value');
+    expect(err.provider?.message).toBe('Invalid X-Api-Key header value');
   });
 
-  it('redacts before clipping, so a key across the clip leaves no fragment', async () => {
+  it('a fake key anywhere in long text leaves no fragment, and the message stays capped', async () => {
     for (let pad = PROVIDER_MESSAGE_MAX - 40; pad <= PROVIDER_MESSAGE_MAX + 5; pad += 5) {
-      const text = `${'e'.repeat(pad)} sk-ant-FAKE-0123456789abcdefghijklmnop tail`;
+      const text = `rate limit ${'e'.repeat(pad)} sk-ant-FAKE-0123456789abcdefghijklmnop overloaded`;
       const { port } = makePort(apiError(text));
       const err = await failure(port);
       expect(err.message, `pad ${pad}`).not.toMatch(/sk-ant|FAKE|0123456789abc/);
+      expect(err.provider!.message!.length).toBeLessThanOrEqual(PROVIDER_MESSAGE_MAX + 3);
     }
   });
 
-  it('clips a long provider message to the limit, on one line', async () => {
-    const text = `API Error: 400\n${'x'.repeat(2_000)}\r\nend`;
-    const { port } = makePort(apiError(text));
-    const err = await failure(port);
-    const message = err.provider!.message!;
-    expect(message.length).toBe(PROVIDER_MESSAGE_MAX + 3);
-    expect(message.endsWith('...')).toBe(true);
-    expect(message).not.toMatch(/[\r\n]/);
-  });
-
-  it('withholds a provider message that quotes case content from the user message', async () => {
-    const caseText = 'db.query("SELECT * FROM users WHERE id=" + req.query.id) // vulnerable';
-    const text = `API Error: 400 messages.0.content.0.text: unexpected ${caseText.slice(0, 40)}`;
-    const { port } = makePort(apiError(text, { status: 400 }));
-    const err = await failure(port, caseText);
-    expect(err.message).not.toContain('SELECT * FROM users');
-    expect(err.message).toContain('withheld');
-    expect(err.message).toContain('HTTP 400');
+  it('runtime error text on an error result goes through the same allowlist', async () => {
+    const { port } = makePort(async function* () {
+      await Promise.resolve();
+      yield result('error_during_execution', { errors: [`failed on ${SLICE}`] });
+    });
+    const err = await failure(port, SLICE);
+    expect(err.message).not.toMatch(/SELECT|hunter2/);
+    expect(err.message).toContain(PROVIDER_MESSAGE_WITHHELD);
   });
 
   it('never echoes a status that is not an integer or an error class outside the closed set', async () => {
@@ -182,6 +250,32 @@ describe('what a failed call costs', () => {
     expect(err.cost?.usd).toBe(0);
   });
 
+  for (const code of ['invalid_request', 'rate_limit', 'billing_error']) {
+    it(`${code} with no result and no tokens is refused before work: zero`, async () => {
+      const { port } = makePort(async function* () {
+        await Promise.resolve();
+        yield assistant('m1', 0, 0, code);
+      });
+      expect((await failure(port)).cost?.usd).toBe(0);
+    });
+  }
+  for (const code of [
+    'server_error',
+    'overloaded',
+    'max_output_tokens',
+    'unknown',
+    'model_not_found',
+    'some_future_code',
+  ]) {
+    it(`${code} with no result is unknown spend, even with no tokens: the charge stands`, async () => {
+      const { port } = makePort(async function* () {
+        await Promise.resolve();
+        yield assistant('m1', 0, 0, code);
+      });
+      expect((await failure(port)).cost).toBeUndefined();
+    });
+  }
+
   it('a failure with reported usage reports that usage', async () => {
     const { port } = makePort(async function* () {
       await Promise.resolve();
@@ -210,20 +304,27 @@ describe('what a failed call costs', () => {
 
 describe('settling the up-front charge in a trial', () => {
   async function runFailingDefense(
-    script: Script,
+    script: Script | ModelPort,
     settlement?: BudgetSettlement,
     timeoutMs = 5_000,
+    store: LoggingCaseStore = new LoggingCaseStore([]),
+    budget: Budget = BIG_BUDGET,
+    expected: abstract new (...args: never[]) => Error = ModelCallError,
   ) {
     const cf = makeCaseFile();
-    const store = new LoggingCaseStore([]);
-    await openAt(store, cf, BIG_BUDGET, PATH_TO.defense);
+    await openAt(store, cf, budget, PATH_TO.defense);
     const sink = new FakeEventSink();
-    const { port } = makePort(script, CANARY_KEY, timeoutMs);
+    const port =
+      typeof script === 'function' ? makePort(script, CANARY_KEY, timeoutMs).port : script;
+    let thrown: unknown;
     let ledger: readonly StageCost[] = [];
     const defense: StageHandler = {
       async run(ctx) {
         try {
           await ctx.runAgent({ ...requestFor('defense'), actor: 'defense' });
+        } catch (e) {
+          thrown = e;
+          throw e;
         } finally {
           ledger = ctx.costs();
         }
@@ -238,10 +339,71 @@ describe('settling the up-front charge in a trial', () => {
       config: { killSwitch: () => false, maxStageAttempts: 1, now: () => NOW },
       ...(settlement === undefined ? {} : { settlement }),
     });
-    await expect(orch.run(cf.id)).rejects.toBeInstanceOf(ModelCallError);
+    if (expected === ModelCallError) {
+      await expect(orch.run(cf.id)).rejects.toBeInstanceOf(ModelCallError);
+    } else {
+      await orch.run(cf.id).catch(() => undefined);
+    }
+    expect(thrown).toBeInstanceOf(expected);
     const events = assertSchemaValid(sink.events(cf.id));
-    return { cf, store, events, ledger };
+    return { cf, store, events, ledger, thrown };
   }
+
+  /** A port that fails every turn with a ModelCallError carrying `cost` as given. */
+  const failingWith = (cost: unknown): ModelPort => ({
+    runTurn: () =>
+      Promise.reject(new ModelCallError('agent turn failed', { cost: cost as StageCost })),
+  });
+  const COST = { stage: 'defense', attempt: 1, inputTokens: 0, outputTokens: 0, usd: 0, wallMs: 5 };
+
+  for (const [kind, bad] of [
+    ['NaN usd', { ...COST, usd: Number.NaN }],
+    ['negative usd', { ...COST, usd: -0.4 }],
+    ['infinite tokens', { ...COST, inputTokens: Number.POSITIVE_INFINITY }],
+    ['negative tokens', { ...COST, outputTokens: -5 }],
+    ['not an object', 'free'],
+  ] as const) {
+    it(`a reported cost with ${kind} is unknown spend: no refund, nothing in the ledger`, async () => {
+      const settlement = recorder();
+      const { ledger } = await runFailingDefense(failingWith(bad), settlement);
+      expect(settlement.calls).toEqual([]);
+      expect(ledger).toEqual([]);
+    });
+  }
+
+  it('a failing overage charge never replaces the call error; it is attached as secondary', async () => {
+    class FailingOverage extends LoggingCaseStore {
+      charged = 0;
+      override chargeBudget(caseId: CaseId, cost: StageCost) {
+        this.charged++;
+        if (this.charged > 1) return Promise.reject(new Error('store down'));
+        return super.chargeBudget(caseId, cost);
+      }
+    }
+    const store = new FailingOverage([]);
+    const { thrown } = await runFailingDefense(
+      failingWith({ ...COST, usd: 0.9 }),
+      recorder(),
+      5_000,
+      store,
+    );
+    expect(thrown).toBeInstanceOf(ModelCallError);
+    expect(((thrown as ModelCallError).settlementError as Error).message).toBe('store down');
+  });
+
+  it('a failed call whose overage overdraws the case is budget-exhausted, as on success', async () => {
+    const settlement = recorder();
+    const { events } = await runFailingDefense(
+      failingWith({ ...COST, usd: 2 }),
+      settlement,
+      5_000,
+      new LoggingCaseStore([]),
+      { maxInputTokens: 1_000_000, maxOutputTokens: 1_000_000, maxUsd: 1 },
+      BudgetExhaustedError,
+    );
+    expect(settlement.calls).toEqual([]);
+    expect(events.map((e) => e.type)).toContain('budget-exhausted');
+  });
 
   function recorder(): BudgetSettlement & {
     calls: { refund: StageCost; seq: number }[];
