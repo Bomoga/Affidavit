@@ -84,3 +84,30 @@ describe('validateMounts', () => {
     expect(() => validateMounts([m(join(workspace, 'missing'))], [workspace])).toThrow();
   });
 });
+
+describe('validateMounts with allowUnderTmp (tool runs)', () => {
+  const opts = { allowUnderTmp: true };
+
+  it('accepts a read-only mount under /tmp', () => {
+    expect(validateMounts([m(repo, '/tmp/osv-scalibr')], [workspace], opts)).toEqual([
+      m(repo, '/tmp/osv-scalibr'),
+    ]);
+  });
+
+  it('refuses a writable mount under /tmp, which would write to the host disk', () => {
+    expect(() => validateMounts([m(repo, '/tmp/osv-scalibr', false)], [workspace], opts)).toThrow(
+      /read-only/,
+    );
+  });
+
+  it.each(['/tmp', '/tmp/', '/tmp/../etc', '/tmpx/../tmp', '/scratch', '/etc/x', '/proc/self'])(
+    'still refuses the target %s',
+    (target) => {
+      expect(() => validateMounts([m(repo, target)], [workspace], opts)).toThrow();
+    },
+  );
+
+  it('refuses anything under /tmp without the option', () => {
+    expect(() => validateMounts([m(repo, '/tmp/osv-scalibr')], [workspace])).toThrow(/reserved/);
+  });
+});

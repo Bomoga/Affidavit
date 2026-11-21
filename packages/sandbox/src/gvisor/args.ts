@@ -62,6 +62,7 @@ const SPEC_KEYS = new Set<string>([
   'maxFileBytes',
   'env',
   'workdir',
+  'user',
   'tmpfs',
   'writableTmpMb',
 ]);
@@ -84,16 +85,36 @@ export interface GvisorRunSpec {
   network?: JailNetwork;
   /** Largest file the jail may write (`RLIMIT_FSIZE`); caps a mounted result file. */
   maxFileBytes?: number;
-  /** Environment for the process. HOME and TMPDIR are always /scratch and cannot be overridden. */
+  /**
+   * `uid:gid` to run as. Default `JAIL_USER` (nobody). Lane 1 tools run as the host user that owns
+   * the case workspace, so they can read `/src` and write `/out`; root (uid or gid 0) is refused.
+   */
+  user?: string;
+  /** Environment for the process. HOME and TMPDIR are always set by the jail and cannot be overridden. */
   env?: Readonly<Record<string, string>>;
   workdir?: string;
   /** Writable tmpfs mounts besides /scratch (service volumes). */
   tmpfs?: readonly TmpfsMount[];
   /**
-   * Size of a writable /tmp in MiB. Unset, /tmp is a read-only tmpfs (witnesses); services such as
-   * a database need a writable one for sockets and temporary files.
+   * Size of a writable /tmp in MiB, at most `MAX_WRITABLE_TMP_MB`. Unset, /tmp is a read-only tmpfs
+   * and `TMPDIR=/scratch` (witnesses). Set, `TMPDIR` and `XDG_CACHE_HOME` point at /tmp: services
+   * such as a database need it for sockets and temporary files, and Lane 1 scanners for their temp
+   * and cache directories. tmpfs lives in the sandbox's memory, so it counts against the memory
+   * limit and never touches the host disk.
    */
   writableTmpMb?: number;
+}
+
+/** Largest writable `/tmp` a run may ask for. */
+export const MAX_WRITABLE_TMP_MB = 4096;
+
+/** Checks a jail `uid:gid`; throws on anything else or on root. */
+export function userArg(user: string | undefined): string {
+  if (user === undefined) return JAIL_USER;
+  const m = /^([0-9]{1,10}):([0-9]{1,10})$/.exec(user);
+  if (m === null) throw new Error(`user must be uid:gid: ${user}`);
+  if (Number(m[1]) === 0 || Number(m[2]) === 0) throw new Error('refusing to run the jail as root');
+  return user;
 }
 
 function networkArgs(network: JailNetwork | undefined): string[] {
@@ -137,11 +158,17 @@ export function tmpfsPathProblem(p: string): string | null {
   return null;
 }
 
+function writableTmpBytes(mb: number): number {
+  if (positiveMb(mb, 'writableTmpMb') > MAX_WRITABLE_TMP_MB)
+    throw new Error(`bad writableTmpMb: ${mb}`);
+  return mb * 1024 * 1024;
+}
+
 function tmpfsArgs(spec: GvisorRunSpec): string[] {
   const tmp =
     spec.writableTmpMb === undefined
       ? 'type=tmpfs,destination=/tmp,readonly'
-      : `type=tmpfs,destination=/tmp,tmpfs-size=${positiveMb(spec.writableTmpMb, 'writableTmpMb') * 1024 * 1024},tmpfs-mode=1777`;
+      : `type=tmpfs,destination=/tmp,tmpfs-size=${writableTmpBytes(spec.writableTmpMb)},tmpfs-mode=1777`;
   const extra = (spec.tmpfs ?? []).flatMap((t) => {
     const problem = tmpfsPathProblem(t.path);
     if (problem !== null) throw new Error(problem);
@@ -212,7 +239,8 @@ const isPinned = (image: string): boolean =>
  * - No network, or only a per-case internal network (see network.ts), read-only root, all capabilities dropped, no privilege gain, unprivileged user.
  * - Memory with swap equal to memory, so the limit cannot be stretched with swap (L2-01 finding).
  * - `/tmp` and `/dev/shm` are read-only tmpfs and `/scratch` is the only writable path, unless the
- *   caller asks for a capped writable `/tmp` or extra capped tmpfs mounts (services only).
+ *   caller asks for a capped writable `/tmp` (services and Lane 1 tools) or extra capped tmpfs
+ *   mounts (services only).
  * - No route out for anything: only `--network none` or a per-case internal network. There is no
  *   egress exception (lead decision 2026-11-20, PR #18), and a spec with any key this function
  *   does not know (`fetch`, `egress`, `dns`, ...) is refused, so no caller can add one.
@@ -242,7 +270,7 @@ export function buildGvisorRunArgs(spec: GvisorRunSpec): string[] {
     '--security-opt',
     'no-new-privileges',
     '--user',
-    JAIL_USER,
+    userArg(spec.user),
     '--pids-limit',
     String(l.pids),
     '--memory',
@@ -264,7 +292,10 @@ export function buildGvisorRunArgs(spec: GvisorRunSpec): string[] {
     '--env',
     'HOME=/scratch',
     '--env',
-    'TMPDIR=/scratch',
+    `TMPDIR=${spec.writableTmpMb === undefined ? '/scratch' : '/tmp'}`,
+    // With a writable /tmp, caches go there too (Go's os.UserCacheDir reads XDG_CACHE_HOME), so a
+    // read-only cache such as OSV-Scanner's offline database is found at /tmp/<tool dir>.
+    ...(spec.writableTmpMb === undefined ? [] : ['--env', 'XDG_CACHE_HOME=/tmp']),
     ...spec.mounts.flatMap((m) => [
       '--mount',
       `type=bind,source=${m.hostPath},destination=${m.containerPath}${m.readOnly ? ',readonly' : ''}`,

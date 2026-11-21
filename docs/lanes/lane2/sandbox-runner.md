@@ -127,9 +127,27 @@ Docker's `--pids-limit` is enforced on the host, where it counts gVisor's own th
 
 `GvisorToolRunner` uses the plain `runsc` runtime with the same flags. Tool results are not judged, and tracing every file a scanner opens in a large repo would be slow and could exceed the trace cap, which would let a repo block its own scan. A repo file name with a newline would also mark the trace tampered. Only the image allowlist (optional), the mount allowlist and the jail apply. Exit codes: 124 when the runner's timeout stopped the tool, 137 when it was OOM-killed.
 
+## What tools get that witnesses do not
+
+Lane 1's scanners need a few things the witness jail does not give (docker/tools/README.md, "Runner contract"). `GvisorToolRunner` gives them, and nothing else changes:
+
+| Need                                         | What the tool runner does                                                                                                                                                                                             | Witnesses                           |
+| -------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
+| A writable temp directory                    | `/tmp` is a writable tmpfs capped at `tmpMb` (default 512 MiB), `TMPDIR=/tmp`, `XDG_CACHE_HOME=/tmp`. It lives in the sandbox's memory, never on the host disk.                                                       | `/tmp` read-only, `TMPDIR=/scratch` |
+| A writable home (Semgrep's `$HOME/.semgrep`) | `HOME=/scratch`, a writable tmpfs, as for witnesses                                                                                                                                                                   | same                                |
+| OSV-Scanner's offline database               | A read-only mount under `/tmp` is allowed (`/tmp/osv-scalibr`); a writable one, or one at `/tmp` itself, is refused. With `XDG_CACHE_HOME=/tmp`, OSV-Scanner 2.7.0 reads `/tmp/osv-scalibr` without its own variable. | nothing may be mounted under `/tmp` |
+| Read `/src`, write `/out`                    | Runs as the uid and gid of the process that owns the case workspace (or `user`), never root                                                                                                                           | nobody (65534)                      |
+| Discovery's scratch mounts                   | A mount at `/tmp` or `/root/.semgrep` is a request for scratch space: its host directory must be empty or absent, and it is replaced by the jail's tmpfs, so nothing reaches the host through it                      | n/a                                 |
+
+`run` also returns the tool's `stderr` (capped at 2 MiB like every jailed run). `ToolRunnerPort` has no field for it yet; see "Open items".
+
+Evidence (2026-11-17, owner's workstation, runsc release-20261109.0): discovery's real-image suite (`packages/discovery/src/tools/tools.docker.test.ts`, the hostile repo included) passed 31 of 31 with its runner swapped for `GvisorToolRunner` in an uncommitted copy. Without `XDG_CACHE_HOME=/tmp`, OSV-Scanner looked for its database under `$HOME/.cache` and exited 127; that is why the variable is set. Sandbox-host tests cover the tool profile directly (capped `/tmp`, writable home, read-only database, scratch mounts left empty on the host, no write to `/root`, timeout exit 124). The containment suite (witness profile) still passes 8 of 8.
+
 ## Open items
 
 - Shared sandbox host and CI runner (P0-10, open decision 1). Until then `runner.integration.test.ts` is skipped in `pnpm test` (see `PROGRESS.md`).
 - Target and witness on a per-case internal network, with no route out (L2-03 and L2-04). Today every run is `--network none`.
 - gVisor logs `SECCOMP WARNING: host filesystem enabled: syscall filters less restrictive` on this host. To evaluate with `--directfs=false` on the audit runtime before the shared host is signed off.
 - Lane 1's `LocalDockerToolRunner` can switch to `GvisorToolRunner` once the lead signs off the SELinux decision above.
+- For the lead (contracts): `ToolRunnerPort.run` could return `stderr`, which `GvisorToolRunner` already does. What `outputPath` should mean is still open; both runners return a fixed directory.
+- For apps/worker: `allowedRoots` must cover the case workspace and its siblings that discovery passes (`<copy>.quarantine`, `<copy>.windows-*`, and the `-quarantine` and `-windows` siblings of the output and scratch directories), plus `docker/tools/config`, the rules and the OSV database directories.

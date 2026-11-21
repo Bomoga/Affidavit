@@ -1,6 +1,5 @@
 import { execFileSync } from 'node:child_process';
 import {
-  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -116,8 +115,7 @@ describe.runIf(onSandboxHost)('gVisor runner on a sandbox host', { timeout: 120_
     const src = join(workspace, 'repo');
     const out = join(workspace, 'out');
     mkdirSync(src, { recursive: true });
-    mkdirSync(out);
-    chmodSync(out, 0o777); // the jail runs as nobody
+    mkdirSync(out, { mode: 0o755 }); // tools run as the workspace owner, so no chmod is needed
     writeFileSync(join(src, 'app.js'), 'const q = "SELECT " + id;');
 
     const tools = new GvisorToolRunner({ outputDir: out, allowedRoots: [workspace] });
@@ -136,11 +134,73 @@ describe.runIf(onSandboxHost)('gVisor runner on a sandbox host', { timeout: 120_
         { hostPath: out, containerPath: '/out', readOnly: false },
       ],
     );
-    expect(result).toEqual({ exitCode: 0, outputPath: out });
+    expect(result).toEqual({ exitCode: 0, outputPath: out, stderr: '' });
     expect(JSON.parse(readFileSync(join(out, 'result.json'), 'utf8'))).toEqual({ size: 25 });
     expect(existsSync(join(src, 'tamper'))).toBe(false);
     expect(leftovers()).toBe('');
     expect(readdirSync(DEFAULT_TRACE_ROOT).length).toBe(traces); // tools run untraced
+  });
+
+  it('gives tools a capped writable /tmp, a writable HOME and a read-only database under /tmp', async () => {
+    const run = join(workspace, 'tool-profile');
+    const src = join(run, 'src');
+    const out = join(run, 'out');
+    const db = join(run, 'db');
+    const scratchTmp = join(run, 'scratch', 'tmp');
+    const scratchHome = join(run, 'scratch', 'semgrep-home');
+    for (const d of [src, out, db, scratchTmp, scratchHome]) mkdirSync(d, { recursive: true });
+    writeFileSync(join(db, 'all.zip'), 'db-bytes');
+    const tools = new GvisorToolRunner({ outputDir: out, allowedRoots: [workspace], tmpMb: 16 });
+    const script = `
+      const fs = require('fs');
+      const r = { tmpdir: process.env.TMPDIR, cache: process.env.XDG_CACHE_HOME, home: process.env.HOME, uid: process.getuid() };
+      fs.writeFileSync('/tmp/work', 'x'); r.tmpWritable = true;
+      fs.mkdirSync(process.env.HOME + '/.semgrep'); r.homeWritable = true;
+      r.db = fs.readFileSync('/tmp/osv-scalibr/all.zip', 'utf8');
+      try { fs.writeFileSync('/tmp/osv-scalibr/x', 'x'); r.dbWritable = true; } catch { r.dbWritable = false; }
+      try { fs.writeFileSync('/tmp/big', Buffer.alloc(32 * 1024 * 1024)); r.tmpCapped = false; } catch { r.tmpCapped = true; }
+      try { fs.writeFileSync('/root/x', 'x'); r.rootWritable = true; } catch { r.rootWritable = false; }
+      fs.writeFileSync('/out/r.json', JSON.stringify(r));`;
+    const result = await tools.run(
+      PROBE_IMAGE,
+      ['node', '-e', script],
+      [
+        { hostPath: src, containerPath: '/src', readOnly: true },
+        { hostPath: out, containerPath: '/out', readOnly: false },
+        { hostPath: scratchTmp, containerPath: '/tmp', readOnly: false },
+        { hostPath: scratchHome, containerPath: '/root/.semgrep', readOnly: false },
+        { hostPath: db, containerPath: '/tmp/osv-scalibr', readOnly: true },
+      ],
+    );
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(readFileSync(join(out, 'r.json'), 'utf8'))).toEqual({
+      tmpdir: '/tmp',
+      cache: '/tmp',
+      home: '/scratch',
+      uid: process.getuid?.(),
+      tmpWritable: true,
+      homeWritable: true,
+      db: 'db-bytes',
+      dbWritable: false,
+      tmpCapped: true,
+      rootWritable: false,
+    });
+    // The scratch requests were served by the jail's tmpfs: nothing reached the host directories.
+    expect(readdirSync(scratchTmp)).toEqual([]);
+    expect(readdirSync(scratchHome)).toEqual([]);
+    expect(readdirSync(db)).toEqual(['all.zip']);
+    expect(leftovers()).toBe('');
+  });
+
+  it('times out a tool and reports exit 124, leaving nothing behind', async () => {
+    const tools = new GvisorToolRunner({
+      outputDir: base,
+      allowedRoots: [workspace],
+      timeoutMs: 2_000,
+    });
+    const result = await tools.run(PROBE_IMAGE, ['node', '-e', 'setInterval(() => {}, 1000)'], []);
+    expect(result.exitCode).toBe(124);
+    expect(leftovers()).toBe('');
   });
 
   it('refuses a mount outside the workspace before starting anything', async () => {
