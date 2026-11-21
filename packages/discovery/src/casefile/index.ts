@@ -6,7 +6,7 @@
  * before it is returned.
  */
 import { constants } from 'node:fs';
-import { open, realpath } from 'node:fs/promises';
+import { lstat, open, realpath } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import {
   BootHints,
@@ -170,8 +170,20 @@ function wanted(a: Arraigned, path: ReachPath | undefined): Want[] {
   return holder ? [holder, ...kept.filter((k) => k !== holder)] : kept;
 }
 
-/** Reads a workspace file without following links, refusing paths that leave the workspace. */
-async function readWorkspaceFile(root: string, file: string): Promise<string | undefined> {
+/**
+ * Reads a workspace file without following links, refusing paths that leave the workspace.
+ *
+ * The path is checked (real path inside the real workspace), then opened, then the open handle is
+ * compared (device and inode) with a stat of the checked path, so a file swapped in between the
+ * check and the open is refused. This narrows the race; it does not close every one. The
+ * workspace must not be writable by repo-controlled processes while a case file is assembled.
+ * `hooks.afterCheck` exists for tests only.
+ */
+export async function readWorkspaceFile(
+  root: string,
+  file: string,
+  hooks: { afterCheck?: () => Promise<void> } = {},
+): Promise<string | undefined> {
   if (isAbsolute(file) || file.includes('\\') || file.split('/').includes('..')) return undefined;
   const base = resolve(root);
   const full = resolve(base, file);
@@ -180,14 +192,17 @@ async function readWorkspaceFile(root: string, file: string): Promise<string | u
   // O_NOFOLLOW covers only the last component and does not exist on Windows, so the real path
   // (links and junctions in any component resolved) must still be inside the real workspace.
   let real: string;
+  let checked: { dev: number; ino: number };
   try {
     const realBase = await realpath(base);
     real = await realpath(join(base, rel));
     const realRel = relative(realBase, real);
     if (realRel === '' || realRel.startsWith('..') || isAbsolute(realRel)) return undefined;
+    checked = await lstat(real);
   } catch {
     return undefined;
   }
+  await hooks.afterCheck?.();
   let handle;
   try {
     handle = await open(real, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
@@ -196,6 +211,7 @@ async function readWorkspaceFile(root: string, file: string): Promise<string | u
   }
   try {
     const st = await handle.stat();
+    if (st.dev !== checked.dev || st.ino !== checked.ino) return undefined;
     if (!st.isFile() || st.size > MAX_SOURCE_BYTES) return undefined;
     const buf = Buffer.alloc(st.size);
     const { bytesRead } = await handle.read(buf, 0, st.size, 0);

@@ -14,10 +14,12 @@
  *
  * This is a heuristic. It removes the planted forms the tests cover; it does not prove that no
  * instruction-like text survives, and it is not the only defence: every slice stays
- * `untrusted: true`, and the Trial's safety envelope fences slice text as data. Known gaps: text
- * assembled at run time (an array of single words joined with spaces, `String.fromCharCode`,
- * values computed from numbers), meaning carried by code structure rather than by literals or
- * names, and short member chains of two or three words (`ignore.all`), which read as code.
+ * `untrusted: true`, and the Trial's safety envelope fences slice text as data. That fence is the
+ * primary control; this is defence in depth. Known gaps: text assembled at run time (an array of
+ * single words joined with spaces, `String.fromCharCode`, values computed from numbers), meaning
+ * carried by code structure rather than by literals or names, sentences made only of words in
+ * `CODE_WORDS`, a word hidden as the last property of a code-word chain (`this.ignore`), and
+ * identifiers of fewer than seven words outside a run.
  */
 import { createHash } from 'node:crypto';
 import type { Slice } from '@affidavit/contracts';
@@ -52,16 +54,33 @@ function wordsOf(s: string): string[] {
 }
 
 /**
- * Words a literal spells. A token (a run of non-whitespace) that is a short member-access chain
- * counts as none; any other token counts every letter run in it, whatever separates them.
+ * Words a literal spells. Every token (a run of non-whitespace) counts every letter run in it,
+ * whatever separates them. In a short member-access chain (`this.userId`) only the words that are
+ * not in `CODE_WORDS` count, so `req.session.user` counts none and `Ignore.all.previous` three.
  */
 function proseWords(s: string): number {
   let n = 0;
   for (const tok of s.split(/[\s\p{Z}]+/u)) {
     const core = tok.replace(/^[^A-Za-z_$]+|[^A-Za-z0-9_$]+$/g, '');
-    if (MEMBER_CHAIN.test(core)) continue;
-    n += wordsOf(tok).length;
+    n += MEMBER_CHAIN.test(core) ? chainWords(core) : wordsOf(tok).length;
   }
+  return n;
+}
+
+const isCodeWord = (w: string): boolean => CODE_WORDS.has(w.toLowerCase());
+
+/**
+ * Words a member chain spells: those not in `CODE_WORDS`, except that a chain rooted in a code
+ * word may end in one property of any name (`this.stocks`, `req.body.allocations`).
+ */
+function chainWords(core: string): number {
+  const segs = core.split('.');
+  const rootIsCode = wordsOf(segs[0] ?? '').every(isCodeWord);
+  let n = 0;
+  segs.forEach((seg, i) => {
+    if (rootIsCode && i === segs.length - 1) return;
+    n += wordsOf(seg).filter((w) => !isCodeWord(w)).length;
+  });
   return n;
 }
 
@@ -103,6 +122,9 @@ function decodeRegex(pattern: string): string {
  * `provenCode`, like a string.
  */
 export function proseRegex(pattern: string): boolean {
+  // A numeric escape is a backreference or a legacy octal escape (`\111` is `I`), and `\cI` is a
+  // control escape spelled with a letter. Not decoded: any of them means the regex is replaced.
+  if (/\\(?:[0-9]|c[A-Za-z])/.test(pattern.replace(/\\\\/g, ''))) return true;
   const letterEscape = /\\x([0-9a-fA-F]{2})|\\u\{([0-9a-fA-F]{1,6})\}|\\u([0-9a-fA-F]{4})/g;
   for (const m of pattern.matchAll(letterEscape)) {
     const code = parseInt(String(m[1] ?? m[2] ?? m[3]), 16);
