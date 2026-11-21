@@ -43,8 +43,20 @@ export interface ExhibitView {
   kind: 'witness' | 'counterexample' | 'patch';
   /** True only when the Judge recorded an admissible result for this exhibit. */
   admitted: boolean;
+  /**
+   * True once the record holds any Judge ruling on this exhibit (a result or an inadmissible
+   * record). False means nothing is recorded yet, which is not the same as rejected.
+   */
+  judged: boolean;
   rejectedBy?: AdmissibilityRule;
   runs: RunView[];
+  /** The differential part of the Judge result, copied as recorded. Absent with no result. */
+  proof?: {
+    vulnPass: boolean;
+    /** Absent when the corpus has no known-safe variant to compare against. */
+    safeVariantFail?: boolean;
+    family?: { passed: number; total: number };
+  };
 }
 
 export interface Section {
@@ -62,6 +74,12 @@ export interface CaseView {
   stamp: 'VERIFIED' | null;
   /** Why the stamp is withheld on a proven-fixed verdict, in plain language. Empty otherwise. */
   stampWithheld: string[];
+  /**
+   * The stamp is withheld only because no Judge patch verification is in the record, and the
+   * cited patch was never rejected. The fix has not failed; its check is just not recorded
+   * (until CR-1, the event stream cannot carry one). False in every other case.
+   */
+  awaitingVerification: boolean;
   /** Plain-language summary first, technical exhibits after. */
   sections: Section[];
   docket: DocketEntry[];
@@ -171,6 +189,8 @@ function docketEntry(e: TrialEvent, exhibits: ReadonlyMap<string, ExhibitView>):
   }
 }
 
+const NO_ACCEPTED_PATCH = 'The record has no Judge result accepting a patch for this case.';
+
 function stampBlockers(
   verdict: Verdict,
   exhibits: ReadonlyMap<string, ExhibitView>,
@@ -187,8 +207,7 @@ function stampBlockers(
   }
   if (!cited.some((id) => exhibits.get(id)?.kind === 'witness' && exhibits.get(id)?.admitted))
     out.push('The verdict cites no admitted witness.');
-  if (acceptedPatches.size === 0)
-    out.push('The record has no Judge result accepting a patch for this case.');
+  if (acceptedPatches.size === 0) out.push(NO_ACCEPTED_PATCH);
   else if (!cited.some((id) => acceptedPatches.has(id)))
     out.push('The verdict does not cite the patch the Judge accepted.');
   return out;
@@ -208,7 +227,7 @@ export function buildCaseView(input: readonly TrialEvent[], extra: CaseViewInput
     const prev = exhibits.get(id);
     if (prev) return prev;
     // An exhibit seen first in a Judge result is a witness unless a submission says otherwise.
-    const next: ExhibitView = { id, kind: 'witness', admitted: false, runs: [] };
+    const next: ExhibitView = { id, kind: 'witness', admitted: false, judged: false, runs: [] };
     exhibits.set(id, next);
     return next;
   };
@@ -221,6 +240,7 @@ export function buildCaseView(input: readonly TrialEvent[], extra: CaseViewInput
             id: e.payload.exhibitId,
             kind: e.payload.kind,
             admitted: false,
+            judged: false,
             runs: [],
           });
         break;
@@ -231,7 +251,20 @@ export function buildCaseView(input: readonly TrialEvent[], extra: CaseViewInput
           id: prev.id,
           kind: prev.kind,
           admitted: r.admissible,
+          judged: true,
           ...(r.rejectedBy !== undefined ? { rejectedBy: r.rejectedBy } : {}),
+          proof: {
+            vulnPass: r.vulnPass,
+            ...(r.safeVariantFail !== undefined ? { safeVariantFail: r.safeVariantFail } : {}),
+            ...(r.familyResults !== undefined
+              ? {
+                  family: {
+                    passed: r.familyResults.filter((f) => f.passed).length,
+                    total: r.familyResults.length,
+                  },
+                }
+              : {}),
+          },
           runs: r.runs.map((run) => ({
             variant: run.variant,
             attempt: run.attempt,
@@ -246,7 +279,12 @@ export function buildCaseView(input: readonly TrialEvent[], extra: CaseViewInput
       }
       case 'exhibit-inadmissible': {
         const prev = ensure(e.payload.exhibitId);
-        exhibits.set(prev.id, { ...prev, admitted: false, rejectedBy: e.payload.rejectedBy });
+        exhibits.set(prev.id, {
+          ...prev,
+          admitted: false,
+          judged: true,
+          rejectedBy: e.payload.rejectedBy,
+        });
         break;
       }
       case 'verdict-written':
@@ -283,6 +321,7 @@ export function buildCaseView(input: readonly TrialEvent[], extra: CaseViewInput
   let headline = 'This case is still being tried.';
   let summary = 'The trial is in progress. A summary appears when the Judge has ruled.';
   let withheld: string[] = [];
+  let awaitingVerification = false;
   if (escalation) {
     status = 'human-review';
     headline = 'Needs human review';
@@ -294,10 +333,19 @@ export function buildCaseView(input: readonly TrialEvent[], extra: CaseViewInput
       case 'proven-fixed':
         withheld = stampBlockers(verdict, exhibits, acceptedPatches);
         status = withheld.length === 0 ? 'verified' : 'unverified';
+        awaitingVerification =
+          withheld.length === 1 &&
+          withheld[0] === NO_ACCEPTED_PATCH &&
+          (verdict.exhibits as readonly string[]).some((id) => {
+            const x = exhibits.get(id);
+            return x?.kind === 'patch' && !x.judged;
+          });
         headline =
           withheld.length === 0
             ? 'Verified: weakness proven and fix confirmed'
-            : 'Fix claimed, not yet confirmed by the recorded evidence';
+            : awaitingVerification
+              ? 'Weakness proven, fix not yet confirmed by a recorded Judge check'
+              : 'Fix claimed, not yet confirmed by the recorded evidence';
         break;
       case 'proven-unfixed':
         status = 'unfixed';
@@ -332,6 +380,7 @@ export function buildCaseView(input: readonly TrialEvent[], extra: CaseViewInput
     summary,
     stamp: status === 'verified' ? 'VERIFIED' : null,
     stampWithheld: withheld,
+    awaitingVerification,
     sections: [
       { id: 'summary', title: 'Summary', body: summary },
       { id: 'exhibits', title: 'Exhibits', body: exhibitList.map((x) => x.id).join(', ') },
@@ -346,6 +395,8 @@ export function buildCaseView(input: readonly TrialEvent[], extra: CaseViewInput
             detail: escalation.detail,
             nextSteps: [
               'A person should review the candidate and its code slices.',
+              'Open the exhibits below to see each attempt and the Judge rule that applied.',
+              'Record a decision with a reason. The case stays open until a person does; nothing closes it automatically.',
               'No conclusion has been reached about the safety of this code.',
             ],
           },
