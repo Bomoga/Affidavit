@@ -19,6 +19,16 @@ const exec = promisify(execFile);
 const NPM_CLI = [
   join(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js'),
   join(dirname(process.execPath), '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+  // Fedora and RHEL nodejsNN packages keep npm in a versioned lib directory.
+  join(
+    dirname(process.execPath),
+    '..',
+    'lib',
+    `node_modules_${process.versions.node.split('.')[0]}`,
+    'npm',
+    'bin',
+    'npm-cli.js',
+  ),
 ].find((p) => existsSync(p));
 
 let root = '';
