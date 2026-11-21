@@ -55,7 +55,7 @@ What `pnpm demo` does, in order:
 Then open the URLs it prints (port 5173 unless it says otherwise):
 
 - `http://127.0.0.1:5173/` (case list)
-- `http://127.0.0.1:5173/cases/nodegoat-sqli-001` (the gate case, recorded). It shows status UNVERIFIED, "Fix claimed, not yet confirmed by the recorded evidence": the recorded verdict says proven-fixed, but the record has no Judge result accepting the patch, and the UI refuses to call it fixed. That is the honest reading; say it on stage rather than hide it.
+- `http://127.0.0.1:5173/cases/nodegoat-sqli-001` (the gate case, recorded). It shows the VERIFIED stamp because the recorded stream contains a Judge `verify-result` event accepting the patch (contracts v1.1). Say plainly that this is a recorded fixture and not a live run: the stamp rests on the recorded Judge event, and the verdict's own claim alone would show UNVERIFIED.
 - `http://127.0.0.1:5173/cases/escalated-001` (the escalated case, recorded). It shows HUMAN REVIEW: a strong candidate, two witnesses not admitted, no conclusion about safety.
 
 Flags (`pnpm demo -- <flag>`): `--memory` skips Docker, `--no-web` skips the web UI and exits after the scan, `--once` tears everything down after startup, `--target <text>` changes the recorded target name (it does not change what is analysed: nothing is analysed).

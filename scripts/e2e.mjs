@@ -25,7 +25,7 @@ try {
   if (r.mode === 'docker') {
     check(true, 'Postgres from docker/compose.yaml started and was provisioned');
   } else {
-    check(allowMemory, `docker path ran (fell back to in-memory: ${r.fallbackReason || 'forced'})`);
+    check(allowMemory, `in-memory replay accepted (Docker was not used: ${r.fallbackReason || 'forced'})`);
   }
 
   const out = r.scan.lines.join('\n');
