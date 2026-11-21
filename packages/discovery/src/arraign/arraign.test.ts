@@ -272,7 +272,17 @@ describe('arraign', () => {
     const r = arraign({
       candidates: [c],
       reachability: [reach(c.id, 'unknown')],
-      negativeControls: [{ id: 'nc-1', file: c.file, range: { startLine: 110, endLine: 120 } }],
+      negativeControls: [
+        {
+          id: 'nc-1',
+          tree: { commit: 'a'.repeat(40), patches: [] },
+          ruleId: c.ruleId,
+          cls: c.cls,
+          file: c.file,
+          range: { startLine: 110, endLine: 120 },
+        },
+      ],
+      tree: { commit: 'a'.repeat(40), patches: [] },
       config,
     });
     expect(r.dismissed.map((d) => d.reason)).toEqual(['negative-control']);

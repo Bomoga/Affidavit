@@ -9,7 +9,7 @@
  * Root rule F3: a candidate whose score is at or above the escalation floor is never dismissed
  * here. If a dismissal rule matches it anyway, it is held for review (`review`) instead.
  */
-import { Candidate, type Dismissal, type VulnClass } from '@affidavit/contracts';
+import { Candidate, CommitSha, type Dismissal, VulnClass } from '@affidavit/contracts';
 import type { CandidateReachability, DataAccessCall } from '../map/index.js';
 
 /** What kind of sink a candidate points at, coarse enough to score. */
@@ -173,11 +173,45 @@ export function arraignConfigFrom(
   });
 }
 
-/** A corpus negative control location (code a rule flags that is known not to be exploitable). */
+/** The tree a scan ran on: a commit and the corpus patch set applied over it (empty for none). */
+export interface ScannedTree {
+  commit: string;
+  patches: readonly string[];
+}
+
+/**
+ * A corpus negative control: code a rule flags that is known not to be exploitable, in one tree.
+ * It matches a candidate only when the scanned tree (commit and patch set), the rule id, the class
+ * and the file are the same and the lines overlap. A control recorded on a patched tree therefore
+ * never dismisses a scan of the vulnerable tree.
+ */
 export interface KnownNegativeControl {
   id: string;
+  tree: ScannedTree;
+  ruleId: string;
+  cls: VulnClass;
   file: string;
   range: { startLine: number; endLine: number };
+}
+
+const treeKey = (t: ScannedTree): string => `${t.commit}|${[...t.patches].sort().join('|')}`;
+
+function checkTree(t: ScannedTree, where: string): ScannedTree {
+  if (!CommitSha.safeParse(t.commit).success) throw new RangeError(`${where}: bad commit`);
+  if (!Array.isArray(t.patches) || t.patches.some((p) => typeof p !== 'string' || p === '')) {
+    throw new RangeError(`${where}: patches must be non-empty strings`);
+  }
+  return t;
+}
+
+function checkControl(n: KnownNegativeControl): KnownNegativeControl {
+  const where = `negative control ${n.id}`;
+  if (typeof n.id !== 'string' || n.id === '') throw new RangeError('negative control: empty id');
+  checkTree(n.tree, where);
+  if (typeof n.ruleId !== 'string' || n.ruleId === '') throw new RangeError(`${where}: no rule id`);
+  if (!VulnClass.safeParse(n.cls).success) throw new RangeError(`${where}: bad class`);
+  if (typeof n.file !== 'string' || n.file === '') throw new RangeError(`${where}: no file`);
+  return n;
 }
 
 export interface ArraignInput {
@@ -188,6 +222,8 @@ export interface ArraignInput {
   /** `RepoMap.dataAccess`, to refine the sink class. */
   dataAccess?: readonly DataAccessCall[];
   negativeControls?: readonly KnownNegativeControl[];
+  /** The tree the candidates were found in. Required when `negativeControls` is not empty. */
+  tree?: ScannedTree;
   config: ArraignConfig;
 }
 
@@ -200,11 +236,17 @@ export interface Arraigned {
   escalationFloor: number;
 }
 
-export interface HeldForReview extends Arraigned {
-  /** The dismissal that matched but was not applied because the score is at or above the floor. */
-  wouldDismiss: Dismissal['reason'];
-  detail: string;
-}
+/**
+ * An F3 hold. `wouldDismiss` is the dismissal that matched but was not applied because the score
+ * is at or above the floor. `route` says who may take it:
+ * - `person`: an `osv-no-path` hold. There is no call path to build a witness on, so it goes to a
+ *   person only, never to trial.
+ * - `person-or-trial`: any other hold. A person, or a second Defense attempt.
+ */
+export type HeldForReview = Arraigned & { detail: string } & (
+    | { wouldDismiss: 'osv-no-path'; route: 'person' }
+    | { wouldDismiss: Exclude<Dismissal['reason'], 'osv-no-path'>; route: 'person-or-trial' }
+  );
 
 export interface ArraignResult {
   /** Highest score first, then by candidate id. */
@@ -235,10 +277,14 @@ function dismissalFor(
   r: CandidateReachability,
   score: number,
   controls: readonly KnownNegativeControl[],
+  tree: string,
   config: ArraignConfig,
 ): { reason: Dismissal['reason']; detail: string } | undefined {
   const nc = controls.find(
     (n) =>
+      treeKey(n.tree) === tree &&
+      n.ruleId === c.ruleId &&
+      n.cls === c.cls &&
       n.file === c.file &&
       n.range.startLine <= c.range.endLine &&
       n.range.endLine >= c.range.startLine,
@@ -251,7 +297,8 @@ function dismissalFor(
     };
   }
   if (r.reachability === 'unreachable') {
-    return { reason: 'unreachable', detail: `map: ${r.reason}: ${r.detail}` };
+    // Only the enum reason: the map's free-text detail can carry repo-derived names.
+    return { reason: 'unreachable', detail: `the map found no path to it (${r.reason})` };
   }
   if (r.reachability !== 'unknown' && score < config.dismissBelow) {
     return {
@@ -264,6 +311,11 @@ function dismissalFor(
 
 export function arraign(input: ArraignInput): ArraignResult {
   const config = checkConfig(input.config);
+  const controls = (input.negativeControls ?? []).map(checkControl);
+  if (controls.length > 0 && input.tree === undefined) {
+    throw new RangeError('negative controls need the scanned tree (input.tree)');
+  }
+  const tree = input.tree ? treeKey(checkTree(input.tree, 'input.tree')) : '';
   const byId = new Map<string, CandidateReachability>();
   for (const r of input.reachability) byId.set(r.candidateId, r);
   const seen = new Set<string>();
@@ -290,11 +342,15 @@ export function arraign(input: ArraignInput): ArraignResult {
       scoreInputs,
     });
     const out: Arraigned = { candidate, reach, sink, escalationFloor: config.escalationFloor };
-    const d = dismissalFor(c, reach, score, input.negativeControls ?? [], config);
+    const d = dismissalFor(c, reach, score, controls, tree, config);
     if (!d) toTrial.push(out);
-    else if (score >= config.escalationFloor)
-      review.push({ ...out, wouldDismiss: d.reason, detail: d.detail });
-    else
+    else if (score >= config.escalationFloor) {
+      review.push(
+        d.reason === 'osv-no-path'
+          ? { ...out, wouldDismiss: d.reason, route: 'person', detail: d.detail }
+          : { ...out, wouldDismiss: d.reason, route: 'person-or-trial', detail: d.detail },
+      );
+    } else
       dismissed.push({ schemaVersion: 1, candidateId: c.id, reason: d.reason, detail: d.detail });
   }
   toTrial.sort(
