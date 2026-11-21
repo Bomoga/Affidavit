@@ -6,6 +6,7 @@ Requests for changes to `packages/contracts`. Lane 3 does not edit contracts; ea
 
 - Raised by: L3-07 (web case view, PR 10). Affects L3-05, L3-06, L3-10, L1-12 (SSE).
 - Contracts version: v1.0.
+- Status: landed in contracts v1.1 (see `packages/contracts/CHANGELOG.md`).
 - Kind: additive (new enum member at the end of `TrialEventType`, new union member in `TrialEvent`). Minor bump.
 
 ### Problem
@@ -28,6 +29,10 @@ Emitted by actor `judge` in stage `verify`, once per `verifyPatch` call (so appe
 
 Fixtures to update in the same PR: `fixtures/trials/nodegoat-sqli-001.events.json` gains a `verify-result` event between the `verify` stage-entered and stage-exited events, with a passing `VerifyResult` for `exhibit-patch-001`. The SSE fixture tests in Lane 1 pick it up automatically.
 
-### What Lane 3 does until then
+### Resolution (v1.1)
+
+`packages/trial` records one `verify-result` (actor `judge`, stage `verify`) per `verifyPatch` call Remedy made, before the verdict. `buildCaseView(events)` in `apps/web` reads those events, counts only ones recorded by the Judge in `verify`, and the `verifyResults` input below is removed. A missing or failing check still renders `unverified`. The CLI renders the new event on one sanitized line.
+
+### What Lane 3 did before v1.1
 
 `buildCaseView(events, { verifyResults })` in `apps/web` accepts `VerifyResult` values from outside the stream. With none supplied, a `proven-fixed` verdict renders as `unverified` with the reason "The record has no Judge result accepting a patch for this case." It does not invent events or trust the verdict's claim. When CR-1 lands, the model reads `verify-result` events and the extra input can go.

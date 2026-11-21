@@ -12,9 +12,12 @@
     "lint": "eslint src",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "start": "tsx src/main.ts",
+    "test:sandbox-host": "AFFIDAVIT_SANDBOX_HOST=1 vitest run"
   },
   "dependencies": {
-    "@affidavit/contracts": "workspace:*"
+    "@affidavit/contracts": "workspace:*",
+    "@affidavit/evidence": "workspace:*"
   }
 }

@@ -16,7 +16,34 @@ sudo bash docker/sandbox/install-gvisor.sh      # runsc, checked against a pinne
 sudo bash docker/sandbox/setup-runsc-audit.sh   # the traced runtime, ends with "AUDIT OK"
 ```
 
-`install-gvisor.sh` checks the tarball against a SHA-512 per architecture written into the script, not against the `.sha512` file published in the same bucket as the tarball. The values are still the `[sha512]` placeholder, so the script refuses to install until a maintainer records the real hashes for the pinned release from a verified download.
+`install-gvisor.sh` checks the tarball against a SHA-512 per architecture written into the script, not against the `.sha512` file published in the same bucket as the tarball.
+
+### Pinned hashes for release 20261109.0
+
+Recorded on 2026-11-17 by the Lane 2 owner. For each architecture, these four agree:
+
+| Source                                                                                                                                         | x86_64                     | aarch64                   |
+| ---------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------- | ------------------------- |
+| SHA-512 of `gvisor.tar.zstd` downloaded from the release bucket                                                                                | `0a0041fd...5275393c`      | `a0b5d911...e17e18ac`     |
+| The bucket's own `gvisor.tar.zstd.sha512`                                                                                                      | same                       | same                      |
+| `SHA512SUMS` on the GitHub release `release-20261109.0` of `google/gvisor` (uploaded by `github-actions[bot]`), entry `gvisor-<arch>.tar.zstd` | same                       | same                      |
+| SHA-256 that GitHub computed for the release asset `gvisor-<arch>.tar.zstd`, compared with the SHA-256 of the bucket download                  | `84c29e8f...6448af12` both | `c7394eca...3325a7b` both |
+
+The GitHub release is served by different infrastructure from the bucket, so a tampered bucket alone would not match it. Also, the x86_64 tarball extracts to files byte-identical to the runsc, shim and `gvisor-bin/` installed on the owner's workstation on 2026-11-14, so the bucket content did not change in between.
+
+To repeat the check for a new release, in an empty directory:
+
+```bash
+R=20261109.0; A=x86_64
+curl -fsSLO "https://storage.googleapis.com/gvisor/releases/release/$R/$A/gvisor.tar.zstd"
+gh release download "release-$R" -R google/gvisor -p SHA512SUMS
+sha512sum gvisor.tar.zstd                       # must equal the next line's hash
+grep "gvisor-$A.tar.zstd" SHA512SUMS
+sha256sum gvisor.tar.zstd                       # must equal GitHub's digest for the asset:
+gh api "repos/google/gvisor/releases/tags/release-$R" -q ".assets[] | select(.name==\"gvisor-$A.tar.zstd\") | .digest"
+```
+
+Changing `RELEASE` needs new hashes recorded this way and a fresh containment run.
 
 The second script registers a Docker runtime called `runsc-affidavit`: runsc with `--strace` for a fixed list of syscalls and `--debug-log=/var/lib/affidavit-runsc/%ID%.%COMMAND%.txt`. The directory is `root:docker`, mode 2770, with a docker group default ACL and the SELinux type `container_var_lib_t` so dockerd can write there. The user running the sandbox must be in the `docker` group, which can read and delete the traces. The trace is a file per container rather than a directory, because runsc creates per-container directories with mode 0750 and the group could not delete them.
 
