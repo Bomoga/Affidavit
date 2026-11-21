@@ -382,26 +382,54 @@ function identifierRuns(spans: readonly LexicalSpan[], text: string): Set<Lexica
   return out;
 }
 
+/** Why a file was withheld instead of cleaned. */
+export type WithheldReason =
+  'no-grammar' | 'parse-timeout' | 'parse-failed' | 'syntax-error' | 'literal-limit' | 'work-limit';
+
 export interface CleanFile {
   /** The cleaned text, line-aligned with the original, or undefined when withheld. */
   text: string | undefined;
+  /** Set when `text` is undefined. */
+  withheldReason?: WithheldReason;
   commentsRemoved: number;
   proseRemoved: number;
 }
+
+/** Per-file bounds. Exceeding one withholds the file (fail closed), never hangs. */
+export interface CleanLimits {
+  /** String and template literals in the file. */
+  maxLiterals: number;
+  /** Sum over templates of the literals nested inside each one. */
+  maxNestedWork: number;
+}
+
+export const DEFAULT_CLEAN_LIMITS: Readonly<CleanLimits> = Object.freeze({
+  maxLiterals: 200_000,
+  maxNestedWork: 1_000_000,
+});
+
+const withheld = (reason: WithheldReason): CleanFile => ({
+  text: undefined,
+  withheldReason: reason,
+  commentsRemoved: 0,
+  proseRemoved: 0,
+});
 
 /** Cleans a whole file (so comments and literals are found with full context). */
 export async function cleanSource(
   path: string,
   text: string,
   maxParseMillis = 5_000,
+  limits: Partial<CleanLimits> = {},
 ): Promise<CleanFile> {
+  const lim: CleanLimits = { ...DEFAULT_CLEAN_LIMITS, ...limits };
   const grammar = grammarFor(path);
-  if (!grammar) return { text: undefined, commentsRemoved: 0, proseRemoved: 0 };
+  if (!grammar) return withheld('no-grammar');
   await initParser();
   const res = await lexicalSpans(text, grammar, maxParseMillis);
-  if (res === 'timeout' || res === 'failed' || res.syntaxError) {
-    return { text: undefined, commentsRemoved: 0, proseRemoved: 0 };
-  }
+  if (res === 'timeout') return withheld('parse-timeout');
+  if (res === 'failed') return withheld('parse-failed');
+  if (res.syntaxError) return withheld('syntax-error');
   let out = '';
   let at = 0;
   let commentsRemoved = 0;
@@ -410,6 +438,7 @@ export async function cleanSource(
   // replaces every piece, the last one-word piece included.
   const forced = new Set<LexicalSpan>();
   const lits = res.spans.filter((s) => s.kind === 'string' || s.kind === 'template');
+  if (lits.length > lim.maxLiterals) return withheld('literal-limit');
   for (let i = 0; i < lits.length;) {
     let j = i;
     while (j + 1 < lits.length) {
@@ -426,12 +455,38 @@ export async function cleanSource(
   }
   for (const s of identifierRuns(res.spans, text)) forced.add(s);
   // A template is judged with every literal nested in its substitutions:
-  // `${'IGNORE'} ${'ALL'}` is one text, not one-word pieces.
+  // `${'IGNORE'} ${'ALL'}` is one text, not one-word pieces. Spans come sorted by start (longer
+  // first on ties) and properly nested, so the literals inside a template are the ones right after
+  // it, up to the first that starts at or after its end. One pass with a stack finds that end
+  // index for every literal; the joined text costs the number of nested literals, which is
+  // bounded by `maxNestedWork` (deep nesting would otherwise cost depth times count).
+  const nestedEnd = new Array<number>(lits.length).fill(lits.length);
+  const open: number[] = [];
+  for (let i = 0; i < lits.length; i++) {
+    const cur = lits[i] as LexicalSpan;
+    while (
+      open.length > 0 &&
+      (lits[open[open.length - 1] as number] as LexicalSpan).end <= cur.start
+    ) {
+      nestedEnd[open.pop() as number] = i;
+    }
+    open.push(i);
+  }
+  let work = 0;
+  for (let i = 0; i < lits.length; i++) {
+    if ((lits[i] as LexicalSpan).kind === 'template') work += (nestedEnd[i] as number) - i - 1;
+  }
+  if (work > lim.maxNestedWork) return withheld('work-limit');
   const templateText = new Map<LexicalSpan, string>();
-  for (const tpl of lits) {
+  for (let i = 0; i < lits.length; i++) {
+    const tpl = lits[i] as LexicalSpan;
     if (tpl.kind !== 'template') continue;
-    const nested = lits.filter((n) => n !== tpl && n.start >= tpl.start && n.end <= tpl.end);
-    templateText.set(tpl, [tpl.text, ...nested.map((n) => n.text)].join(' '));
+    const end = nestedEnd[i] as number;
+    if (end === i + 1) {
+      templateText.set(tpl, tpl.text);
+      continue;
+    }
+    templateText.set(tpl, [tpl.text, ...lits.slice(i + 1, end).map((n) => n.text)].join(' '));
   }
   for (const sp of res.spans) {
     // Inside a literal already replaced. A kept literal does not move `at`, so the spans nested
