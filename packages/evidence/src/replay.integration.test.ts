@@ -15,7 +15,7 @@ import {
   JailExecutor,
   Judge,
   buildRunnerImage,
-  type EvidenceVariant,
+  type ExecutionVariant,
   type TargetEndpoint,
 } from '@affidavit/judge';
 import { Exhibit, Witness } from '@affidavit/contracts';
@@ -99,7 +99,9 @@ describe.runIf(onSandboxHost)('L2-08 replay on a sandbox host', { timeout: 600_0
 
   /** Boots a fresh pair of targets on fresh case networks, as a second machine would. */
   async function freshJudge(): Promise<Judge> {
-    const endpoints = new Map<EvidenceVariant, TargetEndpoint>();
+    // Keyed by every variant an executor may be asked for (`patched` included since L2-07); only
+    // vulnerable and safe are booted here.
+    const endpoints = new Map<ExecutionVariant, TargetEndpoint>();
     for (const variant of ['vulnerable', 'safe'] as const) {
       const net = await createCaseNetwork();
       nets.push(net);
