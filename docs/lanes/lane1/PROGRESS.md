@@ -24,6 +24,16 @@ Contracts version in use: v1.0
 | L1-15 | blocked                             |                 | GitHub App. Gated on App credentials.                                                                                                                                                                                                                                                                 |
 | L1-16 | blocked                             |                 | Blocked on L1-01.                                                                                                                                                                                                                                                                                     |
 
+## L1-01c: NodeGoat ingestion without the escape hatch
+
+Branch `lane1/L1-01c-nodegoat-ingest`, stacked on #51 (`lane1/L1-07-casefile`). Real ingestion of the pinned NodeGoat checkout now returns `ok`, so the L1-07 case file test runs end to end without `AFFIDAVIT_CASEFILE_UNINGESTED_OK` and the case file carries the real redaction locations (three: a private key and two generic API keys; locations only).
+
+- Fonts (TrueType, OpenType, WOFF, WOFF2, EOT) whose structure checks out are left out of the workspace with reason `font-file`, like media. A font that fails the structure check, or sits under an archive name or in the quarantine sidecar, is still a coverage loss.
+- `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, `pnpm-lock.yaml` and SVG files flagged `chunk-split-risk` are covered when the windows pass proves it (`src/tools/windowproof.ts`, rule bounds in `src/tools/matchbound.ts`). Anything else stays fail-closed.
+- Review follow-up (#54 nits): the font absence post-check counts only `ENOENT` as absent (any other `lstat` error returns `incomplete`); the proof hashes the gitleaks config file the container mounts, resolved from the invocation's own `--config` and mounts; the gate-word search also covers each line's base64, hex and percent-decoded text to gitleaks' decode depth; rule bounds honor `(?i)` folding (k to U+212A, 3 bytes; s to U+017F, 2 bytes); `fontkit.testutil.ts` is test-only and left out of the build (`tsconfig.build.json`); a UTF-8 byte-order mark was removed from `fonts.ts`.
+- Known gaps: (1) a match stitched together from decoded text on several lines (shared with every file over 100 KB); (2) the decoded gate-word search uses its own segment finder, which decodes more than gitleaks does (shorter minimum runs, every alignment) but is not gitleaks' exact decoder; (3) the WOFF2 check covers the header, size field and metadata and private block bounds only, not the compressed table stream, which is safe only because every font is left out of the workspace.
+- Lane 3 still reads `fixtures/casefiles/nodegoat-sqli-001.json` (Lead generated). Pointing its tests at `fixtures/casefiles/nodegoat-nosqli-where-001.json` is a Lane 3 code change, so it is listed in the PR, not done here.
+
 ## Blocked
 
 - L1-01 (#32): round 4 review found one blocker and three majors. Waiting on lead decision about a fourth fix round.
