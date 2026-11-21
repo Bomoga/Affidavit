@@ -1,6 +1,15 @@
 import { execFile } from 'node:child_process';
-import { lstat, mkdir, mkdtemp, readFile, readdir, writeFile, chmod } from 'node:fs/promises';
-import { join, relative } from 'node:path';
+import {
+  copyFile,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  writeFile,
+  chmod,
+} from 'node:fs/promises';
+import { dirname, join, posix, relative } from 'node:path';
 import { promisify } from 'node:util';
 import type { CaseFile, PatchExhibit } from '@affidavit/contracts';
 import {
@@ -121,6 +130,85 @@ interface Workspace {
   target: BootedTarget;
   /** The patched build with devDependencies, used only to run the suite; or why there is none. */
   suite: { image: string } | { unavailable: string };
+  /** How `runAddedTests` runs the patch's own test files on the suite image; null when it does not. */
+  addedTests: AddedTestsRun | null;
+}
+
+interface AddedTestsRun {
+  command: string[];
+  mounts: Mount[];
+}
+
+/** Test runners `runAddedTests` knows, by package name, in the order they are looked for. */
+const TEST_RUNNERS: readonly { pkg: string; bin: string; args: string[] }[] = [
+  { pkg: 'vitest', bin: 'vitest', args: ['run'] },
+  { pkg: 'jest', bin: 'jest', args: ['--ci', '--runTestsByPath'] },
+  { pkg: 'mocha', bin: 'mocha', args: [] },
+];
+
+/**
+ * The test runner the vulnerable commit's root `package.json` declares (a dependency or
+ * devDependency named vitest, jest or mocha), or null. Read from the vulnerable commit, never the
+ * patch: a patch cannot change `package.json` scripts or runner config (`suiteManifestChange`).
+ */
+export function testRunnerOf(packageJsonText: string): (typeof TEST_RUNNERS)[number] | null {
+  let pkg: unknown;
+  try {
+    pkg = JSON.parse(packageJsonText);
+  } catch {
+    return null;
+  }
+  if (typeof pkg !== 'object' || pkg === null) return null;
+  const declared = new Set<string>();
+  for (const field of ['dependencies', 'devDependencies'] as const) {
+    const deps = (pkg as Record<string, unknown>)[field];
+    if (typeof deps === 'object' && deps !== null)
+      for (const k of Object.keys(deps)) declared.add(k);
+  }
+  return TEST_RUNNERS.find((r) => declared.has(r.pkg)) ?? null;
+}
+
+/** A test file path the added-tests run can mount: plain relative segments, no `..`. */
+const ADDED_TEST_PATH = /^[A-Za-z0-9_@][A-Za-z0-9._@-]*(\/[A-Za-z0-9_@][A-Za-z0-9._@-]*)*$/;
+
+/**
+ * Plans the added-tests run: the files the patch adds under a test root (`PatchPlan.tests`, only
+ * new files; a patch that edits or deletes a test is refused before any build), copied out of the
+ * applied tree and mounted read only at their paths under the recipe's working directory, run by
+ * the vulnerable commit's own test runner from the suite image's `node_modules/.bin`. Null when
+ * there are no added files, no known runner, or a path or file it will not mount: the added tests
+ * are an extra check whose pass is never required, so not running them never helps a patch.
+ */
+export async function planAddedTests(
+  tests: ParsedDiff,
+  vulnerableRoot: string,
+  appliedRoot: string,
+  workdir: string,
+  scratch: string,
+): Promise<AddedTestsRun | null> {
+  const files = tests.files.filter((f) => f.status === 'added').map((f) => f.path);
+  if (files.length === 0) return null;
+  const pkg = await readIfFile(join(vulnerableRoot, 'package.json'));
+  const runner = pkg === null ? null : testRunnerOf(pkg);
+  if (runner === null) return null;
+  if (!/^\/[A-Za-z0-9._/-]*$/.test(workdir) || workdir.split('/').includes('..')) return null;
+  const copies = join(scratch, 'added-tests');
+  const mounts: Mount[] = [];
+  for (const path of files) {
+    if (!ADDED_TEST_PATH.test(path) || path.split('/').includes('..')) return null;
+    const from = join(appliedRoot, path);
+    const st = await lstat(from).catch(() => null);
+    if (st === null || !st.isFile()) return null;
+    const to = join(copies, path);
+    await mkdir(dirname(to), { recursive: true, mode: 0o755 });
+    await copyFile(from, to);
+    await chmod(to, 0o644);
+    mounts.push({ hostPath: to, containerPath: posix.join(workdir, path), readOnly: true });
+  }
+  return {
+    command: [posix.join(workdir, 'node_modules', '.bin', runner.bin), ...runner.args, ...files],
+    mounts: validateMounts(mounts, [scratch]),
+  };
 }
 
 /**
@@ -190,7 +278,12 @@ async function readIfFile(path: string): Promise<string | null> {
  *   `unavailable` and is not built. A patch that makes the suite build refused is `build`.
  * - `runSuite` runs `npm test` in the suite image, in the recipe's working directory, with no
  *   network. The command is fixed here, and the `scripts` it resolves are the vulnerable commit's
- *   (unchanged, checked above). `runAddedTests` is not run yet (returns null).
+ *   (unchanged, checked above).
+ * - `runAddedTests` runs the files the patch adds under a test root, in a separate run on the
+ *   same suite image: each file is mounted read only at its path, and the vulnerable commit's own
+ *   runner (vitest, jest or mocha, from `node_modules/.bin`) runs only those files. A failure
+ *   rejects the patch (`suite-fails`); no added files, no known runner, or a path it will not
+ *   mount gives null, which changes nothing (`planAddedTests`).
  *
  * Throws only on infrastructure failure.
  */
@@ -334,12 +427,22 @@ export class JailedPatchWorkbench implements PatchWorkbench {
             });
             suite = { image: suiteImage };
           }
+          const addedTests =
+            'image' in suite
+              ? await planAddedTests(
+                  plan.tests,
+                  staged,
+                  join(tree, 'full'),
+                  target.recipe.workdir,
+                  dir,
+                )
+              : null;
           registry.set('patched', target);
           const prepared: PreparedPatch = {
             target: { ...caseFile.target, variant: 'patched', imageDigest: target.imageId },
             workspacePath: join(tree, 'full'),
           };
-          this.#open.set(prepared.workspacePath, { dir, registry, target, suite });
+          this.#open.set(prepared.workspacePath, { dir, registry, target, suite, addedTests });
           keep = true;
           return { ok: true, prepared };
         },
@@ -369,8 +472,23 @@ export class JailedPatchWorkbench implements PatchWorkbench {
     return { passed: run.exitCode === 0 && !run.timedOut && !run.oomKilled };
   }
 
-  runAddedTests(): Promise<{ passed: boolean } | null> {
-    return Promise.resolve(null);
+  async runAddedTests(
+    _caseFile: CaseFile,
+    prepared: PreparedPatch,
+  ): Promise<{ passed: boolean } | null> {
+    const ws = this.#workspace(prepared);
+    if (!('image' in ws.suite) || ws.addedTests === null) return null;
+    const run = await runJailed(
+      {
+        image: ws.suite.image,
+        command: ws.addedTests.command,
+        mounts: ws.addedTests.mounts,
+        workdir: ws.target.recipe.workdir,
+        timeoutMs: SUITE_TIMEOUT_MS,
+      },
+      { trace: false },
+    );
+    return { passed: run.exitCode === 0 && !run.timedOut && !run.oomKilled };
   }
 
   async release(prepared: PreparedPatch): Promise<void> {
