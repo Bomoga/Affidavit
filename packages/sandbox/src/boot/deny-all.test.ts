@@ -47,6 +47,25 @@ describe('no egress exception for the split build', () => {
   ])('refuses a run spec that asks for %s, so no caller can add a route out', (key, value) => {
     expect(() => buildGvisorRunArgs({ ...spec, [key]: value })).toThrow(/unknown run spec key/);
   });
+  it('keeps the networked bundle builder out of the package: only the human-run script fetches', () => {
+    const srcRoot = join(HERE, '..');
+    const files: string[] = [];
+    const walk = (dir: string): void => {
+      for (const e of readdirSync(dir, { withFileTypes: true })) {
+        const p = join(dir, e.name);
+        if (e.isDirectory()) walk(p);
+        else if (e.name.endsWith('.ts') && !e.name.endsWith('.test.ts')) files.push(p);
+      }
+    };
+    walk(srcRoot);
+    for (const f of files) {
+      const text = readFileSync(f, 'utf8');
+      expect(text, f).not.toMatch(/['"]cache['"],\s*['"]add['"]|npm cache add --/);
+      expect(text, f).not.toMatch(/from ['"][./]*scripts\//);
+    }
+    expect(Object.keys(sandbox)).not.toContain('buildDependencyBundle');
+  });
+
   it('still joins only none or a per-case internal network', () => {
     const args = buildGvisorRunArgs(spec);
     expect(args[args.indexOf('--network') + 1]).toBe('none');
@@ -106,7 +125,14 @@ describe('dependencyFetchProblem', () => {
 describe('compose precheck without a YAML dependency', () => {
   it('declares no js-yaml (or any new) dependency', () => {
     const pkg = JSON.parse(readFileSync(PKG, 'utf8')) as { dependencies: Record<string, string> };
-    expect(Object.keys(pkg.dependencies).sort()).toEqual(['@affidavit/contracts', 'dockerode']);
+    // tar-stream is the one addition, for the dependency bundle reader (L2-04c); it is on the
+    // implementation plan's approved Lane 2 list (section 2.3) and already used by evidence.
+    expect(Object.keys(pkg.dependencies).sort()).toEqual([
+      '@affidavit/contracts',
+      'dockerode',
+      'tar-stream',
+    ]);
+    expect(Object.keys(pkg.dependencies)).not.toContain('js-yaml');
   });
 
   it("accepts NodeGoat's compose file as written", () => {

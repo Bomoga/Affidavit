@@ -20,6 +20,15 @@ import { runJailed, type JailedRun } from '../gvisor/runner.js';
 import { baseImageProblem, imageOnBuild, pinImage } from './images.js';
 import { deriveRecipe, type BootRecipe } from './recipe.js';
 import { composePathPairs, execErrorText, scrubPaths } from './scrub.js';
+import { DEPENDENCY_MOUNT, bundleInstallCommand } from '../bundle/coverage.js';
+import {
+  materializeNpmCache,
+  openDependencyBundle,
+  type DependencyBundleCaps,
+  type DependencyBundleRef,
+  type OpenedBundle,
+} from '../bundle/open.js';
+import type { BundleSection } from '../bundle/plan.js';
 
 const exec = promisify(execFile);
 
@@ -86,13 +95,34 @@ export async function stageTree(src: string, dest: string): Promise<StageReport>
   return report;
 }
 
+/** What a build installed from a dependency bundle, for the evidence bundle and replay. */
+export interface BundleUse {
+  /** `sha256:<hex>` of the bundle tar, equal to the pin. */
+  sha256: string;
+  /** The digest of each section the install step mounted. */
+  sections: Partial<Record<BundleSection, string>>;
+  packages: number;
+}
+
 export type BuildOutcome = (
-  | { ok: true; imageId: string; baseImage: string; recipe: BootRecipe; stage: StageReport }
+  | {
+      ok: true;
+      imageId: string;
+      baseImage: string;
+      recipe: BootRecipe;
+      stage: StageReport;
+      /**
+       * Set when a dependency bundle was given. Its digest is an input of the image: replay must
+       * build with the same pinned bundle (`dependencyBundleToolVersions` carries it into
+       * `BundleManifest.toolVersions`).
+       */
+      dependencyBundle?: BundleUse;
+    }
   | {
       ok: false;
       /** `unsupported`: outside what the MVP can boot without weakening a control. */
       unsupported: boolean;
-      step: 'stage' | 'recipe' | 'base' | 'scripts' | 'assemble';
+      step: 'bundle' | 'stage' | 'recipe' | 'base' | 'scripts' | 'assemble';
       /** Host paths are replaced by placeholders (`<tree>`, `<build>`, `<src>`, `<tmp>`). */
       reason: string;
     }
@@ -115,6 +145,15 @@ export interface BuildOptions {
    * that has any devDependency is `unsupported`.
    */
   devDependencies?: boolean;
+  /**
+   * A pinned dependency bundle (lead decision 2026-11-20, L2-04c), built on a networked host by a
+   * human, never by this code. It is verified against its pinned sha256 before anything in it is
+   * used (a mismatch is a `failed` build at step `bundle`), then the sections the build needs are
+   * mounted read only into a jailed `npm ci --offline --ignore-scripts`. No step gains a route out.
+   */
+  dependencyBundle?: DependencyBundleRef;
+  /** Caps for reading the bundle; tests lower them. */
+  dependencyBundleCaps?: Readonly<DependencyBundleCaps>;
 }
 
 const tail = (r: JailedRun): string => `${r.stderr}\n${r.stdout}`.trim().slice(-1500);
@@ -161,6 +200,8 @@ export async function buildTarget(
       dir,
       opts.limits ?? BUILD_LIMITS,
       opts.devDependencies === true,
+      opts.dependencyBundle,
+      opts.dependencyBundleCaps,
     );
     if (!outcome.ok) outcome = { ...outcome, reason: scrub(outcome.reason) };
     return outcome;
@@ -181,16 +222,36 @@ async function buildIn(
   dir: string,
   limits: Readonly<Limits>,
   devDependencies: boolean,
+  bundleRef?: DependencyBundleRef,
+  bundleCaps?: Readonly<DependencyBundleCaps>,
 ): Promise<BuildOutcome> {
   const tree = join(dir, 'tree');
   {
+    // The bundle is checked first, before the checkout is even staged: nothing from a bundle that
+    // is not the pinned one is ever used (fail closed).
+    let bundle: OpenedBundle | undefined;
+    if (bundleRef !== undefined) {
+      const opened = await openDependencyBundle(bundleRef, dir, bundleCaps);
+      if (!opened.ok) {
+        return {
+          ok: false,
+          unsupported: opened.unsupported,
+          step: 'bundle',
+          reason: opened.reason,
+        };
+      }
+      bundle = opened.bundle;
+    }
     let stage: StageReport;
     try {
       stage = await stageTree(srcDir, tree);
     } catch (err) {
       return { ok: false, unsupported: true, step: 'stage', reason: (err as Error).message };
     }
-    const r = await deriveRecipe(tree, hints, { devDependencies });
+    const r = await deriveRecipe(tree, hints, {
+      devDependencies,
+      ...(bundle === undefined ? {} : { bundle: bundle.manifest }),
+    });
     if (!r.ok) return { ok: false, unsupported: true, step: 'recipe', reason: r.reason };
     const recipe = r.recipe;
 
@@ -220,12 +281,35 @@ async function buildIn(
       };
     }
 
+    // Only the sections the recipe needs are laid out, so a runtime image never sees dev packages.
+    let bundleUse: BundleUse | undefined;
+    const cacheDir = join(dir, 'npm-cache');
+    if (bundle !== undefined) {
+      const sections = recipe.install?.sections ?? [];
+      const packages = await materializeNpmCache(bundle, sections, cacheDir);
+      bundleUse = {
+        sha256: `sha256:${bundle.sha256}`,
+        sections: Object.fromEntries(sections.map((s) => [s, bundle.manifest.sections[s].sha256])),
+        packages,
+      };
+    }
+
     let mounts: Mount[];
+    let installMounts: Mount[] = [];
     try {
       mounts = validateMounts(
         [{ hostPath: tree, containerPath: recipe.workdir, readOnly: false }],
         [dir],
       );
+      if (recipe.install !== undefined) {
+        installMounts = validateMounts(
+          [
+            { hostPath: tree, containerPath: recipe.workdir, readOnly: false },
+            { hostPath: cacheDir, containerPath: DEPENDENCY_MOUNT, readOnly: true },
+          ],
+          [dir],
+        );
+      }
     } catch (err) {
       return { ok: false, unsupported: true, step: 'recipe', reason: (err as Error).message };
     }
@@ -244,13 +328,27 @@ async function buildIn(
       },
     };
 
-    // Nothing was installed (step 2 refused any dependency), so only the target's own build runs.
-    const scripts = recipe.buildScript ? [['npm', 'run', 'build']] : [];
-    for (const command of scripts) {
+    // Without a bundle nothing is installed (step 2 refused any dependency). With one, the install
+    // runs first, offline and with lifecycle scripts disabled, from the read-only bundle mount.
+    const scripts: { command: string[]; mounts: Mount[] }[] = [];
+    if (recipe.install !== undefined) {
+      scripts.push({
+        command: bundleInstallCommand(recipe.install.sections),
+        mounts: installMounts,
+      });
+    }
+    if (recipe.buildScript) scripts.push({ command: ['npm', 'run', 'build'], mounts });
+    for (const { command, mounts: stepMounts } of scripts) {
       let run: JailedRun;
       try {
         run = await runJailed(
-          { ...common, image: baseImage, command, timeoutMs: SCRIPTS_TIMEOUT_MS },
+          {
+            ...common,
+            mounts: stepMounts,
+            image: baseImage,
+            command,
+            timeoutMs: SCRIPTS_TIMEOUT_MS,
+          },
           { trace: false, limits },
         );
       } catch (err) {
@@ -289,28 +387,11 @@ async function buildIn(
     await writeFile(`${dockerfile}.dockerignore`, '');
     const iid = join(dir, 'iid');
     try {
-      await exec(
-        'docker',
-        [
-          'build',
-          '--network',
-          'none',
-          '--pull=false',
-          '--quiet',
-          '--label',
-          `${IMAGE_LABEL}=1`,
-          '--iidfile',
-          iid,
-          '-f',
-          dockerfile,
-          tree,
-        ],
-        {
-          timeout: 600_000,
-          maxBuffer: 16 * 1024 * 1024,
-          env: { ...process.env, DOCKER_BUILDKIT: '1' },
-        },
-      );
+      await exec('docker', assembleBuildArgs(dockerfile, tree, iid), {
+        timeout: 600_000,
+        maxBuffer: 16 * 1024 * 1024,
+        env: { ...process.env, DOCKER_BUILDKIT: '1' },
+      });
     } catch (err) {
       // stderr only: the error message repeats the command line, with every host path in it.
       return {
@@ -324,8 +405,37 @@ async function buildIn(
     if (!/^sha256:[0-9a-f]{64}$/.test(imageId)) {
       return { ok: false, unsupported: false, step: 'assemble', reason: `bad image id ${imageId}` };
     }
-    return { ok: true, imageId, baseImage, recipe, stage };
+    return {
+      ok: true,
+      imageId,
+      baseImage,
+      recipe,
+      stage,
+      ...(bundleUse === undefined ? {} : { dependencyBundle: bundleUse }),
+    };
   }
+}
+
+/**
+ * The assemble step's `docker build` arguments: no network (`--network none`), no pull, no build
+ * args, no proxy, no extra hosts, no secrets or SSH. The generated Dockerfile has no RUN step, so
+ * nothing would use a network anyway; the flag makes that hold even if it did.
+ */
+export function assembleBuildArgs(dockerfile: string, context: string, iidFile: string): string[] {
+  return [
+    'build',
+    '--network',
+    'none',
+    '--pull=false',
+    '--quiet',
+    '--label',
+    `${IMAGE_LABEL}=1`,
+    '--iidfile',
+    iidFile,
+    '-f',
+    dockerfile,
+    context,
+  ];
 }
 
 /** What a built tree may hold after the scripts step. Configuration only. */
