@@ -1,0 +1,6 @@
+rules:
+  - id: planted.dir-should-not-run
+    message: a rule directory planted in the scanned repo must never be loaded
+    severity: ERROR
+    languages: [javascript]
+    pattern: eval(...)

@@ -1,5 +1,6 @@
 import {
   Escalation,
+  type Dismissal,
   PromptId,
   TERMINAL_STAGES,
   TrialEvent,
@@ -17,6 +18,8 @@ import {
 import { digestOf } from './canonical.js';
 import type { SubmissionSpec } from './envelope.js';
 import { assertAllowedTools, type ModelRole } from './roles.js';
+import { buildVerdict, finalizeVerdict } from './verdict.js';
+import type { TrialWorkspace } from './workspace.js';
 
 export type ModelTurnRequest = Parameters<ModelPort['runTurn']>[0];
 export type ModelTurnResult = Awaited<ReturnType<ModelPort['runTurn']>>;
@@ -95,6 +98,11 @@ export interface OrchestratorDeps {
   model: ModelPort;
   handlers: Partial<Record<CaseStage, StageHandler>>;
   config: OrchestratorConfig;
+  /**
+   * Lane-internal hand-off store. When given, the recorded Dismissal is kept there so a dismissed
+   * case whose verdict write failed can be repaired by a new Orchestrator instance.
+   */
+  workspace?: TrialWorkspace;
 }
 
 /**
@@ -190,6 +198,14 @@ function overdrawn(b: BudgetState): boolean {
 export class Orchestrator {
   private readonly ledgers = new Map<CaseId, StageCost[]>();
   private readonly runInfos = new Map<CaseId, RunInfo>();
+  private readonly dismissals = new Map<CaseId, Dismissal>();
+  /**
+   * Every exhibit id this run saw submitted, resulted, or rejected, in first-seen order.
+   * KNOWN GAP: in memory only, like the cost ledger. A case resumed in a new Orchestrator cites
+   * only the exhibits seen after the resume. Fixing it needs a seen-exhibit record in the
+   * TrialWorkspace (separate from the admitted-only getExhibits); not done here.
+   */
+  private readonly exhibitsSeen = new Map<CaseId, ExhibitId[]>();
 
   constructor(private readonly deps: OrchestratorDeps) {}
 
@@ -201,11 +217,26 @@ export class Orchestrator {
 
     for (;;) {
       await this.emit(caseId, stage, 'stage-entered', from === undefined ? {} : { from });
-      if (isTerminal(stage)) return { status: 'terminal', stage };
+      if (isTerminal(stage)) {
+        // A terminal case must carry a verdict. If an earlier run reached this stage but failed
+        // before writing it, write it now rather than leave the case closed with no verdict.
+        if (stage === 'dismissed' || stage === 'escalated') {
+          await this.writeTerminalVerdict(caseId, stage, stage);
+        }
+        return { status: 'terminal', stage };
+      }
 
       if (await config.killSwitch()) return { status: 'halted', stage, reason: 'kill-switch' };
       const handler = handlers[stage];
       if (!handler) throw new Error(`no handler for stage ${stage}`);
+      // A verdict on a case that is still in progress means an earlier run wrote it for a
+      // different ending. Rerunning agents could only contradict it, so stop.
+      const early = await store.getVerdict(caseId);
+      if (early !== null) {
+        throw new Error(
+          `case ${caseId} is at ${stage} but already has a ${early.outcome} verdict; refusing to rerun agents`,
+        );
+      }
 
       const outcome = await this.runStage(caseId, stage, handler);
       if (outcome.kind === 'halted') return { status: 'halted', stage, reason: 'kill-switch' };
@@ -213,7 +244,10 @@ export class Orchestrator {
       let next: CaseStage;
       if (outcome.kind === 'advance') {
         next = outcome.next;
+        // Transition first, so a refused transition leaves no verdict behind. A crash between the
+        // transition and the write is repaired on re-entry (see above) from the stored Dismissal.
         await store.transition(caseId, next);
+        if (next === 'dismissed') await this.writeTerminalVerdict(caseId, stage, 'dismissed');
       } else {
         next = 'escalated';
         await this.escalate(caseId, stage, outcome.reason, outcome.detail);
@@ -423,11 +457,69 @@ export class Orchestrator {
   ): Promise<void> {
     if (!isLegalTransition(stage, 'escalated')) throw new EscalationNotAllowedError(stage, reason);
     const escalation = Escalation.parse({ schemaVersion: 1, caseId, reason, detail });
+    // Crash gap: the transition comes first, so a crash before the events below leaves an
+    // escalated case with no `escalated` event. The verdict is repaired on rerun (see run());
+    // the missing events are not.
     await this.deps.store.transition(caseId, 'escalated');
     if (reason === 'budget-exhausted') {
       await this.emit(caseId, stage, 'budget-exhausted', { escalation });
     }
     await this.emit(caseId, stage, 'escalated', { escalation }, 'stenographer');
+    await this.writeTerminalVerdict(caseId, stage, 'escalated');
+  }
+
+  /**
+   * A case that ends dismissed or escalated still gets a contract Verdict, built structurally
+   * from what actually happened: every exhibit seen (inadmissible ones included), the prompts and
+   * models that ran, and the recorded cost. The summary is generated from it and checked.
+   */
+  private async writeTerminalVerdict(
+    caseId: CaseId,
+    stage: CaseStage,
+    outcome: 'dismissed' | 'escalated',
+  ): Promise<void> {
+    const existing = await this.deps.store.getVerdict(caseId);
+    if (existing !== null) {
+      if (existing.outcome === outcome) return;
+      throw new Error(
+        `case ${caseId} ended ${outcome} but already has a ${existing.outcome} verdict`,
+      );
+    }
+    // A dismissed verdict needs the recorded contract Dismissal it summarizes, from this run or
+    // read back from the workspace. Without one, refuse to invent it.
+    if (outcome === 'dismissed') {
+      const dismissal =
+        this.dismissals.get(caseId) ?? (await this.deps.workspace?.getDismissal(caseId));
+      if (!dismissal) {
+        throw new Error(
+          `case ${caseId} is dismissed but no recorded dismissal was found; not writing a dismissed verdict`,
+        );
+      }
+    }
+    const { promptVersions, modelIds } = this.info(caseId);
+    const verdict = finalizeVerdict(
+      buildVerdict({
+        caseId,
+        outcome,
+        exhibits: this.exhibitsSeen.get(caseId) ?? [],
+        promptVersions,
+        modelIds,
+        cost: this.ledger(caseId),
+      }),
+    );
+    await this.deps.store.appendVerdict(verdict);
+    await this.emit(caseId, stage, 'verdict-written', { verdict }, 'stenographer');
+  }
+
+  private noteExhibits(event: TrialEvent): void {
+    let id: ExhibitId | undefined;
+    if (event.type === 'exhibit-submitted' || event.type === 'exhibit-inadmissible') {
+      id = event.payload.exhibitId;
+    } else if (event.type === 'exhibit-result') id = event.payload.result.exhibitId;
+    if (id === undefined) return;
+    const list = this.exhibitsSeen.get(event.caseId) ?? [];
+    if (!list.includes(id)) list.push(id);
+    this.exhibitsSeen.set(event.caseId, list);
   }
 
   private async emit<T extends TrialEventType>(
@@ -451,5 +543,11 @@ export class Orchestrator {
       payload,
     });
     await sink.emit(event);
+    this.noteExhibits(event);
+    if (event.type === 'dismissed') {
+      // Kept where another instance can read it back, so a dismissed case can be repaired.
+      this.dismissals.set(caseId, event.payload.dismissal);
+      await this.deps.workspace?.saveDismissal(caseId, event.payload.dismissal);
+    }
   }
 }

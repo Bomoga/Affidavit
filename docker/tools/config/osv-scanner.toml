@@ -1,0 +1,2 @@
+# Our own, intentionally empty OSV-Scanner config. Always passed with --config so an
+# osv-scanner.toml in the scanned repo (suppressions, overrides) is never applied.

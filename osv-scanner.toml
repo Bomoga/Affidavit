@@ -1,0 +1,11 @@
+# osv-scanner reads this file from the directory of the scanned lockfile.
+
+# GHSA-fc5q-39xc-vjpf: picomatch <= 4.0.7, ReDoS through single-branch repeated extglobs (high).
+# No patched release exists yet (4.0.7 is the latest). picomatch reaches us only through
+# development tooling (build and test globbing), never through code that handles untrusted
+# input, and the sandboxed runner has no network path to it. Time-boxed: re-check when a fix
+# ships, and remove this entry then. The expiry makes CI fail again if nobody does.
+[[IgnoredVulns]]
+id = "GHSA-fc5q-39xc-vjpf"
+ignoreUntil = 2026-12-17
+reason = "No patched picomatch release exists; development tooling only, not reachable with untrusted input. Re-check by 2026-12-17."

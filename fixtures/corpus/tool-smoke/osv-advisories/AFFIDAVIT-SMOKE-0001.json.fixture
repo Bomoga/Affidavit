@@ -1,0 +1,17 @@
+{
+  "id": "AFFIDAVIT-SMOKE-0001",
+  "modified": "2026-01-01T00:00:00Z",
+  "published": "2026-01-01T00:00:00Z",
+  "summary": "Synthetic advisory for the offline OSV smoke test. Not a real vulnerability record.",
+  "affected": [
+    {
+      "package": { "ecosystem": "npm", "name": "lodash" },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [{ "introduced": "0" }, { "fixed": "4.17.21" }]
+        }
+      ]
+    }
+  ]
+}

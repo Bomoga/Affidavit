@@ -97,13 +97,27 @@ export function buildPatchExhibit(caseFile: CaseFile, diff: string): PatchExhibi
 }
 
 /** Accepted only when the Judge names no rule and every check it reports is clean. */
-export function isAccepted(r: VerifyResult): boolean {
+export function isAccepted(r: VerifyResult, expected: readonly string[] = []): boolean {
   return (
     r.rejectedBy === undefined &&
     r.familyFlipped &&
     r.suitePassed &&
     r.rescanClean &&
+    counterexamplesComplete(r, expected) &&
     r.counterexamples.every((c) => !c.survived)
+  );
+}
+
+/**
+ * True only when the Judge reported exactly one result for each counterexample submitted: no
+ * missing id, no extra id, no duplicate. A patch is never accepted on counterexamples that were
+ * not shown to have been rerun.
+ */
+export function counterexamplesComplete(r: VerifyResult, expected: readonly string[]): boolean {
+  const want = new Set(expected);
+  const got = r.counterexamples.map((c) => c.exhibitId as string);
+  return (
+    got.length === want.size && new Set(got).size === got.length && got.every((id) => want.has(id))
   );
 }
 
@@ -119,12 +133,13 @@ export function rejectionRule(r: VerifyResult): AdmissibilityRule | undefined {
   return undefined;
 }
 
-export function describeVerify(r: VerifyResult): string {
+export function describeVerify(r: VerifyResult, expected: readonly string[] = []): string {
   const flags = [
     r.familyFlipped ? null : 'family not flipped',
     r.suitePassed ? null : 'suite failed',
     r.rescanClean ? null : 'rescan not clean',
     r.counterexamples.some((c) => c.survived) ? 'counterexample survived' : null,
+    counterexamplesComplete(r, expected) ? null : 'counterexample results incomplete',
   ].filter((f): f is string => f !== null);
   return `judge: ${r.rejectedBy ?? 'not accepted'}${flags.length ? ` [${flags.join(', ')}]` : ''}`;
 }

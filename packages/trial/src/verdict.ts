@@ -60,6 +60,22 @@ const OUTCOME_TEXT: Record<VerdictOutcome, string> = {
 };
 
 /**
+ * The shortest decimal that round-trips to exactly `n` (what `String(n)` gives), written without
+ * an exponent. `Number(plainDecimal(n)) === n` for every finite non-negative n, so the number the
+ * summary prints is the number `checkSummary` finds in the verdict.
+ */
+export function plainDecimal(n: number): string {
+  const s = String(n);
+  const m = /^(\d+)(?:\.(\d+))?e([+-]\d+)$/.exec(s);
+  if (!m) return s;
+  const digits = `${m[1]}${m[2] ?? ''}`;
+  const point = m[1]!.length + Number(m[3]);
+  if (point <= 0) return `0.${'0'.repeat(-point)}${digits}`;
+  if (point >= digits.length) return digits + '0'.repeat(point - digits.length);
+  return `${digits.slice(0, point)}.${digits.slice(point)}`;
+}
+
+/**
  * Plain-language summary. Every number and exhibit id it prints is copied from the
  * structured verdict as given; nothing is counted, summed, or rounded here.
  */
@@ -68,7 +84,7 @@ export function renderSummary(v: StructuredVerdict): string {
   if (v.severity) lines.push(`Severity: ${v.severity}.`);
   if (v.exhibits.length > 0) lines.push(`Evidence cited: ${v.exhibits.join(', ')}.`);
   if (v.cost.length > 0) {
-    const rows = v.cost.map((c) => `${c.stage} attempt ${c.attempt} $${c.usd}`);
+    const rows = v.cost.map((c) => `${c.stage} attempt ${c.attempt} $${plainDecimal(c.usd)}`);
     lines.push(`Recorded cost by stage: ${rows.join('; ')}.`);
   }
   return lines.join(' ');

@@ -1,0 +1,179 @@
+import { copyFileSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { BundleManifest } from '@affidavit/contracts';
+import { afterAll, describe, expect, it } from 'vitest';
+import {
+  enabledToolNames,
+  isEmptyExit,
+  isOkExit,
+  loadToolManifest,
+  parseToolManifest,
+  repoRoot,
+  ToolSelectionError,
+  toolVersions,
+} from './index.js';
+
+const DIGEST_REF = /^[a-z0-9][a-z0-9./_-]*@sha256:[0-9a-f]{64}$/;
+
+const manifest = loadToolManifest();
+const tmpDirs: string[] = [];
+afterAll(() => {
+  for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
+});
+
+function allDockerfiles(dir: string): string[] {
+  const found: string[] = [];
+  for (const entry of readdirSync(dir)) {
+    const p = join(dir, entry);
+    if (statSync(p).isDirectory()) found.push(...allDockerfiles(p));
+    else if (entry === 'Dockerfile' || entry.startsWith('Dockerfile.')) found.push(p);
+  }
+  return found;
+}
+
+describe('tool manifest', () => {
+  it('records the four tools', () => {
+    expect(manifest.tools.map((t) => t.name).sort()).toEqual([
+      'codeql',
+      'gitleaks',
+      'osv-scanner',
+      'semgrep',
+    ]);
+  });
+
+  it('references every enabled tool by digest, never by tag alone', () => {
+    const names = enabledToolNames(manifest);
+    expect(names.sort()).toEqual(['gitleaks', 'osv-scanner', 'semgrep']);
+    for (const t of manifest.tools.filter((x) => x.enabled)) {
+      expect(t.reference).toMatch(DIGEST_REF);
+      expect(t.reference).toBe(`${t.image}@${t.digest}`);
+      expect(t.digest).toMatch(/^sha256:[0-9a-f]{64}$/);
+    }
+  });
+
+  it('records a version, how it was resolved, and when, for every enabled tool', () => {
+    for (const t of manifest.tools.filter((x) => x.enabled)) {
+      expect(t.version).toMatch(/^\d+\.\d+\.\d+$/);
+      expect(t.resolvedVia.length).toBeGreaterThan(10);
+      expect(t.resolvedOn).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+      expect(t.okExitCodes).toContain(0);
+    }
+  });
+
+  it('keeps CodeQL disabled by default, with no image reference', () => {
+    const codeql = manifest.tools.find((t) => t.name === 'codeql');
+    expect(codeql?.enabled).toBe(false);
+    expect(codeql?.reference).toBeNull();
+    expect(codeql).not.toHaveProperty('enableFlag');
+    expect(readFileSync(join(repoRoot(), 'docker', 'tools', 'tools.json'), 'utf8')).not.toMatch(
+      /ENABLE_CODEQL/,
+    );
+    expect(codeql?.blockedBy).toBe('P0-10');
+    expect(enabledToolNames(manifest)).not.toContain('codeql');
+  });
+
+  it('pins every Dockerfile base image by digest', () => {
+    const files = allDockerfiles(join(repoRoot(), 'docker', 'tools'));
+    expect(files.length).toBeGreaterThan(0);
+    for (const f of files) {
+      const froms = readFileSync(f, 'utf8')
+        .split('\n')
+        .filter((l) => /^\s*FROM\s/i.test(l));
+      expect(froms.length).toBeGreaterThan(0);
+      for (const line of froms) expect(line).toMatch(/@sha256:[0-9a-f]{64}/);
+    }
+  });
+
+  it('uses the same OSV-Scanner digest as the CI dogfooding job', () => {
+    const ci = readFileSync(join(repoRoot(), '.github', 'workflows', 'ci.yml'), 'utf8');
+    const osv = manifest.tools.find((t) => t.name === 'osv-scanner');
+    expect(ci).toContain(osv?.reference ?? 'missing');
+  });
+
+  it('rejects a tag-only or tag-plus-digest reference', () => {
+    const raw = JSON.parse(
+      readFileSync(join(repoRoot(), 'docker', 'tools', 'tools.json'), 'utf8'),
+    ) as {
+      tools: { name: string; reference: string }[];
+    };
+    const mutate = (reference: string) => {
+      const copy = structuredClone(raw);
+      const semgrep = copy.tools.find((t) => t.name === 'semgrep');
+      if (semgrep) semgrep.reference = reference;
+      return () => parseToolManifest(copy);
+    };
+    expect(mutate('docker.io/semgrep/semgrep:latest')).toThrow();
+    expect(mutate('docker.io/semgrep/semgrep:1.184.0@sha256:' + 'a'.repeat(64))).toThrow();
+    expect(mutate('docker.io/semgrep/semgrep@sha256:abc')).toThrow();
+  });
+
+  it('rejects an enabled CodeQL entry that has no digest', () => {
+    const raw = JSON.parse(
+      readFileSync(join(repoRoot(), 'docker', 'tools', 'tools.json'), 'utf8'),
+    ) as {
+      tools: { name: string; enabled: boolean }[];
+    };
+    const copy = structuredClone(raw);
+    const codeql = copy.tools.find((t) => t.name === 'codeql');
+    if (codeql) codeql.enabled = true;
+    expect(() => parseToolManifest(copy)).toThrow();
+  });
+
+  const rawManifest = () =>
+    structuredClone(
+      JSON.parse(readFileSync(join(repoRoot(), 'docker', 'tools', 'tools.json'), 'utf8')) as {
+        tools: { name: string; okExitCodes: number[]; emptyExitCodes?: number[] }[];
+      },
+    );
+
+  it('rejects a duplicate tool name', () => {
+    const copy = rawManifest();
+    copy.tools.push(structuredClone(copy.tools[0]!));
+    expect(() => parseToolManifest(copy)).toThrow(/duplicate/);
+  });
+
+  it('rejects empty okExitCodes and empty-result codes that are not ok codes', () => {
+    const none = rawManifest();
+    none.tools[0]!.okExitCodes = [];
+    expect(() => parseToolManifest(none)).toThrow(/okExitCodes/);
+    const stray = rawManifest();
+    stray.tools[0]!.emptyExitCodes = [99];
+    expect(() => parseToolManifest(stray)).toThrow(/emptyExitCodes/);
+  });
+
+  it('records OSV exit 128 (no packages found) as an empty result', () => {
+    expect(isEmptyExit(manifest, 'osv-scanner', 128)).toBe(true);
+    expect(isOkExit(manifest, 'osv-scanner', 128)).toBe(true);
+    expect(isEmptyExit(manifest, 'semgrep', 128)).toBe(false);
+  });
+
+  it('can be loaded from an explicit path, for deployments without the repo layout', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'affidavit-manifest-'));
+    tmpDirs.push(dir);
+    const file = join(dir, 'tools.json');
+    copyFileSync(join(repoRoot(), 'docker', 'tools', 'tools.json'), file);
+    expect(loadToolManifest(file)).toEqual(manifest);
+  });
+});
+
+describe('BundleManifest.toolVersions', () => {
+  it('maps tools to version and image digest, and fits the contract', () => {
+    const versions = toolVersions(manifest, enabledToolNames(manifest));
+    expect(Object.keys(versions).sort()).toEqual(['gitleaks', 'osv-scanner', 'semgrep']);
+    expect(versions['codeql']).toBeUndefined();
+    for (const t of manifest.tools.filter((x) => x.enabled)) {
+      expect(versions[t.name]).toBe(`${t.version}@${t.digest}`);
+    }
+    expect(versions['semgrep']).toMatch(/^\d+\.\d+\.\d+@sha256:[0-9a-f]{64}$/);
+    const parsed = BundleManifest.shape.toolVersions.safeParse(versions);
+    expect(parsed.success).toBe(true);
+  });
+
+  it('lists only the tools that actually ran, and refuses disabled ones', () => {
+    expect(Object.keys(toolVersions(manifest, ['semgrep']))).toEqual(['semgrep']);
+    expect(() => toolVersions(manifest, ['codeql'])).toThrow(ToolSelectionError);
+    expect(() => toolVersions(manifest, ['nope' as never])).toThrow(/not in the manifest/);
+    expect(() => toolVersions(manifest, ['codeql'])).toThrow(/disabled/);
+  });
+});
