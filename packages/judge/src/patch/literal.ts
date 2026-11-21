@@ -319,7 +319,8 @@ export function findLiteralSpecialCases(
  * content equal to it, or a number literal equal to it) on any kind of added line: conditional,
  * declaration, assignment, array or object member, `case`. So a short value cannot veto a patch by
  * appearing inside other code. Known gap, shared with the family check: a value split across
- * literals (`'..%2f' + 'etc%2fpasswd'`) is not caught.
+ * literals (`'..%2f' + 'etc%2fpasswd'`) is not caught. The Judge passes only values the family
+ * does not already have; see patch-verification.md, "Counterexample values", for the other gaps.
  */
 export function findExactLiteralUses(lines: readonly DiffLine[], params: ParamSpace): LiteralHit[] {
   const { strings, numbers } = paramLiterals(params);
