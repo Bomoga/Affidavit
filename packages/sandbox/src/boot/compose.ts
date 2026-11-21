@@ -34,6 +34,10 @@ export type ComposeRead = { ok: true; target: ComposeTarget } | { ok: false; rea
 /**
  * Keys that make Compose read files outside the compose file, possibly outside the tree (and
  * possibly put their contents into a service's environment). Refused at any depth.
+ *
+ * For `include` and `extends` the pre-scan (`precheckCompose`) is the only guard: Compose follows
+ * them while normalizing, so by the time `findHostReadingKey` sees Compose's output the other
+ * file has already been read and merged in, and the keys themselves are gone.
  */
 export const READS_FILES = new Set([
   'include',
@@ -248,6 +252,10 @@ function environment(v: unknown): { env: Record<string, string>; passThrough: st
  * Picks the target service and its sidecars out of a normalized compose file. The target must be
  * built from the tree root; every other service must come from an image (they are started, never
  * built). Volumes, ports, networks and users are ignored: the jail decides those.
+ *
+ * `volumes`, `privileged`, `network_mode`, `devices` and the like pass the key precheck (they name
+ * no other file); they are dropped only because this function never reads them. Reading any of
+ * them here needs a host-path check first (pinned by a test in yaml-keys.test.ts).
  */
 export function selectServices(normalized: unknown, service: string, treeDir: string): ComposeRead {
   try {

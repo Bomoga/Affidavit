@@ -13,7 +13,7 @@ Static checks run first, so a bad patch never costs a build.
 | 2    | Diff is a plain git diff of text files with safe paths and exact file names, no line over 2000 characters (see below), and the declared `filesTouched` and `linesChanged` equal what the diff contains        | `schema`                                                                                 |
 | 3    | Added plus removed lines at most `maxPatchLinesChanged` (100), files at most `maxPatchFiles` (5)                                                                                                              | `diff-too-large`                                                                         |
 | 4    | The patch does not weaken the target's test suite (see "Suite guard")                                                                                                                                         | `suite-fails`                                                                            |
-| 5    | No added code line special-cases a witness value or loads one of the patch's test files (see below)                                                                                                           | `literal-only-patch`                                                                     |
+| 5    | No added code line special-cases a witness value or an admitted counterexample value or loads one of the patch's test files (see below)                                                                       | `literal-only-patch`                                                                     |
 | 6    | `PatchWorkbench.prepare` checks git reads the same files and line counts, applies the patch to the vulnerable commit, checks every `package.json` keeps its suite keys, and builds it                         | `schema` if it does not apply or git disagrees, `suite-fails` otherwise                  |
 | 7    | The witness family reruns 3 times on `vulnerable` (must pass on every parameter) and 3 times on `patched` (must fail on every parameter)                                                                      | the first of `completes`, `stable-3of3`, `no-egress`, `time-budget`, else `differential` |
 | 8    | The vulnerable commit's own test suite passes on the patched build the witness ran against; the patch's own tests, if run, do not fail                                                                        | `suite-fails`                                                                            |
@@ -47,7 +47,7 @@ Lead decision (2026-11-20): CR-T8 is resolved inside Lane 2, with no contract ch
 
 A counterexample that parses as an Exhibit but fails any of these refuses the whole patch with `schema` before anything is built. It is never skipped into a pass. Its entry gets the `exhibit-counterexample-invalid-<24 hex>` id.
 
-Not changed here: `runCounterexample` still runs over the witness passed with it. Lane 3 passes a carrier witness whose params equal the header, so its ids already match. Open question for the lead: an exhibit that is not readable at all, is for another case, or has the wrong kind still keeps the earlier behaviour (reported `survived: false`, not used, patch not refused). Lane 3 never sends one; making it refuse the patch too would be stricter.
+Not changed here: `runCounterexample` still runs over the witness passed with it. Lane 3 passes a carrier witness whose params equal the header, so its ids already match. A counterexample that cannot be run as submitted is a construction error, like a bad header, and refuses the whole patch with `schema` before anything is built: not a readable Exhibit, another case's `caseId`, a `kind` other than `counterexample`, or code over `maxSourceBytes` (review 2026-11-20; it used to be reported `survived: false` and the patch could still pass).
 
 ## Counterexamples
 
@@ -64,7 +64,7 @@ What is reported for each submitted counterexample:
 | Admissible, and passes any parameter on `patched`, or its patched runs are unclean | `true`                                              |
 | Readable, but the patch was refused before any counterexample ran                  | `true` (nothing was shown against it, so it stands) |
 
-The reasoning: a counterexample that also passes on the safe variant, or that never completes on the vulnerable commit, proves nothing about the bug, so it cannot be allowed to block a correct fix. The trade-off is that a malformed counterexample from Prosecution is silently not used; Prosecution sees `survived: false` and the counterexample's own `runCounterexample` result says why.
+The reasoning: a counterexample that also passes on the safe variant, or that never completes on the vulnerable commit, proves nothing about the bug, so it cannot be allowed to block a correct fix. `survived: false` is kept for evidence that ran and was ruled inadmissible; Prosecution sees it and the counterexample's own `runCounterexample` result says why. A malformed counterexample is never silently dropped: it refuses the patch with `schema`.
 
 ## Diff rules
 
@@ -115,7 +115,7 @@ Known gaps: app code can still tell a suite run from a witness run by its enviro
 
 ## `literal-only-patch`
 
-The plan rejects a patch "whose only change is special-casing a literal value from the witness's parameters". "Only" cannot be checked statically against an author who pads the patch with an unrelated hunk, so the Judge is stricter: any added code line that special-cases a witness value rejects the patch. A real fix does not need the exploit's own payload.
+The plan rejects a patch "whose only change is special-casing a literal value from the witness's parameters". "Only" cannot be checked statically against an author who pads the patch with an unrelated hunk, so the Judge is stricter: any added code line that special-cases a witness value rejects the patch. Counterexample values are checked too, but more narrowly, because Prosecution chooses them: only once the counterexample is admitted (passes on vulnerable, fails on safe), and only as a whole string literal (or a compared number) in an added conditional line, never as a substring. So a patch tailored to Prosecution's proven new value (for example `if (p === "..%2fetc%2fpasswd") return 403;`) is rejected, after the build, while an unproven counterexample carrying a common value such as `"string"` cannot veto a sound patch (security review, 2026-11-20). A real fix does not need the exploit's own payload.
 
 Comment text is stripped before the check, never the whole line: complete `/* ... */` spans anywhere (string-aware, and a span holding a quote or backtick is kept, since the line may continue a string from an earlier line), and a `//` or `# ` comment only when it starts the line. So `/**/ if (id === "1'--") return;` and `*/ if (threshold === 3)` are both caught.
 

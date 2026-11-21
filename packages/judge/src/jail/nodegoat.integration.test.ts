@@ -17,13 +17,23 @@ import { JailedPatchWorkbench, buildPatchApplyImage } from './workbench.js';
 // sandbox host and AFFIDAVIT_NODEGOAT_DIR (the L1-08 corpus checkout:
 // `node packages/corpus/scripts/fetch-pinned.mjs nodegoat`). Run with
 // `pnpm --filter @affidavit/judge test:sandbox-host`; skipped in plain `pnpm test`.
-//
-// Blocked: since the lead decision on PR #18 (2026-11-20, deny-all egress with no exception for
-// a build-time fetch), NodeGoat cannot be built. Every test here fails in beforeAll with
-// TargetBootError (build unsupported, dependency fetch) until dependencies can be supplied
-// without egress. The expectations below are what must hold once it boots again.
 const onSandboxHost = process.env.AFFIDAVIT_SANDBOX_HOST === '1';
 const nodegoat = process.env.AFFIDAVIT_NODEGOAT_DIR;
+/**
+ * Since the lead decision on PR #18 (2026-11-20, deny-all egress with no exception for a
+ * build-time fetch), NodeGoat builds only with a reviewed offline dependency bundle
+ * (`lane2/L2-04c-dependency-bundle`), named by AFFIDAVIT_NODEGOAT_BUNDLE. Without it every test
+ * here would fail in beforeAll with TargetBootError (build unsupported, dependency fetch), so the
+ * suite is skipped, and the reason is in its title in the test output.
+ */
+const bundle = process.env.AFFIDAVIT_NODEGOAT_BUNDLE;
+const SKIP_REASON = !onSandboxHost
+  ? 'not a sandbox host'
+  : nodegoat === undefined
+    ? 'AFFIDAVIT_NODEGOAT_DIR is not set'
+    : bundle === undefined
+      ? 'no NodeGoat dependency bundle (AFFIDAVIT_NODEGOAT_BUNDLE); deny-all egress, PR #18 decision'
+      : null;
 
 const WITNESSES = join(import.meta.dirname, '..', '..', 'witnesses');
 const witnessSource = (name: string) => readFileSync(join(WITNESSES, name), 'utf8');
@@ -201,8 +211,8 @@ const witnessFor = (
     sha256: '0'.repeat(64),
   });
 
-describe.runIf(onSandboxHost && nodegoat !== undefined)(
-  'hand-written NodeGoat witnesses against booted targets',
+describe.skipIf(SKIP_REASON !== null)(
+  `hand-written NodeGoat witnesses against booted targets${SKIP_REASON === null ? '' : ` (skipped: ${SKIP_REASON})`}`,
   { timeout: 600_000 },
   () => {
     let root = '';
