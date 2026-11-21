@@ -125,6 +125,13 @@ importers:
       '@affidavit/evidence':
         specifier: workspace:*
         version: link:../../packages/evidence
+    devDependencies:
+      '@affidavit/judge':
+        specifier: workspace:*
+        version: link:../../packages/judge
+      '@affidavit/sandbox':
+        specifier: workspace:*
+        version: link:../../packages/sandbox
 
   apps/web:
     dependencies:

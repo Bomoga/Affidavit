@@ -14,6 +14,7 @@ Run from this directory, or add `--filter @affidavit/signer` from the repo root.
 - `pnpm lint`
 - `pnpm test` (unit; the cosign tests run too when `cosign` is on PATH)
 - `pnpm test:sandbox-host` adds the key isolation test (Docker; sandbox host)
+- `pnpm test:e2e` runs Lane 2 end to end on one real NodeGoat case (Judge in gVisor, bundle, this signer, public verify, replay); same env as `docs/lanes/lane2/real-judge-host.md` step 9, plus cosign
 - `pnpm start` runs the service (env in `src/main.ts`)
 - cosign: `bash docker/sandbox/install-cosign.sh` (pinned v3.1.4)
 

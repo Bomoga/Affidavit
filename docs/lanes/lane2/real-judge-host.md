@@ -26,6 +26,12 @@ Run by the Lane 2 owner on the Fedora 44 workstation (gVisor release-20261109.0,
 - `pnpm --filter @affidavit/sandbox test:sandbox-host`: **546 of 546**. Containment, witness jail and gVisor runner: **8 of 8** contained and recorded on each. No labelled container or network was left after any run.
 - Not run here: the worker (step 10, waits on Lane 1 wiring) and a real signer (the test does not seal).
 
+## Lane 2 end to end (2026-11-21)
+
+`pnpm --filter @affidavit/signer test:e2e` (`apps/signer/src/e2e.integration.test.ts`) runs everything Lane 2 owns on one real NodeGoat case, with nothing faked inside Lane 2: `createRealJudge` boots both variants in gVisor, admits the gate witness on the differential rule and verifies the corpus safe patch; each exhibit's run log (egress, per-run CPU and peak memory) goes into its bundle record; the bundle is built and stored in `FsEvidenceStore`; the signer service signs its manifest over its unix socket with a fresh cosign key; the public verifier (L2-12) checks the stored bytes from files alone and refuses one changed byte; and `replay` reruns every exhibit through the real Judge to the same outcomes. Only the trial is absent: the verdict is written from the Judge's results, with no ballots.
+
+Same variables as step 9 below, plus cosign on PATH. On 2026-11-21 on this host: 4 of 4 in 155 s, nothing left behind.
+
 ## What still cannot run
 
 - **Without the bundle file, NodeGoat does not build.** The pin is set (2026-11-21), but every host still needs the `<sha256>.tar` in its bundle store; with none configured every NodeGoat case is `unsupported` at build (a dependency fetch). That covers the witness boot, the patched target and the suite image alike.
