@@ -349,7 +349,8 @@ export class Judge implements JudgePort {
         },
         this.#policy,
       );
-      // The vulnerable commit's own suite, on the same build the witness ran against. The
+      // The vulnerable commit's own suite, on a separate devDependencies build of the same patched
+      // tree (never booted or attacked); the witness ran against the target build. The
       // patch's own tests are an extra check: a failure counts, a pass is never required.
       // A suite that cannot be built in the sandbox fails closed: the patch is rejected with
       // `suite-fails` (lead decision 2026-11-20, PR #46), and `verifyPatchReport` says why.
