@@ -15,7 +15,9 @@
  *   exact spelling in its parent directory and is a regular file in the patched tree (a patch that
  *   deletes or renames the file, case-only renames included, is not clean: a person decides);
  * - that file is plain text Semgrep reads whole: at most `maxCaseFileBytes`, no NUL byte, valid
- *   UTF-8 (so no UTF-16), no signature or control bytes `classifyHead` refuses, and no line over
+ *   UTF-8 (so no UTF-16), no signature `classifyHead` refuses in the head, no control byte other
+ *   than tab, newline, vertical tab, form feed, carriage return or escape anywhere in the file
+ *   (`hasOddControlByte`, the rule `classifyHead` applies to the head), and no line over
  *   `maxLineBytes` (a minified-looking file Semgrep may skip without a finding);
  * - the run's SARIF lists the case's rule id among the rules it loaded (a rule missing or renamed
  *   since intake is never clean);
@@ -51,7 +53,6 @@ import { PROSE_MARKER } from '../casefile/slice.js';
 import { normalizeReports, readToolRunReports, type ReportInput } from '../normalize/index.js';
 import {
   classifyHead,
-  hasOddControl,
   loadToolManifest,
   quarantineSnapshot,
   repoRoot,
@@ -154,6 +155,28 @@ function existsExactly(
   }
 }
 
+/**
+ * A control byte other than tab, newline, vertical tab, form feed, carriage return or escape: the
+ * same bytes `classifyHead` refuses in the head (`tools/unscannable.ts`, kept unchanged because the
+ * corpus regression stamp hashes it). A test checks the two agree on every byte value.
+ */
+export function hasOddControlByte(bytes: Uint8Array): boolean {
+  for (const b of bytes) {
+    if (
+      b < 0x20 &&
+      b !== 0x09 &&
+      b !== 0x0a &&
+      b !== 0x0b &&
+      b !== 0x0c &&
+      b !== 0x0d &&
+      b !== 0x1b
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /** Plain text Semgrep reads whole, judged on the opened file; see the header. */
 function plainText(path: string, limits: RescanLimits): boolean {
   const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
@@ -171,7 +194,7 @@ function plainText(path: string, limits: RescanLimits): boolean {
     const bytes = buf.subarray(0, n);
     if (classifyHead(basename(path), bytes.subarray(0, 8192)) !== undefined) return false;
     // classifyHead sees the head only (signatures); NUL and control bytes are checked everywhere.
-    if (bytes.includes(0x00) || hasOddControl(bytes)) return false;
+    if (bytes.includes(0x00) || hasOddControlByte(bytes)) return false;
     let text: string;
     try {
       text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);

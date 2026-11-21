@@ -234,7 +234,7 @@ function matches(head: Uint8Array, sig: Sig): boolean {
 }
 
 /** Control characters other than tab, newline, vertical tab, form feed, carriage return, escape. */
-export function hasOddControl(head: Uint8Array): boolean {
+function hasOddControl(head: Uint8Array): boolean {
   for (const b of head) {
     if (b < 0x20 && ![0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x1b].includes(b)) return true;
   }

@@ -16,7 +16,8 @@ import { join } from 'node:path';
 import type { RescanPort, ToolRunnerPort } from '@affidavit/contracts';
 import { afterAll, describe, expect, it } from 'vitest';
 import { cleanupTmp, symlinks, tmp } from '../tools/testkit.js';
-import { DiscoveryRescan, rescanPatchedTree, type RescanDeps } from './index.js';
+import { classifyHead } from '../tools/index.js';
+import { DiscoveryRescan, hasOddControlByte, rescanPatchedTree, type RescanDeps } from './index.js';
 import {
   NOSQL_WHERE,
   RESCAN as RESCAN_FIXTURES,
@@ -285,6 +286,21 @@ describe('clean is never the default (review of #66)', () => {
   it('is not clean when the case file looks minified (a line over the cap)', async () => {
     const { r } = await withCaseFile(`${patchedText()}var a=${'1+'.repeat(3000)}1;\n`);
     expect(r).toMatchObject({ clean: false, reason: 'not-plain-text' });
+  });
+
+  it('refuses the same control bytes as classifyHead, for every byte value in the head', () => {
+    for (let b = 0; b <= 0xff; b++) {
+      const head = Buffer.concat([
+        Buffer.from('const a = 1;'),
+        Buffer.from([b]),
+        Buffer.from('\n'),
+      ]);
+      const theirs = classifyHead('routes.js', head) !== undefined;
+      // A lone byte of 0x80 or more is invalid UTF-8, which classifyHead and plainText's decoder
+      // both refuse; NUL is refused by both. Everything else is the control-byte rule.
+      const ours = b === 0 || b >= 0x80 || hasOddControlByte(Uint8Array.of(b));
+      expect({ b, refused: ours }).toEqual({ b, refused: theirs });
+    }
   });
 
   it('is not clean when a control byte sits after the first 8192 bytes', async () => {
