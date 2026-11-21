@@ -75,7 +75,11 @@ const QUOTED_LITERAL = String.raw`(?!\$\{[^}\n]{0,128}\}["'\x60])(?!\$[A-Za-z_][
 const B64URL_RUN = (group: number) => `(?=([A-Za-z0-9_-]*))\\${group}`;
 /** A JWT header run (group 1), atomic, that never runs into the next `-eyJ` start. */
 const HEADER_RUN = String.raw`(?=((?:[A-Za-z0-9_]|-(?!eyJ))*))\1`;
-const KEYS = String.raw`(?:password|passwd|secret|token|api[_-]?key|authorization)`;
+/**
+ * Credential-bearing names. The search is unanchored, so any prefix matches (FOO_SECRET_KEY,
+ * client_secret); a bounded suffix covers SECRET_KEY_BASE, secretKey and private_key_id.
+ */
+const KEYS = String.raw`(?:(?:password|passwd|secret|token|api[_-]?key|authorization|(?:private|signing|encryption|secret|master|session|jwt|auth|access|refresh|client|webhook)[_-]?(?:key|secret|token|password))[\w.-]{0,32})`;
 /** Characters an unquoted literal value runs to. Stops at code punctuation. */
 const UNQUOTED = String.raw`[^\s"'\x60,;(){}\[\]<>=:]`;
 
@@ -140,7 +144,21 @@ const PATTERNS: readonly Pattern[] = [
   ),
   // Credentials in a URL's userinfo: scheme://user:pass@host, of any length. Anchored on the
   // literal `://`; user and password are atomic runs that cannot cross another `://`.
-  p(String.raw`(://(?=([^\s/:@]+))\2:)(?=([^\s/@]+))\3(?=@)`, '', `$1${REDACTED}`, true),
+  // The user may be empty (redis://:pass@host).
+  p(String.raw`(://(?=([^\s/:@]*))\2:)(?=([^\s/@]+))\3(?=@)`, '', `$1${REDACTED}`, true),
+  // curl basic auth: `curl -u user:pass` or `--user "user:pass"`, not `"$USER:$PASS"`. The span
+  // from `curl` to the flag is lazy and bounded, so each start costs a constant.
+  p(
+    String.raw`(\bcurl\b[^\n]{0,256}?[ \t](?:-u|--user)[ \t]{1,16}["']?)(?![$])[^\s:'"]{1,128}:(?![$])[^\s'"]{1,256}`,
+    'i',
+    `$1${REDACTED}`,
+  ),
+  // Azure storage and service bus connection strings.
+  p(
+    String.raw`(\b(?:Account|SharedAccess)Key=)[A-Za-z0-9+/]{20}[A-Za-z0-9+/=]{0,512}`,
+    'i',
+    `$1${REDACTED}`,
+  ),
   // Authorization headers and assignments, with or without a scheme, with a literal value.
   p(
     String.raw`(\bauthorization["']?[ \t]{0,16}[:=][ \t]{0,16}["']?(?:(?:bearer|basic|token)[ \t]{1,16})?)${TOKEN_LIT}`,
@@ -184,9 +202,9 @@ const PATTERNS: readonly Pattern[] = [
   ),
   // ...or an unquoted literal of 6+ characters that holds a digit or symbol, is not a `$var`,
   // and is not a member expression or call: `password: hunter22` and `PASSWORD = s3cr3t!` are
-  // caught, `password = req.body.password` and `token = getToken()` are not.
+  // caught, `password = req.body.password`, `token = getToken()` and `max_tokens: 100000` are not.
   p(
-    String.raw`(${KEYS}["']?[ \t]{0,16}[:=][ \t]{0,16})(?![$])(?![A-Za-z_$][\w$]{0,64}(?:\.[\w$]{1,64}){1,16}(?![\w$]))(?=${UNQUOTED}{0,255}[0-9!@#%^*+/~-])${UNQUOTED}{6,256}`,
+    String.raw`(${KEYS}["']?[ \t]{0,16}[:=][ \t]{0,16})(?![$])(?![0-9]{1,256}(?!${UNQUOTED}))(?![A-Za-z_$][\w$]{0,64}(?:\.[\w$]{1,64}){1,16}(?![\w$]))(?=${UNQUOTED}{0,255}[0-9!@#%^*+/~-])${UNQUOTED}{6,256}`,
     'i',
     `$1${REDACTED}`,
   ),
