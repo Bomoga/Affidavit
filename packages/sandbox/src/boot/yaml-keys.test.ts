@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { precheckCompose } from './compose.js';
+import { precheckCompose, selectServices } from './compose.js';
 import { scanYamlKeys } from './yaml-keys.js';
 
 /**
@@ -65,7 +65,52 @@ describe('scanYamlKeys refuses what it does not fully understand', () => {
     ]);
   });
 
+  it('trims the first segment of a plain scalar it also reports as a key', () => {
+    const scan = scanYamlKeys('services:\n  web:\n    labels:\n      - env_file :/etc/shadow\n');
+    expect(scan.ok && scan.keys.map((k) => k.name)).toContain('env_file');
+  });
+
   it('accepts CRLF line endings', () => {
     expect(scanYamlKeys('services:\r\n  web:\r\n    build: .\r\n').ok).toBe(true);
+  });
+});
+
+describe('selectServices drops host-facing keys only because it never reads them', () => {
+  // volumes, privileged, network_mode and devices pass the key precheck (they read no other
+  // file), so the only thing keeping them out of the jail is that selectServices ignores them.
+  // This pins the exact output: a change that starts reading any of them fails here and must add
+  // a host-path check first.
+  it('returns exactly the fields it reads, whatever else a service says', () => {
+    const hostKeys = {
+      volumes: ['/:/host', '/var/run/docker.sock:/var/run/docker.sock'],
+      privileged: true,
+      network_mode: 'host',
+      devices: ['/dev/kvm:/dev/kvm'],
+      cap_add: ['ALL'],
+      pid: 'host',
+    };
+    const r = selectServices(
+      {
+        services: {
+          web: { build: { context: '/tree' }, command: ['node', 'x'], ...hostKeys },
+          mongo: { image: 'mongo:4.4', ...hostKeys },
+        },
+      },
+      'web',
+      '/tree',
+    );
+    expect(r).toEqual({
+      ok: true,
+      target: {
+        dockerfile: 'Dockerfile',
+        command: ['node', 'x'],
+        env: {},
+        passThrough: [],
+        sidecars: [{ name: 'mongo', image: 'mongo:4.4', env: {} }],
+      },
+    });
+    for (const k of Object.keys(hostKeys)) {
+      expect(precheckCompose(`services:\n  web:\n    ${k}: x\n`)).toBeNull();
+    }
   });
 });

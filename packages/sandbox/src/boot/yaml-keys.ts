@@ -318,7 +318,11 @@ export function scanYamlKeys(text: string): KeyScan {
     // parser that disagreed would see a key. Report its first segment as a key too.
     for (const t of toks) {
       if (t.kind !== 'plain' || !t.text.includes(':')) continue;
-      keys.push({ name: t.text.slice(0, t.text.indexOf(':')), empty: false, line: t.line + 1 });
+      keys.push({
+        name: t.text.slice(0, t.text.indexOf(':')).trim(),
+        empty: false,
+        line: t.line + 1,
+      });
     }
     return { ok: true, keys };
   } catch (err) {
