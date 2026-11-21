@@ -101,6 +101,12 @@ Root CLAUDE.md rules apply here. Do not add dependencies without asking.
 
 - A SARIF parser (TBD)
 
+## Re-scan (L1-17)
+
+`DiscoveryRescan` (`src/rescan/`) is Lane 1's `RescanPort`, called by the Judge's `verifyPatch` on the patched tree (the vulnerable commit plus the whole patch, written by the Judge's jailed apply step). It copies that tree (no symlinks, no `.git`) into a fresh directory under `workRoot`, quarantines it, runs our Semgrep rules through `ToolRunnerPort` and the normalizer exactly as intake does, and always removes the directory; the Judge's tree is never written. `rescanPatchedTree` gives the same answer plus a fixed `reason`.
+
+`clean` is true only when the case candidate is a Semgrep finding, its file is a plain relative path that is still a regular file in the patched tree, Semgrep reported no coverage loss, and no finding of the same rule id is in that file (any merged member, or a skipped finding). File and rule are compared, not the range, since a patch moves lines; a second finding of that rule elsewhere in the file is not clean either. Any other tool, a deleted or renamed file, an unsafe path or a partial scan is never clean; a tool failure or malformed report throws. `candidates` is everything the re-scan found. Tests: `rescan.test.ts` (offline, fixture SARIF, `fixtures/corpus/rescan/README.md`), `rescan.docker.test.ts` (pinned image, `AFFIDAVIT_DOCKER_TESTS=1`, also records SARIF with `AFFIDAVIT_RECORD_DIR`).
+
 ## Pipeline (L1-10b)
 
 `discoverCase(deps, input)` in `src/pipeline/` runs ingest, Semgrep through `ToolRunnerPort`, normalize, map, arraign and case file assembly for one repo and commit, in a fresh per-run directory under `workRoot` that is always removed. Outcomes: `case-file`, `dismissed`, `review` (F3 hold), `unsupported`, `incomplete` (partial secret scan), `not-found`. An arraign error (such as duplicate reachability) is a `DiscoveryPipelineError`. `caseFileDiff` names differing top-level fields, never values. `apps/worker` calls it for `AFFIDAVIT_INTAKE_IMPL=real`. Every outcome after arraignment carries `holds`: ALL of the scan's F3 holds (`HeldCandidate`), whichever candidate was asked for, so none is dropped; with `input.holdCaseId` each hold also gets its own assembled case file (`open-case` records them, L1-10c).
