@@ -155,6 +155,153 @@ export async function parseSource(
   }
 }
 
+/** A run of free text or a name in a source file, for slice hygiene (L1-07). */
+export interface LexicalSpan {
+  kind: 'comment' | 'string' | 'template' | 'regex' | 'jsx-text' | 'identifier';
+  /** Index range in the JavaScript string that was parsed (UTF-16 code units, end exclusive). */
+  start: number;
+  end: number;
+  /**
+   * What the literal says: for a string or template, its fragments with escape sequences decoded
+   * (a template substitution counts as the digit 0, a word break that is not whitespace); a regex's pattern; JSX text; an identifier's name.
+   * Empty for a comment.
+   */
+  text: string;
+}
+
+const SIMPLE_ESCAPES: Record<string, string> = {
+  n: '\n',
+  r: '\r',
+  t: '\t',
+  b: '\b',
+  f: '\f',
+  v: '\v',
+  '0': '\0',
+};
+
+/** Decodes one JavaScript escape sequence (`\u0041`, `\u{41}`, `\x41`, `\n`, `\'`, a line continuation). */
+export function decodeEscape(seq: string): string {
+  const body = seq.slice(1);
+  let m = /^u\{([0-9a-fA-F]{1,6})\}$/.exec(body) ?? /^u([0-9a-fA-F]{4})$/.exec(body);
+  m ??= /^x([0-9a-fA-F]{2})$/.exec(body);
+  if (m?.[1]) {
+    const cp = parseInt(m[1], 16);
+    return cp <= 0x10ffff ? String.fromCodePoint(cp) : '';
+  }
+  if (/^(\r\n|\r|\n|\u2028|\u2029)$/.test(body)) return '';
+  return SIMPLE_ESCAPES[body] ?? body;
+}
+
+interface NodeLike {
+  type: string;
+  text: string;
+  children: (NodeLike | null)[];
+}
+
+/** Decoded content of a string or template node: fragments and escapes, a `0` per substitution. */
+function literalText(node: NodeLike): string {
+  let out = '';
+  for (const c of node.children) {
+    if (!c) continue;
+    if (c.type === 'string_fragment' || c.type === 'jsx_text') out += c.text;
+    else if (c.type === 'escape_sequence') out += decodeEscape(c.text);
+    else if (c.type === 'template_substitution') out += '0';
+  }
+  return out;
+}
+
+const IDENTIFIER_TYPES = new Set([
+  'identifier',
+  'property_identifier',
+  'private_property_identifier',
+  'shorthand_property_identifier',
+  'shorthand_property_identifier_pattern',
+  'statement_identifier',
+  'type_identifier',
+]);
+
+/**
+ * Where the comments, literals and names are in a file, for slice hygiene (L1-07). Same parser
+ * and budget as `parseSource`; never throws on hostile input. `syntaxError` is true when the tree
+ * has an error or missing node (the spans found are still returned). Spans nest (a string inside
+ * a template substitution is listed after the template) and are sorted by start.
+ */
+export async function lexicalSpans(
+  text: string,
+  grammar: Grammar,
+  maxParseMillis: number,
+): Promise<{ spans: LexicalSpan[]; syntaxError: boolean } | 'timeout' | 'failed'> {
+  const parser = await parserFor(grammar);
+  const deadline = Date.now() + maxParseMillis;
+  let timedOut = false;
+  let tree;
+  try {
+    tree = parser.parse(text, null, {
+      progressCallback: () => {
+        if (Date.now() > deadline) {
+          timedOut = true;
+          return true;
+        }
+        return false;
+      },
+    });
+  } catch {
+    return 'failed';
+  }
+  if (timedOut) {
+    tree?.delete();
+    return 'timeout';
+  }
+  if (!tree) return 'failed';
+  const cursor = tree.walk();
+  const spans: LexicalSpan[] = [];
+  let syntaxError = false;
+  try {
+    for (;;) {
+      const t = cursor.nodeType;
+      if (t === 'ERROR' || cursor.nodeIsMissing) syntaxError = true;
+      const at = { start: cursor.startIndex, end: cursor.endIndex };
+      let descend = true;
+      if (t === 'comment' || t === 'html_comment' || t === 'hash_bang_line') {
+        spans.push({ kind: 'comment', ...at, text: '' });
+        descend = false;
+      } else if (t === 'string' || t === 'template_string') {
+        const node = cursor.currentNode as unknown as NodeLike;
+        spans.push({
+          kind: t === 'string' ? 'string' : 'template',
+          ...at,
+          text: literalText(node),
+        });
+      } else if (t === 'regex') {
+        const node = cursor.currentNode as unknown as NodeLike;
+        const pattern = node.children.find((c) => c?.type === 'regex_pattern');
+        spans.push({ kind: 'regex', ...at, text: pattern?.text ?? '' });
+        descend = false;
+      } else if (t === 'jsx_text') {
+        spans.push({ kind: 'jsx-text', ...at, text: cursor.nodeText });
+        descend = false;
+      } else if (IDENTIFIER_TYPES.has(t)) {
+        spans.push({ kind: 'identifier', ...at, text: cursor.nodeText });
+        descend = false;
+      }
+      if (descend && cursor.gotoFirstChild()) continue;
+      let up = false;
+      while (!cursor.gotoNextSibling()) {
+        if (!cursor.gotoParent()) {
+          up = true;
+          break;
+        }
+      }
+      if (up) break;
+    }
+  } finally {
+    cursor.delete();
+    tree.delete();
+  }
+  spans.sort((a, b) => a.start - b.start || b.end - a.end);
+  return { spans, syntaxError };
+}
+
 interface CursorLike {
   nodeType: string;
   nodeIsNamed: boolean;

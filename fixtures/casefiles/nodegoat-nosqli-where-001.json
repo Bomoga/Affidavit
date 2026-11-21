@@ -1,0 +1,81 @@
+{
+  "schemaVersion": 1,
+  "id": "case-nodegoat-nosqli-where-001",
+  "tenantId": "tenant-dev",
+  "target": {
+    "repo": "repo-nodegoat",
+    "commit": "c5cb68a7084e4ae7dcc60e6a98768720a81841e8",
+    "variant": "vulnerable"
+  },
+  "candidate": {
+    "schemaVersion": 1,
+    "id": "cand-928da6f478e4389f",
+    "tool": "semgrep",
+    "ruleId": "affidavit.injection.nosql-where-template",
+    "cls": "injection",
+    "file": "app/data/allocations-dao.js",
+    "range": {
+      "startLine": 77,
+      "endLine": 79
+    },
+    "reachability": "reachable",
+    "score": 0.77,
+    "scoreInputs": {
+      "reachability": 1,
+      "sinkType": 0.9,
+      "noAuthOnPath": 0,
+      "toolAgreement": 0.5
+    },
+    "toolAgreement": 1
+  },
+  "slices": [
+    {
+      "file": "app/data/allocations-dao.js",
+      "range": {
+        "startLine": 57,
+        "endLine": 110
+      },
+      "code": "    this.getByUserIdAndThreshold = (userId, threshold, callback) => {\n        const parsedUserId = parseInt(userId);\n\n        const searchCriteria = () => {\n\n            if (threshold) {\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n                return {\n                    $where: `this.userId == ${parsedUserId} && this.stocks > '${threshold}'`\n                };\n            }\n            return {\n                userId: parsedUserId\n            };\n        };\n\n        allocationsCol.find(searchCriteria()).toArray((err, allocations) => {\n            if (err) return callback(err, null);\n            if (!allocations.length) return callback(\"[text removed]\", null);\n\n            let doneCounter = 0;\n            const userAllocations = [];\n\n            allocations.forEach( alloc => {\n                userDAO.getUserById(alloc.userId, (err, user) => {\n                    if (err) return callback(err, null);\n\n                    alloc.userName = user.userName;\n                    alloc.firstName = user.firstName;\n                    alloc.lastName = user.lastName;\n\n                    doneCounter += 1;\n                    userAllocations.push(alloc);\n\n                    if (doneCounter === allocations.length) {\n                        callback(null, userAllocations);\n                    }\n                });\n            });\n        });\n    };",
+      "strippedComments": true,
+      "untrusted": true
+    },
+    {
+      "file": "app/routes/allocations.js",
+      "range": {
+        "startLine": 11,
+        "endLine": 31
+      },
+      "code": "    this.displayAllocations = (req, res, next) => {\n\n\n\n\n        const {\n            userId\n        } = req.params;\n        const {\n            threshold\n        } = req.query;\n\n        allocationsDAO.getByUserIdAndThreshold(userId, threshold, (err, allocations) => {\n            if (err) return next(err);\n            return res.render(\"allocations\", {\n                userId,\n                allocations,\n                environmentalScripts\n            });\n        });\n    };",
+      "strippedComments": true,
+      "untrusted": true
+    }
+  ],
+  "route": {
+    "method": "GET",
+    "path": "/allocations/:userId",
+    "handlerFile": "app/routes/allocations.js",
+    "middleware": [
+      "isLoggedIn"
+    ],
+    "authRequired": true
+  },
+  "bootHints": {
+    "kind": "compose",
+    "path": "docker-compose.yml",
+    "service": "web",
+    "ports": [
+      4000
+    ],
+    "healthRoute": "/login",
+    "healthTimeoutMs": 60000,
+    "stubs": [],
+    "env": {}
+  },
+  "redactions": [],
+  "escalationFloor": 0.7,
+  "safeVariant": {
+    "repo": "repo-nodegoat",
+    "commit": "c5cb68a7084e4ae7dcc60e6a98768720a81841e8",
+    "variant": "safe"
+  }
+}
