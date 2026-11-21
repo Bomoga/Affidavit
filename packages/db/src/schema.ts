@@ -354,7 +354,7 @@ export const stageRuns = pgTable(
 
 /**
  * Durable "a person has to look" marker, written by the orchestration when a stage cannot be
- * retried (attempts used up, budget exhausted). Insert-only, one row per attempt. The case is
+ * retried (attempts used up, budget exhausted), and by `openHeldCase` for an F3 hold (`f3-hold`). Insert-only, one row per attempt. The case is
  * left where it is; nothing is dismissed. The shape is a stopgap until contracts say how such a
  * case is escalated (docs/lanes/lane1/contract-requests.md).
  */
@@ -384,7 +384,7 @@ export const reviewFlags = pgTable(
     check('review_flags_visit_valid', sql`${t.visit} >= 0`),
     check(
       'review_flags_reason_valid',
-      sql`${t.reason} in ('attempts-exhausted', 'budget-exhausted')`,
+      sql`${t.reason} in ('attempts-exhausted', 'budget-exhausted', 'f3-hold')`,
     ),
   ],
 ).enableRLS();

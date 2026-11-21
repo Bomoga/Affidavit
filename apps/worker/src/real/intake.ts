@@ -7,15 +7,16 @@
  * these stages do not write a new one: they re-derive it from the source and refuse to go on unless
  * real discovery reproduces it. `open-case --discover` opens cases from the same pipeline.
  *
- * - intake: ingestion must succeed. `unsupported` and `incomplete` have no contract slot (CR-4)
+ * - intake: ingestion must succeed and the candidate must still go to trial. `unsupported` and `incomplete` have no contract slot (CR-4)
  *   and no legal transition (escalated is reachable from defense onward only), so the job fails
  *   with IntakeRefusedError. The reason is the failed attempt's recorded error; recovery retries
  *   it up to AFFIDAVIT_MAX_STAGE_ATTEMPTS and then writes a review flag (attempts-exhausted), so a
  *   person sees it. Never dismissed, never retried forever.
  * - map: the re-derived candidate's reachability and route must equal the stored ones.
- * - arraign: the whole re-derived case file must equal the stored one; only then defense. Any
- *   other outcome (dismissal, F3 hold, candidate not found, a difference) fails the job the same
- *   way: a case opened for trial is never dismissed here.
+ * - arraign: the whole re-derived case file must equal the stored one; only then defense.
+ * - A dismissal, an F3 hold or a candidate not found fails the job at any of the three stages
+ *   with DiscoveryOutcomeError, which names the outcome; a difference fails it with
+ *   CaseFileMismatchError, which names the fields. A case opened for trial is never dismissed here.
  *
  * Within one process the pipeline runs once per case and the three stages share the result; after
  * a restart a stage runs it again.
@@ -52,12 +53,44 @@ export class CaseFileMismatchError extends Error {
   }
 }
 
+type OtherOutcome = Extract<DiscoverCaseOutcome, { kind: 'dismissed' | 'review' | 'not-found' }>;
+
+/**
+ * Real discovery no longer sends this case's candidate to trial: it was dismissed, held for
+ * review (F3), or not produced at all. Names the outcome and discovery's own reason codes, never
+ * repository content. The case is never dismissed here; recovery flags it for a person.
+ */
+export class DiscoveryOutcomeError extends Error {
+  readonly outcome: OtherOutcome['kind'];
+  constructor(stage: CaseStage, o: OtherOutcome) {
+    const what =
+      o.kind === 'dismissed'
+        ? `would be dismissed (${o.dismissal.reason})`
+        : o.kind === 'review'
+          ? `is held for review (F3: would dismiss as ${o.wouldDismiss}, route ${o.route})`
+          : 'was not found by the scan';
+    super(
+      `${stage}: real discovery no longer sends this case's candidate to trial: it ${what}; the case is never dismissed here, so a person must look`,
+    );
+    this.name = 'DiscoveryOutcomeError';
+    this.outcome = o.kind;
+  }
+}
+
 /** The case's repository has no entry in AFFIDAVIT_REPO_SOURCES. */
 export class NoSourceError extends Error {
   constructor(repo: string) {
     super(`AFFIDAVIT_REPO_SOURCES has no source for repository ${repo}`);
     this.name = 'NoSourceError';
   }
+}
+
+function describeRefusal(
+  o: Extract<DiscoverCaseOutcome, { kind: 'unsupported' | 'incomplete' }>,
+): string {
+  return o.kind === 'unsupported'
+    ? `${o.reason}: ${o.detail}`
+    : `${o.reason}, ${o.coverageLosses} coverage loss(es) in the secret scan`;
 }
 
 const MAX_CACHED = 64;
@@ -109,25 +142,22 @@ export function realIntakeCores(opts: {
   }
 
   const reproduced = (stage: CaseStage, stored: CaseFile, o: DiscoverCaseOutcome) => {
-    if (o.kind !== 'case-file') {
-      throw new CaseFileMismatchError(stage, `discovery outcome is ${o.kind}, not a case file`);
+    if (o.kind === 'case-file') return caseFileDiff(stored, o.caseFile);
+    if (o.kind === 'dismissed' || o.kind === 'review' || o.kind === 'not-found') {
+      throw new DiscoveryOutcomeError(stage, o);
     }
-    return caseFileDiff(stored, o.caseFile);
+    throw new IntakeRefusedError(o.kind, describeRefusal(o));
   };
 
   return {
     intake: async (env) => {
       await repairIntakeEntry(env);
       const { outcome } = await rederive(env);
-      if (outcome.kind === 'unsupported') {
-        throw new IntakeRefusedError('unsupported', `${outcome.reason}: ${outcome.detail}`);
+      if (outcome.kind === 'unsupported' || outcome.kind === 'incomplete') {
+        throw new IntakeRefusedError(outcome.kind, describeRefusal(outcome));
       }
-      if (outcome.kind === 'incomplete') {
-        throw new IntakeRefusedError(
-          'incomplete',
-          `${outcome.reason}, ${outcome.coverageLosses} coverage loss(es) in the secret scan`,
-        );
-      }
+      // Fail here, naming the outcome, rather than at map with a mismatch.
+      if (outcome.kind !== 'case-file') throw new DiscoveryOutcomeError('intake', outcome);
       await env.checkpoint('after-discovery');
       await moveTo(env, 'map');
     },

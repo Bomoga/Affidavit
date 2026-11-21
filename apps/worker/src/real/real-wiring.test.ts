@@ -14,18 +14,20 @@ import type { DiscoverCaseOutcome } from '@affidavit/discovery';
 import { DEFAULT_TRACE_ROOT } from '@affidavit/sandbox';
 import { createModelPortFromEnv, resolveModelTable } from '@affidavit/trial';
 import { describe, expect, it } from 'vitest';
-import { ConfigError, describeConfig, loadConfig } from '../config.js';
+import { ConfigError, describeConfig, loadConfig, startupWarnings } from '../config.js';
 import { fakeJudge } from '../fakes/stages.js';
 import { prepareCores } from '../handlers.js';
 import {
   CaseFileMismatchError,
+  DiscoveryOutcomeError,
   IntakeRefusedError,
   NoSourceError,
   realIntakeCores,
   type Discover,
 } from './intake.js';
-import type { RealJudgeHostProbe } from '@affidavit/judge';
+import type { RealJudge, RealJudgeHostProbe } from '@affidavit/judge';
 import { PrerequisiteError, checkPrerequisites, realHostProbe, type HostProbe } from './prereqs.js';
+import { buildModel } from './components.js';
 import { TrialHaltedError, realTrialCores } from './trial.js';
 
 const SECRET = 'hunter2-not-a-real-password';
@@ -102,7 +104,10 @@ async function refusal(env: Record<string, string>, h: Host): Promise<Prerequisi
 describe('real wiring config', () => {
   it('loads every real setting with conservative defaults', () => {
     const c = loadConfig(realEnv);
-    expect(c.intakeSettings?.toolRunner).toBe('docker');
+    // Scanners run under gVisor unless plain Docker is asked for by name.
+    expect(c.intakeSettings?.toolRunner).toBe('gvisor');
+    expect(c.intakeSettings?.toolRunnerExplicit).toBe(false);
+    expect(startupWarnings(c)).toEqual([]);
     expect(c.trialSettings?.killSwitch).toBe(false);
     expect(c.trialSettings?.turnBudget).toEqual({
       maxInputTokens: 100_000,
@@ -158,7 +163,10 @@ describe('startup prerequisites', () => {
       'a non-Linux host',
       host({ platform: 'win32' }),
       {},
-      ['the real Judge needs a Linux sandbox host with gVisor (this host is win32)'],
+      [
+        'AFFIDAVIT_TOOLRUNNER=gvisor needs a Linux sandbox host with gVisor (this host is win32) (AFFIDAVIT_TOOLRUNNER is unset, so gVisor is the default; set AFFIDAVIT_TOOLRUNNER=docker',
+        'the real Judge needs a Linux sandbox host with gVisor (this host is win32)',
+      ],
     ],
     [
       'an unreachable Docker daemon',
@@ -373,7 +381,25 @@ describe('startup prerequisites', () => {
       AFFIDAVIT_REPO_SOURCES: realEnv.AFFIDAVIT_REPO_SOURCES!,
     };
     const h = host({ platform: 'win32', dockerInfo: ['runc'] });
-    await expect(checkPrerequisites(loadConfig(env), h.probe, h.judge)).resolves.toBeUndefined();
+    // Unset: gVisor is the default, and this host has none, so it refuses and says how to opt out.
+    const e = await refusal(env, h);
+    expect(e.problems).toEqual([
+      expect.stringContaining('set AFFIDAVIT_TOOLRUNNER=docker to scan under plain Docker'),
+      expect.stringContaining('Docker has no "runsc" runtime'),
+    ]);
+    // Plain Docker only by name, with a startup warning.
+    const docker = loadConfig({ ...env, AFFIDAVIT_TOOLRUNNER: 'docker' });
+    expect(docker.intakeSettings?.toolRunnerExplicit).toBe(true);
+    await expect(checkPrerequisites(docker, h.probe, h.judge)).resolves.toBeUndefined();
+    expect(startupWarnings(docker)).toEqual([
+      expect.stringContaining(
+        'AFFIDAVIT_TOOLRUNNER=docker: scanners run on untrusted repository content under plain Docker',
+      ),
+    ]);
+    expect(startupWarnings(loadConfig({ ...env, AFFIDAVIT_TOOLRUNNER: 'gvisor' }))).toEqual([]);
+    expect(() => loadConfig({ ...env, AFFIDAVIT_TOOLRUNNER: 'runc' })).toThrow(
+      /AFFIDAVIT_TOOLRUNNER must be "docker" or "gvisor"/,
+    );
   });
 
   it('prepareCores refuses before building anything, and skips checks for injected parts', async () => {
@@ -414,6 +440,89 @@ describe('startup prerequisites', () => {
       log: (m) => logs.push(m),
     });
     expect(logs).toEqual([]);
+  });
+
+  /** A RealJudge stand-in that records whether it was closed. */
+  function fakeRealJudge(notes: string[] = []) {
+    const state = { built: 0, closed: 0 };
+    const factory = () => {
+      state.built++;
+      return Promise.resolve({
+        judge: fakeJudge(),
+        notes,
+        release: () => Promise.resolve(),
+        close: () => {
+          state.closed++;
+          return Promise.resolve();
+        },
+      } as unknown as RealJudge);
+    };
+    return { state, factory };
+  }
+
+  it('lists host and environment problems in one error and never builds the Judge then', async () => {
+    const config = loadConfig(realEnv);
+    const { state, factory } = fakeRealJudge();
+    const err = await prepareCores(config, {
+      env: {
+        ...realEnv,
+        AFFIDAVIT_ESCALATION_FLOOR: '7',
+        AFFIDAVIT_MODEL_MODE: 'sometimes',
+        ANTHROPIC_MODEL_DEFENSE: 'not-a-model',
+        ANTHROPIC_API_KEY: SECRET,
+      },
+      probe: host({ missing: ['/srv/affidavit/intake'] }).probe,
+      judgeProbe: host().judge,
+      realJudgeFactory: factory,
+      log: () => {},
+    }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(PrerequisiteError);
+    const problems = (err as PrerequisiteError).problems;
+    expect(problems).toHaveLength(4);
+    expect(problems[0]).toContain('AFFIDAVIT_INTAKE_WORK_ROOT');
+    expect(problems[1]).toContain('discovery: escalationFloor must be a number in 0..1');
+    expect(problems[2]).toContain('the model port: AFFIDAVIT_MODEL_MODE');
+    expect(problems[3]).toContain('the model table');
+    expect((err as Error).message).not.toContain(SECRET);
+    expect(state.built).toBe(0);
+  });
+
+  it('builds the Judge last and closes it when a later step throws', async () => {
+    const config = loadConfig(realEnv);
+    const h = host();
+    const { state, factory } = fakeRealJudge(['no RescanPort']);
+    const err = await prepareCores(config, {
+      env: realEnv,
+      probe: h.probe,
+      judgeProbe: h.judge,
+      discover: () => Promise.reject(new Error('unused')),
+      realJudgeFactory: factory,
+      log: (m) => {
+        if (m.startsWith('real Judge:')) throw new Error('log sink is down');
+      },
+    }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect((err as Error).message).toBe('log sink is down');
+    expect(state).toEqual({ built: 1, closed: 1 });
+
+    // A healthy start keeps it open until close().
+    const ok = fakeRealJudge();
+    const prepared = await prepareCores(config, {
+      env: realEnv,
+      probe: h.probe,
+      judgeProbe: h.judge,
+      discover: () => Promise.reject(new Error('unused')),
+      realJudgeFactory: ok.factory,
+      log: () => {},
+    });
+    expect(ok.state).toEqual({ built: 1, closed: 0 });
+    await prepared.close();
+    expect(ok.state).toEqual({ built: 1, closed: 1 });
   });
 });
 /** A StageEnv over in-memory state, for one stage job. */
@@ -464,6 +573,7 @@ const reproduced: DiscoverCaseOutcome = {
   caseFile: stored,
   withheld: [],
   scanPartial: false,
+  holds: [],
 };
 
 async function failure(p: Promise<unknown>): Promise<Error> {
@@ -527,23 +637,52 @@ describe('real intake cores', () => {
     expect(h.transitions).toEqual([]);
   });
 
-  it('never dismisses: a dismissal or a held candidate fails the job', async () => {
-    for (const outcome of [
-      { kind: 'not-found', candidateId: stored.candidate.id },
+  const otherOutcomes: [DiscoverCaseOutcome, string][] = [
+    [{ kind: 'not-found', candidateId: stored.candidate.id, holds: [] }, 'not found'],
+    [
       {
         kind: 'review',
         candidateId: stored.candidate.id,
-        wouldDismiss: 'below-floor',
-        route: null,
-        detail: 'held',
+        wouldDismiss: 'unreachable',
+        route: 'person-or-trial',
+        detail: 'the map found no path to it (no-route)',
+        holds: [],
       },
-    ] as unknown as DiscoverCaseOutcome[]) {
-      const cores = realIntakeCores({ discover: () => Promise.resolve(outcome), sources });
-      const h = stageEnv('map', { stage: 'map' });
-      expect(await failure(cores.map!(h.env))).toBeInstanceOf(CaseFileMismatchError);
-      expect(h.transitions).toEqual([]);
-    }
-  });
+      'held for review (F3: would dismiss as unreachable, route person-or-trial)',
+    ],
+    [
+      {
+        kind: 'dismissed',
+        dismissal: {
+          schemaVersion: 1,
+          candidateId: stored.candidate.id,
+          reason: 'below-threshold',
+          detail: 'score 0.1 is below the dismissal threshold 0.2',
+        },
+        holds: [],
+      },
+      'would be dismissed (below-threshold)',
+    ],
+  ];
+
+  it.each(otherOutcomes)(
+    'never dismisses, and names the outcome: %o fails intake and map precisely',
+    async (outcome, label) => {
+      for (const stage of ['intake', 'map', 'arraign'] as const) {
+        const cores = realIntakeCores({ discover: () => Promise.resolve(outcome), sources });
+        const h = stageEnv(stage, { stage });
+        const err = await failure(cores[stage]!(h.env));
+        expect(err).toBeInstanceOf(DiscoveryOutcomeError);
+        expect(err).not.toBeInstanceOf(CaseFileMismatchError);
+        expect((err as DiscoveryOutcomeError).outcome).toBe(outcome.kind);
+        expect(err.message).toContain(`${stage}: `);
+        expect(err.message).toContain(label);
+        expect(err.message).toContain('never dismissed here');
+        expect(err.message).not.toContain('does not reproduce');
+        expect(h.transitions).toEqual([]);
+      }
+    },
+  );
 
   it('names a repository with no source, without printing other sources', async () => {
     const cores = realIntakeCores({
@@ -588,6 +727,28 @@ describe('real trial cores', () => {
     expect(h.transitions).toEqual([]);
   });
 
+  it('reads the API key from the sealed snapshot, never from process.env', async () => {
+    const saved = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = 'would-be-used-if-read-from-process-env';
+    try {
+      // buildModel is what prepareCores uses; the snapshot (sealSecrets) has no key.
+      const cores = realTrialCores({
+        model: buildModel({}, () => false),
+        judge: fakeJudge(),
+        modelTable: resolveModelTable({}),
+        settings: trialSettings,
+        maxStageAttempts: 3,
+        killSwitch: () => false,
+      });
+      const h = stageEnv('defense', { stage: 'defense' });
+      const err = await failure(cores.defense!(h.env));
+      expect((err as TrialHaltedError).reason).toBe('model-unconfigured');
+      expect(h.charges).toEqual([]);
+    } finally {
+      if (saved === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = saved;
+    }
+  });
   it('halts on the kill switch without moving the case', async () => {
     const cores = realTrialCores({
       model: createModelPortFromEnv({}, { env: () => ({ ANTHROPIC_API_KEY: SECRET }) }),

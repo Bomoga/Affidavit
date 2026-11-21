@@ -1,8 +1,10 @@
 /**
- * Opens one case for the real wiring: runs the same discovery pipeline the real intake stages run
- * (same settings, same tool runner) on a repository named in AFFIDAVIT_REPO_SOURCES, and if it
- * produces a case file, opens the case with the AFFIDAVIT_CASE_MAX_* budget and enqueues intake.
- * Wiring only. Prints the case id, or why no case was opened; never a source URL.
+ * Opens cases for the real wiring: runs the same discovery pipeline the real intake stages run
+ * (same settings, same tool runner) on a repository named in AFFIDAVIT_REPO_SOURCES. A trial
+ * candidate is opened with the AFFIDAVIT_CASE_MAX_* budget and intake is enqueued; every F3 hold
+ * of the scan is opened as its own case and flagged for a person (review flag `f3-hold`, never
+ * queued, never dismissed; see real/open.ts). Wiring only. Prints the case ids, or why no trial
+ * case was opened; never a source URL.
  *
  *   pnpm --filter @affidavit/worker open-case -- --tenant <id> --repo <id> --commit <40 hex>
  *     [--candidate <candidate id>] [--case-id <id>]
@@ -12,9 +14,11 @@
 import { randomUUID } from 'node:crypto';
 import { parseArgs } from 'node:util';
 import { CaseId, RepoId, TenantId } from '@affidavit/contracts';
-import { openPool, startCase } from '@affidavit/db';
-import { loadConfig } from './config.js';
+import { openHeldCase, openPool, startCase } from '@affidavit/db';
+import { loadConfig, startupWarnings } from './config.js';
+import { sealSecrets } from './real/child-env.js';
 import { buildDiscover } from './real/components.js';
+import { openCaseFromDiscovery } from './real/open.js';
 import { checkPrerequisites } from './real/prereqs.js';
 
 async function main(): Promise<number> {
@@ -45,49 +49,43 @@ async function main(): Promise<number> {
     console.error(`AFFIDAVIT_REPO_SOURCES has no source for repository ${repo}`);
     return 2;
   }
+  // From here on no child process can inherit a credential: the wiring reads the snapshot.
+  const env = sealSecrets();
+  for (const w of startupWarnings(config)) console.error(`[open-case] warning: ${w}`);
   // Intake prerequisites only; the trial and Judge are the worker's.
   await checkPrerequisites({ ...config, trialSettings: null, judgeSettings: null });
-  const discover = buildDiscover(s, process.env);
-  const outcome = await discover({
-    caseId: CaseId.parse(values['case-id'] ?? `case-${randomUUID()}`),
-    tenantId: TenantId.parse(tenant),
-    repo: RepoId.parse(repo),
-    source,
-    commit,
-    ...(values.candidate ? { candidateId: values.candidate } : {}),
-  });
-  if (outcome.kind !== 'case-file') {
-    // Fixed fields only: the outcome kind and discovery's own reason codes.
-    const why =
-      outcome.kind === 'unsupported'
-        ? `${outcome.reason}: ${outcome.detail}`
-        : outcome.kind === 'incomplete'
-          ? `${outcome.reason}, ${outcome.coverageLosses} coverage loss(es)`
-          : outcome.kind === 'review'
-            ? `candidate ${outcome.candidateId} is held for review (F3), not dismissed`
-            : outcome.kind === 'dismissed'
-              ? 'the candidate was dismissed by arraignment with a recorded reason'
-              : 'no candidate to try';
-    console.error(`no case opened (${outcome.kind}): ${why}`);
-    return 1;
-  }
+  const discover = buildDiscover(s, env);
   const pool = await openPool(config.appDatabaseUrl, 'affidavit_app');
+  let result;
   try {
-    await startCase(pool, outcome.caseFile, config.caseBudget);
+    result = await openCaseFromDiscovery(
+      {
+        discover,
+        startCase: (cf) => startCase(pool, cf, config.caseBudget),
+        openHeldCase: (cf, detail) => openHeldCase(pool, cf, config.caseBudget, detail),
+      },
+      {
+        caseId: CaseId.parse(values['case-id'] ?? `case-${randomUUID()}`),
+        tenantId: TenantId.parse(tenant),
+        repo: RepoId.parse(repo),
+        source,
+        commit,
+        ...(values.candidate ? { candidateId: values.candidate } : {}),
+      },
+    );
   } finally {
     await pool.end();
   }
-  console.log(
-    JSON.stringify({
-      caseId: outcome.caseFile.id,
-      candidate: outcome.caseFile.candidate.id,
-      scanPartial: outcome.scanPartial,
-      withheld: outcome.withheld.length,
-    }),
-  );
-  return 0;
+  for (const h of result.held) {
+    console.error(
+      `F3 hold recorded for a person: case ${h.caseId}, candidate ${h.candidate}, route ${h.route}`,
+    );
+  }
+  if (result.why !== null) console.error(`no trial case opened (${result.why})`);
+  console.log(JSON.stringify({ opened: result.opened, held: result.held }));
+  // Success when something was recorded: a trial case, or at least one hold for a person.
+  return result.opened !== null || result.held.length > 0 ? 0 : 1;
 }
-
 main().then(
   (code) => process.exit(code),
   (err: unknown) => {

@@ -14,6 +14,7 @@ import {
 } from '@affidavit/judge';
 import { PLAIN_RUNTIME } from '@affidavit/sandbox';
 import type { WorkerConfig } from '../config.js';
+import { childEnv } from './child-env.js';
 import { realJudgeConfig } from './components.js';
 
 const exec = promisify(execFile);
@@ -27,30 +28,45 @@ export interface HostProbe {
   dockerRuntimes(): Promise<string[] | null>;
 }
 
-export const realHostProbe: HostProbe = {
-  platform: process.platform,
-  isDirectory: (p) =>
-    stat(p).then(
-      (s) => s.isDirectory(),
-      () => false,
-    ),
-  isRegularFile: (p) =>
-    lstat(p).then(
-      (s) => s.isFile(),
-      () => false,
-    ),
-  async dockerRuntimes() {
-    try {
-      const { stdout } = await exec('docker', ['info', '--format', '{{json .Runtimes}}'], {
-        timeout: 20_000,
-      });
-      const parsed: unknown = JSON.parse(stdout);
-      return parsed !== null && typeof parsed === 'object' ? Object.keys(parsed) : [];
-    } catch {
-      return null;
-    }
-  },
-};
+/**
+ * The host probe. `docker` is the command and leading arguments that stand for the Docker CLI
+ * (a test points it at a stub). Every child process gets `childEnv()`, never the worker's own
+ * environment: no API key, database URL or repository source reaches it.
+ */
+export function makeHostProbe(
+  o: { docker?: readonly [string, ...string[]]; env?: () => Record<string, string> } = {},
+): HostProbe {
+  const [command, ...lead] = o.docker ?? ['docker'];
+  const env = o.env ?? (() => childEnv());
+  return {
+    platform: process.platform,
+    isDirectory: (p) =>
+      stat(p).then(
+        (s) => s.isDirectory(),
+        () => false,
+      ),
+    isRegularFile: (p) =>
+      lstat(p).then(
+        (s) => s.isFile(),
+        () => false,
+      ),
+    async dockerRuntimes() {
+      try {
+        const { stdout } = await exec(
+          command,
+          [...lead, 'info', '--format', '{{json .Runtimes}}'],
+          { timeout: 20_000, env: env() },
+        );
+        const parsed: unknown = JSON.parse(stdout);
+        return parsed !== null && typeof parsed === 'object' ? Object.keys(parsed) : [];
+      } catch {
+        return null;
+      }
+    },
+  };
+}
+
+export const realHostProbe: HostProbe = makeHostProbe();
 
 export class PrerequisiteError extends Error {
   constructor(readonly problems: readonly string[]) {
@@ -82,9 +98,13 @@ export async function checkPrerequisites(
   const judge = config.judgeSettings;
 
   if (intake) {
+    // gVisor is the default; plain Docker only when asked for by name (it logs a warning).
+    const fallback = intake.toolRunnerExplicit
+      ? ''
+      : ' (AFFIDAVIT_TOOLRUNNER is unset, so gVisor is the default; set AFFIDAVIT_TOOLRUNNER=docker to scan under plain Docker without gVisor isolation)';
     if (intake.toolRunner === 'gvisor' && probe.platform !== 'linux') {
       problems.push(
-        `AFFIDAVIT_TOOLRUNNER=gvisor needs a Linux sandbox host with gVisor (this host is ${probe.platform})`,
+        `AFFIDAVIT_TOOLRUNNER=gvisor needs a Linux sandbox host with gVisor (this host is ${probe.platform})${fallback}`,
       );
     }
     const runtimes = await probe.dockerRuntimes();
@@ -92,7 +112,7 @@ export async function checkPrerequisites(
       problems.push('the Docker daemon cannot be reached (docker info failed)');
     } else if (intake.toolRunner === 'gvisor' && !runtimes.includes(PLAIN_RUNTIME)) {
       problems.push(
-        `Docker has no "${PLAIN_RUNTIME}" runtime (run docker/sandbox/install-gvisor.sh as root)`,
+        `Docker has no "${PLAIN_RUNTIME}" runtime (run docker/sandbox/install-gvisor.sh as root)${fallback}`,
       );
     }
     if (intake.workRoot !== '' && !(await probe.isDirectory(intake.workRoot))) {

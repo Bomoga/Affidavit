@@ -237,6 +237,7 @@ describePg('worker real wiring, injected fakes, real Postgres and Graphile Worke
         caseFile: file,
         withheld: [],
         scanPartial: false,
+        holds: [],
       });
     };
     const fake = new FakeJudge({

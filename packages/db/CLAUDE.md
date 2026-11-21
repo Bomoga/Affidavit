@@ -42,6 +42,7 @@ Run from this directory, or add `--filter @affidavit/db` from the repo root.
   - `PgCaseFileSource` is the keyed `CaseFileSource`. The task wrapper refuses a queue job whose Graphile key does not equal the key of its payload.
   - Sweep limit: `sweepLimit` (default 500) cases per pass in (tenant, case id) order, continuing after the last one on the next pass.
   - `startCase` is not atomic by design; the sweep repairs a crash after `open`.
+  - `openHeldCase` (L1-10c) opens a case for an F3 hold found by discovery and writes a `review_flags` row with reason `f3-hold` (migration 0007) for its intake visit, with no stage job: the sweep and recovery leave it alone, and it is never dismissed. Idempotent. How a person sends a `person-or-trial` hold on to a second Defense attempt is CR-13.
 
 Root CLAUDE.md rules apply here. Do not add dependencies without asking.
 

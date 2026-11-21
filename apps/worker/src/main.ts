@@ -1,11 +1,14 @@
 import { describeConfig, loadConfig } from './config.js';
+import { sealSecrets } from './real/child-env.js';
 import { startWorker } from './worker.js';
 
 /** Process entry point: configuration from the environment, then run until signalled. */
 async function main(): Promise<void> {
   const config = loadConfig();
+  // From here on no child process can inherit a credential: the wiring reads the snapshot.
+  const env = sealSecrets();
   console.error('[worker] starting', JSON.stringify(describeConfig(config)));
-  const worker = await startWorker(config);
+  const worker = await startWorker(config, { components: { env } });
   const shutdown = () => {
     void worker.stop().then(() => process.exit(0));
   };
