@@ -51,6 +51,7 @@ import { PROSE_MARKER } from '../casefile/slice.js';
 import { normalizeReports, readToolRunReports, type ReportInput } from '../normalize/index.js';
 import {
   classifyHead,
+  hasOddControl,
   loadToolManifest,
   quarantineSnapshot,
   repoRoot,
@@ -169,7 +170,8 @@ function plainText(path: string, limits: RescanLimits): boolean {
     }
     const bytes = buf.subarray(0, n);
     if (classifyHead(basename(path), bytes.subarray(0, 8192)) !== undefined) return false;
-    if (bytes.includes(0x00)) return false;
+    // classifyHead sees the head only (signatures); NUL and control bytes are checked everywhere.
+    if (bytes.includes(0x00) || hasOddControl(bytes)) return false;
     let text: string;
     try {
       text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);

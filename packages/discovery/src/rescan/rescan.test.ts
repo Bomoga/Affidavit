@@ -287,6 +287,14 @@ describe('clean is never the default (review of #66)', () => {
     expect(r).toMatchObject({ clean: false, reason: 'not-plain-text' });
   });
 
+  it('is not clean when a control byte sits after the first 8192 bytes', async () => {
+    const text = `${patchedText()}${`// ${'x'.repeat(60)}\n`.repeat(200)}\u0001\n`;
+    expect(text.indexOf('\u0001')).toBeGreaterThan(8192);
+    const { r, seen } = await withCaseFile(text);
+    expect(r).toMatchObject({ clean: false, reason: 'not-plain-text' });
+    expect(seen.calls).toBe(0);
+  });
+
   it('is not clean when the case file holds a control byte', async () => {
     const { r } = await withCaseFile(`${patchedText()}\u0001\n`);
     expect(r).toMatchObject({ clean: false, reason: 'not-plain-text' });
