@@ -311,6 +311,36 @@ export function findLiteralSpecialCases(
   return hits;
 }
 
+/** An added line that decides something: a branch, a comparison, a ternary or a membership test. */
+const CONDITIONAL = /\b(?:if|while|case|switch)\b|[=!]==?|\?|\.(?:includes|indexOf|has)\s*\(/;
+
+/**
+ * The stricter check for values that come from counterexamples, which Prosecution chooses: an
+ * added code line counts only when it is a conditional and holds the value as a whole string
+ * literal (never a substring), or compares a parameter number. The Judge calls it only with the
+ * params of counterexamples that were admitted (passed on vulnerable, failed on safe), so a
+ * common value in an unproven counterexample cannot veto a sound patch.
+ */
+export function findCounterexampleSpecialCases(
+  lines: readonly DiffLine[],
+  params: ParamSpace,
+): LiteralHit[] {
+  const { strings, numbers } = paramLiterals(params);
+  const hits: LiteralHit[] = [];
+  for (const { path, text } of lines) {
+    if (isTestFile(path)) continue;
+    const code = stripComments(text);
+    if (!CONDITIONAL.test(code)) continue;
+    const literals = stringLiterals(code);
+    const value =
+      strings.find((s) => literals.includes(s)) ??
+      comparesNumber(code, numbers) ??
+      arrayMembership(code, numbers);
+    if (value !== undefined) hits.push({ path, line: text, value });
+  }
+  return hits;
+}
+
 /**
  * Lines that skip, narrow or cut short a suite: `.only`, `.skip`, `xit`, `fdescribe`, a runtime
  * `this.skip()` or `ctx.skip()`, and ending the process (`process.exit`, `process.kill`).
