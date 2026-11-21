@@ -14,7 +14,8 @@
     "format:check": "prettier --check .",
     "test": "vitest run",
     "test:sandbox-host": "AFFIDAVIT_SANDBOX_HOST=1 vitest run src/replay.integration.test.ts",
-    "test:s3": "vitest run src/store.s3.integration.test.ts"
+    "test:s3": "vitest run src/store.s3.integration.test.ts",
+    "verify": "node --import tsx src/verify-main.ts"
   },
   "dependencies": {
     "@affidavit/contracts": "workspace:*",
