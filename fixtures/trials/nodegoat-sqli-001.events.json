@@ -313,7 +313,10 @@
         "caseId": "case-nodegoat-sqli-001",
         "outcome": "proven-fixed",
         "severity": "high",
-        "exhibits": ["exhibit-witness-001", "exhibit-patch-001"],
+        "exhibits": [
+          "exhibit-witness-001",
+          "exhibit-patch-001"
+        ],
         "ballots": [
           {
             "schemaVersion": 1,
@@ -322,7 +325,9 @@
             "mandate": "security",
             "inputVariant": "raw-results-only",
             "confidence": 0.8,
-            "citedExhibits": ["exhibit-witness-001"],
+            "citedExhibits": [
+              "exhibit-witness-001"
+            ],
             "question": "severity",
             "vote": "high"
           }
