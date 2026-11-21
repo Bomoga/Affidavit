@@ -13,6 +13,9 @@ import { EGRESS_ALLOWLIST, findEgress } from './egress-guard.js';
 // is a command string run under gVisor, not a host child_process call, so it is not a finding.
 
 const SRC = fileURLToPath(new URL('..', import.meta.url));
+/** Typed values the allowed sanctioned snippets pass: declared, so not unresolved identifiers. */
+const TYPED =
+  'declare const img: string, n: string, ref: string, name: string, f: string, dir: string;';
 
 // Read through the namespace so this file still loads (and fails test by test) against a guard
 // that does not export it yet.
@@ -72,7 +75,11 @@ describe('egress guard over src/', () => {
 
   it('every allowlist entry is still needed (no stale exceptions)', () => {
     for (const a of EGRESS_ALLOWLIST) {
-      const text = readFileSync(join(SRC, a.file), 'utf8');
+      const judgeDir = join(SRC, '..', '..', 'judge', 'src');
+      const path = a.file.startsWith('judge:')
+        ? join(judgeDir, a.file.slice('judge:'.length))
+        : join(SRC, a.file);
+      const text = readFileSync(path, 'utf8');
       const within = (a as { within?: string }).within;
       expect(
         findEgress(a.file, text, []).some(
@@ -277,7 +284,7 @@ describe('egress guard self-test: each snippet must be caught', () => {
       `spawn('tar', ['-x', '-f', f, '-C', dir, '--no-same-owner', '--no-same-permissions']);`,
     ],
   ])('allows %s in a sanctioned file', (_label, call) => {
-    const code = `import { spawn } from 'node:child_process'; ${call}`;
+    const code = `import { spawn } from 'node:child_process'; ${TYPED} ${call}`;
     expect(findEgress('gvisor/runner.ts', code, [])).toEqual([]);
   });
 
@@ -316,7 +323,7 @@ describe('egress guard self-test: each snippet must be caught', () => {
     ],
     [
       'promisified docker with typed values, in a sanctioned file',
-      `import { execFile } from 'node:child_process'; import { promisify } from 'node:util'; const exec = promisify(execFile); await exec('docker', ['rm', '--force', name]).catch(() => undefined);`,
+      `import { execFile } from 'node:child_process'; import { promisify } from 'node:util'; const exec = promisify(execFile); export async function rm(name: string) { await exec('docker', ['rm', '--force', name]).catch(() => undefined); }`,
     ],
   ])('allows %s', (_label, code) => {
     expect(findEgress('gvisor/runner.ts', code, [])).toEqual([]);
@@ -412,7 +419,7 @@ describe('egress guard self-test: final delta review', () => {
       `const NET = ['--rm', '--network', 'none']; const ARGS = ['run', ...NET, img]; spawn('docker', ARGS);`,
     ],
   ])('allows %s', (_label, body) => {
-    expect(findEgress('gvisor/runner.ts', spawnIt(body), [])).toEqual([]);
+    expect(findEgress('gvisor/runner.ts', spawnIt(`${TYPED} ${body}`), [])).toEqual([]);
   });
 
   it('a reviewed exception covers one call site, not every finding with its label', () => {
@@ -435,14 +442,141 @@ describe('egress guard self-test: final delta review', () => {
     expect(findEgress('gvisor/runner.ts', `${read('gvisor/runner.ts')}\n${param}`)).not.toEqual([]);
   });
 
-  it('names the two exceptions that have network on purpose, with reasons', () => {
+  it('names every exception that has network on purpose, with reasons', () => {
     const byDesign = EGRESS_ALLOWLIST.filter(
       (a) => (a as { networkByDesign?: boolean }).networkByDesign === true,
     );
     expect(byDesign.map((a) => [a.file, (a as { name?: string }).name])).toEqual([
       ['boot/images.ts', 'pinImage pulls from Docker Hub'],
+      ['boot/images.ts', 'pullPinned pulls from Docker Hub'],
       ['containment/plain-docker.ts', 'plain-Docker baseline on the default bridge'],
+      ['judge:jail/workbench.ts', 'patch-apply image built on the host with network'],
+      ['judge:jail/harness.ts', 'witness-runner image built on the host with network'],
     ]);
     for (const a of byDesign) expect(a.reason.length).toBeGreaterThan(60);
+  });
+});
+
+/** Last round of #55: `.require`, argv constants and mutation, and packages/judge/src. */
+describe('egress guard self-test: last round', () => {
+  type Root = { prefix: string; dir: string };
+  const roots = (): readonly Root[] =>
+    (guard as { GUARD_ROOTS?: readonly Root[] }).GUARD_ROOTS ?? [];
+  const spawnIt = (body: string): string => `import { spawn } from 'node:child_process'; ${body}`;
+  const whats = (file: string, code: string): string[] =>
+    findEgress(file, code, []).map((f) => f.what);
+
+  // (a) any `.require` member access.
+  it.each([
+    ['snippet.cjs', `module.require('node:http');`],
+    ['snippet.cjs', `process.mainModule.require('node:http');`],
+    ['snippet.ts', `const r = x.require; r('node:http');`],
+    ['snippet.ts', `x['require']('node:http');`],
+  ])('catches .require in %s: %s', (file, code) => {
+    expect(whats(file, code)).toContain('use .require');
+  });
+
+  // (b) argv constants are resolved, mutation is a finding, an unresolved element is a finding.
+  it.each([
+    [
+      'a push onto an argv array',
+      `const a = ['run', '--network', 'none', 'x']; a.push('--network=host'); spawn('docker', a);`,
+      'args mutation a.push',
+    ],
+    [
+      'an index assignment into an argv array',
+      `const a = ['run', '--network', 'none', 'x']; a[2] = 'host'; spawn('docker', a);`,
+      'args mutation a[...] =',
+    ],
+    [
+      'unshift onto a spread source',
+      `const NET = ['--network', 'none']; NET.unshift('--privileged'); spawn('docker', ['run', ...NET, 'x']);`,
+      'args mutation NET.unshift',
+    ],
+    [
+      'splice on an argv array',
+      `const a = ['run', '--network', 'none', 'x']; a.splice(2, 1, 'host'); spawn('docker', a);`,
+      'args mutation a.splice',
+    ],
+    [
+      'a const string flag as an element',
+      `const NET = '--network=host'; spawn('docker', ['run', NET, 'x']);`,
+      'args --network host',
+    ],
+    [
+      'a const string tar flag',
+      `export function x(f: string) { const T = '--to-command=sh'; spawn('tar', ['-x', '-f', f, T]); }`,
+      'tar flag --to-command',
+    ],
+    [
+      'a const string subcommand',
+      `const SUB = 'pull'; spawn('docker', [SUB, 'evil/image']);`,
+      'docker pull',
+    ],
+    [
+      'an unresolved identifier element',
+      `spawn('docker', ['rm', '--force', who]);`,
+      'args unresolved identifier who',
+    ],
+    [
+      'a spread of a non-const',
+      `let NET = ['--network', 'none']; spawn('docker', ['run', ...NET, 'x']);`,
+      'args spread ...NET',
+    ],
+  ])('catches %s', (_label, body, what) => {
+    expect(whats('gvisor/runner.ts', spawnIt(body))).toContain(what);
+  });
+  it.each([
+    [
+      'a const string value',
+      `export function f(img: string) { const NONE = 'none'; spawn('docker', ['run', '--network', NONE, img]); }`,
+    ],
+    [
+      'a parameter element',
+      `export function f(who: string) { spawn('docker', ['rm', '--force', who]); }`,
+    ],
+    [
+      'reading an argv array',
+      `const a = ['ps', '--quiet']; const n = a.length; spawn('docker', a);`,
+    ],
+  ])('allows %s', (_label, body) => {
+    expect(whats('gvisor/runner.ts', spawnIt(body))).toEqual([]);
+  });
+
+  // (c) packages/judge/src is scanned too.
+  it('scans packages/judge/src as well as packages/sandbox/src', () => {
+    const r = roots();
+    expect(r.map((x) => x.prefix)).toEqual(['', 'judge:']);
+    const judge = r.find((x) => x.prefix === 'judge:');
+    expect(judge).toBeDefined();
+    const files = sourceFiles(judge?.dir ?? '');
+    expect(files.length).toBeGreaterThan(10);
+    const findings = files.flatMap((f) =>
+      findEgress(
+        `judge:${relative(judge?.dir ?? '', f)
+          .split('\\')
+          .join('/')}`,
+        readFileSync(f, 'utf8'),
+      ),
+    );
+    expect(findings).toEqual([]);
+  });
+  it('finds the judge host builds without the allowlist', () => {
+    const judge = roots().find((x) => x.prefix === 'judge:');
+    const at = (rel: string): string[] =>
+      whats(`judge:${rel}`, readFileSync(join(judge?.dir ?? '', rel), 'utf8'));
+    expect(at('jail/workbench.ts')).toContain('docker build without --network none');
+    expect(at('jail/harness.ts')).toContain('docker build without --network none');
+  });
+  it('judge files use their own package.json and sanctioned list', () => {
+    expect(
+      whats('judge:snippet.ts', `import { trace } from '@opentelemetry/api'; void trace;`),
+    ).toEqual([]);
+    expect(
+      whats('snippet.ts', `import { trace } from '@opentelemetry/api'; void trace;`),
+    ).not.toEqual([]);
+    const ps = `import { execFile } from 'node:child_process'; execFile('docker', ['ps']);`;
+    expect(whats('judge:jail/harness.ts', ps)).toEqual([]);
+    expect(whats('judge:patch/diff.ts', ps)).not.toEqual([]);
   });
 });

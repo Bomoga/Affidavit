@@ -1,21 +1,27 @@
-// Test tooling: a static egress LINT over this package's own source. Imported only by
-// egress-guard.test.ts and never exported from the package index, so the TypeScript compiler
-// (a root devDependency) is never loaded at run time. It is not scanned itself.
+// Test tooling: a static egress LINT over the host code in packages/sandbox/src and
+// packages/judge/src (GUARD_ROOTS). Imported only by egress-guard.test.ts and never exported from
+// the package index, so the TypeScript compiler (a root devDependency) is never loaded at run
+// time. It is not scanned itself.
 //
 // What it is and is not: a lint that raises the cost of a mistake, and of slipping a network call
-// past review, in this package's host code. It is NOT a security boundary. A determined author
+// past review, in Lane 2 host code. It is NOT a security boundary. A determined author
 // can always write code a static check does not understand. The runtime boundary is gVisor with
 // `--network none` (or an internal-only case network) and no egress for anything the Judge or an
 // agent runs; the dependency bundle build is a human-run host step outside `src/`.
 //
-// Two reviewed exceptions have network on purpose, by design, and are human-review items for the
+// Five reviewed exceptions have network on purpose, by design, and are human-review items for the
 // lead (an egress and supply-chain decision on the host, not a jail matter). Each is a named
 // `networkByDesign` entry in EGRESS_ALLOWLIST:
 // - `pinImage` (boot/images.ts) runs `docker pull` against Docker Hub on the host to pin an image
 //   by digest. That includes target-named compose sidecar images (boot/boot.ts calls it per
 //   sidecar), so a target's compose file chooses which public images the host pulls.
+// - `pullPinned` (boot/images.ts) runs `docker pull` against Docker Hub for a digest-pinned ref.
 // - The plain-Docker containment baseline (containment/plain-docker.ts) runs a probe container on
 //   Docker's default bridge, which has a route out, as the comparison case for the jail.
+// - `buildPatchApplyImage` (judge jail/workbench.ts) runs `docker build` on the host with network:
+//   the patch-apply Dockerfile installs a pinned `git` package with `apk add`.
+// - `buildRunnerImage` (judge jail/harness.ts) runs `docker build` on the host with network: the
+//   witness-runner Dockerfile runs `npm ci` from its lockfile. Both images then run with none.
 import { readFileSync, readdirSync } from 'node:fs';
 import { builtinModules } from 'node:module';
 import { dirname, join } from 'node:path';
@@ -70,8 +76,8 @@ export const ALLOWED_BUILTINS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * The only files under `src/` that may import `child_process`, by named import of its spawn
- * functions. In these files the executable must be a string literal from `ALLOWED_EXECUTABLES`.
+ * The only files that may import `child_process`, by named import of its spawn functions. Paths
+ * are relative to a scan root, with that root's prefix (`judge:` for packages/judge/src). In these files the executable must be a string literal from `ALLOWED_EXECUTABLES`.
  */
 export const CHILD_PROCESS_FILES: readonly string[] = [
   'boot/build.ts',
@@ -81,6 +87,8 @@ export const CHILD_PROCESS_FILES: readonly string[] = [
   'containment/record.ts',
   'gvisor/network.ts',
   'gvisor/runner.ts',
+  'judge:jail/harness.ts',
+  'judge:jail/workbench.ts',
 ];
 
 /** Executables a sanctioned file may run on the host. git, npm and every fetch tool are not here. */
@@ -154,8 +162,10 @@ export const EGRESS_ALLOWLIST: readonly EgressAllow[] = [
     file: 'boot/images.ts',
     what: 'docker pull',
     within: 'pullPinned',
+    name: 'pullPinned pulls from Docker Hub',
+    networkByDesign: true,
     reason:
-      'pulls an image Lane 2 already pinned by digest (`name:tag@sha256:...`, checked before the call) so the daemon has it; no container runs',
+      'NETWORK BY DESIGN, a human-review item for the lead: the Docker daemon pulls from Docker Hub on the host an image already pinned by digest (`name:tag@sha256:...`, checked before the call). No container runs, but it is a host pull from a public registry',
   },
   {
     file: 'containment/plain-docker.ts',
@@ -207,16 +217,61 @@ export const EGRESS_ALLOWLIST: readonly EgressAllow[] = [
     reason:
       'the sidecar readiness command from the compose recipe, run by `docker exec` inside that sidecar on the internal case network',
   },
+  {
+    file: 'judge:jail/workbench.ts',
+    what: 'docker build without --network none',
+    within: 'buildPatchApplyImage',
+    name: 'patch-apply image built on the host with network',
+    networkByDesign: true,
+    reason:
+      'NETWORK BY DESIGN, a human-review item for the lead: the patch-apply image is built on the host from docker/sandbox/patch-apply, a digest-pinned base plus a version-pinned `apk add git`, which needs the Alpine package mirror. The Judge then runs the image by ID with no network. A host build with network is an egress and supply-chain decision, not a jail matter',
+  },
+  {
+    file: 'judge:jail/harness.ts',
+    what: 'docker build without --network none',
+    within: 'buildRunnerImage',
+    name: 'witness-runner image built on the host with network',
+    networkByDesign: true,
+    reason:
+      'NETWORK BY DESIGN, a human-review item for the lead: the witness-runner image is built on the host from docker/sandbox/witness-runner, a digest-pinned base plus `npm ci --ignore-scripts` from its committed lockfile, which needs the npm registry. The witness then runs in it with no network. A host build with network is an egress and supply-chain decision, not a jail matter',
+  },
 ];
 
-/** The package's declared runtime dependencies: the only npm packages host code may import. */
-const PACKAGE_JSON = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'package.json');
-const DECLARED: ReadonlySet<string> = new Set(
-  Object.keys(
-    (JSON.parse(readFileSync(PACKAGE_JSON, 'utf8')) as { dependencies?: Record<string, string> })
-      .dependencies ?? {},
-  ),
-);
+const PACKAGES = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+
+/** Where the guard scans, and the prefix its file keys carry (`judge:jail/harness.ts`). */
+export const GUARD_ROOTS: readonly { prefix: string; dir: string }[] = [
+  { prefix: '', dir: join(PACKAGES, 'sandbox', 'src') },
+  { prefix: 'judge:', dir: join(PACKAGES, 'judge', 'src') },
+];
+
+/** Each package's declared runtime dependencies: the only npm packages its host code may import. */
+const declaredDeps = (pkg: string): ReadonlySet<string> =>
+  new Set(
+    Object.keys(
+      (
+        JSON.parse(readFileSync(join(PACKAGES, pkg, 'package.json'), 'utf8')) as {
+          dependencies?: Record<string, string>;
+        }
+      ).dependencies ?? {},
+    ),
+  );
+const DECLARED: Record<string, ReadonlySet<string>> = {
+  '': declaredDeps('sandbox'),
+  'judge:': declaredDeps('judge'),
+};
+/** Array methods that change an argv array in place. */
+const MUTATORS = new Set([
+  'push',
+  'unshift',
+  'splice',
+  'pop',
+  'shift',
+  'fill',
+  'copyWithin',
+  'reverse',
+  'sort',
+]);
 const BUILTINS = new Set(builtinModules);
 /**
  * Declared packages host code may still not import. `dockerode` is declared but unused: a Docker API
@@ -290,7 +345,11 @@ const packageName = (spec: string): string => {
 };
 
 /** Null when host code in `file` may import `spec` (allowlist), else the finding label. */
-function moduleProblem(spec: string, sanctioned: boolean): string | null {
+function moduleProblem(
+  spec: string,
+  sanctioned: boolean,
+  declared: ReadonlySet<string>,
+): string | null {
   if (spec.startsWith('./') || spec.startsWith('../')) return null;
   const bare = spec.startsWith('node:') ? spec.slice(5) : spec;
   if (spec.startsWith('node:') || BUILTINS.has(bare)) {
@@ -302,7 +361,7 @@ function moduleProblem(spec: string, sanctioned: boolean): string | null {
   }
   const name = packageName(spec);
   if (BANNED_PACKAGES.has(name)) return `import ${name} (banned)`;
-  return DECLARED.has(name) ? null : `import ${name} (not a declared dependency)`;
+  return declared.has(name) ? null : `import ${name} (not a declared dependency)`;
 }
 
 const plainString = (n: ts.Node | undefined): string | null =>
@@ -401,7 +460,8 @@ interface ArgWord {
  *
  * - a runtime import, re-export, `import()` or `require()` of anything but a relative path, a
  *   built-in in `ALLOWED_BUILTINS` (plus `child_process` in `CHILD_PROCESS_FILES`), or a package
- *   in this package's `dependencies`; a module name that is not a plain string literal;
+ *   in the scanned package's `dependencies`; a module name that is not a plain string literal;
+ *   any `.require` member access (`module.require`, `process.mainModule.require`, `x['require']`);
  * - any value reference to `fetch`, `XMLHttpRequest`, `WebSocket`, `EventSource`, `eval` or
  *   `Function`; any reference to `globalThis`, `window`, `self` or `global` other than `typeof`;
  *   `process.binding`, `process.dlopen`, `process.getBuiltinModule` (dot or bracket) and computed
@@ -410,9 +470,13 @@ interface ArgWord {
  *   `require`) a direct call, so destructuring or aliasing one is a finding;
  * - `dockerode`, although declared;
  * - in the sanctioned files, a spawn whose executable is not a literal in `ALLOWED_EXECUTABLES`;
- *   whose argv is not an inline array literal or a `const` array literal in scope in the same file
- *   (elements: literals, typed values, and spreads of other such `const` arrays), so a variable of
- *   unknown origin is a finding; a package-manager or fetch-tool word, a
+ *   whose argv is not an inline array literal or a `const` array literal in scope in the same file,
+ *   so a variable of unknown origin is a finding. Spreads of other such `const` arrays are
+ *   followed; any other spread is a finding. An element that names a same-file `const` string
+ *   literal is checked as that string; an element naming nothing declared in the file is a
+ *   finding; other elements are typed values and not checked. Any in-place change to a `const`
+ *   argv array (`push`, `unshift`, `splice` and the other mutating methods, an index or `length`
+ *   assignment, `delete`, `++`/`--`) is a finding. Then: a package-manager or fetch-tool word, a
  *   docker subcommand outside the allowlist (no `pull`, `exec`, `cp`, `push`), a docker `build`,
  *   `run` or `create` without `--network none`, a `network create` without `--internal`, or a tar
  *   flag outside the allowlist (no `--to-command`, `-I`, `--use-compress-program`,
@@ -451,6 +515,7 @@ export function findEgress(
   };
   const src = (n: ts.Node): string => n.getText(sf).replace(/\s+/g, ' ').slice(0, 80);
   const sanctioned = CHILD_PROCESS_FILES.includes(file);
+  const declared = DECLARED[file.startsWith('judge:') ? 'judge:' : ''] ?? new Set<string>();
 
   // Local names bound to child_process spawn functions (named imports, and promisify of one).
   const childFns = new Set<string>();
@@ -498,12 +563,63 @@ export function findEgress(
   };
   bind(sf);
 
-  /** A `const` array literal `id` names in scope, or undefined. */
-  const constArray = (id: ts.Identifier): ts.ArrayLiteralExpression | undefined => {
+  /** True when `e` is written to: assigned, `++`/`--`, or deleted. */
+  const isWritten = (e: ts.Expression): boolean => {
+    const p = e.parent;
+    return (
+      (ts.isBinaryExpression(p) &&
+        p.left === e &&
+        p.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+        p.operatorToken.kind <= ts.SyntaxKind.LastAssignment) ||
+      ((ts.isPrefixUnaryExpression(p) || ts.isPostfixUnaryExpression(p)) &&
+        (p.operator === ts.SyntaxKind.PlusPlusToken ||
+          p.operator === ts.SyntaxKind.MinusMinusToken)) ||
+      ts.isDeleteExpression(p)
+    );
+  };
+
+  /** Reports every in-place change to the `const` argv array `d` anywhere in the file. */
+  const checked = new Set<ts.VariableDeclaration>();
+  const checkMutation = (d: ts.VariableDeclaration): void => {
+    if (checked.has(d) || !ts.isIdentifier(d.name)) return;
+    checked.add(d);
+    const name = d.name.text;
+    const walk = (n: ts.Node): void => {
+      if (ts.isIdentifier(n) && n.text === name && n !== d.name && declarationOf(n) === d) {
+        const p = n.parent;
+        if (ts.isPropertyAccessExpression(p) && p.expression === n) {
+          if (MUTATORS.has(p.name.text)) add(p, `args mutation ${name}.${p.name.text}`);
+          else if (isWritten(p)) add(p, `args mutation ${name}.${p.name.text} =`);
+        }
+        if (ts.isElementAccessExpression(p) && p.expression === n) {
+          const key = plainString(p.argumentExpression);
+          if (key !== null && MUTATORS.has(key)) add(p, `args mutation ${name}.${key}`);
+          else if (isWritten(p)) add(p, `args mutation ${name}[...] =`);
+        }
+      }
+      ts.forEachChild(n, walk);
+    };
+    walk(sf);
+  };
+
+  /** The `const` declaration of an array literal `id` names in scope, or undefined. */
+  const constArray = (id: ts.Identifier): ts.VariableDeclaration | undefined => {
     const d = declarationOf(id);
     if (d === undefined || d === 'other' || d.initializer === undefined) return undefined;
-    const init = strip(d.initializer);
-    return ts.isArrayLiteralExpression(init) ? init : undefined;
+    return ts.isArrayLiteralExpression(strip(d.initializer)) ? d : undefined;
+  };
+
+  /** One non-spread argv element: a literal, a same-file `const` string, or a typed value. */
+  const elementOf = (el: ts.Expression): ArgWord => {
+    const e = strip(el);
+    if (!ts.isIdentifier(e)) return { node: el, word: plainString(e) };
+    const d = declarationOf(e);
+    if (d === undefined) {
+      add(el, `args unresolved identifier ${e.text}`);
+      return { node: el, word: null };
+    }
+    if (d === 'other' || d.initializer === undefined) return { node: el, word: null };
+    return { node: el, word: plainString(strip(d.initializer)) };
   };
 
   /**
@@ -521,11 +637,13 @@ export function findEgress(
       const out: ArgWord[] = [];
       for (const el of e.elements) {
         if (!ts.isSpreadElement(el)) {
-          out.push({ node: el, word: plainString(el) });
+          out.push(elementOf(el));
           continue;
         }
         const inner = strip(el.expression);
-        const arr = ts.isIdentifier(inner) ? constArray(inner) : undefined;
+        const d = ts.isIdentifier(inner) ? constArray(inner) : undefined;
+        if (d !== undefined) checkMutation(d);
+        const arr = d?.initializer === undefined ? undefined : strip(d.initializer);
         const sub = arr === undefined ? null : argvOf(arr, el, seen);
         if (arr === undefined) add(el, `args spread ${src(el)}`);
         if (sub === null) out.push({ node: el, word: null });
@@ -540,7 +658,10 @@ export function findEgress(
         return null;
       }
       const init = strip(d.initializer);
-      if (ts.isArrayLiteralExpression(init)) return argvOf(init, at, seen);
+      if (ts.isArrayLiteralExpression(init)) {
+        checkMutation(d);
+        return argvOf(init, at, seen);
+      }
       const origin = ts.isCallExpression(init) ? `${src(init.expression)}(...)` : src(init);
       add(at, `args <const> ${e.text} = ${origin}`);
       return null;
@@ -551,7 +672,10 @@ export function findEgress(
 
   const checkDocker = (call: ts.CallExpression, argv: ArgWord[]): void => {
     const words = argv.map((a) => a.word);
-    const at: ts.Node = argv[0]?.node ?? call;
+    // Anchor at the call unless the first word is inline, so `within` names the calling function.
+    const first0 = argv[0]?.node;
+    const inline = first0 !== undefined && first0.pos >= call.pos && first0.end <= call.end;
+    const at: ts.Node = inline ? first0 : call;
     const sub = words[0];
     if (sub === null || sub === undefined) {
       const first = argv[0];
@@ -661,7 +785,7 @@ export function findEgress(
         ) {
           add(node, 'child_process re-export');
         } else {
-          const problem = moduleProblem(spec, sanctioned);
+          const problem = moduleProblem(spec, sanctioned, declared);
           if (problem !== null) add(node, problem);
         }
       }
@@ -679,7 +803,7 @@ export function findEgress(
         else if (spec === 'child_process' || spec === 'node:child_process') {
           add(node, `${how} of child_process`);
         } else {
-          const problem = moduleProblem(spec, sanctioned);
+          const problem = moduleProblem(spec, sanctioned, declared);
           if (problem !== null) add(node, problem);
         }
       }
@@ -719,6 +843,13 @@ export function findEgress(
       ) {
         add(node, `alias of ${name}`);
       }
+    }
+    // Any `.require` member: `module.require(...)`, `process.mainModule.require(...)`, `x['require']`.
+    if (
+      (ts.isPropertyAccessExpression(node) && node.name.text === 'require') ||
+      (ts.isElementAccessExpression(node) && plainString(node.argumentExpression) === 'require')
+    ) {
+      add(node, 'use .require');
     }
     // process.binding / dlopen / getBuiltinModule, Reflect.get / apply / construct.
     if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression)) {
