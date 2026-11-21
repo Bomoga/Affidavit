@@ -7,10 +7,12 @@ import {
   type CaseId,
   type CaseStage,
   type CaseStore,
+  type RescanPort,
   type TrialEvent,
 } from '@affidavit/contracts';
 import { parseStagePayload, type StageEnv } from '@affidavit/db';
-import type { DiscoverCaseOutcome } from '@affidavit/discovery';
+import { DiscoveryRescan, type DiscoverCaseOutcome } from '@affidavit/discovery';
+import { FakeRescan } from '@affidavit/testing';
 import { DEFAULT_TRACE_ROOT } from '@affidavit/sandbox';
 import { createModelPortFromEnv, resolveModelTable } from '@affidavit/trial';
 import { describe, expect, it } from 'vitest';
@@ -27,7 +29,7 @@ import {
 } from './intake.js';
 import type { RealJudge, RealJudgeHostProbe } from '@affidavit/judge';
 import { PrerequisiteError, checkPrerequisites, realHostProbe, type HostProbe } from './prereqs.js';
-import { buildModel } from './components.js';
+import { buildModel, realJudgeConfig } from './components.js';
 import { TrialHaltedError, realTrialCores } from './trial.js';
 
 const SECRET = 'hunter2-not-a-real-password';
@@ -523,6 +525,81 @@ describe('startup prerequisites', () => {
     expect(ok.state).toEqual({ built: 1, closed: 0 });
     await prepared.close();
     expect(ok.state).toEqual({ built: 1, closed: 1 });
+  });
+});
+
+describe('the real Judge re-scan (L1-17)', () => {
+  /** A RealJudge factory that records the RescanPort it was handed. */
+  function recordingFactory() {
+    const seen: { rescan: RescanPort | undefined; calls: number } = { rescan: undefined, calls: 0 };
+    const factory = (_s: unknown, _p?: unknown, rescan?: RescanPort) => {
+      seen.calls++;
+      seen.rescan = rescan;
+      return Promise.resolve({
+        judge: fakeJudge(),
+        notes: [],
+        release: () => Promise.resolve(),
+        close: () => Promise.resolve(),
+      } as unknown as RealJudge);
+    };
+    return { seen, factory };
+  }
+
+  it('hands the real Judge the discovery re-scan when intake is real', async () => {
+    const h = host();
+    const { seen, factory } = recordingFactory();
+    const prepared = await prepareCores(loadConfig(realEnv), {
+      env: realEnv,
+      probe: h.probe,
+      judgeProbe: h.judge,
+      discover: () => Promise.reject(new Error('unused')),
+      realJudgeFactory: factory,
+      log: () => {},
+    });
+    expect(seen.calls).toBe(1);
+    expect(seen.rescan).toBeInstanceOf(DiscoveryRescan);
+    await prepared.close();
+  });
+
+  it('passes an injected RescanPort through unchanged (fake-backed)', async () => {
+    const h = host();
+    const { seen, factory } = recordingFactory();
+    const fake = new FakeRescan({ clean: false });
+    const prepared = await prepareCores(loadConfig(realEnv), {
+      env: realEnv,
+      probe: h.probe,
+      judgeProbe: h.judge,
+      discover: () => Promise.reject(new Error('unused')),
+      realJudgeFactory: factory,
+      rescan: fake,
+      log: () => {},
+    });
+    expect(seen.rescan).toBe(fake);
+    expect(await seen.rescan?.rescan(stored, '/unused')).toEqual({ clean: false, candidates: [] });
+    await prepared.close();
+  });
+
+  it('has no re-scan without real intake, so verifyPatch keeps failing closed', async () => {
+    const env = { ...realEnv, AFFIDAVIT_INTAKE_IMPL: 'fake' };
+    const h = host();
+    const { seen, factory } = recordingFactory();
+    const prepared = await prepareCores(loadConfig(env), {
+      env,
+      probe: h.probe,
+      judgeProbe: h.judge,
+      realJudgeFactory: factory,
+      log: () => {},
+    });
+    expect(seen.calls).toBe(1);
+    expect(seen.rescan).toBeUndefined();
+    await prepared.close();
+  });
+
+  it('puts the re-scan on the RealJudgeConfig, and leaves it off when there is none', () => {
+    const s = loadConfig(realEnv).judgeSettings!;
+    const fake = new FakeRescan();
+    expect(realJudgeConfig(s, fake).rescan).toBe(fake);
+    expect('rescan' in realJudgeConfig(s)).toBe(false);
   });
 });
 /** A StageEnv over in-memory state, for one stage job. */
