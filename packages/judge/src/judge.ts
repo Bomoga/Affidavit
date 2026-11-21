@@ -16,6 +16,7 @@ import type { ExecutionVariant, WitnessExecutor } from './executor.js';
 import { addedLines, parseUnifiedDiff, selectFiles } from './patch/diff.js';
 import type { ParsedDiff } from './patch/diff.js';
 import {
+  findExactLiteralUses,
   findLiteralSpecialCases,
   findSuiteTampering,
   isTestFile,
@@ -192,9 +193,10 @@ export class Judge implements JudgePort {
    * another kind, over the size limit, a bad header) refuses the patch with `schema`. When the
    * patch is refused before any counterexample ran, every runnable counterexample is reported as
    * surviving (nothing was shown) and refused ones as `survived: false`. The literal-only check
-   * runs on the family's values before building, and again with admitted counterexamples' header
-   * values (the same full check) once they are admitted; a counterexample that was not admitted
-   * contributes no values, so an unproven one cannot veto a patch.
+   * runs on the family's values before building; once counterexamples are admitted, an added
+   * line holding one of their header values as a whole literal (`findExactLiteralUses`, no
+   * substrings) also rejects. A counterexample that was not admitted contributes no values, so an
+   * unproven one cannot veto a patch.
    *
    * `rejectedBy` names the first failed rule in that order. A failed re-scan has no rule of its
    * own in contracts v1.0 and shows only as `rescanClean: false`. When a check never ran, its
@@ -354,13 +356,11 @@ export class Judge implements JudgePort {
       }
       const rescan = await deps.rescan.rescan(cf, prepared.workspacePath);
 
-      // A patch tailored to a value Prosecution proved: admitted counterexamples' values get the
-      // full literal check, the same one as the family's. Values of counterexamples that were not
-      // admitted are never checked, so an unproven counterexample cannot veto a sound patch.
-      const tailored =
-        admittedParams.length > 0 &&
-        findLiteralSpecialCases(addedLines(diff), [...params, ...admittedParams], testFilesOf(diff))
-          .length > 0;
+      // A patch tailored to a value Prosecution proved: an added line holding an admitted
+      // counterexample's value as a whole literal (any kind of line). Never a substring, and
+      // counterexamples that were not admitted contribute nothing, so Prosecution cannot veto a
+      // sound patch with a short or common value. The family's values had the full check above.
+      const tailored = findExactLiteralUses(addedLines(diff), admittedParams).length > 0;
       const rejectedBy: AdmissibilityRule | undefined =
         (tailored ? 'literal-only-patch' : undefined) ??
         family.rejectedBy ??
