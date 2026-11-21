@@ -388,7 +388,14 @@ export class Judge implements JudgePort {
           results.push({ exhibitId, survived: false });
           continue;
         }
-        admittedParams.push(...space);
+        // Only the counterexample's genuinely new values: one the family already has (an index
+        // pick, an unchosen parameter) had the family's own check, and must not get a second,
+        // different one that Prosecution could use to veto a correct patch.
+        const familyValues = new Set(params.flatMap((q) => q.values.map((v) => canonicalJson(v))));
+        for (const q of space) {
+          const fresh = q.values.filter((v) => !familyValues.has(canonicalJson(v)));
+          if (fresh.length > 0) admittedParams.push({ name: q.name, values: fresh });
+        }
         const attempts = await this.#attempts(cf, [['patched', prepared.target]], code, space);
         const survived = counterexampleSurvives(
           { exhibitId, familySize: familySize(space), attempts },
