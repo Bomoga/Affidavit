@@ -71,7 +71,29 @@
     "stubs": [],
     "env": {}
   },
-  "redactions": [],
+  "redactions": [
+    {
+      "file": "artifacts/cert/server.key",
+      "startLine": 1,
+      "endLine": 15,
+      "kind": "private-key",
+      "placeholder": "[REDACTED:private-key:1]"
+    },
+    {
+      "file": "config/env/development.js",
+      "startLine": 6,
+      "endLine": 6,
+      "kind": "generic-api-key",
+      "placeholder": "[REDACTED:generic-api-key:2]"
+    },
+    {
+      "file": "config/env/test.js",
+      "startLine": 6,
+      "endLine": 6,
+      "kind": "generic-api-key",
+      "placeholder": "[REDACTED:generic-api-key:2]"
+    }
+  ],
   "escalationFloor": 0.7,
   "safeVariant": {
     "repo": "repo-nodegoat",

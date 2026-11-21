@@ -1,4 +1,4 @@
-import { cp, mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { cp, lstat, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
 import { inspect } from 'node:util';
 import { loadToolManifest, quarantineSnapshot, runTool } from '../tools/index.js';
@@ -158,24 +158,38 @@ export async function ingestRepo(deps: IngestDeps, req: IngestRequest): Promise<
     const map = await buildRedactionMap(repoDir, findings, maxFileBytes);
     const r = map.redactor;
     redactor = r; // from here on, errors are scrubbed of known values before they leave
+    const incomplete = (): IngestIncomplete => ({
+      status: 'incomplete',
+      reason: 'partial-secret-scan',
+      commit,
+      coverage: {
+        notifications: run.notifications.map((n) => ({
+          level: n.level,
+          ...(n.id === undefined ? {} : { id: n.id }),
+          message: r.apply(n.message),
+        })),
+      },
+    });
     // Fail closed: a scan that did not cover everything is not an ok result. The coverage detail
-    // goes back to the caller; no workspace is written and the case directory is removed.
-    if (run.partial) {
-      const incomplete: IngestIncomplete = {
-        status: 'incomplete',
-        reason: 'partial-secret-scan',
-        commit,
-        coverage: {
-          notifications: run.notifications.map((n) => ({
-            level: n.level,
-            ...(n.id === undefined ? {} : { id: n.id }),
-            message: r.apply(n.message),
-          })),
-        },
-      };
-      return incomplete;
-    }
+    // goes back to the caller; no workspace is kept and the case directory is removed. The one
+    // loss an ok result may carry is a font whose structure checks out (`binary-font`): the
+    // workspace build keeps every such file out, which is checked below.
+    const gaps = run.notifications.filter((n) => n.id !== 'binary-font');
+    const fontNotes = run.notifications.length - gaps.length;
+    const partial = gaps.length > 0 || fontNotes !== run.binaryFontFiles.length;
+    if (partial) return incomplete();
     const built = await buildWorkspace(repoDir, wsDir, r, map.excluded, maxFileBytes);
+    // Every font the scan skipped must be absent from the workspace (left out as `font-file`, or
+    // inside a directory left out for another reason). Otherwise fail closed. Only ENOENT proves
+    // absence; any other lstat error means the check could not be made, which is also incomplete.
+    for (const p of run.binaryFontFiles) {
+      const inWs = join(wsDir, ...r.applyPath(p.replace(/^\/src\//, '')).split('/'));
+      const absent = await lstat(inWs).then(
+        () => false,
+        (e: unknown) => (e as NodeJS.ErrnoException | null)?.code === 'ENOENT',
+      );
+      if (!absent) return incomplete();
+    }
     const leaks = await findLeaks(wsDir, r);
     if (leaks.length > 0) throw new RedactionLeakError(leaks.map((p) => r.applyPath(p)));
 
@@ -191,11 +205,13 @@ export async function ingestRepo(deps: IngestDeps, req: IngestRequest): Promise<
       redactor: r,
       excluded: built.excluded,
       scan: {
-        partial: run.partial,
+        partial,
         // messages hold repo paths, and a path can carry a secret
         notifications: run.notifications.map((n) => ({ ...n, message: r.apply(n.message) })),
         binaryMediaFiles: run.binaryMediaFiles.map((p) => r.applyPath(p)),
         windowedFiles: run.windowedFiles.map((p) => r.applyPath(p)),
+        binaryFontFiles: run.binaryFontFiles.map((p) => r.applyPath(p)),
+        windowProvenFiles: run.windowProvenFiles.map((p) => r.applyPath(p)),
         quarantined: run.quarantined.map((p) => r.applyPath(p)),
         findings: map.findings,
         redactedValues: r.size,

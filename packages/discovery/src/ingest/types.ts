@@ -58,7 +58,13 @@ export type ExclusionReason =
    * reads these as text, but UTF-16 text or text past a chunk cut inside them can be missed and a
    * binary cannot be rewritten, so they are left out whole rather than shipped unscanned.
    */
-  | 'media-file';
+  | 'media-file'
+  /**
+   * A TrueType, OpenType, WOFF, WOFF2 or EOT file whose structure checks out (judged by its bytes
+   * and extension, see tools/fonts.ts). The scanner skips fonts, so their bytes are not scanned;
+   * they are left out whole rather than shipped unscanned.
+   */
+  | 'font-file';
 
 export interface ExcludedFile {
   /** Repo-relative path. Already passed through the redactor. */
@@ -67,11 +73,22 @@ export interface ExcludedFile {
 }
 
 export interface IngestScan {
-  /** Always false on an ok result: a partial scan returns IngestIncomplete instead. */
+  /**
+   * Always false on an ok result: a partial scan returns IngestIncomplete instead. The only
+   * notifications an ok result can carry are `binary-font` ones, for fonts kept out of the
+   * workspace (binaryFontFiles).
+   */
   partial: boolean;
   notifications: ToolNotification[];
   binaryMediaFiles: string[];
   windowedFiles: string[];
+  /**
+   * Font files the scanner skipped. Each is left out of the workspace (reason `font-file`); that is
+   * what lets an ok result carry their `binary-font` notifications, which are listed here too.
+   */
+  binaryFontFiles: string[];
+  /** Lockfiles and SVG files whose chunk-split-risk the windows pass proved away (tools/windowproof.ts). */
+  windowProvenFiles: string[];
   /** Tool-control paths that quarantine moved aside for the scan (not removed from the workspace). */
   quarantined: readonly string[];
   /** Distinct gitleaks findings after merging the snapshot, quarantine and windows reports. */

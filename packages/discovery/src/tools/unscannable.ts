@@ -1,5 +1,6 @@
 import { open } from 'node:fs/promises';
 import { extname, join, relative, sep } from 'node:path';
+import { fontFormatOf } from './fonts.js';
 import { NonUtf8NameError, listDir } from './walk.js';
 
 /**
@@ -202,12 +203,17 @@ const SNIFF_BYTES = 100_000;
  *   key block is flagged, wherever the cuts really fall. It fails safe: it flags keys that no cut
  *   would split. Probed against the pinned gitleaks: a key with a blank line inside is missed at
  *   some offsets and found at others; a key without one is always found.
+ * - `binary-font`: a TrueType, OpenType, WOFF, WOFF2 or EOT file whose extension agrees and whose
+ *   structure checks out (fonts.ts). gitleaks does not scan it. A coverage loss for the tools layer;
+ *   ingestion keeps such files out of the workspace (reason `font-file`), like media. A font that
+ *   fails the structure check keeps its old kind (`skipped-file-type` or `non-text-content`).
  * - `unreadable`: could not be opened by the host user, or a directory that could not be listed. This is judged by the uid discovery runs
  *   as, so it is unreliable if the worker runs as root (root can open mode 000 files that the
  *   unprivileged jail cannot).
  */
 export type UnscannableKind =
   | 'binary-media'
+  | 'binary-font'
   | 'skipped-file-type'
   | 'binary-header-mismatch'
   | 'archive-name-mismatch'
@@ -518,6 +524,10 @@ async function inspectFile(full: string, name: string, buf: Buffer): Promise<Uns
       if (bytesRead === 0) break;
       const chunk = buf.subarray(0, bytesRead);
       if (first) {
+        // A font whose structure checks out (never under a name gitleaks reads as an archive).
+        if (!ARCHIVE_NAME.test(name) && fontFormatOf(name, chunk, (await fh.stat()).size)) {
+          return ['binary-font'];
+        }
         const head = classifyHead(name, chunk);
         // A known signature or a non-text start decides it; no need to read the rest.
         if (head === 'binary-media') {

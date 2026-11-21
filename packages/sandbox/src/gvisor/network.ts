@@ -129,6 +129,26 @@ export async function removeCaseNetwork(net: CaseNetwork): Promise<void> {
   if (left.stdout.trim() !== '') throw new Error(`network ${net.name} was left behind`);
 }
 
+/**
+ * Run ids of every case network on this Docker host (`affidavit-net-<runId>` with `RUN_LABEL`),
+ * whatever process made it. Lists only; removing a run is `removeCaseNetwork`, and only for a run
+ * whose owner is proven dead (the Judge's worker leases).
+ */
+export async function listCaseNetworkRuns(): Promise<string[]> {
+  const filter = `label=${RUN_LABEL}`;
+  const ls = await exec('docker', ['network', 'ls', '--format', '{{.Name}}', '--filter', filter]);
+  return ls.stdout
+    .split('\n')
+    .filter((l) => CASE_NETWORK.test(l))
+    .map((name) => name.slice('affidavit-net-'.length));
+}
+
+/** The case network handle for a run id, for `removeCaseNetwork`. */
+export function caseNetworkOfRun(runId: string): CaseNetwork {
+  if (!/^[0-9a-f]{16}$/.test(runId)) throw new Error('not a case network run id');
+  return { name: `affidavit-net-${runId}`, runId, subnet: '' };
+}
+
 export interface ServiceSpec {
   image: string;
   command: readonly string[];
