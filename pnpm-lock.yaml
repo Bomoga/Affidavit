@@ -112,6 +112,9 @@ importers:
       '@affidavit/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@affidavit/evidence':
+        specifier: workspace:*
+        version: link:../../packages/evidence
 
   apps/web:
     dependencies:
