@@ -166,12 +166,16 @@ describe('discoverCase', () => {
   it('returns not-found for a candidate the scan does not produce', async () => {
     const { deps, input } = setup({ 'package.json': EXPRESS_PKG, 'app.js': APP });
     const out = await discoverCase(deps, { ...input, candidateId: 'cand-not-there' });
-    expect(out).toEqual({ kind: 'not-found', candidateId: 'cand-not-there' });
+    expect(out).toEqual({ kind: 'not-found', candidateId: 'cand-not-there', holds: [] });
   });
 
   it('returns not-found when nothing goes to trial and no candidate is named', async () => {
     const { deps, input } = setup({ 'package.json': EXPRESS_PKG, 'app.js': APP }, []);
-    expect(await discoverCase(deps, input)).toEqual({ kind: 'not-found', candidateId: null });
+    expect(await discoverCase(deps, input)).toEqual({
+      kind: 'not-found',
+      candidateId: null,
+      holds: [],
+    });
   });
 
   it('returns unsupported for a repository with no Node app, with fixed text only', async () => {
@@ -191,6 +195,65 @@ describe('discoverCase', () => {
     expect(out.kind).toBe('incomplete');
     if (out.kind === 'incomplete') expect(out.coverageLosses).toBeGreaterThan(0);
     expect(readdirSync(workRoot)).toEqual([]);
+  });
+
+  describe('F3 holds (a dismissal rule matched at or above the floor)', () => {
+    // A second sink in a function no route reaches: the map says unreachable. With a floor of 0
+    // every dismissal rule that matches is held instead of applied.
+    const HELD_APP = [
+      ...APP.split('\n').slice(0, -1),
+      'function unused(req) {',
+      "  db.query('select * from u where id = ' + req.query.id, () => {});",
+      '}',
+      '',
+    ].join('\n');
+    const HELD_LINE = 11;
+    const files = { 'package.json': EXPRESS_PKG, 'app.js': HELD_APP };
+    const findings = [
+      { file: 'app.js', line: SINK_LINE },
+      { file: 'app.js', line: HELD_LINE },
+    ];
+    const holdAll = { escalationFloor: 0, dismissBelow: 0 };
+
+    it('lists every hold next to the trial case file when no candidate is named', async () => {
+      const { deps, input, workRoot } = setup(files, findings);
+      const out = await discoverCase({ ...deps, arraignConfig: holdAll }, input);
+      expect(out.kind).toBe('case-file');
+      if (out.kind !== 'case-file') return;
+      expect(out.caseFile.candidate.range.startLine).toBe(SINK_LINE);
+      expect(out.holds).toHaveLength(1);
+      expect(out.holds[0]).toMatchObject({ wouldDismiss: 'unreachable', route: 'person-or-trial' });
+      expect(out.holds[0]?.caseFile).toBeUndefined();
+      expect(readdirSync(workRoot)).toEqual([]);
+    });
+
+    it('assembles a case file of its own for each hold when asked', async () => {
+      const { deps, input } = setup(files, findings);
+      const out = await discoverCase(
+        { ...deps, arraignConfig: holdAll },
+        { ...input, holdCaseId: (c) => CaseId.parse(`held-${c}`) },
+      );
+      if (out.kind !== 'case-file') throw new Error(`expected a case file, got ${out.kind}`);
+      const [hold] = out.holds;
+      expect(hold).toBeDefined();
+      const cf = CaseFile.parse(hold?.caseFile);
+      expect(cf.id).toBe(`held-${hold?.candidateId}`);
+      expect(cf.candidate.id).toBe(hold?.candidateId);
+      expect(cf.candidate.range.startLine).toBe(HELD_LINE);
+    });
+
+    it('returns review, with the holds, when the held candidate is named', async () => {
+      const { deps, input } = setup(files, findings);
+      const first = await discoverCase({ ...deps, arraignConfig: holdAll }, input);
+      if (first.kind !== 'case-file') throw new Error(`expected a case file, got ${first.kind}`);
+      const held = first.holds[0]?.candidateId ?? '';
+      const out = await discoverCase(
+        { ...deps, arraignConfig: holdAll },
+        { ...input, candidateId: held },
+      );
+      expect(out).toMatchObject({ kind: 'review', candidateId: held, route: 'person-or-trial' });
+      if (out.kind === 'review') expect(out.holds.map((h) => h.candidateId)).toEqual([held]);
+    });
   });
 
   it('turns an arraignment input error into a typed DiscoveryPipelineError', async () => {

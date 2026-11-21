@@ -73,7 +73,11 @@ export async function stageAttemptState(
   });
 }
 
-export type ReviewReason = 'attempts-exhausted' | 'budget-exhausted';
+/**
+ * Why a person has to look. `f3-hold`: discovery held the candidate (a dismissal rule matched at or
+ * above the escalation floor), so it was opened for review instead of being queued (`openHeldCase`).
+ */
+export type ReviewReason = 'attempts-exhausted' | 'budget-exhausted' | 'f3-hold';
 
 /**
  * Records that a person has to look at a case stage (insert-only, once per attempt). Returns true

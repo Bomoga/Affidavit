@@ -106,4 +106,20 @@ Semgrep SARIF carries only a rule's `metadata.cwe` (as tags) in `properties.tags
 
 **Request.** Decide where the boot happens: (a) before `open` (`open-case` builds and boots both variants, writes `imageDigest`, and the worker keeps the targets running for the case), or (b) a contract change so the Judge (Lane 2) boots per case and the digest is recorded as an event or a Judge-owned field rather than in the immutable case file. Also: which stage seals the bundle (after verify, before the verdict), and the ports for the workbench and rescan in the worker.
 
-**Status.** Answered for the boot by #61 (option b): `createRealJudge` boots each case's variants (`CaseTargets`) and binds the digests on a copy of the case file; the worker uses it for `AFFIDAVIT_JUDGE_IMPL=real` (L1-10b). Still open: a `RescanPort` (Lane 1) so `verifyPatch` can run, the bundle sealing stage, and whether a "targets booted" event carries the digests (contracts). Intake refusals (`unsupported`, `incomplete`) remain failed attempts plus a review flag (CR-4, CR-8).
+**Status.** Answered for the boot by #61 (option b): `createRealJudge` boots each case's variants (`CaseTargets`) and binds the digests on a copy of the case file; the worker uses it for `AFFIDAVIT_JUDGE_IMPL=real` (L1-10b). The `RescanPort` is provided by L1-17 (`DiscoveryRescan`, wired when intake is also real; no contract change was needed). Still open: the bundle sealing stage, and whether a "targets booted" event carries the digests (contracts). Intake refusals (`unsupported`, `incomplete`) remain failed attempts plus a review flag (CR-4, CR-8).
+
+## CR-12: child processes of other lanes' components inherit the worker environment (raised by L1-10c)
+
+**Problem.** `GvisorToolRunner` (`packages/sandbox/src/gvisor/runner.ts`, `spawn('docker', args)`), `LocalDockerToolRunner` (`packages/testing/src/infra.ts`, `execFile('docker', ...)`) and the target build (`packages/sandbox/src/boot/build.ts`, `{ ...process.env, DOCKER_BUILDKIT }`) start `docker` with the parent's whole environment. In the worker that environment held `ANTHROPIC_API_KEY`, both database URLs and the repository sources.
+
+**Interim (L1-10c).** The worker entry points (`main.ts`, `open-case`) call `sealSecrets` after `loadConfig`: those variables are moved out of `process.env` into a private snapshot the wiring reads (the model port gets the key through its `env` override). The worker's own `docker info` probe passes an explicit minimal environment (`childEnv` in `apps/worker/src/real/child-env.ts`). Tested with a canary variable and a stub child.
+
+**Request.** Lane 2 and the lead (`packages/testing`): an `env` option on each runner and on the target build, defaulting to a minimal allowlist (what the Docker CLI needs) instead of `process.env`, so a component is safe on its own and not only behind the worker's seal.
+
+## CR-13: an F3 hold found by `open-case` has no contract slot (raised by L1-10c)
+
+**Problem.** A discovery scan can hold candidates for review (F3: a dismissal rule matched at or above the escalation floor). `open-case` must record each one durably, but no contract event or stage fits a hold found before trial: `escalated` is reachable from defense onward only, and `Escalation.reason` has no pre-trial value.
+
+**Interim (L1-10c).** Each hold is opened as a case of its own at intake with its assembled case file and flagged for a person: `review_flags` reason `f3-hold` (migration 0007), detail with arraignment's `wouldDismiss`, `route` and detail, no stage job (`openHeldCase` in `@affidavit/db`). The recovery sweep leaves a flagged visit alone, so it is never queued or dismissed.
+
+**Request.** Decide how a `person-or-trial` hold reaches a second Defense attempt (an operator action that clears the flag and enqueues intake, or a contract path), and whether a hold is an event (for example `held-for-review` with the route) so the courtroom can show it. Related: CR-8.

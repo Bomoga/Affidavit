@@ -16,8 +16,13 @@ export interface IntakeSettings {
   sources: Readonly<Record<string, string>>;
   /** Local paths as sources (CLI and tests only). Default off: https clone URLs only. */
   allowLocalSource: boolean;
-  /** How scanners run, both through ToolRunnerPort: plain Docker or Lane 2's gVisor runner. */
+  /**
+   * How scanners run, both through ToolRunnerPort: Lane 2's gVisor runner (the default) or plain
+   * Docker. Plain Docker only when AFFIDAVIT_TOOLRUNNER=docker is set, and it logs a warning.
+   */
   toolRunner: ToolRunnerKind;
+  /** False when AFFIDAVIT_TOOLRUNNER was unset and gVisor is the default. */
+  toolRunnerExplicit: boolean;
   /** Wall-clock cap per scanner run, gVisor runner only. */
   toolTimeoutMs: number;
 }
@@ -222,10 +227,12 @@ function sourcesVar(env: Env, problems: string[]): Record<string, string> {
 }
 
 function intakeSettings(env: Env, problems: string[]): IntakeSettings {
+  // gVisor unless plain Docker is asked for by name: repository content is untrusted.
   const runner = env['AFFIDAVIT_TOOLRUNNER'];
-  let toolRunner: ToolRunnerKind = 'docker';
-  if (runner === 'gvisor') toolRunner = 'gvisor';
-  else if (runner !== undefined && runner !== '' && runner !== 'docker') {
+  const toolRunnerExplicit = runner !== undefined && runner !== '';
+  let toolRunner: ToolRunnerKind = 'gvisor';
+  if (runner === 'docker') toolRunner = 'docker';
+  else if (toolRunnerExplicit && runner !== 'gvisor') {
     problems.push('AFFIDAVIT_TOOLRUNNER must be "docker" or "gvisor"');
   }
   return {
@@ -233,6 +240,7 @@ function intakeSettings(env: Env, problems: string[]): IntakeSettings {
     sources: sourcesVar(env, problems),
     allowLocalSource: boolVar(env, 'AFFIDAVIT_INTAKE_ALLOW_LOCAL_SOURCE', false, problems),
     toolRunner,
+    toolRunnerExplicit,
     toolTimeoutMs: intVar(env, 'AFFIDAVIT_TOOL_TIMEOUT_MS', 600_000, 10_000, 3_600_000, problems),
   };
 }
@@ -397,6 +405,19 @@ export function loadConfig(env: Env = process.env): WorkerConfig {
   };
   if (problems.length > 0) throw new ConfigError(problems);
   return config;
+}
+
+/**
+ * Settings that start but weaken a guarantee, to log once at startup. Names only, never values.
+ */
+export function startupWarnings(config: WorkerConfig): string[] {
+  const out: string[] = [];
+  if (config.intakeSettings?.toolRunner === 'docker') {
+    out.push(
+      'AFFIDAVIT_TOOLRUNNER=docker: scanners run on untrusted repository content under plain Docker (runc), without gVisor isolation; unset it or use gvisor on a Linux sandbox host (docs/lanes/lane1/real-wiring.md)',
+    );
+  }
+  return out;
 }
 
 /** The non-secret part of the configuration, safe to log. Source URLs are not listed. */

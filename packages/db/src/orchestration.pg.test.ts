@@ -5,6 +5,7 @@ import { PgCaseStore } from './case-store.js';
 import {
   StageDidNotAdvanceError,
   ensureStageJob,
+  openHeldCase,
   reconcileOnce,
   stageHandler,
   type ReconcileOptions,
@@ -101,6 +102,35 @@ describePg('stage attempts, review flags, open-case sweep and recovery', () => {
     await expect(
       withTenant(db().app, A, (tx) => tx.execute(sql`select * from public.list_open_cases(10)`)),
     ).rejects.toThrow(/permission denied/);
+  });
+
+  it('openHeldCase records an F3 hold durably for a person: flagged, never queued, idempotent', async () => {
+    const file = sampleCase(A);
+    expect(
+      await openHeldCase(db().app, file, BUDGET, 'held: unreachable (route person-or-trial)'),
+    ).toBe(true);
+    expect(await openHeldCase(db().app, file, BUDGET, 'again')).toBe(false);
+    expect(await storeA.stage(file.id)).toBe('intake');
+    const flags = await db().admin.query<{ reason: string; detail: string; visit: number }>(
+      `select reason, detail, visit from review_flags where case_id = $1`,
+      [file.id],
+    );
+    expect(flags.rows).toEqual([
+      { reason: 'f3-hold', detail: 'held: unreachable (route person-or-trial)', visit: 1 },
+    ]);
+    expect(await count(`select count(*) as n from stage_jobs where case_id = '${file.id}'`)).toBe(
+      0,
+    );
+    const entered = await count(
+      `select count(*) as n from events where case_id = '${file.id}' and type = 'stage-entered'`,
+    );
+    expect(entered).toBe(1);
+    // Neither the sweep nor recovery queues it: a person decides.
+    const actions = await reconcileOnce(opts());
+    expect(actions.filter((a) => a.payload.caseId === file.id)).toEqual([]);
+    expect(await count(`select count(*) as n from stage_jobs where case_id = '${file.id}'`)).toBe(
+      0,
+    );
   });
 
   it('PgCaseFileSource is a keyed, tenant scoped read', async () => {

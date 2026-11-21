@@ -1,4 +1,4 @@
-# Real wiring runbook (L1-10b)
+# Real wiring runbook (L1-10b, L1-10c, L1-17)
 
 How to run `apps/worker` with real stages: real discovery for intake, map and arraign, the real
 trial orchestrator on the real model port, and the real Judge on the gVisor witness jail. The
@@ -11,16 +11,32 @@ placeholder. Never put a real secret in this file, a commit, a shell history fil
 | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `AFFIDAVIT_INTAKE_IMPL=real` | intake, map and arraign run `discoverCase` (`packages/discovery/src/pipeline`) on the case's pinned repo and commit, and refuse to go on unless it reproduces the stored case file.                                                                                                                     |
 | `AFFIDAVIT_TRIAL_IMPL=real`  | defense, prosecution, remedy and verify run `@affidavit/trial`'s `Orchestrator` and handlers on `createModelPortFromEnv`. The jury must be off (no jury handler yet, L3-11).                                                                                                                            |
-| `AFFIDAVIT_JUDGE_IMPL=real`  | the Judge is Lane 2's `createRealJudge` (`packages/judge/src/jail/real.ts`): `Judge` on the gVisor `JailExecutor`, `CaseTargets` booting each case's vulnerable and safe variants, the jailed patch workbench, `FsEvidenceStore` and `SignerClient`. Host steps: `docs/lanes/lane2/real-judge-host.md`. |
+| `AFFIDAVIT_JUDGE_IMPL=real`  | the Judge is Lane 2's `createRealJudge` (`packages/judge/src/jail/real.ts`): `Judge` on the gVisor `JailExecutor`, `CaseTargets` booting each case's vulnerable and safe variants, the jailed patch workbench, `FsEvidenceStore` and `SignerClient`; with intake also `real`, discovery's re-scan (`DiscoveryRescan`) as its `RescanPort`. Host steps: `docs/lanes/lane2/real-judge-host.md`. |
 
 Each switch is independent. Unset or `fake` keeps the scripted fake for that part.
 
 ## Startup refuses, it never half starts
 
 `loadConfig` lists every missing or malformed variable in one `ConfigError`. Then `prepareCores`
-checks the host (`checkPrerequisites`) and lists every missing fact in one `PrerequisiteError`,
-before any database connection is opened. Messages name variables and host facts, never values:
-a database URL, a repository source or a key never appears in an error or in `describeConfig`.
+checks the host (`checkPrerequisites`) and builds every environment-derived component
+(discovery's arraignment settings and tool runner, the model port, the model table), and lists
+every problem from all of them in one `PrerequisiteError`, before any database connection is
+opened. Only then is the real Judge built, last, because it takes a worker lease and may sweep;
+if anything after it fails, the Judge is closed (lease released, timers stopped) before the error
+goes up. Messages name variables and host facts, never values: a database URL, a repository
+source or a key never appears in an error or in `describeConfig`.
+
+## Child processes never see a secret
+
+`main.ts` and `open-case` call `sealSecrets` right after `loadConfig`: `ANTHROPIC_API_KEY`, both
+database URLs and `AFFIDAVIT_REPO_SOURCES` are moved out of `process.env` into a private snapshot.
+The model port reads the key from that snapshot on every call. So no child process can inherit
+one, including those that other lanes' components spawn with the inherited environment (the tool
+runners, the Judge's jail and its probes). The worker's own `docker info` probe gets an explicit
+minimal environment (`childEnv`: `PATH`, `HOME`, `DOCKER_HOST`, `DOCKER_CONFIG`, `DOCKER_CONTEXT`,
+`DOCKER_CERT_PATH`, `DOCKER_TLS_VERIFY`, `XDG_RUNTIME_DIR`, plus `SYSTEMROOT`, `TEMP`, `TMP` and
+`PATHEXT` on Windows). An explicit environment option on the other lanes' runners is requested in
+`contract-requests.md` (CR-12).
 
 ## Environment variables
 
@@ -48,15 +64,15 @@ Required means required when the switch in the "For" column is `real`.
 
 ### For intake `real`
 
-| Name                                  | Purpose                                                                                              | Required | Example placeholder                                          |
-| ------------------------------------- | ---------------------------------------------------------------------------------------------------- | -------- | ------------------------------------------------------------ |
-| `AFFIDAVIT_INTAKE_WORK_ROOT`          | absolute, existing directory for per-run discovery workspaces (each run gets its own and removes it) | yes      | `/srv/affidavit/intake`                                      |
-| `AFFIDAVIT_REPO_SOURCES`              | JSON object from repository id to clone URL or local path; ids are logged, sources never are         | yes      | `{"OWASP/NodeGoat":"https://github.com/OWASP/NodeGoat.git"}` |
-| `AFFIDAVIT_INTAKE_ALLOW_LOCAL_SOURCE` | `true` lets a source be a local path (testing)                                                       | no       | `false`                                                      |
-| `AFFIDAVIT_TOOLRUNNER`                | `gvisor` (Lane 2 `GvisorToolRunner`) or `docker` (plain local Docker, default)                       | no       | `gvisor`                                                     |
-| `AFFIDAVIT_TOOL_TIMEOUT_MS`           | per scanner run (default 600000)                                                                     | no       | `600000`                                                     |
-| `AFFIDAVIT_ESCALATION_FLOOR`          | F3 floor, read by discovery's `arraignConfigFrom`                                                    | no       | (discovery default)                                          |
-| `AFFIDAVIT_DISMISS_BELOW`             | dismissal threshold, read by `arraignConfigFrom`                                                     | no       | (discovery default)                                          |
+| Name                                  | Purpose                                                                                                                                                                                                                     | Required | Example placeholder                                          |
+| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- | ------------------------------------------------------------ |
+| `AFFIDAVIT_INTAKE_WORK_ROOT`          | absolute, existing directory for per-run discovery workspaces (each run gets its own and removes it)                                                                                                                        | yes      | `/srv/affidavit/intake`                                      |
+| `AFFIDAVIT_REPO_SOURCES`              | JSON object from repository id to clone URL or local path; ids are logged, sources never are                                                                                                                                | yes      | `{"OWASP/NodeGoat":"https://github.com/OWASP/NodeGoat.git"}` |
+| `AFFIDAVIT_INTAKE_ALLOW_LOCAL_SOURCE` | `true` lets a source be a local path (testing)                                                                                                                                                                              | no       | `false`                                                      |
+| `AFFIDAVIT_TOOLRUNNER`                | `gvisor` (Lane 2 `GvisorToolRunner`, the default when unset) or `docker` (plain local Docker: only when set by name, and startup logs a warning that scanners run on untrusted repository content without gVisor isolation) | no       | `gvisor`                                                     |
+| `AFFIDAVIT_TOOL_TIMEOUT_MS`           | per scanner run (default 600000)                                                                                                                                                                                            | no       | `600000`                                                     |
+| `AFFIDAVIT_ESCALATION_FLOOR`          | F3 floor, read by discovery's `arraignConfigFrom`                                                                                                                                                                           | no       | (discovery default)                                          |
+| `AFFIDAVIT_DISMISS_BELOW`             | dismissal threshold, read by `arraignConfigFrom`                                                                                                                                                                            | no       | (discovery default)                                          |
 
 ### For trial `real`
 
@@ -103,7 +119,7 @@ Mapped onto `RealJudgeConfig` (field in brackets); Lane 2's check names the fiel
 
 Checked at startup; each line is one possible `PrerequisiteError` entry.
 
-- Linux, when the Judge is real or `AFFIDAVIT_TOOLRUNNER=gvisor` (gVisor does not run on Windows or macOS).
+- Linux, when the Judge is real or intake runs on gVisor (`AFFIDAVIT_TOOLRUNNER` unset or `gvisor`; gVisor does not run on Windows or macOS). With `AFFIDAVIT_TOOLRUNNER` unset on a host without gVisor, startup refuses and says to set `AFFIDAVIT_TOOLRUNNER=docker` explicitly to scan under plain Docker.
 - A reachable Docker daemon, when intake or the Judge is real.
 - The `runsc` Docker runtime (`docker/sandbox/install-gvisor.sh`, as root), for gVisor.
 - The `runsc-affidavit` audit runtime and its trace directory (`docker/sandbox/setup-runsc-audit.sh`, as root), for the Judge.
@@ -125,13 +141,13 @@ The only secret input is `ANTHROPIC_API_KEY`. The database passwords are generat
 6. Start `apps/signer` and set `AFFIDAVIT_SIGNER_SOCKET`.
 7. Export the variables above, with `AFFIDAVIT_JURY_ENABLED=false`, and `export ANTHROPIC_API_KEY="<from the secrets store>"` in that shell only.
 8. Start the worker (`node --import tsx apps/worker/src/main.ts`). It refuses with a list if anything is missing.
-9. Open a case: `pnpm --filter @affidavit/worker open-case -- --tenant <tenant> --repo <repo id> --commit <40 hex>`. It runs the same discovery as intake and opens the case only for a case file; a dismissal, an F3 hold or an unsupported repository is printed and nothing is opened.
+9. Open a case: `pnpm --filter @affidavit/worker open-case -- --tenant <tenant> --repo <repo id> --commit <40 hex>`. It runs the same discovery as intake. The trial candidate (the one named with `--candidate`, or the highest-ranked) is opened and queued. Every F3 hold of the scan (a dismissal rule matched at or above the escalation floor) is opened as a case of its own, `<case id>-hold-<digest>`, and flagged for a person: a `review_flags` row with reason `f3-hold` and arraignment's route (`person`, or `person-or-trial`: a person or a second Defense attempt) in its detail, no stage job, never dismissed. A dismissal or an unsupported repository opens no trial case and is printed. Find the holds with `select case_id, detail from review_flags where reason = 'f3-hold'`.
 10. Follow the case with `affidavit` (apps/cli) or the `events` table.
 
 ## What happens when something is refused
 
 - Intake `unsupported` or `incomplete` (a partial secret scan): no contract slot exists for it (CR-4) and `escalated` is not reachable from intake, so the attempt fails with `IntakeRefusedError` and its reason. Recovery retries up to `AFFIDAVIT_MAX_STAGE_ATTEMPTS` and then writes a `review_flags` row (`attempts-exhausted`). Never dismissed, never retried forever.
-- Real discovery does not reproduce the stored case file (other code, other rules, a dismissal, a hold, a duplicate-reachability error from arraign): `CaseFileMismatchError` or `DiscoveryPipelineError`, same path. A case opened for trial is never dismissed by Lane 1.
+- Real discovery no longer sends the case's candidate to trial (it would be dismissed, it is held for review under F3, or the scan does not find it): `DiscoveryOutcomeError`, naming the outcome and discovery's reason codes, at the first of intake, map or arraign. Real discovery produces a case file that differs from the stored one: `CaseFileMismatchError`, naming the fields. A duplicate-reachability error from arraign: `DiscoveryPipelineError`. All take the same path as above. A case opened for trial is never dismissed by Lane 1.
 - No API key, or a key the provider refused: the stage halts with `TrialHaltedError` (`model-unconfigured`) before any charge; recovery retries (zero-amount cost rows) and then flags the stage for review. Set the key and clear the flag to resume.
 - Kill switch: same path, reason `kill-switch`.
 
@@ -140,7 +156,7 @@ The only secret input is `ANTHROPIC_API_KEY`. The database passwords are generat
 These are outside this lane's packages or need the lead; each is tracked in `contract-requests.md`.
 
 - Targets now boot per case (`CaseTargets`, #61); a boot failure is a failed Defense attempt and then a review flag, never a dismissal. Booted targets are released when a trial stage lands the case in a terminal stage and on shutdown; a case flagged for review keeps its targets until the worker stops (no hook from the review flag yet). Targets live in process memory, so a restart boots them again.
-- `verifyPatch` needs Lane 1's `RescanPort`, which does not exist yet (only `FakeRescan`): without it `verifyPatch` fails closed, so Remedy cannot be verified and the case is flagged for review. Startup logs this as a `real Judge:` note.
+- `verifyPatch` gets Lane 1's re-scan (`DiscoveryRescan`, L1-17) only when intake is real as well: it reuses the intake tool runner (`AFFIDAVIT_TOOLRUNNER`), timeout and work root. With `AFFIDAVIT_INTAKE_IMPL` unset or `fake` there is no re-scan, `verifyPatch` fails closed, Remedy cannot be verified and the case is flagged for review; startup logs this as a `real Judge:` note. The re-scan is clean only when the case's Semgrep rule was loaded and no longer fires anywhere in the case's file of the patched tree, that file is plain text with its exact name, and the scan reported no coverage loss (`packages/discovery/CLAUDE.md`, "Re-scan"). The coverage check is global: Semgrep's notifications carry no reliable file path, so a timeout or parse error in any file of the patched tree makes the re-scan not clean and the case goes to review. How often that happens on real repositories is unmeasured ([metric]).
 - No stage seals an evidence bundle; `createRealJudge` holds the evidence store and signer client for it (CR-11, second half).
 - No single-stage entry in the trial package (CR-7). The worker runs `Orchestrator.run` per stage job and stops it after one transition. The trial workspace (admitted witness, patch) and the cost ledger are in process memory, so a worker restart mid-trial fails the next stage and flags it for review.
 - No jury handler (L3-11), so the jury must be disabled.

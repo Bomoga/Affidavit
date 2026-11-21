@@ -3,8 +3,8 @@
     {
       "app": "nodegoat",
       "commit": "c5cb68a7084e4ae7dcc60e6a98768720a81841e8",
-      "bundleSha256": null,
-      "note": "Not pinned yet. A human builds the bundle on a networked host with packages/sandbox/scripts/build-dependency-bundle.ts, reviews the manifest, then sets the digest here."
+      "bundleSha256": "57e33bc3e70ae6434374f0341ecb16e3abe83141f751baa59d6f7f20fa8420da",
+      "note": "Built 2026-11-21 by the Lane 2 owner on the Fedora sandbox host (node v22.23.1, npm 10.9.8) with packages/sandbox/scripts/build-dependency-bundle.ts. A second build produced the identical tar. Manifest reviewed: 396 production and 356 dev packages, all resolved from registry.npmjs.org, prepare ignored for domelementtype@2.3.0, entities@2.2.0 and uuid@3.3.2, dev excludes per packages/sandbox/bundle-exclusions.json, fsevents skipped (darwin only)."
     }
   ]
 }
