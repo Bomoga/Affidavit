@@ -36,7 +36,7 @@ const config = (over: Partial<RealJudgeConfig> = {}): RealJudgeConfig => ({
   evidence: store,
   signerSocket: SOCKET,
   signer,
-  sources: () => Promise.resolve({ ok: true, dir: '/src' }),
+  sources: (_cf, v) => Promise.resolve({ ok: true, dir: `/src/${v}` }),
   dependencyBundles: [{ app: 'nodegoat', repo: 'repo-nodegoat', path: BUNDLE, storeRoot: STORE }],
   rescan: { rescan: () => Promise.resolve({ clean: true, candidates: [] }) },
   ...over,
@@ -46,6 +46,7 @@ const goodProbe = (over: Partial<RealJudgeHostProbe> = {}): RealJudgeHostProbe =
   platform: 'linux',
   isDirectory: () => Promise.resolve(true),
   isSocket: () => Promise.resolve(true),
+  realpath: (p) => Promise.resolve(p),
   dockerRuntimes: () => Promise.resolve(['runc', 'runsc', 'runsc-affidavit']),
   imagePresent: () => Promise.resolve(true),
   pins: () => [{ app: 'nodegoat', commit: COMMIT, bundleSha256: 'd'.repeat(64) }],
@@ -150,26 +151,102 @@ describe('checkRealJudgePrerequisites', () => {
     expect(r.notes.join('\n')).toMatch(/verifyPatch fails closed/);
   });
 
-  it('a daemon config that cannot be read is a problem, and images are not probed then', async () => {
+  it('a daemon config that cannot be read is a problem, and everything else is still checked', async () => {
     let probed = 0;
     const r = await checkRealJudgePrerequisites(
       config(),
       goodProbe({
         dockerRuntimes: () => Promise.resolve(null),
-        imagePresent: () => (probed++, Promise.resolve(true)),
+        imagePresent: () => (probed++, Promise.resolve(false)),
+        isSocket: () => Promise.resolve(false),
       }),
     );
-    expect(r.problems.join('\n')).toMatch(/Docker daemon config cannot be read/);
-    expect(probed).toBe(0);
+    const text = r.problems.join('\n');
+    expect(text).toMatch(/Docker daemon config cannot be read/);
+    expect(text).toMatch(/runnerImage .* image is not present/);
+    expect(text).toMatch(/applyImage .* image is not present/);
+    expect(text).toMatch(/signerSocket/);
+    expect(probed).toBe(2);
+  });
+
+  describe('isolation of the evidence store and the signer (review of #61)', () => {
+    const link = (map: Record<string, string>) => (p: string) => Promise.resolve(map[p] ?? p);
+
+    it('refuses a work root that is a symlink into the evidence store', async () => {
+      const r = await checkRealJudgePrerequisites(
+        config(),
+        goodProbe({ realpath: link({ [WORK]: `${EVIDENCE}/judge` }) }),
+      );
+      expect(r.problems.join('\n')).toMatch(
+        /workRoot and evidenceRoot must not contain one another/,
+      );
+      noSecrets(r.problems);
+    });
+
+    it('refuses an evidence store that resolves inside the work root, or to the same directory', async () => {
+      for (const target of [`${WORK}/ev`, WORK]) {
+        const r = await checkRealJudgePrerequisites(
+          config(),
+          goodProbe({ realpath: link({ [EVIDENCE]: target }) }),
+        );
+        expect(r.problems.join('\n')).toMatch(/must not contain one another/);
+      }
+    });
+
+    it('compares case-insensitively where the filesystem is (Windows, macOS)', async () => {
+      const r = await checkRealJudgePrerequisites(
+        config(),
+        goodProbe({
+          platform: 'darwin',
+          realpath: link({ [WORK]: `${EVIDENCE.toUpperCase()}/judge` }),
+        }),
+      );
+      expect(r.problems.join('\n')).toMatch(/must not contain one another/);
+    });
+
+    it('refuses a signer socket under the work root, the bundle store or the evidence store', async () => {
+      for (const sock of [`${WORK}/s.sock`, `${STORE}/s.sock`, `${EVIDENCE}/s.sock`]) {
+        const r = await checkRealJudgePrerequisites(
+          config(),
+          goodProbe({ realpath: link({ [SOCKET]: sock }) }),
+        );
+        expect(r.problems.join('\n')).toMatch(/signerSocket .* must not be under/);
+        noSecrets(r.problems);
+      }
+    });
+
+    it('refuses an evidence store under the bundle store (mounted read only into builds)', async () => {
+      const r = await checkRealJudgePrerequisites(
+        config(),
+        goodProbe({ realpath: link({ [EVIDENCE]: `${STORE}/ev` }) }),
+      );
+      expect(r.problems.join('\n')).toMatch(
+        /evidenceRoot must not be under a dependency bundle store/,
+      );
+    });
+
+    it('a path that cannot be resolved is a problem, not a pass', async () => {
+      const r = await checkRealJudgePrerequisites(
+        config(),
+        goodProbe({ realpath: (p) => Promise.resolve(p === SOCKET ? null : p) }),
+      );
+      expect(r.problems.join('\n')).toMatch(/signerSocket .* cannot be resolved/);
+    });
   });
 });
 
 describe('createRealJudge', () => {
+  let sweeps = 0;
   const nothingStarts: TargetBootDeps = {
     buildTarget: () => Promise.reject(new Error('must not build')),
     createCaseNetwork: () => Promise.reject(new Error('must not start')),
     bootTarget: () => Promise.reject(new Error('must not start')),
     removeCaseNetwork: () => Promise.resolve(),
+    fingerprintTree: (d) => Promise.resolve(d),
+    sweepOrphans: () => {
+      sweeps++;
+      return Promise.resolve({ containers: 0, networks: 0 });
+    },
   };
 
   it('throws a RealJudgePrerequisiteError before anything is built', async () => {
@@ -180,6 +257,14 @@ describe('createRealJudge', () => {
     expect(err).toBeInstanceOf(RealJudgePrerequisiteError);
     expect((err as Error).message).toMatch(/signerSocket/);
     noSecrets([(err as Error).message]);
+    expect(sweeps).toBe(0);
+  });
+
+  it('sweeps orphans of a previous worker run at startup, after the check passes', async () => {
+    const before = sweeps;
+    const real = await createRealJudge(config(), { probe: goodProbe(), deps: nothingStarts });
+    expect(sweeps).toBe(before + 1);
+    await real.close();
   });
 
   it('assembles the Judge on the case targets and hands the case bundle to the builds', async () => {
@@ -224,10 +309,10 @@ describe('createRealJudge', () => {
     const { rescan: _r, ...noRescan } = config();
     void _r;
     const deps: TargetBootDeps = {
-      buildTarget: () =>
+      buildTarget: (d) =>
         Promise.resolve({
           ok: true,
-          imageId: `sha256:${'a'.repeat(64)}`,
+          imageId: `sha256:${(d.endsWith('safe') ? 'b' : 'a').repeat(64)}`,
           baseImage: 'node',
           recipe: {
             base: 'node',
@@ -254,6 +339,8 @@ describe('createRealJudge', () => {
           sidecarImages: {},
         }),
       removeCaseNetwork: () => Promise.resolve(),
+      fingerprintTree: (d) => Promise.resolve(d),
+      sweepOrphans: () => Promise.resolve({ containers: 0, networks: 0 }),
     };
     const real = await createRealJudge(noRescan, { probe: goodProbe(), deps });
     expect(real.notes.join('\n')).toMatch(/RescanPort/);

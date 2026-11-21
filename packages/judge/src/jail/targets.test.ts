@@ -1,3 +1,6 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { CaseFile } from '@affidavit/contracts';
 import type {
   BootOutcome,
@@ -16,6 +19,7 @@ import {
   CaseBootError,
   CaseTargets,
   directorySources,
+  fingerprintSourceTree,
   recipeSurfaceMismatch,
   type SourceResolver,
   type TargetBootDeps,
@@ -47,6 +51,7 @@ interface FakeOpts {
   createNetwork?: (n: number) => Promise<CaseNetwork>;
   remove?: (net: CaseNetwork) => Promise<void>;
   recipeFor?: (dir: string) => BootRecipe;
+  fingerprint?: (dir: string) => Promise<string>;
 }
 
 /** Fake sandbox steps that record their order and which networks are still alive. */
@@ -103,6 +108,13 @@ function fakeDeps(o: FakeOpts = {}) {
       log.push(`remove ${net.name}`);
       if (o.remove) await o.remove(net);
       alive.delete(net.name);
+    },
+    fingerprintTree(dir) {
+      return o.fingerprint ? o.fingerprint(dir) : Promise.resolve(`tree:${dir}`);
+    },
+    sweepOrphans() {
+      log.push('sweep');
+      return Promise.resolve({ containers: 0, networks: 0 });
     },
   };
   return { deps, log, alive, buildOpts };
@@ -499,5 +511,126 @@ describe('CaseBoundJudge', () => {
     ).rejects.toBeInstanceOf(CaseBootError);
     expect(exec.requests).toEqual([]);
     expect(alive.size).toBe(0);
+  });
+});
+
+describe('the safe variant must differ from the vulnerable one (review of #61)', () => {
+  it('refuses a resolver that returns the same tree for both variants, building nothing', async () => {
+    const { targets, log } = provider({}, () => Promise.resolve({ ok: true, dir: VULN_DIR }));
+    const exec = new ScriptedExecutor(() => raw([true, true, true]));
+    const judge = new CaseBoundJudge(new Judge(exec, DEFAULT_POLICY), targets);
+    const out = await targets.boot(caseFile());
+    expect(out).toMatchObject({ ok: false, kind: 'unsupported', variant: 'safe', step: 'compare' });
+    expect(!out.ok && out.reason).toMatch(/same source tree/);
+    expect(log.some((l) => l.startsWith('build') || l.startsWith('boot'))).toBe(false);
+    await expect(
+      judge.runWitness(caseFile(), gateWitness(), ['vulnerable']),
+    ).rejects.toBeInstanceOf(CaseBootError);
+    expect(exec.requests).toEqual([]);
+  });
+
+  it('refuses two directories whose trees have the same content', async () => {
+    const { targets } = provider({ fingerprint: () => Promise.resolve('same') });
+    const out = await targets.boot(caseFile());
+    expect(out).toMatchObject({ kind: 'unsupported', step: 'compare' });
+    expect(!out.ok && out.reason).toMatch(/same source tree/);
+  });
+
+  it('refuses identical vulnerable and safe images before any boot', async () => {
+    const { targets, log, alive } = provider({
+      build: () => ({
+        ok: true,
+        imageId: digestOf(VULN_DIR),
+        baseImage: 'node',
+        recipe: recipe(),
+        stage: {} as never,
+      }),
+    });
+    const out = await targets.boot(caseFile());
+    expect(out).toMatchObject({ ok: false, kind: 'unsupported', variant: 'safe', step: 'compare' });
+    expect(!out.ok && out.reason).toMatch(/same image/);
+    expect(log.some((l) => l.startsWith('network') || l.startsWith('boot'))).toBe(false);
+    expect(alive.size).toBe(0);
+  });
+
+  it('a fingerprint that throws is boot-failed, never a pass', async () => {
+    const { targets } = provider({ fingerprint: () => Promise.reject(new Error('EACCES')) });
+    expect(await targets.boot(caseFile())).toMatchObject({ ok: false, kind: 'boot-failed' });
+  });
+});
+
+describe('sessions after a failed teardown (review of #61)', () => {
+  it('keeps a boot-failed case whose teardown failed tracked, and retries the teardown', async () => {
+    let removable = false;
+    const { targets, alive } = provider({
+      boot: (n) => (n === 2 ? { status: 'failed', reason: 'unhealthy' } : healthy()),
+      remove: () => (removable ? Promise.resolve() : Promise.reject(new Error('busy'))),
+    });
+    const cf = caseFile();
+    expect(await targets.boot(cf)).toMatchObject({ ok: false, kind: 'boot-failed' });
+    expect(targets.caseIds).toEqual([cf.id]);
+    await expect(targets.release(cf.id)).rejects.toThrow(/busy/);
+    expect(targets.caseIds).toEqual([cf.id]);
+    removable = true;
+    await targets.release(cf.id);
+    expect(targets.caseIds).toEqual([]);
+    expect(alive.size).toBe(0);
+  });
+
+  it('does not boot again while an earlier teardown is still failing', async () => {
+    const { targets, log } = provider({
+      boot: (n) => (n === 2 ? { status: 'failed', reason: 'unhealthy' } : healthy()),
+      remove: () => Promise.reject(new Error('busy')),
+    });
+    const cf = caseFile();
+    await targets.boot(cf);
+    const builds = log.filter((l) => l.startsWith('build')).length;
+    const again = await targets.boot(cf);
+    expect(!again.ok && again.teardown).toMatch(/busy/);
+    expect(log.filter((l) => l.startsWith('build')).length).toBe(builds);
+  });
+
+  it('a session whose boot threw is a boot-failed outcome, and release is a no-op after it', async () => {
+    const { targets } = provider({}, () => {
+      throw new Error('resolver bug');
+    });
+    const cf = caseFile();
+    expect(await targets.boot(cf)).toMatchObject({
+      ok: false,
+      kind: 'boot-failed',
+      step: 'source',
+    });
+    await targets.release(cf.id);
+    await targets.release(cf.id);
+    expect(targets.caseIds).toEqual([]);
+  });
+
+  it('sweepOrphans delegates to the sandbox sweep', async () => {
+    const { targets, log } = provider();
+    expect(await targets.sweepOrphans()).toEqual({ containers: 0, networks: 0 });
+    expect(log).toEqual(['sweep']);
+  });
+});
+
+describe('fingerprintSourceTree', () => {
+  it('is equal for equal content, differs on any change, and skips VCS data', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'affidavit-fp-'));
+    try {
+      const make = (name: string, body: string) => {
+        const d = join(root, name);
+        mkdirSync(join(d, 'app'), { recursive: true });
+        writeFileSync(join(d, 'app', 'a.js'), body);
+        return d;
+      };
+      const a = make('a', 'x');
+      const b = make('b', 'x');
+      const c = make('c', 'y');
+      mkdirSync(join(b, '.git'));
+      writeFileSync(join(b, '.git', 'HEAD'), 'ignored');
+      expect(await fingerprintSourceTree(a)).toBe(await fingerprintSourceTree(b));
+      expect(await fingerprintSourceTree(a)).not.toBe(await fingerprintSourceTree(c));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

@@ -129,6 +129,31 @@ export async function removeCaseNetwork(net: CaseNetwork): Promise<void> {
   if (left.stdout.trim() !== '') throw new Error(`network ${net.name} was left behind`);
 }
 
+/**
+ * Removes every container and case network carrying `RUN_LABEL`, whatever run made it: the
+ * leftovers of an earlier worker process that died mid-case. Only for startup on a host where
+ * this process is the only Affidavit user of Docker, since it also removes another live process's
+ * jails. Containers first (one `docker rm` each), then each case network through
+ * `removeCaseNetwork`, then checks that nothing labelled is left.
+ */
+export async function sweepCaseResources(): Promise<{ containers: number; networks: number }> {
+  const filter = `label=${RUN_LABEL}`;
+  const ps = await exec('docker', ['ps', '--all', '--quiet', '--filter', filter]);
+  const ids = ps.stdout.split('\n').filter((l) => l !== '');
+  for (const id of ids) await exec('docker', ['rm', '--force', '--volumes', id]);
+  const ls = await exec('docker', ['network', 'ls', '--format', '{{.Name}}', '--filter', filter]);
+  const names = ls.stdout.split('\n').filter((l) => CASE_NETWORK.test(l));
+  for (const name of names) {
+    await removeCaseNetwork({ name, runId: name.slice('affidavit-net-'.length), subnet: '' });
+  }
+  const left = await exec('docker', ['ps', '--all', '--quiet', '--filter', filter]);
+  const nets = await exec('docker', ['network', 'ls', '--quiet', '--filter', filter]);
+  if (left.stdout.trim() !== '' || nets.stdout.trim() !== '') {
+    throw new Error('labelled containers or networks were left behind by the sweep');
+  }
+  return { containers: ids.length, networks: names.length };
+}
+
 export interface ServiceSpec {
   image: string;
   command: readonly string[];

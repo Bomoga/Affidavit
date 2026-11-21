@@ -1,10 +1,17 @@
+import { createHash } from 'node:crypto';
+import { lstat, readFile, readdir, readlink } from 'node:fs/promises';
+import { join } from 'node:path';
 import { CaseFile } from '@affidavit/contracts';
 import type { TargetRef, TargetVariant } from '@affidavit/contracts';
 import {
+  BUILT_TREE_CAPS,
+  SKIPPED,
   bootTarget,
   buildTarget,
   createCaseNetwork,
   removeCaseNetwork,
+  sweepCaseResources,
+  type TreeCaps,
   type BootOutcome,
   type BootRecipe,
   type BuildOptions,
@@ -91,6 +98,10 @@ export interface TargetBootDeps {
   createCaseNetwork(): Promise<CaseNetwork>;
   bootTarget(net: CaseNetwork, imageId: string, recipe: BootRecipe): Promise<BootOutcome>;
   removeCaseNetwork(net: CaseNetwork): Promise<void>;
+  /** A content hash of a source tree (`fingerprintSourceTree`). */
+  fingerprintTree(dir: string): Promise<string>;
+  /** Removes every labelled container and case network left by an earlier run (`sweepCaseResources`). */
+  sweepOrphans(): Promise<{ containers: number; networks: number }>;
 }
 
 export const SANDBOX_BOOT: TargetBootDeps = {
@@ -98,7 +109,50 @@ export const SANDBOX_BOOT: TargetBootDeps = {
   createCaseNetwork,
   bootTarget,
   removeCaseNetwork,
+  fingerprintTree: (dir) => fingerprintSourceTree(dir),
+  sweepOrphans: sweepCaseResources,
 };
+
+/**
+ * SHA-256 over a source tree as the build would stage it: every regular file's relative path and
+ * bytes, and every symlink's path and target text (never followed), in sorted order, skipping what
+ * staging skips (`SKIPPED`: `.git`, `node_modules`, `.env*`, `.npmrc`). Two trees with the same
+ * fingerprint stage to the same build context, so a safe variant equal to its vulnerable tree is
+ * caught before anything is built. Read only, `lstat` only. Throws past `BUILT_TREE_CAPS`.
+ */
+export async function fingerprintSourceTree(
+  root: string,
+  caps: Readonly<TreeCaps> = BUILT_TREE_CAPS,
+): Promise<string> {
+  const hash = createHash('sha256');
+  let entries = 0;
+  let bytes = 0;
+  const walk = async (rel: string): Promise<void> => {
+    const names = (await readdir(join(root, rel))).sort();
+    for (const name of names) {
+      if (SKIPPED(name)) continue;
+      const r = rel === '' ? name : `${rel}/${name}`;
+      const p = join(root, r);
+      const st = await lstat(p);
+      if (++entries > caps.maxEntries) throw new Error('source tree has too many entries');
+      if (st.isDirectory()) {
+        hash.update(`d\0${r}\0`);
+        await walk(r);
+      } else if (st.isFile()) {
+        bytes += st.size;
+        if (bytes > caps.maxBytes) throw new Error('source tree is too large');
+        hash.update(`f\0${r}\0${st.size}\0`);
+        hash.update(await readFile(p));
+      } else if (st.isSymbolicLink()) {
+        hash.update(`l\0${r}\0${await readlink(p)}\0`);
+      } else {
+        hash.update(`o\0${r}\0`);
+      }
+    }
+  };
+  await walk('');
+  return hash.digest('hex');
+}
 
 /**
  * Why a case's targets could not be booted. `unsupported`: outside what the MVP can boot without
@@ -168,6 +222,8 @@ interface Session {
   targets: BootedTargets;
   booted: Partial<Record<EvidenceVariant, BootedTarget>>;
   sources: Partial<Record<EvidenceVariant, string>>;
+  /** Case networks a failed teardown could not remove; retried by the next boot or `release`. */
+  leftovers: CaseNetwork[];
 }
 
 const withoutDigest = (ref: TargetRef | undefined) => {
@@ -334,26 +390,29 @@ export class CaseTargets implements TargetProvider {
 
   /**
    * Tears down a case's targets (both case networks, so every container and anonymous volume on
-   * them) and forgets the session. Tries every network, then throws the first error. A case with
-   * no session is a no-op. A `patched` target the workbench still holds is the workbench's to
-   * release.
+   * them, plus any network an earlier failed teardown left) and forgets the session. Tries every
+   * network, then throws the first error; a network that could not be removed keeps the case in
+   * `caseIds`, so a later `release` or `close` retries it. A case with no session, or whose session
+   * already failed and left nothing, is a no-op. A `patched` target the workbench still holds is
+   * the workbench's to release.
    */
   async release(caseId: string): Promise<void> {
     const pending = this.#sessions.get(caseId);
     if (pending === undefined) return;
-    this.#sessions.delete(caseId);
     const session = await pending;
-    let first: Error | undefined;
-    for (const v of ['safe', 'vulnerable'] as const) {
-      const t = session.booted[v];
-      if (t === undefined) continue;
-      try {
-        await this.#deps.removeCaseNetwork(t.endpoint.net);
-      } catch (err) {
-        first ??= err instanceof Error ? err : new Error(message(err));
-      }
-      session.targets.delete(v);
-    }
+    const nets = [
+      ...(['safe', 'vulnerable'] as const).flatMap((v) => {
+        const t = session.booted[v];
+        return t === undefined ? [] : [t.endpoint.net];
+      }),
+      ...session.leftovers,
+    ];
+    session.booted = {};
+    session.targets.delete('vulnerable');
+    session.targets.delete('safe');
+    const { left, first } = await this.#removeAll(nets);
+    session.leftovers = left;
+    if (left.length === 0 && this.#sessions.get(caseId) === pending) this.#sessions.delete(caseId);
     if (first !== undefined) throw first;
   }
 
@@ -368,6 +427,29 @@ export class CaseTargets implements TargetProvider {
       }
     }
     if (first !== undefined) throw first;
+  }
+
+  /**
+   * Removes every labelled container and case network an earlier worker process left (it died
+   * mid-case, so nothing released them). Call once at startup, before any case is booted, on a
+   * host where this process is the only Affidavit user of Docker.
+   */
+  sweepOrphans(): Promise<{ containers: number; networks: number }> {
+    return this.#deps.sweepOrphans();
+  }
+
+  async #removeAll(nets: readonly CaseNetwork[]): Promise<{ left: CaseNetwork[]; first?: Error }> {
+    const left: CaseNetwork[] = [];
+    let first: Error | undefined;
+    for (const net of nets) {
+      try {
+        await this.#deps.removeCaseNetwork(net);
+      } catch (err) {
+        left.push(net);
+        first ??= err instanceof Error ? err : new Error(message(err));
+      }
+    }
+    return first === undefined ? { left } : { left, first };
   }
 
   async #ready(caseFile: CaseFile): Promise<Session> {
@@ -392,6 +474,19 @@ export class CaseTargets implements TargetProvider {
       }
       // A failed boot may be transient; an unsupported one is not.
       if (session.outcome.ok || session.outcome.kind === 'unsupported') return session;
+      // Never boot again over networks an earlier teardown left: retry removing them first, and
+      // keep reporting the failure (with its teardown) while any is still there.
+      if (session.leftovers.length > 0) {
+        const { left, first } = await this.#removeAll(session.leftovers);
+        session.leftovers = left;
+        if (left.length > 0) {
+          session.outcome = {
+            ...session.outcome,
+            teardown: `still left after retry: ${first?.message ?? 'unknown'}`.slice(0, 800),
+          };
+          return session;
+        }
+      }
       if (this.#sessions.get(cf.id) === existing) this.#sessions.delete(cf.id);
       return this.#session(cf);
     }
@@ -400,6 +495,7 @@ export class CaseTargets implements TargetProvider {
     return started;
   }
 
+  /** Never rejects: an unexpected throw is a `boot-failed` outcome after a full teardown. */
   async #bootSession(cf: CaseFile, key: string): Promise<Session> {
     const session: Session = {
       key,
@@ -413,8 +509,36 @@ export class CaseTargets implements TargetProvider {
       targets: new BootedTargets(),
       booted: {},
       sources: {},
+      leftovers: [],
     };
-    session.outcome = await this.#bootBoth(cf, session);
+    try {
+      session.outcome = await this.#bootBoth(cf, session);
+    } catch (err) {
+      session.outcome = {
+        ok: false,
+        kind: 'boot-failed',
+        variant: 'vulnerable',
+        step: 'boot',
+        reason: `unexpected error: ${message(err)}`,
+      };
+    }
+    if (!session.outcome.ok) {
+      // Anything a boot registered but did not hand over is torn down here too.
+      const stray = (['safe', 'vulnerable'] as const).flatMap((v) => {
+        const t = session.booted[v];
+        return t === undefined ? [] : [t.endpoint.net];
+      });
+      session.booted = {};
+      session.targets.delete('vulnerable');
+      session.targets.delete('safe');
+      if (stray.length > 0) {
+        const { left, first } = await this.#removeAll(stray);
+        session.leftovers.push(...left);
+        if (first !== undefined && session.outcome.teardown === undefined) {
+          session.outcome = { ...session.outcome, teardown: first.message.slice(0, 800) };
+        }
+      }
+    }
     return session;
   }
 
@@ -439,6 +563,26 @@ export class CaseTargets implements TargetProvider {
       }
       if (!src.ok) return fail('unsupported', v, 'source', src.reason);
       session.sources[v] = src.dir;
+    }
+
+    // 1b. A known-safe variant that is the vulnerable tree proves nothing: refuse it before any
+    // build (same directory, or the same content as staging would see it).
+    if (session.sources.safe !== undefined) {
+      const sameTree = 'the safe variant is the same source tree as the vulnerable one';
+      if (session.sources.safe === session.sources.vulnerable) {
+        return fail('unsupported', 'safe', 'compare', sameTree);
+      }
+      let fingerprints: string[];
+      try {
+        fingerprints = await Promise.all(
+          variants.map((v) => this.#deps.fingerprintTree(session.sources[v] as string)),
+        );
+      } catch (err) {
+        return fail('boot-failed', 'safe', 'compare', `source fingerprint: ${message(err)}`);
+      }
+      if (fingerprints[0] === fingerprints[1]) {
+        return fail('unsupported', 'safe', 'compare', sameTree);
+      }
     }
 
     // 2. Builds, all before any boot.
@@ -471,93 +615,114 @@ export class CaseTargets implements TargetProvider {
       built[v] = out;
     }
 
-    // 3. The safe variant must look the same to the witness.
-    if (built.safe !== undefined && built.vulnerable !== undefined) {
-      const mismatch = recipeSurfaceMismatch(built.vulnerable.recipe, built.safe.recipe);
+    // 3. The safe variant must be another image, and look the same to the witness.
+    const vb = built.vulnerable as Extract<BuildOutcome, { ok: true }>;
+    if (built.safe !== undefined) {
+      if (built.safe.imageId === vb.imageId) {
+        return fail(
+          'unsupported',
+          'safe',
+          'compare',
+          'the safe variant built to the same image as the vulnerable one',
+        );
+      }
+      const mismatch = recipeSurfaceMismatch(vb.recipe, built.safe.recipe);
       if (mismatch !== null) return fail('unsupported', 'safe', 'compare', mismatch);
     }
+
+    // The bound case file is built (and parsed) before anything runs, so it cannot throw later.
+    const bound = CaseFile.parse({
+      ...cf,
+      target: { ...cf.target, imageDigest: vb.imageId },
+      ...(cf.safeVariant === undefined || built.safe === undefined
+        ? {}
+        : { safeVariant: { ...cf.safeVariant, imageDigest: built.safe.imageId } }),
+    });
 
     // 4. Boots, each on its own case network; any failure removes every network made so far.
     const nets: CaseNetwork[] = [];
     const teardown = async (failure: CaseBootFailure): Promise<CaseBootFailure> => {
-      const problems: string[] = [];
-      for (const net of nets.reverse()) {
-        try {
-          await this.#deps.removeCaseNetwork(net);
-        } catch (err) {
-          problems.push(`${net.name}: ${message(err)}`);
-        }
-      }
+      const { left, first } = await this.#removeAll([...nets].reverse());
+      nets.length = 0;
       session.booted = {};
-      return problems.length === 0 ? failure : { ...failure, teardown: problems.join('; ') };
+      session.leftovers.push(...left);
+      return left.length === 0
+        ? failure
+        : {
+            ...failure,
+            teardown:
+              `${left.map((n) => n.name).join(', ')} not removed: ${first?.message ?? ''}`.slice(
+                0,
+                800,
+              ),
+          };
     };
-    for (const v of variants) {
-      const b = built[v] as Extract<BuildOutcome, { ok: true }>;
-      let net: CaseNetwork;
-      try {
-        net = await this.#deps.createCaseNetwork();
-      } catch (err) {
-        return teardown(fail('boot-failed', v, 'network', `case network: ${message(err)}`));
+    try {
+      for (const v of variants) {
+        const b = built[v] as Extract<BuildOutcome, { ok: true }>;
+        let net: CaseNetwork;
+        try {
+          net = await this.#deps.createCaseNetwork();
+        } catch (err) {
+          return await teardown(fail('boot-failed', v, 'network', `case network: ${message(err)}`));
+        }
+        nets.push(net);
+        let boot: BootOutcome;
+        try {
+          boot = await this.#deps.bootTarget(net, b.imageId, b.recipe);
+        } catch (err) {
+          return await teardown(fail('boot-failed', v, 'boot', `boot error: ${message(err)}`));
+        }
+        if (boot.status !== 'healthy') {
+          return await teardown(
+            fail(
+              boot.status === 'unsupported' ? 'unsupported' : 'boot-failed',
+              v,
+              'boot',
+              boot.reason,
+            ),
+          );
+        }
+        session.booted[v] = {
+          endpoint: { net, hosts: boot.hosts, url: boot.url },
+          imageId: b.imageId,
+          sidecarImages: boot.sidecarImages,
+          recipe: b.recipe,
+          ...(b.dependencyBundle === undefined
+            ? {}
+            : { dependencyBundleSha256: b.dependencyBundle.sha256 }),
+        };
       }
-      nets.push(net);
-      let boot: BootOutcome;
-      try {
-        boot = await this.#deps.bootTarget(net, b.imageId, b.recipe);
-      } catch (err) {
-        return teardown(fail('boot-failed', v, 'boot', `boot error: ${message(err)}`));
-      }
-      if (boot.status !== 'healthy') {
-        return teardown(
+      const vt = session.booted.vulnerable as BootedTarget;
+      const st = session.booted.safe;
+      if (
+        st !== undefined &&
+        (st.endpoint.url !== vt.endpoint.url ||
+          canonicalJson(Object.keys(st.endpoint.hosts).sort()) !==
+            canonicalJson(Object.keys(vt.endpoint.hosts).sort()))
+      ) {
+        return await teardown(
           fail(
-            boot.status === 'unsupported' ? 'unsupported' : 'boot-failed',
-            v,
-            'boot',
-            boot.reason,
+            'unsupported',
+            'safe',
+            'compare',
+            'the safe target answers at another URL or host names',
           ),
         );
       }
-      session.booted[v] = {
-        endpoint: { net, hosts: boot.hosts, url: boot.url },
-        imageId: b.imageId,
-        sidecarImages: boot.sidecarImages,
-        recipe: b.recipe,
-        ...(b.dependencyBundle === undefined
-          ? {}
-          : { dependencyBundleSha256: b.dependencyBundle.sha256 }),
-      };
-    }
-    const vt = session.booted.vulnerable as BootedTarget;
-    const st = session.booted.safe;
-    if (
-      st !== undefined &&
-      (st.endpoint.url !== vt.endpoint.url ||
-        canonicalJson(Object.keys(st.endpoint.hosts).sort()) !==
-          canonicalJson(Object.keys(vt.endpoint.hosts).sort()))
-    ) {
-      return teardown(
-        fail(
-          'unsupported',
-          'safe',
-          'compare',
-          'the safe target answers at another URL or host names',
-        ),
+
+      // 5. Record.
+      const digests: Partial<Record<TargetVariant, string>> = { vulnerable: vt.imageId };
+      session.targets.set('vulnerable', vt);
+      if (st !== undefined) {
+        digests.safe = st.imageId;
+        session.targets.set('safe', st);
+      }
+      return { ok: true, digests, caseFile: bound, warnings };
+    } catch (err) {
+      return await teardown(
+        fail('boot-failed', 'vulnerable', 'boot', `unexpected error: ${message(err)}`),
       );
     }
-
-    // 5. Record.
-    const digests: Partial<Record<TargetVariant, string>> = { vulnerable: vt.imageId };
-    session.targets.set('vulnerable', vt);
-    if (st !== undefined) {
-      digests.safe = st.imageId;
-      session.targets.set('safe', st);
-    }
-    const bound = CaseFile.parse({
-      ...cf,
-      target: { ...cf.target, imageDigest: vt.imageId },
-      ...(cf.safeVariant === undefined || st === undefined
-        ? {}
-        : { safeVariant: { ...cf.safeVariant, imageDigest: st.imageId } }),
-    });
-    return { ok: true, digests, caseFile: bound, warnings };
   }
 }

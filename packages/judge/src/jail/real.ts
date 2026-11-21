@@ -1,4 +1,4 @@
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, realpath, stat } from 'node:fs/promises';
 import { isAbsolute, relative, resolve } from 'node:path';
 import type {
   CaseFile,
@@ -70,6 +70,11 @@ export interface RealJudgeConfig {
   traceRoot?: string;
   /** Docker daemon config that registers the gVisor runtimes (default `/etc/docker/daemon.json`). */
   dockerDaemonConfig?: string;
+  /**
+   * Remove every labelled container and case network a previous worker run left, at startup
+   * (default true). Turn off only on a host shared with another live Affidavit process.
+   */
+  sweepOrphans?: boolean;
 }
 
 /** Host facts the startup check reads; injectable so the check is tested without a host. */
@@ -77,6 +82,8 @@ export interface RealJudgeHostProbe {
   platform: NodeJS.Platform;
   isDirectory(path: string): Promise<boolean>;
   isSocket(path: string): Promise<boolean>;
+  /** The path with every symlink resolved, or null when it cannot be resolved. */
+  realpath(path: string): Promise<string | null>;
   /** Runtime names registered in the daemon config, or null when it cannot be read. */
   dockerRuntimes(daemonConfig: string): Promise<string[] | null>;
   imagePresent(imageId: string): Promise<boolean>;
@@ -100,6 +107,11 @@ export const realJudgeHostProbe: RealJudgeHostProbe = {
     stat(p).then(
       (s) => s.isSocket(),
       () => false,
+    ),
+  realpath: (p) =>
+    realpath(p).then(
+      (r) => r,
+      () => null,
     ),
   async dockerRuntimes(daemonConfig) {
     try {
@@ -136,8 +148,12 @@ export class RealJudgePrerequisiteError extends Error {
   }
 }
 
-function inside(child: string, parent: string): boolean {
-  const rel = relative(resolve(parent), resolve(child));
+/** Case-insensitive file systems by default: Windows and macOS. */
+const fold = (platform: NodeJS.Platform, p: string): string =>
+  platform === 'win32' || platform === 'darwin' ? resolve(p).toLowerCase() : resolve(p);
+
+function inside(child: string, parent: string, platform: NodeJS.Platform): boolean {
+  const rel = relative(fold(platform, parent), fold(platform, child));
   return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
 }
 
@@ -201,21 +217,57 @@ export async function checkRealJudgePrerequisites(
       problems.push(`${field} (${env}) is not an existing directory`);
     }
   }
-  // The witness runner holds no writable path to the evidence store (root CLAUDE.md).
+  // The witness runner holds no writable path to the evidence store (root CLAUDE.md). Compared
+  // after resolving every symlink, in both directions, case-insensitively where the file system
+  // is, so a work root that is a link into the store (or the store itself) is caught.
+  const real = async (field: string, env: string, p: string, exists: boolean) => {
+    if (!isAbsolute(p)) return null;
+    const r = await probe.realpath(p);
+    if (r === null && exists) problems.push(`${field} (${env}) cannot be resolved`);
+    return r;
+  };
+  const workReal = await real(
+    'workRoot',
+    'AFFIDAVIT_JUDGE_WORK_ROOT',
+    config.workRoot,
+    await probe.isDirectory(config.workRoot),
+  );
+  const evidenceReal = await real(
+    'evidenceRoot',
+    'AFFIDAVIT_EVIDENCE_DIR',
+    config.evidenceRoot,
+    await probe.isDirectory(config.evidenceRoot),
+  );
+  const os = probe.platform;
   if (
-    config.workRoot !== '' &&
-    config.evidenceRoot !== '' &&
-    (inside(config.workRoot, config.evidenceRoot) || inside(config.evidenceRoot, config.workRoot))
+    workReal !== null &&
+    evidenceReal !== null &&
+    (inside(workReal, evidenceReal, os) || inside(evidenceReal, workReal, os))
   ) {
     problems.push(
       'workRoot and evidenceRoot must not contain one another (the jail gets no path to the evidence store)',
     );
   }
   const storeRoot = (config.evidence as { root?: unknown }).root;
-  if (typeof storeRoot === 'string' && resolve(storeRoot) !== resolve(config.evidenceRoot)) {
-    problems.push('the evidence store is rooted somewhere other than evidenceRoot');
+  if (typeof storeRoot === 'string') {
+    const storeReal = isAbsolute(storeRoot) ? await probe.realpath(storeRoot) : null;
+    if (
+      storeReal === null ||
+      evidenceReal === null ||
+      fold(os, storeReal) !== fold(os, evidenceReal)
+    ) {
+      problems.push('the evidence store is rooted somewhere other than evidenceRoot');
+    }
   }
-
+  // Bundle stores are mounted read only into builds; the evidence store and the signer stay out.
+  const bundleStores: string[] = [];
+  for (const b of config.dependencyBundles ?? []) {
+    const r = isAbsolute(b.storeRoot) ? await probe.realpath(b.storeRoot) : null;
+    if (r !== null) bundleStores.push(r);
+  }
+  if (evidenceReal !== null && bundleStores.some((s) => inside(evidenceReal, s, os))) {
+    problems.push('evidenceRoot must not be under a dependency bundle store');
+  }
   const images: [string, string, string, string][] = [
     [
       'runnerImage',
@@ -233,7 +285,7 @@ export async function checkRealJudgePrerequisites(
   for (const [field, env, value, how] of images) {
     if (!IMAGE_ID.test(value))
       problems.push(`${field} (${env}) must be a local image ID (sha256:<64 hex>)`);
-    else if (runtimes !== null && !(await probe.imagePresent(value))) {
+    else if (!(await probe.imagePresent(value))) {
       problems.push(`the ${field} (${env}) image is not present locally (build it with ${how})`);
     }
   }
@@ -242,8 +294,17 @@ export async function checkRealJudgePrerequisites(
     problems.push(
       'signerSocket (AFFIDAVIT_SIGNER_SOCKET) is not a listening unix socket (start apps/signer)',
     );
+  } else {
+    const sock = await real('signerSocket', 'AFFIDAVIT_SIGNER_SOCKET', config.signerSocket, true);
+    const mountable = [workReal, evidenceReal, ...bundleStores].filter(
+      (r): r is string => r !== null,
+    );
+    if (sock !== null && mountable.some((root) => inside(sock, root, os))) {
+      problems.push(
+        'signerSocket (AFFIDAVIT_SIGNER_SOCKET) must not be under workRoot, evidenceRoot or a dependency bundle store (paths a jail or build can mount)',
+      );
+    }
   }
-
   const configured = config.dependencyBundles ?? [];
   if (configured.length === 0) {
     notes.push(
@@ -395,6 +456,15 @@ export async function createRealJudge(
       report.bundles.find((b) => b.repo === cf.target.repo && b.commit === cf.target.commit)?.ref,
     ...(opts.deps === undefined ? {} : { deps: opts.deps }),
   });
+  if (config.sweepOrphans !== false) {
+    try {
+      await targets.sweepOrphans();
+    } catch (err) {
+      throw new RealJudgePrerequisiteError([
+        `the startup sweep of labelled containers and networks from a previous run failed: ${(err as Error).message.slice(0, 300)}`,
+      ]);
+    }
+  }
   const executor = new JailExecutor({
     workRoot: config.workRoot,
     runnerImage: config.runnerImage,
