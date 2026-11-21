@@ -1,5 +1,6 @@
 import { useId, useState, type ReactNode } from 'react';
 import type { CaseView, DocketEntry, ExhibitView } from '../model/caseView.js';
+import { Courtroom } from './Courtroom.js';
 import { REVIEW_REASON, RULE_TEXT, STATUS_STAMP } from './status.js';
 
 // Everything below renders case content (summaries, ids, details) as React text children only.
@@ -19,6 +20,30 @@ export function Stamp({ view }: { view: CaseView }) {
       {text}
     </p>
   );
+}
+
+/**
+ * Shown under an UNVERIFIED stamp when the only thing missing is the Judge's patch check, so the
+ * state is not read as a failed fix. Static text; the stamp itself stays UNVERIFIED.
+ */
+export function StampNote({ view }: { view: CaseView }) {
+  if (!view.awaitingVerification) return null;
+  return (
+    <p className="stamp-note">
+      Judge verification event not yet recorded. Nothing in the record says the fix failed.
+    </p>
+  );
+}
+
+/** Plain-language state of one exhibit, from the Judge's record only. */
+export function exhibitState(x: ExhibitView): string {
+  if (x.admitted) return 'admitted';
+  if (!x.judged) return x.kind === 'patch' ? 'Judge check not recorded' : 'no Judge result yet';
+  return 'not admitted';
+}
+
+function yesNo(v: boolean): string {
+  return v ? 'yes' : 'no';
 }
 
 function Collapsible({
@@ -63,8 +88,34 @@ function ExhibitDetail({ exhibit }: { exhibit: ExhibitView }) {
       <p className="meta">
         {exhibit.admitted
           ? 'Admitted by the Judge.'
-          : `Not admitted by the Judge. ${exhibit.rejectedBy ? RULE_TEXT[exhibit.rejectedBy] : 'The rule that applied is not recorded.'}`}
+          : !exhibit.judged
+            ? exhibit.kind === 'patch'
+              ? 'The Judge has not ruled on this patch in the record yet. It has not been rejected.'
+              : 'The Judge has not ruled on this exhibit in the record yet. It has not been rejected.'
+            : `Not admitted by the Judge. ${exhibit.rejectedBy ? RULE_TEXT[exhibit.rejectedBy] : 'The rule that applied is not recorded.'}`}
       </p>
+      {exhibit.proof ? (
+        <dl className="proof">
+          <div>
+            <dt>Passes on the vulnerable code</dt>
+            <dd>{yesNo(exhibit.proof.vulnPass)}</dd>
+          </div>
+          <div>
+            <dt>Fails on the known-safe variant</dt>
+            <dd>
+              {exhibit.proof.safeVariantFail === undefined
+                ? 'no safe variant on record'
+                : yesNo(exhibit.proof.safeVariantFail)}
+            </dd>
+          </div>
+          {exhibit.proof.family ? (
+            <div>
+              <dt>Family parameters passing</dt>
+              <dd>{`${exhibit.proof.family.passed} of ${exhibit.proof.family.total}`}</dd>
+            </div>
+          ) : null}
+        </dl>
+      ) : null}
       {exhibit.runs.length === 0 ? (
         <p className="muted">No Judge runs are recorded for this exhibit.</p>
       ) : (
@@ -222,6 +273,7 @@ export function CaseFile({
       <p className="label">{`Case file ${slug ?? view.caseId}`}</p>
       <h1 id="page-heading">{view.headline}</h1>
       <Stamp view={view} />
+      <StampNote view={view} />
       {connection}
 
       <section aria-labelledby="summary-heading">
@@ -231,6 +283,14 @@ export function CaseFile({
         {view.status === 'unverified' && view.stampWithheld.length > 0 ? (
           <div className="panel">
             <h3>Why this is not verified</h3>
+            {view.awaitingVerification ? (
+              <p>
+                The verdict says the fix works, and the Judge has not rejected the patch. But the
+                Judge&apos;s own patch check is not in this record yet, and the VERIFIED stamp rests
+                only on that check, never on the verdict&apos;s claim. The stamp appears once the
+                check is recorded and passes.
+              </p>
+            ) : null}
             <ul>
               {view.stampWithheld.map((reason, i) => (
                 <li key={i}>{reason}</li>
@@ -261,25 +321,22 @@ export function CaseFile({
         </section>
       ) : null}
 
+      <Courtroom view={view} />
+
       <section aria-labelledby="exhibits-heading">
         <h2 id="exhibits-heading">{`Exhibits (${view.exhibits.length})`}</h2>
         {view.exhibits.length === 0 ? (
           <p className="muted">No exhibits have been filed.</p>
         ) : (
           view.exhibits.map((x) => (
-            <Collapsible
-              key={x.id}
-              level={3}
-              title={x.id}
-              meta={`${x.kind}, ${x.admitted ? 'admitted' : 'not admitted'}`}
-            >
+            <Collapsible key={x.id} level={3} title={x.id} meta={`${x.kind}, ${exhibitState(x)}`}>
               <ExhibitDetail exhibit={x} />
             </Collapsible>
           ))
         )}
       </section>
 
-      <section aria-label="Docket">
+      <section aria-label="Docket" className="docket-section">
         <Collapsible level={2} title="Docket" meta={`${view.docket.length} entries`}>
           <ol className="docket">
             {view.docket.map((d) => (
