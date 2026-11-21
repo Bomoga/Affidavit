@@ -14,6 +14,63 @@ import type { ModelTurnRequest } from '../orchestrator.js';
 import { ROLE_TOOLS } from '../roles.js';
 import { DEFAULT_MODEL_TABLE } from './models.js';
 
+/**
+ * Credential-shaped samples a witness might quote from a target repo. Each is built by
+ * concatenation so no token-shaped literal sits in the source for a secret scanner to flag.
+ * `value` is the part that must never be printed or recorded without opt-in.
+ */
+export const CREDENTIAL_SAMPLES: readonly { kind: string; text: string; value: string }[] = (() => {
+  const s = (kind: string, prefix: string, value: string, suffix = '') => ({
+    kind,
+    text: `${prefix}${value}${suffix}`,
+    value,
+  });
+  const jwt = `${'ey' + 'J'}hbGciOiJIUzI1NiJ9.${'ey' + 'J'}zdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fw`;
+  return [
+    s('aws access key id', 'const id = "', 'AK' + 'IA' + 'Q3EGRX7MBDEXAMPL', '";'),
+    s('aws sts key id', 'id=', 'AS' + 'IA' + 'Y34FZKBOKMUTVV7A'),
+    s(
+      'aws secret access key',
+      'aws_secret_access_key = "',
+      'wJalrXUtnFEMI/K7MDENG/bPxRfiCY' + 'EXAMPLEKEY',
+      '"',
+    ),
+    s('github pat', 'token: ', 'gh' + 'p_' + 'R4nd0mT0k3nV4lu3F0rT3st1ngPurp0s3s12'),
+    s('github oauth', 'x ', 'gh' + 'o_' + 'R4nd0mT0k3nV4lu3F0rT3st1ngPurp0s3s12'),
+    s('github fine-grained', 'x ', 'github' + '_pat_' + '11ABCDEFG0123456789_abcdefghijklmnop'),
+    s('slack', 'x ', 'xo' + 'xb-' + '1234567890-0987654321-AbCdEfGhIjKlMnOp'),
+    s('stripe live', 'x ', 'sk' + '_live_' + '51H8abcdefghijklmnopqrstu'),
+    s('stripe restricted', 'x ', 'rk' + '_live_' + '51H8abcdefghijklmnopqrstu'),
+    s('google api key', 'key ', 'AI' + 'za' + 'SyA1234567890abcdefghijklmnopqrstu-_'),
+    s('npm token', 'x ', 'np' + 'm_' + 'abcdefghijklmnopqrstuvwxyz0123456789'),
+    s('jwt', 'GET / HTTP/1.1\nCookie: session=', jwt),
+    s(
+      'pem private key',
+      'const k = `',
+      '-----BEGIN ' + 'RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA7bq9\n-----END RSA PRIVATE KEY-----',
+      '`;',
+    ),
+    s('url userinfo', 'mongodb://admin:', 'S3cr3tPassw0rd', '@db.internal:27017/app'),
+    s('password assignment', 'password=', 'hunter2hunter2'),
+    s('quoted password', 'const password = "', 'correct horse battery', '";'),
+    s('secret json', '{"client_secret": "', 'q9w8e7r6t5y4u3i2', '"}'),
+    s('passwd yaml', "passwd: '", 'pa55w0rd-long', "'"),
+    s('authorization assignment', 'authorization=', 'Zm9vOmJhcmJhenF1eA'),
+  ];
+})();
+
+/** Ordinary code and short values that must not be treated as credentials. */
+export const NOT_CREDENTIALS: readonly string[] = [
+  'const password = req.body.password;',
+  'if (user.password === password) return token;',
+  'const token = getToken(req);',
+  'secret = process.env.SECRET',
+  'password=abc123',
+  "const password = 'short';",
+  'GET /login?user={{u}}&next=/home HTTP/1.1',
+  'https://example.com/path@section',
+];
+
 /** A key-shaped canary. Tests grep every output for it. */
 export const CANARY_KEY = 'sk-ant-api03-CANARY-0123456789abcdefghij-DO-NOT-LEAK';
 

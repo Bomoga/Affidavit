@@ -1,6 +1,22 @@
 import { describe, expect, it } from 'vitest';
 import { REDACTED, clipRedacted, describeThrown, redact, redactDeep } from './redact.js';
-import { CANARY_KEY } from './test-stubs.js';
+import { CANARY_KEY, CREDENTIAL_SAMPLES, NOT_CREDENTIALS } from './test-stubs.js';
+
+describe('third-party credential forms', () => {
+  for (const sample of CREDENTIAL_SAMPLES) {
+    it(`redacts a ${sample.kind}`, () => {
+      const out = redact(sample.text);
+      expect(out).not.toContain(sample.value);
+      expect(out).toContain(REDACTED);
+    });
+  }
+
+  for (const text of NOT_CREDENTIALS) {
+    it(`leaves ordinary text alone: ${text}`, () => {
+      expect(redact(text)).toBe(text);
+    });
+  }
+});
 
 /** Every substring of the key of this length or more counts as a leak. */
 const FRAGMENT = 6;

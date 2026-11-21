@@ -112,6 +112,10 @@ describe('createModelPortFromEnv', () => {
       'prod',
       'dev',
       'testing',
+      ' test',
+      'test ',
+      '﻿test',
+      'test\n',
     ]) {
       const env = deployEnv === undefined ? dir : { ...dir, AFFIDAVIT_ENV: deployEnv };
       for (const mode of ['record', 'replay']) {
@@ -123,7 +127,7 @@ describe('createModelPortFromEnv', () => {
       expect(() => createModelPortFromEnv({ ...env, AFFIDAVIT_MODEL_MODE: 'live' })).not.toThrow();
       expect(() => createModelPortFromEnv(env)).not.toThrow();
     }
-    for (const deployEnv of ['development', 'test', ' Development ', 'TEST']) {
+    for (const deployEnv of ['development', 'test', ' Development ', 'TEST', '\ttest\t']) {
       for (const mode of ['record', 'replay']) {
         expect(
           () =>

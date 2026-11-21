@@ -41,7 +41,9 @@ import {
 } from './submit-tools.js';
 import {
   CANARY_KEY,
+  CREDENTIAL_SAMPLES,
   GOOD_WITNESS,
+  NOT_CREDENTIALS,
   ROLE_OF_PROMPT,
   assistant,
   requestFor,
@@ -995,6 +997,44 @@ describe('agent submissions are never rewritten', () => {
       const text = `${(err as Error).message} ${(err as Error).stack ?? ''} ${logs.map((l) => l.message).join(' ')}`;
       expect(text).not.toContain(CANARY_KEY);
       expect(readdirSync(dir, { recursive: true })).toEqual([]);
+    }
+  });
+
+  const cost = {
+    stage: 'defense' as const,
+    attempt: 1,
+    inputTokens: 1,
+    outputTokens: 1,
+    usd: 0,
+    wallMs: 1,
+  };
+  for (const sample of CREDENTIAL_SAMPLES) {
+    it(`refuses to record a witness quoting a ${sample.kind} unless explicitly allowed`, async () => {
+      const req = requestFor('defense', sample.kind);
+      const submission = { template: sample.text, params: [] };
+      const dir = tmp();
+      const err = await new FileRecordingStore(dir)
+        .write(req, { outcome: 'submitted', submission, cost }, [CANARY_KEY])
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ModelCallError);
+      expect(`${(err as Error).message} ${(err as Error).stack ?? ''}`).not.toContain(sample.value);
+      expect(readdirSync(dir, { recursive: true })).toEqual([]);
+
+      const allowed = new FileRecordingStore(dir, { allowSecrets: true });
+      await allowed.write(req, { outcome: 'submitted', submission, cost }, [CANARY_KEY]);
+      const replayed = await allowed.read(req);
+      expect(JSON.stringify(replayed.submission)).toBe(JSON.stringify(submission));
+    });
+  }
+
+  it('records ordinary code and short values without refusing', async () => {
+    const dir = tmp();
+    const store = new FileRecordingStore(dir);
+    for (const text of NOT_CREDENTIALS) {
+      const req = requestFor('defense', text);
+      const submission = { template: text, params: [] };
+      await store.write(req, { outcome: 'submitted', submission, cost }, [CANARY_KEY]);
+      expect(JSON.stringify((await store.read(req)).submission)).toBe(JSON.stringify(submission));
     }
   });
 

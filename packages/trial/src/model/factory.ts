@@ -56,7 +56,8 @@ export function createModelPortFromEnv(
   const mode = modelModeFrom(env);
   // Fail closed: record and replay run only where the deployment says it is development or
   // test. Unset, production, or anything else means live only.
-  const deployEnv = (env[DEPLOY_ENV_VAR] ?? '').trim().toLowerCase();
+  // ASCII spaces and tabs only: a value padded with NBSP, a BOM or a newline is not accepted.
+  const deployEnv = (env[DEPLOY_ENV_VAR] ?? '').replace(/^[ \t]+|[ \t]+$/g, '').toLowerCase();
   if (mode !== 'live' && !(RECORD_REPLAY_ENVS as readonly string[]).includes(deployEnv)) {
     throw new ModelConfigError(
       `${MODEL_MODE_ENV_VAR}=${mode} needs ${DEPLOY_ENV_VAR} set to development or test; anywhere else only live runs`,

@@ -36,6 +36,33 @@ const PATTERNS: readonly [RegExp, string][] = [
   [/(\bbearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, `$1${REDACTED}`],
   // Credential-looking URL query parameters.
   [/([?&](?:key|token|auth|sig|signature)=)[^&\s"'#]+/gi, `$1${REDACTED}`],
+  // PEM private key blocks, whole (or from the header on, if the block is cut).
+  [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g, REDACTED],
+  // AWS access key ids, and secret access keys next to the word aws.
+  [/\b(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA|AIPA)[A-Z0-9]{16}\b/g, REDACTED],
+  [/(aws[\w-]{0,30}["']?\s*[:=]\s*["']?)[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+])/gi, `$1${REDACTED}`],
+  // GitHub, Slack, Stripe, Google and npm tokens.
+  [/\b(?:ghp_|gho_|ghu_|ghs_|ghr_|github_pat_)[A-Za-z0-9_]{20,}/g, REDACTED],
+  [/\bxox[abprs]-[A-Za-z0-9-]{10,}/g, REDACTED],
+  [/\b(?:sk|rk)_live_[A-Za-z0-9]{10,}/g, REDACTED],
+  [/\bAIza[0-9A-Za-z_-]{35}/g, REDACTED],
+  [/\bnpm_[A-Za-z0-9]{36}/g, REDACTED],
+  // A JWT anywhere (header.payload.signature).
+  [/\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+/g, REDACTED],
+  // Credentials in a URL's userinfo: scheme://user:pass@host.
+  [/(\b[a-z][a-z0-9+.-]*:\/\/[^\s/:@]+:)[^\s/@]+(?=@)/gi, `$1${REDACTED}`],
+  // Password, secret, token, api key or authorization assigned a literal of 8+ characters:
+  // quoted (`password = "..."`, `"client_secret": "..."`), or unquoted with no spaces around
+  // `=` (`password=...` in config and query strings). Code such as
+  // `password = req.body.password` or `token = getToken()` has no literal and is left alone.
+  [
+    /((?:password|passwd|secret|token|api[_-]?key|authorization)["']?\s*[:=]\s*)(["'`])[^"'`\n]{8,}?\2/gi,
+    `$1$2${REDACTED}$2`,
+  ],
+  [
+    /((?:password|passwd|secret|token|api[_-]?key|authorization)=)(?![\w$]+(?:\.[\w$]+)+(?![\w$]))(?![\w$.]+\()[^\s"'`&;,)}\]]{8,}/gi,
+    `$1${REDACTED}`,
+  ],
 ];
 
 export function redact(text: string, secrets: readonly (string | undefined)[] = []): string {
