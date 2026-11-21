@@ -41,7 +41,7 @@ Contracts version in use: v1.0
 
 - CLI: shutdown hang (`pool.end` waits on a checked-out client during SIGINT or timeout), unguarded open, shared deadline, more invisible characters to strip, dead column padding.
 - db: pool sizing knob derived from concurrency, pool test fast-fail, `leaseLost` clock wording, compatibility shim for dropped functions.
-- API (L1-12): an API token provider for machine clients (apps/mcp sends a bearer token); org-based tenancy instead of one tenant per GitHub user; trustProxy and per-client rate limits behind a proxy; push instead of 1 s polling for SSE; wire apps/worker and apps/cli to start the API (not a pure config change, so not done).
+- API (L1-12): a Postgres-backed SessionStore (sessions table, forced RLS) for more than one API instance; an API token provider for machine clients (apps/mcp sends a bearer token); org-based tenancy instead of one tenant per GitHub user; trustProxy and per-client rate limits behind a proxy; push instead of 1 s polling for SSE; wire apps/worker and apps/cli to start the API (not a pure config change, so not done).
 
 ## Decisions made in this lane
 

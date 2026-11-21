@@ -2,6 +2,12 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type { DevAuthConfig, GithubAuthConfig } from './config.js';
 import { sendError } from './errors.js';
+import {
+  MemorySessionStore,
+  SESSION_ABSOLUTE_TTL_MS,
+  SESSION_ID_RE,
+  type SessionStore,
+} from './session-store.js';
 
 export interface Principal {
   tenantId: string;
@@ -16,7 +22,7 @@ export interface AuthProvider {
   readonly mode: 'dev' | 'github';
   /** True when the browser carries an ambient credential (a cookie), so CSRF applies. */
   readonly usesCookies: boolean;
-  authenticate(req: FastifyRequest): Principal | null;
+  authenticate(req: FastifyRequest): Promise<Principal | null>;
   /** Adds the provider's own routes (sign-in, sign-out). */
   register(app: FastifyInstance): void;
 }
@@ -31,14 +37,14 @@ export function devAuth(config: DevAuthConfig): AuthProvider {
   return {
     mode: 'dev',
     usesCookies: false,
-    authenticate: () => principal,
+    authenticate: () => Promise.resolve(principal),
     register: () => undefined,
   };
 }
 
 export const SESSION_COOKIE = 'affidavit_session';
 export const STATE_COOKIE = 'affidavit_oauth_state';
-export const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+export const SESSION_TTL_MS = SESSION_ABSOLUTE_TTL_MS;
 const STATE_TTL_S = 600;
 const GITHUB_TENANT_RE = /^github-[1-9][0-9]{0,19}$/;
 const OAUTH_PARAM_RE = /^[A-Za-z0-9_-]{1,256}$/;
@@ -52,24 +58,33 @@ export function githubTenantId(userId: number): string {
   return `github-${userId}`;
 }
 
+/** The cookie: a random session id plus the tenant and subject it must match on the server. */
 interface SessionPayload {
-  v: 1;
+  v: 2;
+  i: string;
   t: string;
   s: string;
-  e: number;
 }
 
 function encodeSession(p: SessionPayload): string {
   return Buffer.from(JSON.stringify(p), 'utf8').toString('base64url');
 }
 
-function decodeSession(raw: string, now: number): SessionPayload | null {
+function decodeSession(raw: string): SessionPayload | null {
   if (!/^[A-Za-z0-9_-]{1,1024}$/.test(raw)) return null;
   try {
     const p = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')) as Partial<SessionPayload>;
-    if (p.v !== 1 || typeof p.t !== 'string' || typeof p.s !== 'string') return null;
-    if (typeof p.e !== 'number' || p.e <= now) return null;
-    if (!GITHUB_TENANT_RE.test(p.t) || !/^[0-9]{1,20}$/.test(p.s)) return null;
+    if (
+      p.v !== 2 ||
+      typeof p.i !== 'string' ||
+      typeof p.t !== 'string' ||
+      typeof p.s !== 'string'
+    ) {
+      return null;
+    }
+    if (!SESSION_ID_RE.test(p.i) || !GITHUB_TENANT_RE.test(p.t) || !/^[0-9]{1,20}$/.test(p.s)) {
+      return null;
+    }
     return p as SessionPayload;
   } catch {
     return null;
@@ -85,24 +100,41 @@ async function readCapped(res: Response): Promise<unknown> {
 export interface GithubAuthDeps {
   fetch?: typeof fetch;
   now?: () => number;
+  /** Server-side session state. Defaults to an in-process store (see MemorySessionStore). */
+  sessions?: SessionStore;
 }
 
 /**
  * GitHub OAuth (web flow). Sign-in sets a signed, httpOnly, Secure, SameSite=Lax session cookie
- * holding only the tenant, the GitHub user id and an expiry. The access token is used once to read
+ * holding a random session id, the tenant and the GitHub user id; the session itself lives in a
+ * SessionStore (8 hours absolute, 1 hour idle) and logout deletes it. The access token is used once to read
  * the user id and then dropped. The client secret goes only into the token exchange body.
  */
 export function githubAuth(config: GithubAuthConfig, deps: GithubAuthDeps = {}): AuthProvider {
   const doFetch = deps.fetch ?? ((...a: Parameters<typeof fetch>) => fetch(...a));
   const now = deps.now ?? Date.now;
 
-  function authenticate(req: FastifyRequest): Principal | null {
+  const sessions = deps.sessions ?? new MemorySessionStore();
+
+  /** The signed, well-formed session cookie of a request, or null. */
+  function sessionCookie(req: FastifyRequest): SessionPayload | null {
     const raw = req.cookies[SESSION_COOKIE];
     if (!raw) return null;
     const unsigned = req.unsignCookie(raw);
     if (!unsigned.valid || unsigned.value === null) return null;
-    const p = decodeSession(unsigned.value, now());
-    return p ? { tenantId: p.t, subject: p.s, via: 'cookie' } : null;
+    return decodeSession(unsigned.value);
+  }
+
+  /**
+   * Valid only when the signed cookie names a live server-side session of the same tenant and
+   * subject. Logout, expiry (absolute and idle) and an unknown id all end in null.
+   */
+  async function authenticate(req: FastifyRequest): Promise<Principal | null> {
+    const p = sessionCookie(req);
+    if (!p) return null;
+    const rec = await sessions.use(p.i, p.t, now());
+    if (!rec || rec.subject !== p.s) return null;
+    return { tenantId: rec.tenantId, subject: rec.subject, via: 'cookie' };
   }
 
   async function exchange(code: string): Promise<{ id: number } | null> {
@@ -188,12 +220,10 @@ export function githubAuth(config: GithubAuthConfig, deps: GithubAuthDeps = {}):
         user = null;
       }
       if (!user) return sendError(reply, 502, 'oauth-failed');
-      const session = encodeSession({
-        v: 1,
-        t: githubTenantId(user.id),
-        s: String(user.id),
-        e: now() + SESSION_TTL_MS,
-      });
+      const tenantId = githubTenantId(user.id);
+      const subject = String(user.id);
+      const sid = await sessions.create(tenantId, subject, now());
+      const session = encodeSession({ v: 2, i: sid, t: tenantId, s: subject });
       reply.setCookie(SESSION_COOKIE, session, {
         signed: true,
         httpOnly: true,
@@ -215,7 +245,11 @@ export function githubAuth(config: GithubAuthConfig, deps: GithubAuthDeps = {}):
     app.post(
       '/auth/logout',
       { ...authLimit, onRequest: app.csrfProtection.bind(app) },
-      (_req, reply) => {
+      async (req, reply) => {
+        // Revoke on the server, so a copied cookie stops working too. The store deletes the
+        // session only for the tenant the signed cookie names.
+        const p = sessionCookie(req);
+        if (p) await sessions.revoke(p.i, p.t);
         reply.clearCookie(SESSION_COOKIE, { path: '/' });
         return reply.code(204).send();
       },

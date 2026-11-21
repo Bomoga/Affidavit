@@ -103,7 +103,7 @@ describePg('API over Postgres with RLS', () => {
       if (e.type === 'verdict-written') await store.appendVerdict(e.payload.verdict);
     }
     expected = await sink.events(id);
-    expect(expected).toHaveLength(19);
+    expect(expected).toHaveLength(fixtureEvents('nodegoat-sqli-001', caseA).length);
   }, 120_000);
 
   afterAll(async () => {

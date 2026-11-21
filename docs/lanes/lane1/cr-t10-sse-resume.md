@@ -11,7 +11,7 @@ Status: resolved by Lane 1 in L1-12 (`apps/api`). Raised by Lane 3 in `docs/lane
 
 ## Web client check
 
-`apps/web` (`createTrialStream` with `createSseTransport`) was run, unchanged, against this server, with the server forcing a close every 120 ms while a case was being written. It completed the full 19-event nodegoat stream with no gaps and no duplicates in all three setups: `applyResume` setting `Last-Event-ID`, `applyResume` setting `?after`, and no `applyResume` (replay from 0, client dedupes). No change to `apps/web` was made.
+`apps/web` (`createTrialStream` with `createSseTransport`) was run, unchanged, against this server, with the server forcing a close every 120 ms while a case was being written. It completed the full nodegoat stream (20 events after contracts v1.1) with no gaps and no duplicates in all three setups: `applyResume` setting `Last-Event-ID`, `applyResume` setting `?after`, and no `applyResume` (replay from 0, client dedupes). No change to `apps/web` was made.
 
 ## Follow-ups for Lane 3 (not edited by Lane 1)
 

@@ -84,7 +84,7 @@ describe('GET /cases/:id/events replays the fixture stream', () => {
     const res = await app.inject({
       method: 'GET',
       url: `/cases/${ID}/events`,
-      headers: { 'last-event-id': '18' },
+      headers: { 'last-event-id': String(FIXTURE.length - 1) },
     });
     expect(res.statusCode).toBe(200);
     expect(parseSse(res.body).events).toEqual([]);

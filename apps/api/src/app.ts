@@ -12,9 +12,17 @@ import Fastify, {
   type FastifyReply,
   type FastifyRequest,
   type FastifyServerOptions,
+  type preHandlerAsyncHookHandler,
   type preHandlerHookHandler,
 } from 'fastify';
-import { devAuth, githubAuth, type AuthProvider, type Principal } from './auth.js';
+import {
+  devAuth,
+  githubAuth,
+  type AuthProvider,
+  type GithubAuthDeps,
+  type Principal,
+} from './auth.js';
+import type { SessionStore } from './session-store.js';
 import { UnknownTenantError, type CaseBackend } from './backend.js';
 import { isLoopbackHost, secretsOf, type ApiConfig } from './config.js';
 import { ApiError, NOT_FOUND_BODY, sendError } from './errors.js';
@@ -49,6 +57,8 @@ export interface BuildAppOptions {
   logger?: Exclude<FastifyServerOptions['logger'], boolean> | false;
   /** Called with a verified, parsed webhook. A no-op until L1-15. */
   onWebhook?: (hook: GithubWebhook) => Promise<void>;
+  /** Server-side sessions for GitHub auth. Defaults to an in-process MemorySessionStore. */
+  sessions?: SessionStore;
 }
 
 const serializers = {
@@ -78,10 +88,7 @@ function isAcceptableRepoUrl(raw: string): boolean {
   }
 }
 
-export function authFromConfig(
-  config: ApiConfig,
-  deps: { fetch?: typeof fetch; now?: () => number } = {},
-): AuthProvider {
+export function authFromConfig(config: ApiConfig, deps: GithubAuthDeps = {}): AuthProvider {
   return config.auth.mode === 'dev' ? devAuth(config.auth) : githubAuth(config.auth, deps);
 }
 
@@ -92,6 +99,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     options.auth ??
     authFromConfig(config, {
       ...(options.fetch ? { fetch: options.fetch } : {}),
+      ...(options.sessions ? { sessions: options.sessions } : {}),
       now,
     });
   const secrets = secretsOf(config);
@@ -213,17 +221,13 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     reply.code(404).send(NOT_FOUND_BODY),
   );
 
-  const requireAuth: preHandlerHookHandler = (req, reply, done) => {
-    const p = auth.authenticate(req);
-    if (!p) {
-      void sendError(reply, 401, 'unauthenticated');
-      return;
-    }
+  const requireAuth: preHandlerAsyncHookHandler = async (req, reply) => {
+    const p = await auth.authenticate(req);
+    if (!p) return sendError(reply, 401, 'unauthenticated');
     req.principal = p;
-    done();
   };
   const readHooks = [requireAuth];
-  const writeHooks: preHandlerHookHandler[] = auth.usesCookies
+  const writeHooks: (preHandlerHookHandler | preHandlerAsyncHookHandler)[] = auth.usesCookies
     ? [requireAuth, app.csrfProtection.bind(app)]
     : [requireAuth];
 
