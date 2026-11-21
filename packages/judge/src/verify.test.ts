@@ -436,14 +436,22 @@ describe('Judge.verifyPatch', () => {
       ]);
     });
 
-    it("matches an admitted counterexample's value only as a whole literal in a conditional", async () => {
-      // "/etc/passwd" is admitted, but the patch only has it inside a longer literal.
+    it("holds an admitted counterexample's values to the full literal check, declarations included", async () => {
+      const traversal: ParamSpace = [{ name: 'threshold', values: ['..%2fetc%2fpasswd'] }];
       const admittedOnly = (req: ExecutionRequest) => req.variant === 'vulnerable';
-      const { verify } = counterOnly('counterexample source', admittedOnly);
-      const r = await verify(typeGuard(), [
-        counterexample({}, [{ name: 'threshold', values: ['/etc/passwd'] }]),
-      ]);
-      expect(r.rejectedBy).toBeUndefined();
+      for (const lines of [
+        // Bound to a name first, then compared: the declaration line carries the value.
+        [
+          `            const BAD = '..%2fetc%2fpasswd';`,
+          `            if (threshold === BAD) return 403;`,
+        ],
+        // Inside a longer literal: the original substring rule (4 characters or more) applies.
+        [`            if (path.includes("/x/..%2fetc%2fpasswd/")) return 403;`],
+      ]) {
+        const { verify } = counterOnly('counterexample source', admittedOnly);
+        const r = await verify(patchExhibit(addLines(lines)), [counterexample({}, traversal)]);
+        expect(r.rejectedBy).toBe('literal-only-patch');
+      }
     });
 
     it('returns exactly one result per submitted counterexample, in order', async () => {
