@@ -187,9 +187,12 @@ export class Judge implements JudgePort {
    *
    * A counterexample counts against the patch only once it is admissible: it reruns on
    * `vulnerable` (and `safe`, when the case has one) under every rule of evidence first. An
-   * inadmissible or malformed counterexample is reported `survived: false` and is not used. When
-   * the patch is refused before any counterexample ran, every readable counterexample is reported
-   * as surviving (nothing was shown) and unreadable ones as `survived: false`.
+   * inadmissible counterexample (it ran and failed a rule) is reported `survived: false` and is
+   * not used. A counterexample that cannot be run as submitted (not an Exhibit, another case,
+   * another kind, over the size limit, a bad header) refuses the patch with `schema`. When the
+   * patch is refused before any counterexample ran, every runnable counterexample is reported as
+   * surviving (nothing was shown) and refused ones as `survived: false`. The literal-only check
+   * covers the counterexamples' header values as well as the family's.
    *
    * `rejectedBy` names the first failed rule in that order. A failed re-scan has no rule of its
    * own in contracts v1.0 and shows only as `rescanClean: false`. When a check never ran, its
@@ -211,27 +214,36 @@ export class Judge implements JudgePort {
     const familyParams = w?.success ? w.data.params : undefined;
     // One entry per submitted counterexample, in order, so the result names exactly what was
     // submitted. Each runs over the params in its own header (CR-T8), and its id is minted from
-    // them, the same recipe Lane 3 uses. A counterexample whose header is missing or unreadable
-    // refuses the whole patch with `schema` below: it can never be skipped into a pass.
-    const counters = counterexamples.map((c) => {
+    // them, the same recipe Lane 3 uses. A counterexample that cannot be run as submitted (not an
+    // Exhibit, another case, not a counterexample, over the size limit, or a missing or unreadable
+    // header) is a construction error: it refuses the whole patch with `schema` below, so it can
+    // never be skipped into a pass. `survived: false` is kept for evidence that ran and was ruled
+    // inadmissible.
+    interface Counter {
+      exhibitId: ExhibitId;
+      refused: boolean;
+      code?: string;
+      params?: ParamSpace;
+    }
+    const counters = counterexamples.map((c): Counter => {
+      const refused: Counter = { exhibitId: fallbackId('counterexample', c), refused: true };
+      // Without a readable witness the patch is refused with `schema` anyway.
+      if (familyParams === undefined) return refused;
       const parsed = safely(() => Exhibit.safeParse(c));
-      if (parsed?.success !== true || familyParams === undefined) {
-        return { exhibitId: fallbackId('counterexample', c), badHeader: false };
+      if (parsed?.success !== true) return refused;
+      if (
+        parsed.data.kind !== 'counterexample' ||
+        parsed.data.caseId !== cf.id ||
+        utf8Bytes(parsed.data.code) > this.#policy.maxSourceBytes
+      ) {
+        return refused;
       }
       const header = readCounterexampleParams(parsed.data.code, familyParams, this.#policy);
       const exhibitId = header.ok
         ? safely(() => counterexampleExhibitId(parsed.data, header.params))
         : undefined;
-      if (!header.ok || exhibitId === undefined) {
-        return { exhibitId: fallbackId('counterexample', c), badHeader: true };
-      }
-      const usable =
-        parsed.data.kind === 'counterexample' &&
-        parsed.data.caseId === cf.id &&
-        utf8Bytes(parsed.data.code) <= this.#policy.maxSourceBytes;
-      return usable
-        ? { exhibitId, badHeader: false, code: parsed.data.code, params: header.params }
-        : { exhibitId, badHeader: false };
+      if (!header.ok || exhibitId === undefined) return refused;
+      return { exhibitId, refused: false, code: parsed.data.code, params: header.params };
     });
     const reject = (rule: AdmissibilityRule): VerifyResult =>
       VerifyResult.parse({
@@ -259,7 +271,7 @@ export class Judge implements JudgePort {
     }
     if (utf8Bytes(p.data.diff) > this.#policy.maxSourceBytes) return reject('schema');
     if (!w?.success || !this.#witnessFits(cf, w.data)) return reject('schema');
-    if (counters.some((c) => c.badHeader)) return reject('schema');
+    if (counters.some((c) => c.refused)) return reject('schema');
     const parse = parseUnifiedDiff(p.data.diff);
     if (!parse.ok || !declaredMatches(p.data, parse.diff)) return reject('schema');
     const diff = parse.diff;
@@ -270,7 +282,12 @@ export class Judge implements JudgePort {
       return reject('diff-too-large');
     }
     if (findSuiteTampering(diff).length > 0) return reject('suite-fails');
-    if (findLiteralSpecialCases(addedLines(diff), w.data.params, testFilesOf(diff)).length > 0) {
+    // Every value the patch could be tailored to: the family's and each counterexample's header.
+    const literalParams: ParamSpace = [
+      ...w.data.params,
+      ...counters.flatMap((c) => c.params ?? []),
+    ];
+    if (findLiteralSpecialCases(addedLines(diff), literalParams, testFilesOf(diff)).length > 0) {
       return reject('literal-only-patch');
     }
 

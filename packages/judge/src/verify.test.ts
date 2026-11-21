@@ -260,24 +260,15 @@ describe('Judge.verifyPatch', () => {
     );
     const survivor = counterexample({ id: 'exhibit-counter-002' as never, code: 'still works' });
     const unproven = counterexample({ code: 'passes everywhere' });
-    const otherCase = counterexample({ caseId: 'case-other' as never });
-    const malformed = { kind: 'counterexample', code: 1 } as unknown as Exhibit;
-    const r = await verify(patchExhibit(), [
-      counterexample(),
-      survivor,
-      unproven,
-      otherCase,
-      malformed,
-    ]);
+    // Counterexamples for another case or of the wrong shape refuse the whole patch (schema);
+    // see 'counterexample params header (CR-T8)'.
+    const r = await verify(patchExhibit(), [counterexample(), survivor, unproven]);
     expect(r.rejectedBy).toBe('counterexample-survives');
-    expect(r.counterexamples.slice(0, 4)).toEqual([
+    expect(r.counterexamples).toEqual([
       { exhibitId: cid(), survived: false },
       { exhibitId: cid(survivor), survived: true },
       { exhibitId: cid(unproven), survived: false },
-      { exhibitId: cid(otherCase), survived: false },
     ]);
-    expect(r.counterexamples[4]?.exhibitId).toMatch(/^exhibit-counterexample-invalid-/);
-    expect(r.counterexamples[4]?.survived).toBe(false);
     // An inadmissible counterexample is never rerun on the patch.
     expect(
       exec.requests.some(
@@ -370,6 +361,14 @@ describe('Judge.verifyPatch', () => {
           },
         ]),
       ],
+      // Construction errors: the counterexample never runs, so it must not be skipped into a pass.
+      ['another caseId', counterexample({ caseId: 'case-other' as never })],
+      ['kind witness', counterexample({ kind: 'witness' as never })],
+      [
+        'code over maxSourceBytes',
+        counterexample({ code: 'x'.repeat(DEFAULT_POLICY.maxSourceBytes + 1) }),
+      ],
+      ['a value that is not an Exhibit', { kind: 'counterexample', code: 1 } as unknown as Exhibit],
     ])(
       'refuses the patch with schema for a counterexample with %s, before building',
       async (_, bad) => {
@@ -384,6 +383,24 @@ describe('Judge.verifyPatch', () => {
         expect(exec.requests).toHaveLength(0);
       },
     );
+
+    it("rejects a patch that special-cases a counterexample's header value (literal-only-patch)", async () => {
+      // The family never mentions this value; only the counterexample's header does.
+      const traversal: ParamSpace = [{ name: 'threshold', values: ['..%2fetc%2fpasswd'] }];
+      const { exec, workbench, verify } = setup(answer);
+      const r = await verify(
+        patchExhibit(
+          addLines([
+            `            if (threshold === "..%2fetc%2fpasswd") return 403;`,
+            `            const parsed = parseInt(threshold, 10);`,
+          ]),
+        ),
+        [counterexample({}, traversal)],
+      );
+      expect(r.rejectedBy).toBe('literal-only-patch');
+      expect(workbench.prepared).toHaveLength(0);
+      expect(exec.requests).toHaveLength(0);
+    });
 
     it('returns exactly one result per submitted counterexample, in order', async () => {
       const { verify } = setup(answer);
