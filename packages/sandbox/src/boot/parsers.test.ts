@@ -193,9 +193,17 @@ describe('compose', () => {
     expect(precheckCompose('services:\n  web:\n    build: .\n')).toBeNull();
     expect(
       precheckCompose(
-        'x-base: &base\n  restart: always\nservices:\n  web:\n    <<: *base\n    build: .\n    command: ["echo", "env_file: no"]\n    secrets: []',
+        'x-base:\n  restart: always\nservices:\n  web:\n    build: .\n    command: ["echo", "env_file: no"]\n    secrets: []',
       ),
     ).toBeNull();
+  });
+  it('refuses anchors and merge keys even when what they share is harmless (fail closed)', () => {
+    // The key scanner is a security check and refuses constructs it does not fully read.
+    expect(
+      precheckCompose(
+        'x-base: &base\n  restart: always\nservices:\n  web:\n    <<: *base\n    build: .\n    command: ["echo", "env_file: no"]\n    secrets: []',
+      ),
+    ).not.toBeNull();
   });
   it('walks an alias that refers back to an ancestor only once', () => {
     const cyclic: Record<string, unknown> = { services: {} };

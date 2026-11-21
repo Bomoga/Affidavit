@@ -9,14 +9,21 @@
  *
  * - tags (`!reset`, `!!binary`), explicit keys (`? `), directives (`%`), more than one document,
  *   reserved indicators (`@`, a backquote);
- * - tab indentation, NUL, a byte order mark, a bare carriage return;
- * - a key that is an alias, spans lines, or is a double-quoted scalar with an escape;
+ * - anchors (`&`), aliases (`*`) and merge keys (`<<`);
+ * - tab indentation, NUL, a byte order mark, a bare carriage return, and the other characters
+ *   go-yaml treats as line breaks (NEL, U+2028, U+2029);
+ * - a flow collection or a quoted scalar inside one that spans lines;
+ * - a key that spans lines or is a double-quoted scalar with an escape;
  * - duplicate keys in one mapping (block or flow);
  * - unterminated quotes and unbalanced flow brackets.
  *
- * Anchors, aliases and merge keys need no special handling: every key is checked where it is
- * written, so an alias can only repeat a key that was already seen. Block scalars (`|`, `>`) are
- * skipped as text.
+ * This is a security check (the precheck must see every key Compose will), so the scanner only
+ * skips text where it knows exactly where the text ends. A block scalar (`|`, `>`, optionally
+ * with `+` or `-` and a comment) is read only as the value of a key that starts its line; its
+ * content is the following lines indented deeper than that key, and it must have at least one,
+ * with no line less indented than the first. Every other block scalar is refused: after `- `,
+ * after an anchor, in a flow collection, with an indentation indicator or with text after the
+ * header.
  */
 
 export interface YamlKey {
@@ -30,7 +37,7 @@ export interface YamlKey {
 export type KeyScan = { ok: true; keys: YamlKey[] } | { ok: false; reason: string };
 
 interface Tok {
-  kind: 'plain' | 'quoted' | 'ind' | 'alias' | 'anchor' | 'block';
+  kind: 'plain' | 'quoted' | 'ind' | 'block';
   text: string;
   line: number;
   col: number;
@@ -68,6 +75,7 @@ function tokenize(s: string): Tok[] {
   while (i < s.length) {
     const c = s[i] as string;
     if (c === '\n') {
+      if (flowStack.length > 0) refuse('a flow collection spanning lines');
       i++;
       line++;
       lineStart = i;
@@ -102,22 +110,53 @@ function tokenize(s: string): Tok[] {
     if (c === '!') refuse('a YAML tag');
     if (c === '@' || c === '`') refuse(`a reserved indicator ${c}`);
     if (c === '?' && isSpace(s[i + 1])) refuse('an explicit key');
-    if ((c === '|' || c === '>') && flowStack.length === 0) {
-      // A block scalar: the rest of this line holds only its header, and its content is every
-      // following line that is blank or indented deeper than this line.
-      const parent = indentOf(lineStart);
+    if (c === '|' || c === '>') {
+      if (flowStack.length > 0) refuse('a block scalar inside a flow collection');
+      // Only `<key>: |` with the key as the first token of its line: the owning node is then that
+      // key's mapping, whose column is the key's, so YAML and this scanner agree on where the
+      // content ends.
+      const colon = toks.at(-1);
+      const key = toks.at(-2);
+      const before = toks.at(-3);
+      if (
+        colon?.kind !== 'ind' ||
+        colon.text !== ':' ||
+        colon.line !== line ||
+        (key?.kind !== 'plain' && key?.kind !== 'quoted') ||
+        key.line !== line ||
+        key.endLine !== line ||
+        key.col !== indentOf(lineStart) ||
+        (before !== undefined && before.endLine === line)
+      ) {
+        refuse('a block scalar that is not the value of a key starting its line');
+      }
+      const keyCol = (key as Tok).col;
+      let e = s.indexOf('\n', i);
+      if (e < 0) e = s.length;
+      if (!/^[|>][+-]?(?: +#.*)?$/.test(s.slice(i, e).trimEnd())) {
+        refuse('a block scalar header outside the subset');
+      }
       push({ kind: 'block', text: '', line, col });
-      while (i < s.length && s[i] !== '\n') i++;
+      i = e;
+      let contentIndent = -1;
       while (i < s.length) {
         const next = i + 1;
         const end = s.indexOf('\n', next);
-        const text = s.slice(next, end < 0 ? s.length : end);
-        if (text.trim() !== '' && indentOf(next) <= parent) break;
+        const text = s.slice(next, end < 0 ? s.length : end).replace(/\r$/, '');
         if (/^ *\t/.test(text)) refuse('tab indentation');
+        if (text.trim() !== '') {
+          const ind = indentOf(next);
+          if (ind <= keyCol) break;
+          if (contentIndent < 0) contentIndent = ind;
+          else if (ind < contentIndent) {
+            refuse('a block scalar whose content dedents below its first line');
+          }
+        }
         i = end < 0 ? s.length : end;
         line++;
         lineStart = next;
       }
+      if (contentIndent < 0) refuse('a block scalar with no content');
       continue;
     }
     if (c === '[' || c === '{') {
@@ -151,14 +190,8 @@ function tokenize(s: string): Tok[] {
       i++;
       continue;
     }
-    if (c === '&' || c === '*') {
-      let j = i + 1;
-      while (j < s.length && !isSpace(s[j]) && !FLOW.includes(s[j] as string)) j++;
-      if (j === i + 1) refuse(`an empty ${c === '&' ? 'anchor' : 'alias'}`);
-      push({ kind: c === '&' ? 'anchor' : 'alias', text: s.slice(i + 1, j), line, col });
-      i = j;
-      continue;
-    }
+    if (c === '&') refuse('an anchor');
+    if (c === '*') refuse('an alias');
     if (c === '"' || c === "'") {
       let j = i + 1;
       let text = '';
@@ -193,6 +226,7 @@ function tokenize(s: string): Tok[] {
         text += ch;
         j++;
       }
+      if (flowStack.length > 0 && line !== startLine) refuse('a flow collection spanning lines');
       push({ kind: 'quoted', text, line: startLine, col, endLine: line, escaped });
       i = j + 1;
       quoteEnd = i;
@@ -227,6 +261,10 @@ export function scanYamlKeys(text: string): KeyScan {
     if (text.includes('\0')) refuse('a NUL byte');
     if (text.includes('﻿')) refuse('a byte order mark');
     if (text.includes('�')) refuse('text that is not UTF-8');
+    if (/\r(?!\n)/.test(text)) refuse('a bare carriage return');
+    if ([0x85, 0x2028, 0x2029].some((cp) => text.includes(String.fromCharCode(cp)))) {
+      refuse('a NEL, U+2028 or U+2029 line break');
+    }
     const toks = tokenize(text);
     const keys: YamlKey[] = [];
     const block: { col: number; keys: Set<string> }[] = [];
@@ -243,10 +281,10 @@ export function scanYamlKeys(text: string): KeyScan {
       }
       const colon = toks[idx + 1];
       if (colon?.kind !== 'ind' || colon.text !== ':') return;
-      if (t.kind === 'alias') refuse('an alias used as a key');
-      if (t.kind === 'anchor' || t.kind === 'block') return;
+      if (t.kind === 'block') return;
       if (t.endLine !== t.line || colon.line !== t.endLine) refuse('a key that spans lines');
       if (t.escaped === true) refuse('a key with an escape sequence');
+      if (t.text === '<<') refuse('a merge key');
 
       if (t.flow > 0) {
         const set = flow.at(-1);
