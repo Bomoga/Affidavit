@@ -11,6 +11,7 @@ import {
   runJailed,
   stageTree,
   validateMounts,
+  type CaseNetwork,
   type Mount,
 } from '@affidavit/sandbox';
 import { renderDiff, type ParsedDiff } from '../patch/diff.js';
@@ -103,6 +104,26 @@ interface Workspace {
   target: BootedTarget;
   /** The patched build with devDependencies, used only to run the suite; or why there is none. */
   suite: { image: string } | { unavailable: string };
+}
+
+/**
+ * Runs `fn` while owning a booted target's case network. The network is removed unless `fn`
+ * returns `ok: true` (it was handed over to `release`); a refusal or a throw both remove it, so a
+ * failed prepare never leaks a running target and its sidecars.
+ */
+export async function ownBootedTarget<T extends { ok: boolean }>(
+  net: CaseNetwork,
+  fn: () => Promise<T>,
+  remove: (net: CaseNetwork) => Promise<void> = removeCaseNetwork,
+): Promise<T> {
+  let handedOver = false;
+  try {
+    const out = await fn();
+    handedOver = out.ok;
+    return out;
+  } finally {
+    if (!handedOver) await remove(net);
+  }
 }
 
 /** Every `package.json` under `root` (relative paths), skipping `node_modules` and `.git`. */
@@ -238,35 +259,38 @@ export class JailedPatchWorkbench implements PatchWorkbench {
         }
         throw err;
       }
-      let suite: Workspace['suite'];
-      const vulnerableSuite = await deriveRecipe(staged, caseFile.bootHints, {
-        devDependencies: true,
-      });
-      if (!vulnerableSuite.ok) {
-        suite = { unavailable: `the suite cannot be built: ${vulnerableSuite.reason}` };
-      } else {
-        const built = await buildTarget(join(tree, 'code'), caseFile.bootHints, {
-          workRoot: this.opts.workRoot,
+      // From here the booted network is ours until it is handed over to `release`: any refusal or
+      // throw (deriveRecipe, buildTarget, a patched target already registered) removes it.
+      return await ownBootedTarget(target.endpoint.net, async (): Promise<PrepareOutcome> => {
+        let suite: Workspace['suite'];
+        const vulnerableSuite = await deriveRecipe(staged, caseFile.bootHints, {
           devDependencies: true,
         });
-        if (!built.ok) {
-          await removeCaseNetwork(target.endpoint.net);
-          return {
-            ok: false,
-            stage: 'build',
-            detail: `the suite build failed (${built.step}): ${built.reason}`.slice(0, 500),
-          };
+        if (!vulnerableSuite.ok) {
+          suite = { unavailable: `the suite cannot be built: ${vulnerableSuite.reason}` };
+        } else {
+          const built = await buildTarget(join(tree, 'code'), caseFile.bootHints, {
+            workRoot: this.opts.workRoot,
+            devDependencies: true,
+          });
+          if (!built.ok) {
+            return {
+              ok: false,
+              stage: 'build',
+              detail: `the suite build failed (${built.step}): ${built.reason}`.slice(0, 500),
+            };
+          }
+          suite = { image: built.imageId };
         }
-        suite = { image: built.imageId };
-      }
-      this.opts.targets.set('patched', target);
-      const prepared: PreparedPatch = {
-        target: { ...caseFile.target, variant: 'patched', imageDigest: target.imageId },
-        workspacePath: join(tree, 'full'),
-      };
-      this.#open.set(prepared.workspacePath, { dir, target, suite });
-      keep = true;
-      return { ok: true, prepared };
+        this.opts.targets.set('patched', target);
+        const prepared: PreparedPatch = {
+          target: { ...caseFile.target, variant: 'patched', imageDigest: target.imageId },
+          workspacePath: join(tree, 'full'),
+        };
+        this.#open.set(prepared.workspacePath, { dir, target, suite });
+        keep = true;
+        return { ok: true, prepared };
+      });
     } finally {
       if (!keep) await removeBuildDir(dir);
     }

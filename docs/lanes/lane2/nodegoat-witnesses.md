@@ -33,8 +33,9 @@ injected `threshold` and passes only when another user's allocations come back. 
 safe variant works. A control witness makes the same login and the same allocations request with
 thresholds the safe code accepts (`0`, `50`, `99`) and must pass on both variants: user1 logs in
 (302) and sees "Asset Allocations for John Doe". A broken login, seed or allocations page on the
-safe variant fails the control, so it cannot pass for a fixed bug. The control passes on both
-variants, so it is itself rejected by `differential`, as it should be.
+safe variant fails the control, so it cannot pass for a fixed bug. It is expected to pass on both
+variants, and so to be rejected by `differential` itself; that has not been run yet (NodeGoat
+cannot be built until the dependency bundle lands).
 
 Both witnesses use only NodeGoat's seeded synthetic accounts (`artifacts/db-reset.js`) and talk
 only to `target`; the jail gives them no other route.

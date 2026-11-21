@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { ExecutionRequest } from '../executor.js';
 import { BootedTargets, type BootedTarget } from './booted.js';
-import { APPLY_SCRIPT, NUMSTAT_SCRIPT, splitNumstat } from './workbench.js';
+import { APPLY_SCRIPT, NUMSTAT_SCRIPT, ownBootedTarget, splitNumstat } from './workbench.js';
 
 const target = (url: string): BootedTarget =>
   ({
@@ -42,6 +42,50 @@ describe('BootedTargets', () => {
     expect((await t.endpoint(req('patched'))).url).toBe('http://target:4000');
     t.delete('patched');
     await expect(t.endpoint(req('patched'))).rejects.toThrow();
+  });
+});
+
+describe('ownBootedTarget (the patched network is never leaked)', () => {
+  const net = { name: 'affidavit-net-1111111111111111' } as never;
+  const recorder = () => {
+    const removed: unknown[] = [];
+    return { removed, remove: (n: unknown) => (removed.push(n), Promise.resolve()) };
+  };
+
+  it('removes the network when a later step throws', async () => {
+    const { removed, remove } = recorder();
+    await expect(
+      ownBootedTarget(net, () => Promise.reject(new Error('deriveRecipe threw')), remove),
+    ).rejects.toThrow(/deriveRecipe threw/);
+    expect(removed).toEqual([net]);
+  });
+
+  it('removes the network when a patched target is already registered', async () => {
+    const { removed, remove } = recorder();
+    const targets = new BootedTargets({ patched: target('http://old:4000') });
+    await expect(
+      ownBootedTarget(
+        net,
+        () => {
+          targets.set('patched', target('http://new:4000'));
+          return Promise.resolve({ ok: true as const });
+        },
+        remove,
+      ),
+    ).rejects.toThrow(/already registered/);
+    expect(removed).toEqual([net]);
+  });
+
+  it('removes it on a refused outcome and keeps it only when handed over', async () => {
+    const { removed, remove } = recorder();
+    expect(await ownBootedTarget(net, () => Promise.resolve({ ok: false }), remove)).toEqual({
+      ok: false,
+    });
+    expect(removed).toEqual([net]);
+    expect(await ownBootedTarget(net, () => Promise.resolve({ ok: true }), remove)).toEqual({
+      ok: true,
+    });
+    expect(removed).toEqual([net]);
   });
 });
 
