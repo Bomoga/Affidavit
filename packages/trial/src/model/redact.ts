@@ -23,7 +23,9 @@ export const REDACTED = '[redacted]';
 export const OVERSIZED = '[redacted: oversized]';
 /** Longest text `redact` scans; anything longer is replaced by `OVERSIZED`. */
 export const MAX_REDACT_CHARS = 256 * 1024;
-/** `detectCredential` scans longer strings in windows of this size... */
+/** Longest string `detectCredential` scans at all; a longer one fails closed. */
+export const MAX_SCAN_CHARS = 8 * 1024 * 1024;
+/** `detectCredential` scans longer strings in windows of this size (bounded patterns only)... */
 export const SCAN_WINDOW_CHARS = 64 * 1024;
 /** ...overlapping by this much, more than the longest bounded match below. */
 export const SCAN_OVERLAP_CHARS = 8 * 1024;
@@ -41,6 +43,16 @@ export interface ScanBudget {
  * Nothing follows it in any pattern, so the trailing run never backtracks.
  */
 const TOKEN = String.raw`[A-Za-z0-9._~+/=-]{8}[A-Za-z0-9._~+/=-]*`;
+/**
+ * Not a literal: a member-access chain (`process.env.KEY`, `config.apiKey`, `headers["x"]`) or a
+ * bare identifier with no digit (`authHeader`), ending where the token would end. Each accessor
+ * starts with `.` or `[`, which the identifier part excludes, so the split is unique and the
+ * bounded check stays linear. A real JWT is still caught by its own pattern.
+ */
+const NONLITERAL = String.raw`(?!(?:[A-Za-z_$][\w$]{0,128}(?:\.[A-Za-z_$][\w$]{0,128}|\[[^\]\n]{0,128}\]){1,16}|[A-Za-z_]{1,256})(?![A-Za-z0-9._~+/=\[-]))`;
+const TOKEN_LIT = `${NONLITERAL}${TOKEN}`;
+/** A quoted body that interpolates (`${...}`) is a template, not a literal. */
+const NO_TEMPLATE = String.raw`(?![^"'\x60\n]{0,256}\$\{)`;
 /** A base64url run, matched atomically (lookahead plus backreference) so it never backtracks. */
 const B64URL_RUN = (group: number) => `(?=([A-Za-z0-9_-]*))\\${group}`;
 /** A JWT header run (group 1), atomic, that never runs into the next `-eyJ` start. */
@@ -52,11 +64,18 @@ const UNQUOTED = String.raw`[^\s"'\x60,;(){}\[\]<>=:]`;
 interface Pattern {
   re: RegExp;
   replacement: string;
+  /**
+   * The match can be longer than a scan window (an unbounded JWT, userinfo or PEM body), so
+   * `detectCredential` runs it over the whole string, never window by window. It is linear, so
+   * this costs one pass.
+   */
+  whole?: boolean;
 }
 
-const p = (source: string, flags: string, replacement = REDACTED): Pattern => ({
+const p = (source: string, flags: string, replacement = REDACTED, whole = false): Pattern => ({
   re: new RegExp(source, `g${flags}`),
   replacement,
+  whole,
 });
 
 const PATTERNS: readonly Pattern[] = [
@@ -90,6 +109,8 @@ const PATTERNS: readonly Pattern[] = [
   p(
     String.raw`(?<![A-Za-z0-9_])eyJ(?=[A-Za-z0-9_-]{8})${HEADER_RUN}\.eyJ(?=[A-Za-z0-9_-]{8})${B64URL_RUN(2)}(?:\.[A-Za-z0-9_-]*)?`,
     '',
+    REDACTED,
+    true,
   ),
   // PEM private key blocks, blank lines and CRLF included (an encrypted PEM has `Proc-Type` and
   // `DEK-Info` headers and a blank line before its body): through the END line, or to the end of
@@ -101,21 +122,21 @@ const PATTERNS: readonly Pattern[] = [
   ),
   // Credentials in a URL's userinfo: scheme://user:pass@host, of any length. Anchored on the
   // literal `://`; user and password are atomic runs that cannot cross another `://`.
-  p(String.raw`(://(?=([^\s/:@]+))\2:)(?=([^\s/@]+))\3(?=@)`, '', `$1${REDACTED}`),
+  p(String.raw`(://(?=([^\s/:@]+))\2:)(?=([^\s/@]+))\3(?=@)`, '', `$1${REDACTED}`, true),
   // Authorization headers and assignments, with or without a scheme, with a literal value.
   p(
-    String.raw`(\bauthorization["']?[ \t]{0,16}[:=][ \t]{0,16}["']?(?:(?:bearer|basic|token)[ \t]{1,16})?)${TOKEN}`,
+    String.raw`(\bauthorization["']?[ \t]{0,16}[:=][ \t]{0,16}["']?(?:(?:bearer|basic|token)[ \t]{1,16})?)${TOKEN_LIT}`,
     'i',
     `$1${REDACTED}`,
   ),
   // Key and token headers or assignments: x-api-key, ANTHROPIC_API_KEY, api_key, access_token.
   p(
-    String.raw`((?:x-api-key|api[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token)["']?[ \t]{0,16}[:=][ \t]{0,16}["']?)${TOKEN}`,
+    String.raw`((?:x-api-key|api[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token)["']?[ \t]{0,16}[:=][ \t]{0,16}["']?)${TOKEN_LIT}`,
     'i',
     `$1${REDACTED}`,
   ),
   // A bare bearer token with a literal value (not `$TOKEN`, not `' + token`).
-  p(String.raw`(\bbearer[ \t]{1,16})${TOKEN}`, 'i', `$1${REDACTED}`),
+  p(String.raw`(\bbearer[ \t]{1,16})${TOKEN_LIT}`, 'i', `$1${REDACTED}`),
   // Credential-looking URL query parameters (not `{{placeholders}}` or `$vars`).
   p(
     String.raw`([?&](?:key|token|auth|sig|signature)=)[^&\s"'#$<>{}][^&\s"'#<>{}]*`,
@@ -125,13 +146,13 @@ const PATTERNS: readonly Pattern[] = [
   // Password, secret, token, api key or authorization assigned a quoted literal of 8+
   // characters. Only a leading `$` marks a placeholder (`"${PASSWORD}"`); `$` inside counts.
   p(
-    String.raw`(${KEYS}["']?[ \t]{0,16}[:=][ \t]{0,16})(["'\x60])(?![$])[^"'\x60\n]{8,256}\2`,
+    String.raw`(${KEYS}["']?[ \t]{0,16}[:=][ \t]{0,16})(["'\x60])(?![$])${NO_TEMPLATE}[^"'\x60\n]{8,256}\2`,
     'i',
     `$1$2${REDACTED}$2`,
   ),
   // A quoted literal too long for the bound above is a credential too: redact the whole run.
   p(
-    String.raw`(${KEYS}["']?[ \t]{0,16}[:=][ \t]{0,16})(["'\x60])(?![$])[^"'\x60\n]{257}[^"'\x60\n]*`,
+    String.raw`(${KEYS}["']?[ \t]{0,16}[:=][ \t]{0,16})(["'\x60])(?![$])${NO_TEMPLATE}[^"'\x60\n]{257}[^"'\x60\n]*`,
     'i',
     `$1$2${REDACTED}`,
   ),
@@ -146,9 +167,9 @@ const PATTERNS: readonly Pattern[] = [
 ];
 
 /** The same patterns without the global flag, for a stateless `test`. */
-const DETECTORS: readonly RegExp[] = PATTERNS.map(
-  ({ re }) => new RegExp(re.source, re.flags.replace('g', '')),
-);
+const detector = ({ re }: Pattern) => new RegExp(re.source, re.flags.replace('g', ''));
+const WHOLE_DETECTORS: readonly RegExp[] = PATTERNS.filter((x) => x.whole).map(detector);
+const WINDOW_DETECTORS: readonly RegExp[] = PATTERNS.filter((x) => !x.whole).map(detector);
 
 const clock = (b: ScanBudget) => b.now ?? (() => performance.now());
 
@@ -211,11 +232,19 @@ export function detectCredential(value: unknown, budget: ScanBudget = {}): Crede
   const limit = budget.budgetMs ?? DEFAULT_SCAN_BUDGET_MS;
   const started = now();
   const scan = (text: string): CredentialScan => {
+    // Hard cap: a string this large is never scanned at all; it fails closed.
+    if (text.length > MAX_SCAN_CHARS) return 'over-budget';
+    // Unbounded patterns run once over the whole string (each is a single linear pass), so a
+    // token longer than a window is never split and missed.
+    for (const re of WHOLE_DETECTORS) {
+      if (re.test(text)) return 'credential';
+      if (now() - started > limit) return 'over-budget';
+    }
     const step = SCAN_WINDOW_CHARS - SCAN_OVERLAP_CHARS;
     const whole = text.length <= MAX_REDACT_CHARS;
     for (let at = 0; at < text.length || at === 0; at += step) {
       const window = whole ? text : text.slice(at, at + SCAN_WINDOW_CHARS);
-      for (const re of DETECTORS) {
+      for (const re of WINDOW_DETECTORS) {
         if (re.test(window)) return 'credential';
         if (now() - started > limit) return 'over-budget';
       }

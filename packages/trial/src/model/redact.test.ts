@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   MAX_REDACT_CHARS,
+  MAX_SCAN_CHARS,
   OVERSIZED,
   REDACTED,
   clipRedacted,
@@ -60,6 +61,30 @@ describe('linear-time scanning of hostile input', () => {
       const text = `${'x '.repeat(at / 2)}${' '.repeat(at % 2)}${value}`.padEnd(1024 * 1024, ' ');
       expect(detectCredential({ t: text }), `at ${at}`).toBe('credential');
     }
+  });
+
+  const LONG_RUNS: readonly [string, string][] = [
+    [
+      'JWT with a 70K header',
+      `${'ey' + 'J'}${'a'.repeat(70_000)}.${'ey' + 'J'}${'b'.repeat(20)}.sig`,
+    ],
+    ['userinfo with a 70K password', `https://u:${'p'.repeat(70_000)}@h`],
+    ['userinfo with a 70K user', `https://${'u'.repeat(70_000)}:pw@h`],
+  ];
+  for (const size of [400 * 1024, 2 * 1024 * 1024]) {
+    for (const [kind, token] of LONG_RUNS) {
+      it(`finds a ${kind} inside a ${size / 1024} KB string, in under a second`, () => {
+        const pad = ' '.repeat(Math.floor((size - token.length) / 2));
+        const text = `${pad}${token}${pad}`;
+        const t0 = performance.now();
+        expect(detectCredential({ t: text })).toBe('credential');
+        expect(performance.now() - t0).toBeLessThan(1000);
+      });
+    }
+  }
+
+  it('fails closed on a string over the hard scan cap', () => {
+    expect(detectCredential({ t: ' '.repeat(MAX_SCAN_CHARS + 1) })).toBe('over-budget');
   });
 
   it('fails closed when the scan exceeds its work budget', () => {
