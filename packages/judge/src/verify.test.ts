@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { VerifyResult } from '@affidavit/contracts';
 import type { Exhibit, ParamSpace, PatchExhibit, Witness } from '@affidavit/contracts';
-import { canonicalJson } from './canonical.js';
+import { canonicalJson, sha256Hex } from './canonical.js';
+import { counterexampleParamsHeader } from './counterexample.js';
 import type { ExecutionRequest, RawAttempt } from './executor.js';
 import { Judge, counterexampleExhibitId, patchExhibitId } from './judge.js';
 import { parseUnifiedDiff, renderDiff } from './patch/diff.js';
@@ -22,17 +23,25 @@ const PAYLOADS = ["1'; return true; var x='", "0' || '1'=='1", "'; sleep(5000); 
 const PARAMS: ParamSpace = [{ name: 'threshold', values: PAYLOADS }];
 const witness = (): Witness => ({ ...gateWitness(), template: 'witness source', params: PARAMS });
 
-const counterexample = (over: Partial<Exhibit> = {}): Exhibit =>
-  ({
+/**
+ * A counterexample as Lane 3 builds it: the params header it runs over (CR-T8), then the code.
+ * `over.code` is the code after the header.
+ */
+const counterexample = (over: Partial<Exhibit> = {}, params: ParamSpace = PARAMS): Exhibit => {
+  const { code = 'counterexample source', ...rest } = over;
+  return {
     schemaVersion: 1,
     id: 'exhibit-counter-001',
     caseId: 'case-nodegoat-sqli-001',
     author: 'prosecution',
     kind: 'counterexample',
-    code: 'counterexample source',
     sha256: '9'.repeat(64),
-    ...over,
-  }) as Exhibit;
+    ...rest,
+    code: `${counterexampleParamsHeader(params)}\n${code}`,
+  } as Exhibit;
+};
+/** What runs after the params header (a witness template has none). */
+const body = (template: string): string => template.slice(template.indexOf('\n') + 1);
 
 /** A target where the bug is real and the patch fixes it for every parameter. */
 const fixedByPatch = (req: ExecutionRequest): RawAttempt =>
@@ -63,8 +72,9 @@ const addLines = (lines: string[], path = 'app/data/allocations-dao.js'): string
     '',
   ].join('\n');
 
-/** The id the Judge mints for a counterexample run over the witness's family. */
-const cid = (c: Exhibit = counterexample()) => counterexampleExhibitId(c, PARAMS);
+/** The id the Judge mints for a counterexample run over the params in its header. */
+const cid = (c: Exhibit = counterexample(), params: ParamSpace = PARAMS) =>
+  counterexampleExhibitId(c, params);
 const PATCH_ID = patchExhibitId(patchExhibit());
 
 describe('Judge.verifyPatch', () => {
@@ -79,7 +89,7 @@ describe('Judge.verifyPatch', () => {
       rescanClean: true,
       counterexamples: [{ exhibitId: cid(), survived: false }],
     });
-    expect(exec.requests.map((q) => `${q.variant}:${q.attempt}:${q.template}`)).toEqual([
+    expect(exec.requests.map((q) => `${q.variant}:${q.attempt}:${body(q.template)}`)).toEqual([
       'vulnerable:1:witness source',
       'vulnerable:2:witness source',
       'vulnerable:3:witness source',
@@ -241,10 +251,10 @@ describe('Judge.verifyPatch', () => {
     const { exec, verify } = setup((req) =>
       raw(
         PAYLOADS.map(() =>
-          req.template === 'passes everywhere'
+          body(req.template) === 'passes everywhere'
             ? true
             : req.variant === 'vulnerable' ||
-              (req.variant === 'patched' && req.template === 'still works'),
+              (req.variant === 'patched' && body(req.template) === 'still works'),
         ),
       ),
     );
@@ -270,7 +280,9 @@ describe('Judge.verifyPatch', () => {
     expect(r.counterexamples[4]?.survived).toBe(false);
     // An inadmissible counterexample is never rerun on the patch.
     expect(
-      exec.requests.some((q) => q.template === 'passes everywhere' && q.variant === 'patched'),
+      exec.requests.some(
+        (q) => body(q.template) === 'passes everywhere' && q.variant === 'patched',
+      ),
     ).toBe(false);
   });
 
@@ -283,9 +295,120 @@ describe('Judge.verifyPatch', () => {
     expect(out?.exhibitId).toMatch(/^exhibit-counterexample-[0-9a-f]{24}$/);
   });
 
+  describe('counterexample params header (CR-T8)', () => {
+    // Prosecution keeps one Defense value and adds a new one of the same parameter.
+    const NEW_VALUE = "'; return this.userId != 0; '";
+    const CHOSEN: ParamSpace = [{ name: 'threshold', values: [PAYLOADS[1]!, NEW_VALUE] }];
+    /** Lane 3's id recipe, written out: canonical {caseId, kind, params, template} hashed. */
+    const lane3Id = (c: Exhibit, params: ParamSpace) =>
+      `exhibit-counterexample-${sha256Hex(
+        canonicalJson({ caseId: c.caseId, kind: 'counterexample', params, template: c.code }),
+      ).slice(0, 24)}`;
+    /**
+     * The witness flips on the patch. The counterexample passes on vulnerable, fails on safe, and
+     * on the patch only its new value still gets through.
+     */
+    const answer = (req: ExecutionRequest): RawAttempt => {
+      const values = req.params[0]!.values;
+      if (body(req.template) !== 'counterexample source') return fixedByPatch(req);
+      return raw(
+        values.map((v) =>
+          req.variant === 'vulnerable' ? true : req.variant === 'patched' && v === NEW_VALUE,
+        ),
+      );
+    };
+
+    it('runs a counterexample over the params in its header, not the Defense family', async () => {
+      const { exec, verify } = setup(answer);
+      const c = counterexample({}, CHOSEN);
+      const r = await verify(patchExhibit(), [c]);
+      const runs = exec.requests.filter((q) => body(q.template) === 'counterexample source');
+      expect(runs.map((q) => q.variant)).toEqual([
+        ...Array<string>(3).fill('vulnerable'),
+        ...Array<string>(3).fill('safe'),
+        ...Array<string>(3).fill('patched'),
+      ]);
+      expect(runs.every((q) => canonicalJson(q.params) === canonicalJson(CHOSEN))).toBe(true);
+      // The witness itself still runs over the Defense family.
+      expect(
+        exec.requests
+          .filter((q) => q.template === 'witness source')
+          .every((q) => canonicalJson(q.params) === canonicalJson(PARAMS)),
+      ).toBe(true);
+      expect(r.counterexamples).toEqual([{ exhibitId: lane3Id(c, CHOSEN), survived: true }]);
+      expect(r.counterexamples[0]?.exhibitId).toBe(cid(c, CHOSEN));
+      expect(r.counterexamples[0]?.exhibitId).not.toBe(cid(c, PARAMS));
+      expect(r.rejectedBy).toBe('counterexample-survives');
+    });
+
+    it('names a counterexample that the patch defeats with the id Lane 3 computed', async () => {
+      const { verify } = setup((req) =>
+        body(req.template) === 'counterexample source'
+          ? raw(req.params[0]!.values.map(() => req.variant === 'vulnerable'))
+          : fixedByPatch(req),
+      );
+      const c = counterexample({}, CHOSEN);
+      const r = await verify(patchExhibit(), [c]);
+      expect(r.counterexamples).toEqual([{ exhibitId: lane3Id(c, CHOSEN), survived: false }]);
+      expect(r.rejectedBy).toBeUndefined();
+    });
+
+    const headerless = (code: string): Exhibit => ({ ...counterexample(), code });
+    it.each([
+      ['no header', headerless('counterexample source')],
+      ['a header that is not JSON', headerless('// affidavit counterexample params: [{\ncode')],
+      [
+        'a header naming a parameter the family does not declare',
+        counterexample({}, [{ name: 'role', values: ['admin'] }]),
+      ],
+      [
+        'a header over the family size cap',
+        counterexample({}, [
+          {
+            name: 'threshold',
+            values: Array.from({ length: DEFAULT_POLICY.maxFamilySize + 1 }, (_, i) => `v${i}`),
+          },
+        ]),
+      ],
+    ])(
+      'refuses the patch with schema for a counterexample with %s, before building',
+      async (_, bad) => {
+        const { exec, workbench, verify } = setup(answer);
+        const r = await verify(patchExhibit(), [counterexample(), bad]);
+        expect(r.rejectedBy).toBe('schema');
+        expect(r.familyFlipped).toBe(false);
+        expect(r.counterexamples).toHaveLength(2);
+        expect(r.counterexamples[0]).toEqual({ exhibitId: cid(), survived: true });
+        expect(r.counterexamples[1]?.exhibitId).toMatch(/^exhibit-counterexample-invalid-/);
+        expect(workbench.prepared).toHaveLength(0);
+        expect(exec.requests).toHaveLength(0);
+      },
+    );
+
+    it('returns exactly one result per submitted counterexample, in order', async () => {
+      const { verify } = setup(answer);
+      const a = counterexample({}, CHOSEN);
+      const b = counterexample();
+      const accepted = await verify(patchExhibit(), [a, b, a]);
+      expect(accepted.counterexamples.map((c) => c.exhibitId)).toEqual([
+        cid(a, CHOSEN),
+        cid(b),
+        cid(a, CHOSEN),
+      ]);
+      const early = await verify(patchExhibit(GATE_PATCH_DIFF, { linesChanged: 1 }), [a, b, a]);
+      expect(early.rejectedBy).toBe('schema');
+      expect(early.counterexamples.map((c) => c.exhibitId)).toEqual([
+        cid(a, CHOSEN),
+        cid(b),
+        cid(a, CHOSEN),
+      ]);
+      expect((await verify(patchExhibit(), [])).counterexamples).toEqual([]);
+    });
+  });
+
   it('accepts a patch when the only counterexample is inadmissible', async () => {
     const { verify } = setup((req) =>
-      req.template === 'counterexample source'
+      body(req.template) === 'counterexample source'
         ? raw([], { exitCode: null, timedOut: true, artifact: null })
         : fixedByPatch(req),
     );
@@ -296,7 +419,7 @@ describe('Judge.verifyPatch', () => {
 
   it('counts an admissible counterexample that never completes on the patch as surviving', async () => {
     const { verify } = setup((req) =>
-      req.template === 'counterexample source' && req.variant === 'patched'
+      body(req.template) === 'counterexample source' && req.variant === 'patched'
         ? raw([], { exitCode: null, timedOut: true, artifact: null })
         : fixedByPatch(req),
     );

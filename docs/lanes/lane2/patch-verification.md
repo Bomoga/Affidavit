@@ -9,6 +9,7 @@ Static checks run first, so a bad patch never costs a build.
 | Step | Check                                                                                                                                                                                                         | Fails with                                                                               |
 | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
 | 1    | Patch exhibit parses, belongs to this case, is authored by `remedy`, `sha256` is the SHA-256 of `diff`, `code` equals `diff`, diff within `maxSourceBytes`; witness parses and fits the case                  | `schema`                                                                                 |
+| 1b   | Every counterexample that parses as an Exhibit carries a readable params header (see "Counterexample params header"); a missing or bad header refuses the whole patch | `schema` |
 | 2    | Diff is a plain git diff of text files with safe paths and exact file names, no line over 2000 characters (see below), and the declared `filesTouched` and `linesChanged` equal what the diff contains        | `schema`                                                                                 |
 | 3    | Added plus removed lines at most `maxPatchLinesChanged` (100), files at most `maxPatchFiles` (5)                                                                                                              | `diff-too-large`                                                                         |
 | 4    | The patch does not weaken the target's test suite (see "Suite guard")                                                                                                                                         | `suite-fails`                                                                            |
@@ -25,7 +26,28 @@ The caps in step 3 are configuration, not measurements. Tune them once real Reme
 
 ## Ids
 
-The Judge mints every id in a `VerifyResult` and never echoes a submitted one. The patch id is `exhibit-patch-` plus the first 24 hex digits of the SHA-256 of canonical JSON `{caseId, diff, kind: "patch"}`, the same recipe Lane 3 uses; counterexample ids are `counterexampleExhibitId(counterexample, witness.params)`, as in `runCounterexample`. An exhibit too malformed to read gets the `exhibit-<kind>-invalid-<24 hex>` fallback. Recipes and test vectors: `rules-of-evidence.md`, "Exhibit ids".
+The Judge mints every id in a `VerifyResult` and never echoes a submitted one. The patch id is `exhibit-patch-` plus the first 24 hex digits of the SHA-256 of canonical JSON `{caseId, diff, kind: "patch"}`, the same recipe Lane 3 uses; counterexample ids are `counterexampleExhibitId(counterexample, headerParams)`, where `headerParams` is the parameter space in the counterexample's own header (CR-T8). That is the id Prosecution computed (`packages/trial/src/counterexample.ts`, `counterexampleExhibitId`), so Remedy's exact-id check matches. The result has exactly one entry per submitted counterexample, in submission order, also when the patch is refused early. An exhibit too malformed to read gets the `exhibit-<kind>-invalid-<24 hex>` fallback. Recipes and test vectors: `rules-of-evidence.md`, "Exhibit ids".
+
+## Counterexample params header (CR-T8)
+
+Lead decision (2026-11-20): CR-T8 is resolved inside Lane 2, with no contract change. A Prosecution counterexample is the family template run over a parameter space Prosecution chose (a subset of the Defense values, or new values of a declared parameter). Lane 3 writes that space as the first line of the code:
+
+```
+// affidavit counterexample params: <canonical JSON ParamSpace, U+2028 and U+2029 escaped>
+<family template>
+```
+
+`verifyPatch` reads it with `readCounterexampleParams` (`packages/judge/src/counterexample.ts`) and runs the counterexample over that space on `vulnerable`, `safe` and `patched`, never over the witness's family. The header is accepted only when:
+
+1. it is the first line, starts with the prefix above, and code follows it after a newline (`\n`);
+2. the JSON parses as the contract `ParamSpace`, with no `__proto__` key at any depth;
+3. the line is byte for byte what `counterexampleParamsHeader` writes for that space (canonical JSON, separators escaped), so one space has one header and one id;
+4. the parameter names are the witness family's, in the family's order (values may differ);
+5. the space is within `maxFamilySize` combinations and `maxParamsBytes`.
+
+A counterexample that parses as an Exhibit but fails any of these refuses the whole patch with `schema` before anything is built. It is never skipped into a pass. Its entry gets the `exhibit-counterexample-invalid-<24 hex>` id.
+
+Not changed here: `runCounterexample` still runs over the witness passed with it. Lane 3 passes a carrier witness whose params equal the header, so its ids already match. Open question for the lead: an exhibit that is not readable at all, is for another case, or has the wrong kind still keeps the earlier behaviour (reported `survived: false`, not used, patch not refused). Lane 3 never sends one; making it refuse the patch too would be stricter.
 
 ## Counterexamples
 
@@ -35,6 +57,7 @@ What is reported for each submitted counterexample:
 
 | Counterexample                                                                     | `survived`                                          |
 | ---------------------------------------------------------------------------------- | --------------------------------------------------- |
+| Parses as an Exhibit, but its params header is missing or bad                     | patch refused with `schema`; entry `false`          |
 | Malformed, another case, wrong kind, or over `maxSourceBytes`                      | `false` (not used)                                  |
 | Readable but inadmissible (for example it also passes on `safe`, or is unstable)   | `false` (not used)                                  |
 | Admissible, and fails every parameter on `patched` with clean runs                 | `false`                                             |

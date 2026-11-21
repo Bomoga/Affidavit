@@ -46,6 +46,7 @@ Contracts version in use: v1.0
 - 2026-11-15 (lead decision, flagged on PR #17): a counterexample counts against a patch only after it is admitted on `vulnerable` and `safe` under every rule of evidence. Inadmissible and malformed counterexamples are reported `survived: false` and not used.
 - 2026-11-15: verifyPatch mints the patch id (`{caseId, diff, kind: "patch"}`, the recipe Lane 3 already uses) and counterexample ids; submitted ids are never echoed. A patch whose `sha256` or `code` disagrees with its diff is `schema`. A patch that deletes or edits existing tests or test scripts is `suite-fails` before any build.
 - 2026-11-15: A dirty re-scan shows only as `rescanClean: false`, because contracts v1.0 has no rule for it. A patch that does not apply is `schema`; one that does not build is `suite-fails`.
+- 2026-11-20 (lead decision, CR-T8 resolved in Lane 2): verifyPatch reads the `// affidavit counterexample params:` header Lane 3 writes, runs each counterexample over those params, and mints its id from them (the id Prosecution computed). One result per submitted counterexample. A counterexample with a missing or bad header refuses the patch with `schema`, before any build. See `patch-verification.md`.
 
 ## Metrics from real runs
 

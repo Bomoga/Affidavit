@@ -11,6 +11,7 @@ import type {
 } from '@affidavit/contracts';
 import { familySize } from './artifact.js';
 import { EXHIBIT_ID_HEX_CHARS, canonicalJson, mintExhibitId, sha256Hex } from './canonical.js';
+import { readCounterexampleParams } from './counterexample.js';
 import type { ExecutionVariant, WitnessExecutor } from './executor.js';
 import { addedLines, parseUnifiedDiff, selectFiles } from './patch/diff.js';
 import type { ParsedDiff } from './patch/diff.js';
@@ -175,8 +176,14 @@ export class Judge implements JudgePort {
    * counterexample on the patched target, and the discovery re-scan.
    *
    * Ids are minted by the Judge: the patch from its case and diff (`patchExhibitId`), each
-   * counterexample from its case, code and the witness's family (`counterexampleExhibitId`).
-   * Submitted ids are never echoed back.
+   * counterexample from its case, code and the params in its header (`counterexampleExhibitId`
+   * over `readCounterexampleParams`, CR-T8), which is the id Lane 3 computed. Submitted ids are
+   * never echoed back, and the result has exactly one entry per submitted counterexample, in order.
+   *
+   * A counterexample runs over the params in its header, not the witness's family. A
+   * counterexample that parses as an Exhibit but whose header is missing, unreadable, not
+   * canonical, names other parameters than the family, or is over the family limits refuses the
+   * whole patch with `schema` before anything is built (fail closed).
    *
    * A counterexample counts against the patch only once it is admissible: it reruns on
    * `vulnerable` (and `safe`, when the case has one) under every rule of evidence first. An
@@ -201,20 +208,30 @@ export class Judge implements JudgePort {
     const minted = p?.success ? safely(() => patchExhibitId(p.data)) : undefined;
     const patchId = minted ?? fallbackId('patch', patch);
     const w = safely(() => Witness.safeParse(witness));
-    const params = w?.success ? w.data.params : undefined;
+    const familyParams = w?.success ? w.data.params : undefined;
+    // One entry per submitted counterexample, in order, so the result names exactly what was
+    // submitted. Each runs over the params in its own header (CR-T8), and its id is minted from
+    // them, the same recipe Lane 3 uses. A counterexample whose header is missing or unreadable
+    // refuses the whole patch with `schema` below: it can never be skipped into a pass.
     const counters = counterexamples.map((c) => {
       const parsed = safely(() => Exhibit.safeParse(c));
+      if (parsed?.success !== true || familyParams === undefined) {
+        return { exhibitId: fallbackId('counterexample', c), badHeader: false };
+      }
+      const header = readCounterexampleParams(parsed.data.code, familyParams, this.#policy);
+      const exhibitId = header.ok
+        ? safely(() => counterexampleExhibitId(parsed.data, header.params))
+        : undefined;
+      if (!header.ok || exhibitId === undefined) {
+        return { exhibitId: fallbackId('counterexample', c), badHeader: true };
+      }
       const usable =
-        parsed?.success === true &&
         parsed.data.kind === 'counterexample' &&
         parsed.data.caseId === cf.id &&
         utf8Bytes(parsed.data.code) <= this.#policy.maxSourceBytes;
-      const exhibitId =
-        parsed?.success === true && params !== undefined
-          ? (safely(() => counterexampleExhibitId(parsed.data, params)) ??
-            fallbackId('counterexample', c))
-          : fallbackId('counterexample', c);
-      return { exhibitId, code: usable && parsed?.success ? parsed.data.code : undefined };
+      return usable
+        ? { exhibitId, badHeader: false, code: parsed.data.code, params: header.params }
+        : { exhibitId, badHeader: false };
     });
     const reject = (rule: AdmissibilityRule): VerifyResult =>
       VerifyResult.parse({
@@ -242,6 +259,7 @@ export class Judge implements JudgePort {
     }
     if (utf8Bytes(p.data.diff) > this.#policy.maxSourceBytes) return reject('schema');
     if (!w?.success || !this.#witnessFits(cf, w.data)) return reject('schema');
+    if (counters.some((c) => c.badHeader)) return reject('schema');
     const parse = parseUnifiedDiff(p.data.diff);
     if (!parse.ok || !declaredMatches(p.data, parse.diff)) return reject('schema');
     const diff = parse.diff;
@@ -291,8 +309,8 @@ export class Judge implements JudgePort {
         plan.tests.files.length === 0 ? null : await deps.workbench.runAddedTests(cf, prepared);
       const suite = { passed: ownSuite.passed === true && addedTests?.passed !== false };
       const results: VerifyResult['counterexamples'] = [];
-      for (const { exhibitId, code } of counters) {
-        if (code === undefined) {
+      for (const { exhibitId, code, params: space } of counters) {
+        if (code === undefined || space === undefined) {
           results.push({ exhibitId, survived: false });
           continue;
         }
@@ -301,8 +319,8 @@ export class Judge implements JudgePort {
         const admitted = judgeEvidence(
           {
             exhibitId,
-            familySize: size,
-            attempts: await this.#attempts(cf, this.#targets(cf, ['vulnerable']), code, params),
+            familySize: familySize(space),
+            attempts: await this.#attempts(cf, this.#targets(cf, ['vulnerable']), code, space),
           },
           this.#policy,
         );
@@ -310,9 +328,9 @@ export class Judge implements JudgePort {
           results.push({ exhibitId, survived: false });
           continue;
         }
-        const attempts = await this.#attempts(cf, [['patched', prepared.target]], code, params);
+        const attempts = await this.#attempts(cf, [['patched', prepared.target]], code, space);
         const survived = counterexampleSurvives(
-          { exhibitId, familySize: size, attempts },
+          { exhibitId, familySize: familySize(space), attempts },
           this.#policy,
         );
         results.push({ exhibitId, survived });
