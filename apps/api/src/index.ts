@@ -1,2 +1,13 @@
-// TODO: placeholder for @affidavit/api. No logic yet.
-export {};
+export { buildApp, authFromConfig, BODY_LIMIT, WEBHOOK_BODY_LIMIT } from './app.js';
+export type { BuildAppOptions, GithubWebhook } from './app.js';
+export { devAuth, githubAuth, githubTenantId } from './auth.js';
+export type { AuthProvider, Principal } from './auth.js';
+export { UnknownTenantError } from './backend.js';
+export type { CaseBackend, CaseView, TenantCases } from './backend.js';
+export { ConfigError, loadApiConfig, isLoopbackHost } from './config.js';
+export type { ApiConfig, AuthConfig, SseConfig } from './config.js';
+export { MemoryCaseBackend } from './memory-backend.js';
+export { PgCaseBackend } from './pg-backend.js';
+export { backendFromConfig, startServer } from './server.js';
+export { formatEvent, resumeAfter, trialEventStream } from './sse.js';
+export { signGithubBody, verifyGithubSignature } from './webhook.js';
