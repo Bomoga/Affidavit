@@ -35,8 +35,14 @@ export interface ScanBudget {
   now?: () => number;
 }
 
-/** A literal credential body in a header or bearer token: never `$VAR`, a quote, or code. */
-const TOKEN = String.raw`[A-Za-z0-9._~+/=-]{8,1024}`;
+/**
+ * A literal credential body in a header or bearer token: never `$VAR`, a quote, or code. At
+ * least 8 characters, then the whole rest of the run, so a long value leaves nothing behind.
+ * Nothing follows it in any pattern, so the trailing run never backtracks.
+ */
+const TOKEN = String.raw`[A-Za-z0-9._~+/=-]{8}[A-Za-z0-9._~+/=-]*`;
+/** A base64url run, matched atomically (lookahead plus backreference) so it never backtracks. */
+const B64URL_RUN = (group: number) => `(?=([A-Za-z0-9_-]*))\\${group}`;
 const KEYS = String.raw`(?:password|passwd|secret|token|api[_-]?key|authorization)`;
 /** Characters an unquoted literal value runs to. Stops at code punctuation. */
 const UNQUOTED = String.raw`[^\s"'\x60,;(){}\[\]<>=:]`;
@@ -74,18 +80,24 @@ const PATTERNS: readonly Pattern[] = [
   p(String.raw`\bAIza[0-9A-Za-z_-]{35}`, ''),
   p(String.raw`\bGOCSPX-[A-Za-z0-9_-]{20,255}`, ''),
   p(String.raw`\bnpm_[A-Za-z0-9]{36}`, ''),
-  // A JWT anywhere (header.payload.signature); each body matched atomically.
+  // A JWT anywhere (header.payload.signature), of any length. A match starts only where a
+  // base64url run starts (lookbehind), and each segment is one atomic run, so every character
+  // is visited a bounded number of times however long the token is: no bound to fail open on.
   p(
-    String.raw`\beyJ(?=([A-Za-z0-9_-]{8,256}))\1\.eyJ(?=([A-Za-z0-9_-]{8,4096}))\2\.[A-Za-z0-9_-]{0,1024}`,
+    String.raw`(?<![A-Za-z0-9_-])eyJ(?=[A-Za-z0-9_-]{8})${B64URL_RUN(1)}\.eyJ(?=[A-Za-z0-9_-]{8})${B64URL_RUN(2)}(?:\.[A-Za-z0-9_-]*)?`,
     '',
   ),
-  // PEM private key blocks, whole, or the header and what follows if the block is cut.
+  // PEM private key blocks: the header, the rest of its line, then every following non-empty
+  // line up to and including an END line, or up to a blank line or the end of the text. Line by
+  // line, so a missing END never stops at an arbitrary cut. Each line starts with a literal
+  // newline and excludes newlines, so the scan is linear.
   p(
-    String.raw`-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----(?:[\s\S]{0,8192}?-----END [A-Z ]{0,40}PRIVATE KEY-----|[\s\S]{0,8192})`,
+    String.raw`-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----[^\r\n]*(?:\r?\n(?!-----END )[^\r\n]+)*(?:\r?\n-----END [A-Z ]{0,40}PRIVATE KEY-----)?`,
     '',
   ),
-  // Credentials in a URL's userinfo: scheme://user:pass@host. Anchored on the literal `://`.
-  p(String.raw`(://[^\s/:@]{1,128}:)(?=([^\s/@]{1,256}))\2(?=@)`, '', `$1${REDACTED}`),
+  // Credentials in a URL's userinfo: scheme://user:pass@host, of any length. Anchored on the
+  // literal `://`; user and password are atomic runs that cannot cross another `://`.
+  p(String.raw`(://(?=([^\s/:@]+))\2:)(?=([^\s/@]+))\3(?=@)`, '', `$1${REDACTED}`),
   // Authorization headers and assignments, with or without a scheme, with a literal value.
   p(
     String.raw`(\bauthorization["']?[ \t]{0,16}[:=][ \t]{0,16}["']?(?:(?:bearer|basic|token)[ \t]{1,16})?)${TOKEN}`,
@@ -102,15 +114,22 @@ const PATTERNS: readonly Pattern[] = [
   p(String.raw`(\bbearer[ \t]{1,16})${TOKEN}`, 'i', `$1${REDACTED}`),
   // Credential-looking URL query parameters (not `{{placeholders}}` or `$vars`).
   p(
-    String.raw`([?&](?:key|token|auth|sig|signature)=)[^&\s"'#$<>{}]{1,1024}`,
+    String.raw`([?&](?:key|token|auth|sig|signature)=)[^&\s"'#$<>{}][^&\s"'#<>{}]*`,
     'i',
     `$1${REDACTED}`,
   ),
-  // Password, secret, token, api key or authorization assigned a quoted literal of 8+ characters.
+  // Password, secret, token, api key or authorization assigned a quoted literal of 8+
+  // characters. Only a leading `$` marks a placeholder (`"${PASSWORD}"`); `$` inside counts.
   p(
-    String.raw`(${KEYS}["']?[ \t]{0,16}[:=][ \t]{0,16})(["'\x60])[^"'\x60\n$]{8,256}\2`,
+    String.raw`(${KEYS}["']?[ \t]{0,16}[:=][ \t]{0,16})(["'\x60])(?![$])[^"'\x60\n]{8,256}\2`,
     'i',
     `$1$2${REDACTED}$2`,
+  ),
+  // A quoted literal too long for the bound above is a credential too: redact the whole run.
+  p(
+    String.raw`(${KEYS}["']?[ \t]{0,16}[:=][ \t]{0,16})(["'\x60])(?![$])[^"'\x60\n]{257}[^"'\x60\n]*`,
+    'i',
+    `$1$2${REDACTED}`,
   ),
   // ...or an unquoted literal of 6+ characters that holds a digit or symbol, is not a `$var`,
   // and is not a member expression or call: `password: hunter22` and `PASSWORD = s3cr3t!` are

@@ -70,6 +70,24 @@ export const CREDENTIAL_SAMPLES: readonly { kind: string; text: string; value: s
     s('openai key', 'x ', 'sk' + '-' + 'AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdefghij'),
     s('unquoted yaml password', 'password: ', 'hunter22'),
     s('spaced uppercase password', 'PASSWORD = ', 's3cr3t!'),
+    s('quoted password with $ inside', 'const password = "', 'pa$$w0rd!xyz', '";'),
+    s('quoted secret longer than 256', 'secret = "', 'q1w2e3r4'.repeat(50), '"'),
+    s(
+      'PEM body of 20 KB without END',
+      '',
+      `-----BEGIN ${'PRIVATE KEY'}-----\n${`${'MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7'.padEnd(64, 'A')}\n`.repeat(320)}`,
+      '\nafter the blank line',
+    ),
+    s('5000-char bearer header', 'Authorization: Bearer ', 'Ab9-'.repeat(1250)),
+    s('5000-char bare bearer', 'curl -H x Bearer ', 'Zz8_'.repeat(1250)),
+    s('5000-char token query', 'GET /x?token=', 'Qq7.'.repeat(1250), ' HTTP/1.1'),
+    s(
+      'oversized JWT',
+      'Cookie: s=',
+      `${'ey' + 'J'}${'h'.repeat(300)}.${'ey' + 'J'}${'p'.repeat(10_000)}.${'s'.repeat(500)}`,
+    ),
+    s('long URL userinfo password', 'postgres://svc:', 'Pw9'.repeat(150), '@db:5432/app'),
+    s('long URL userinfo user', `postgres://${'u'.repeat(300)}:`, 'Pw9Pw9Pw9', '@db/app'),
   ];
 })();
 
@@ -102,6 +120,20 @@ export const HOSTILE_INPUTS: readonly { kind: string; text: string }[] = (() => 
     { kind: 'repeated ?token=', text: fill('?token=') },
     { kind: 'repeated slack hook path', text: fill('hooks.slack' + '.com/services/') },
     { kind: 'repeated secret="', text: fill('secret="') },
+    { kind: 'one long quoted value', text: fill('a', 'password="') },
+    { kind: 'one long JWT header run', text: fill('a', 'ey' + 'J') },
+    { kind: 'one long bearer run', text: fill('Ab9-', 'Bearer ') },
+    { kind: 'repeated ://a:', text: fill('://a:') },
+    { kind: 'one long userinfo run', text: fill('a', 'x://') },
+    {
+      kind: 'PEM headers between blank lines',
+      text: fill(`-----BEGIN ${'RSA PRIVATE KEY'}-----\n\n`),
+    },
+    {
+      kind: 'PEM header and many lines',
+      text: fill('QUJD\n', `-----BEGIN ${'PRIVATE KEY'}-----\n`),
+    },
+    { kind: 'repeated eyJ segments', text: fill('eyJaaaaaaaaa.') },
   ];
 })();
 

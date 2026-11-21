@@ -16,6 +16,8 @@ describe('third-party credential forms', () => {
     it(`redacts a ${sample.kind}`, () => {
       const out = redact(sample.text);
       expect(out).not.toContain(sample.value);
+      // No partial value is left behind after a bounded match.
+      expect(out).not.toContain(sample.value.slice(-16));
       expect(out).toContain(REDACTED);
       expect(detectCredential({ template: sample.text })).toBe('credential');
     });
