@@ -73,6 +73,16 @@ const addLines = (lines: string[], path = 'app/data/allocations-dao.js'): string
     '',
   ].join('\n');
 
+/** A diff that creates `path` with `lines`. */
+const newFile = (path: string, lines: string[]) =>
+  [
+    `--- /dev/null`,
+    `+++ b/${path}`,
+    `@@ -0,0 +1,${lines.length} @@`,
+    ...lines.map((l) => `+${l}`),
+    '',
+  ].join('\n');
+
 /** The id the Judge mints for a counterexample run over the params in its header. */
 const cid = (c: Exhibit = counterexample(), params: ParamSpace = PARAMS) =>
   counterexampleExhibitId(c, params);
@@ -243,6 +253,66 @@ describe('Judge.verifyPatch', () => {
       familyFlipped: true,
       suitePassed: false,
       rejectedBy: 'suite-fails',
+    });
+  });
+
+  it('rejects a patch whose suite is unavailable with suite-fails (fail closed)', async () => {
+    // Lead decision 2026-11-20 (PR #46): a suite that cannot run is never a pass. The earlier
+    // version of this test asserted no rejection; that was fail-open.
+    const reason = 'the suite cannot be built: node_modules/x resolves outside the npm registry';
+    const { workbench } = setup(fixedByPatch, { suiteUnavailable: reason });
+    const judge = new Judge(new ScriptedExecutor(fixedByPatch), DEFAULT_POLICY, {
+      workbench,
+      rescan: new RecordingRescan(),
+    });
+    const report = await judge.verifyPatchReport(gateCaseFile(), patchExhibit(), witness(), []);
+    expect(report.suite).toEqual({ state: 'unavailable', reason });
+    expect(report.result).toMatchObject({
+      familyFlipped: true,
+      suitePassed: false,
+      rejectedBy: 'suite-fails',
+    });
+    expect(await judge.verifyPatch(gateCaseFile(), patchExhibit(), witness(), [])).toEqual(
+      report.result,
+    );
+  });
+
+  it('names the family rule first when the family does not flip and the suite is unavailable', async () => {
+    const { verify } = setup(
+      (req) => raw(PAYLOADS.map((_, i) => req.variant === 'vulnerable' || i === 2)),
+      { suiteUnavailable: 'no suite' },
+    );
+    expect(await verify()).toMatchObject({ familyFlipped: false, rejectedBy: 'differential' });
+  });
+
+  it('never accepts a patch whose suite is unavailable, whatever else holds', async () => {
+    // Every other check passes: family flips, no counterexample survives, re-scan clean.
+    const { verify } = setup(fixedByPatch, { suiteUnavailable: 'no suite' });
+    const r = await verify(patchExhibit(), []);
+    expect(r).toMatchObject({ familyFlipped: true, rescanClean: true, counterexamples: [] });
+    expect(r.rejectedBy).toBe('suite-fails');
+  });
+
+  it('still rejects failing patch tests when the suite is unavailable', async () => {
+    const test = newFile('test/sqli.test.js', [`it('blocks', () => get("0' || '1'=='1"));`]);
+    const { verify } = setup(fixedByPatch, {
+      suiteUnavailable: 'no suite',
+      addedTestsPassed: false,
+    });
+    expect((await verify(patchExhibit(GATE_PATCH_DIFF + test))).rejectedBy).toBe('suite-fails');
+  });
+
+  it('says the suite did not run when the patch is refused before building', async () => {
+    const { workbench } = setup();
+    const judge = new Judge(new ScriptedExecutor(fixedByPatch), DEFAULT_POLICY, {
+      workbench,
+      rescan: new RecordingRescan(),
+    });
+    const big = patchExhibit(addLines(Array.from({ length: 150 }, (_, i) => `// ${i}`)));
+    const report = await judge.verifyPatchReport(gateCaseFile(), big, witness(), []);
+    expect(report).toMatchObject({
+      suite: { state: 'not-run' },
+      result: { rejectedBy: 'diff-too-large' },
     });
   });
 
@@ -618,14 +688,6 @@ describe('Judge.verifyPatch', () => {
   });
 
   describe('test files in the patch', () => {
-    const newFile = (path: string, lines: string[]) =>
-      [
-        `--- /dev/null`,
-        `+++ b/${path}`,
-        `@@ -0,0 +1,${lines.length} @@`,
-        ...lines.map((l) => `+${l}`),
-        '',
-      ].join('\n');
     /** The gate patch plus one more line in allocations-dao.js. */
     const gateWith = (line: string) =>
       GATE_PATCH_DIFF.replace('@@ -70,5 +70,6 @@', '@@ -70,5 +70,7 @@').replace(

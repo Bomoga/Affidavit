@@ -1,0 +1,265 @@
+{
+  "app": "nodegoat",
+  "commit": "c5cb68a7084e4ae7dcc60e6a98768720a81841e8",
+  "note": "Written by hand from server.js and app/routes/index.js and tutorial.js at the pinned commit, not produced by the map. Routes are in registration order. middleware is the chain in front of the handler without application-wide app.use middleware (that is appMiddleware, registered in server.js before routes(app, db) runs). Labels are the source form of each argument: an identifier is its name, a call is its callee name followed by (). Three things the map must not invent: app.use('/tutorial', tutorialRouter) is a mount, not a route; app.use(ErrorHandler) is registered after every route, so it is in no route's chain; app.get('/learn', ...) has an inline handler, so its handlerFile is index.js. The twelve /tutorial/<page> routes come from a for...of loop over a literal array in tutorial.js.",
+  "appMiddleware": [
+    "favicon()",
+    "bodyParser.json()",
+    "bodyParser.urlencoded()",
+    "session()",
+    "express.static()"
+  ],
+  "routes": [
+    {
+      "method": "GET",
+      "path": "/",
+      "middleware": [],
+      "handlerFile": "app/routes/session.js",
+      "authRequired": false
+    },
+    {
+      "method": "GET",
+      "path": "/login",
+      "middleware": [],
+      "handlerFile": "app/routes/session.js",
+      "authRequired": false
+    },
+    {
+      "method": "POST",
+      "path": "/login",
+      "middleware": [],
+      "handlerFile": "app/routes/session.js",
+      "authRequired": false
+    },
+    {
+      "method": "GET",
+      "path": "/signup",
+      "middleware": [],
+      "handlerFile": "app/routes/session.js",
+      "authRequired": false
+    },
+    {
+      "method": "POST",
+      "path": "/signup",
+      "middleware": [],
+      "handlerFile": "app/routes/session.js",
+      "authRequired": false
+    },
+    {
+      "method": "GET",
+      "path": "/logout",
+      "middleware": [],
+      "handlerFile": "app/routes/session.js",
+      "authRequired": false
+    },
+    {
+      "method": "GET",
+      "path": "/dashboard",
+      "middleware": ["isLoggedIn"],
+      "handlerFile": "app/routes/session.js",
+      "authRequired": true
+    },
+    {
+      "method": "GET",
+      "path": "/profile",
+      "middleware": ["isLoggedIn"],
+      "handlerFile": "app/routes/profile.js",
+      "authRequired": true
+    },
+    {
+      "method": "POST",
+      "path": "/profile",
+      "middleware": ["isLoggedIn"],
+      "handlerFile": "app/routes/profile.js",
+      "authRequired": true
+    },
+    {
+      "method": "GET",
+      "path": "/contributions",
+      "middleware": ["isLoggedIn"],
+      "handlerFile": "app/routes/contributions.js",
+      "authRequired": true
+    },
+    {
+      "method": "POST",
+      "path": "/contributions",
+      "middleware": ["isLoggedIn"],
+      "handlerFile": "app/routes/contributions.js",
+      "authRequired": true
+    },
+    {
+      "method": "GET",
+      "path": "/benefits",
+      "middleware": ["isLoggedIn"],
+      "handlerFile": "app/routes/benefits.js",
+      "authRequired": true
+    },
+    {
+      "method": "POST",
+      "path": "/benefits",
+      "middleware": ["isLoggedIn"],
+      "handlerFile": "app/routes/benefits.js",
+      "authRequired": true
+    },
+    {
+      "method": "GET",
+      "path": "/allocations/:userId",
+      "middleware": ["isLoggedIn"],
+      "handlerFile": "app/routes/allocations.js",
+      "authRequired": true
+    },
+    {
+      "method": "GET",
+      "path": "/memos",
+      "middleware": ["isLoggedIn"],
+      "handlerFile": "app/routes/memos.js",
+      "authRequired": true
+    },
+    {
+      "method": "POST",
+      "path": "/memos",
+      "middleware": ["isLoggedIn"],
+      "handlerFile": "app/routes/memos.js",
+      "authRequired": true
+    },
+    {
+      "method": "GET",
+      "path": "/learn",
+      "middleware": ["isLoggedIn"],
+      "handlerFile": "app/routes/index.js",
+      "authRequired": true
+    },
+    {
+      "method": "GET",
+      "path": "/research",
+      "middleware": ["isLoggedIn"],
+      "handlerFile": "app/routes/research.js",
+      "authRequired": true
+    },
+    {
+      "method": "GET",
+      "path": "/tutorial",
+      "middleware": [],
+      "handlerFile": "app/routes/tutorial.js",
+      "authRequired": false
+    },
+    {
+      "method": "GET",
+      "path": "/tutorial/a1",
+      "middleware": [],
+      "handlerFile": "app/routes/tutorial.js",
+      "authRequired": false
+    },
+    {
+      "method": "GET",
+      "path": "/tutorial/a2",
+      "middleware": [],
+      "handlerFile": "app/routes/tutorial.js",
+      "authRequired": false
+    },
+    {
+      "method": "GET",
+      "path": "/tutorial/a3",
+      "middleware": [],
+      "handlerFile": "app/routes/tutorial.js",
+      "authRequired": false
+    },
+    {
+      "method": "GET",
+      "path": "/tutorial/a4",
+      "middleware": [],
+      "handlerFile": "app/routes/tutorial.js",
+      "authRequired": false
+    },
+    {
+      "method": "GET",
+      "path": "/tutorial/a5",
+      "middleware": [],
+      "handlerFile": "app/routes/tutorial.js",
+      "authRequired": false
+    },
+    {
+      "method": "GET",
+      "path": "/tutorial/a6",
+      "middleware": [],
+      "handlerFile": "app/routes/tutorial.js",
+      "authRequired": false
+    },
+    {
+      "method": "GET",
+      "path": "/tutorial/a7",
+      "middleware": [],
+      "handlerFile": "app/routes/tutorial.js",
+      "authRequired": false
+    },
+    {
+      "method": "GET",
+      "path": "/tutorial/a8",
+      "middleware": [],
+      "handlerFile": "app/routes/tutorial.js",
+      "authRequired": false
+    },
+    {
+      "method": "GET",
+      "path": "/tutorial/a9",
+      "middleware": [],
+      "handlerFile": "app/routes/tutorial.js",
+      "authRequired": false
+    },
+    {
+      "method": "GET",
+      "path": "/tutorial/a10",
+      "middleware": [],
+      "handlerFile": "app/routes/tutorial.js",
+      "authRequired": false
+    },
+    {
+      "method": "GET",
+      "path": "/tutorial/redos",
+      "middleware": [],
+      "handlerFile": "app/routes/tutorial.js",
+      "authRequired": false
+    },
+    {
+      "method": "GET",
+      "path": "/tutorial/ssrf",
+      "middleware": [],
+      "handlerFile": "app/routes/tutorial.js",
+      "authRequired": false
+    }
+  ],
+  "dataAccess": [
+    {
+      "kind": "mongo",
+      "method": "find",
+      "collection": "allocations",
+      "file": "app/data/allocations-dao.js",
+      "startLine": 86
+    },
+    {
+      "kind": "mongo",
+      "method": "update",
+      "collection": "users",
+      "file": "app/data/benefits-dao.js",
+      "startLine": 24
+    },
+    {
+      "kind": "code-eval",
+      "method": "eval",
+      "file": "app/routes/contributions.js",
+      "startLine": 32
+    },
+    {
+      "kind": "code-eval",
+      "method": "eval",
+      "file": "app/routes/contributions.js",
+      "startLine": 33
+    },
+    {
+      "kind": "code-eval",
+      "method": "eval",
+      "file": "app/routes/contributions.js",
+      "startLine": 34
+    }
+  ]
+}
