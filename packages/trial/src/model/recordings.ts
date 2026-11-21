@@ -4,8 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { PromptId, StageCost } from '@affidavit/contracts';
 import { canonicalJson, sha256Hex } from '../canonical.js';
 import type { ModelTurnRequest, ModelTurnResult } from '../orchestrator.js';
-import { NoModelRecordingError } from './errors.js';
-import { redactDeep } from './redact.js';
+import { ModelCallError, NoModelRecordingError } from './errors.js';
+import { containsSecret, redactDeep } from './redact.js';
 
 /** Where recorded agent outputs live by default: `fixtures/models/` at the repo root (Lane 3). */
 export const DEFAULT_RECORDINGS_DIR = resolve(
@@ -104,6 +104,17 @@ export class FileRecordingStore implements RecordingStore {
 
   write(req: ModelTurnRequest, result: ModelTurnResult, secrets: readonly string[]): Promise<void> {
     const hash = inputSha256(req);
+    // The submission is stored exactly as the agent sent it, so a replayed exhibit matches the
+    // live one byte for byte. It is never pattern-redacted; one that carries a secret value is
+    // refused instead. Every other field is redacted as usual.
+    const { submission, ...rest } = result;
+    if (containsSecret(submission, secrets)) {
+      return Promise.reject(
+        new ModelCallError('refusing to record a submission that contains the API key'),
+      );
+    }
+    const stored = redactDeep(rest, secrets) as ModelTurnResult;
+    if ('submission' in result) stored.submission = submission;
     const recording: ModelRecording = {
       schemaVersion: 1,
       promptId: safeSegment(req.promptId),
@@ -111,7 +122,7 @@ export class FileRecordingStore implements RecordingStore {
       model: req.model,
       inputSha256: hash,
       userSha256: sha256Hex(req.user),
-      result: redactDeep(result, secrets) as ModelTurnResult,
+      result: stored,
     };
     const file = this.path(req, hash);
     mkdirSync(join(this.dir, recording.promptId), { recursive: true });

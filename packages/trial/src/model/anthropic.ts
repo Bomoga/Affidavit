@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { Options, SDKResultMessage } from '@anthropic-ai/claude-agent-sdk';
+import type { Options, SDKMessage, SDKResultMessage } from '@anthropic-ai/claude-agent-sdk';
 import { PromptId, type CaseStage, type StageCost } from '@affidavit/contracts';
 import { getPrompt } from '@affidavit/prompts';
 import { KillSwitchError, type ModelTurnRequest, type ModelTurnResult } from '../orchestrator.js';
@@ -10,7 +10,7 @@ import { ModelCallError, ModelConfigError, ModelUnconfiguredError } from './erro
 import { isKnownModelId, type ModelTable } from './models.js';
 import type { PreflightModelPort } from './preflight.js';
 import { FileRecordingStore, type RecordingStore } from './recordings.js';
-import { clipRedacted, describeThrown, redact, redactDeep } from './redact.js';
+import { clipRedacted, containsSecret, describeThrown, redact } from './redact.js';
 import {
   DENIED_BUILTIN_TOOLS,
   SUBMIT_SERVER_NAME,
@@ -135,8 +135,12 @@ export class AnthropicModelPort implements PreflightModelPort {
     if (!(config.timeoutMs > 0)) throw new ModelConfigError('timeoutMs must be positive');
     this.transport = config.transport ?? sdkTransport;
     this.env = config.env ?? (() => process.env);
+    // Record mode writes files, so where they go must be chosen explicitly, never defaulted.
+    if (config.mode === 'record' && config.recordings === undefined) {
+      throw new ModelConfigError('record mode needs an explicit recording store');
+    }
     this.recordings =
-      config.recordings ?? (config.mode === 'live' ? undefined : new FileRecordingStore());
+      config.recordings ?? (config.mode === 'replay' ? new FileRecordingStore() : undefined);
   }
 
   /** Aborts every turn in flight; each one throws KillSwitchError. */
@@ -289,9 +293,20 @@ export class AnthropicModelPort implements PreflightModelPort {
     const exceeds = (u: Usage): boolean =>
       u.inputTokens > req.budget.maxInputTokens || u.outputTokens > req.budget.maxOutputTokens;
 
+    // Resolves when the turn is aborted, so a stream that ignores the abort still ends here.
+    const aborted = new Promise<'aborted'>((resolve) => {
+      if (ac.signal.aborted) resolve('aborted');
+      ac.signal.addEventListener('abort', () => resolve('aborted'), { once: true });
+    });
+
     let streamError: unknown;
+    let iterator: AsyncIterator<SDKMessage> | undefined;
     try {
-      for await (const msg of this.transport({ prompt: req.user, options })) {
+      iterator = this.transport({ prompt: req.user, options })[Symbol.asyncIterator]();
+      for (;;) {
+        const next = await Promise.race([iterator.next(), aborted]);
+        if (next === 'aborted' || next.done === true) break;
+        const msg = next.value;
         if (killed) break;
         if (msg.type === 'assistant') {
           if (msg.error === 'authentication_failed') authFailed = true;
@@ -318,14 +333,15 @@ export class AnthropicModelPort implements PreflightModelPort {
       clearTimeout(timer);
       if (poll !== undefined) clearInterval(poll);
       this.inflight.delete(kill);
+      // Ask a stream that is still open to close; never wait on it, since it may be hung.
+      void Promise.resolve()
+        .then(() => iterator?.return?.())
+        .catch(() => undefined);
       workdir.dispose();
     }
 
     if (killed) throw new KillSwitchError();
     if (authFailed) throw new ModelUnconfiguredError('the provider rejected the API key');
-    if (streamError !== undefined && !timedOut && !overBudget) {
-      throw new ModelCallError(`agent turn failed: ${describeThrown(streamError, secrets)}`);
-    }
 
     const wallMs = Math.max(0, Math.round(result?.duration_ms ?? now() - started));
     let used: Usage;
@@ -353,34 +369,49 @@ export class AnthropicModelPort implements PreflightModelPort {
       wallMs,
     };
 
+    // Only the agent's own behaviour maps to an outcome. A provider failure (wall-clock timeout,
+    // a hung or broken stream, a stream with no result, an execution error) is a call error
+    // unless the agent had already submitted, so an outage can never read as "no submission"
+    // and dismiss a candidate.
     const outcome = ((): ModelTurnResult['outcome'] => {
-      if (overBudget || exceeds(used) || result?.subtype === 'error_max_budget_usd') {
-        return 'budget-exhausted';
+      if (overBudget) return 'budget-exhausted';
+      if (!box.captured) {
+        if (timedOut) {
+          throw new ModelCallError('agent turn hit the wall-clock cap before any submission');
+        }
+        if (streamError !== undefined) {
+          throw new ModelCallError(`agent turn failed: ${describeThrown(streamError, secrets)}`);
+        }
       }
+      if (exceeds(used) || result?.subtype === 'error_max_budget_usd') return 'budget-exhausted';
       if (box.captured) return 'submitted';
-      if (timedOut || result?.subtype === 'error_max_turns') return 'turn-cap';
-      return 'no-submission';
-    })();
-
-    if (outcome === 'no-submission') {
-      if (result === undefined) {
-        throw new ModelCallError('agent stream ended without a result');
-      }
+      if (result === undefined) throw new ModelCallError('agent stream ended without a result');
+      // The agent used every turn it had and never called its submit tool.
+      if (result.subtype === 'error_max_turns') return 'turn-cap';
       if (result.subtype === 'error_during_execution' || result.is_error) {
         const detail = result.subtype === 'success' ? result.result : result.errors.join('; ');
         // Redacted whole, then clipped: never the other way round.
         throw new ModelCallError(`agent turn failed: ${clipRedacted(detail, secrets)}`);
       }
-    }
+      return 'no-submission';
+    })();
 
+    const out: ModelTurnResult = { outcome, cost };
+    if (box.captured) {
+      // The submission is passed on exactly as the agent sent it: the Judge must run the witness
+      // the agent submitted, and the exhibit must match it byte for byte, so no pattern-based
+      // redaction ever touches it. The one thing it may never carry is the key itself; a
+      // submission containing it is refused, not passed on and not recorded.
+      if (containsSecret(box.submission, secrets)) {
+        throw new ModelCallError('the agent submission contained the API key and was refused');
+      }
+      out.submission = box.submission;
+    }
     this.log(
       'info',
       `model turn ${promptId} on ${req.model} ended ${outcome}${timedOut ? ' (wall-clock cap)' : ''}`,
       secrets,
     );
-    const out: ModelTurnResult = { outcome, cost };
-    // Redacted like everything else that leaves the port: the submission ends up in events.
-    if (box.captured) out.submission = redactDeep(box.submission, secrets);
     return out;
   }
 }

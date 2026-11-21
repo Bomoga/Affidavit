@@ -100,6 +100,30 @@ describe('createModelPortFromEnv', () => {
     expect(() => modelModeFrom({ AFFIDAVIT_MODEL_MODE: 'yolo' })).toThrow(ModelConfigError);
   });
 
+  it('refuses record and replay in production; live only there', () => {
+    const prod = { AFFIDAVIT_ENV: 'production', AFFIDAVIT_RECORD_DIR: tmpdir() };
+    expect(() => createModelPortFromEnv({ ...prod, AFFIDAVIT_MODEL_MODE: 'record' })).toThrow(
+      /production/,
+    );
+    expect(() => createModelPortFromEnv({ ...prod, AFFIDAVIT_MODEL_MODE: 'replay' })).toThrow(
+      /production/,
+    );
+    expect(() => createModelPortFromEnv({ ...prod, AFFIDAVIT_MODEL_MODE: 'live' })).not.toThrow();
+    expect(() => createModelPortFromEnv({ AFFIDAVIT_ENV: 'production' })).not.toThrow();
+  });
+
+  it('record mode runs only with an explicit AFFIDAVIT_RECORD_DIR', () => {
+    expect(() => createModelPortFromEnv({ AFFIDAVIT_MODEL_MODE: 'record' })).toThrow(
+      /AFFIDAVIT_RECORD_DIR/,
+    );
+    expect(() =>
+      createModelPortFromEnv({ AFFIDAVIT_MODEL_MODE: 'record', AFFIDAVIT_RECORD_DIR: '' }),
+    ).toThrow(ModelConfigError);
+    expect(() =>
+      createModelPortFromEnv({ AFFIDAVIT_MODEL_MODE: 'record', AFFIDAVIT_RECORD_DIR: tmpdir() }),
+    ).not.toThrow();
+  });
+
   it('builds without an API key, since the key is read only at call time', () => {
     expect(() => createModelPortFromEnv({})).not.toThrow();
     expect(() => createModelPortFromEnv({ AFFIDAVIT_MODEL_TIMEOUT_MS: '5' })).toThrow(

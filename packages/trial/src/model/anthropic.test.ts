@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { PromptId } from '@affidavit/contracts';
 import { FakeEventSink } from '@affidavit/testing';
-import { SUBMISSIONS } from '../envelope.js';
+import { SUBMISSIONS, WitnessSubmission } from '../envelope.js';
 import { KillSwitchError, Orchestrator, type StageHandler } from '../orchestrator.js';
 import { ROLE_TOOLS } from '../roles.js';
 import {
@@ -29,7 +29,14 @@ import {
 } from './errors.js';
 import { DEFAULT_MODEL_TABLE } from './models.js';
 import { FileRecordingStore } from './recordings.js';
-import { DENIED_BUILTIN_TOOLS, SUBMIT_SERVER_NAME, qualifiedToolName } from './submit-tools.js';
+import {
+  DENIED_BUILTIN_TOOLS,
+  SUBMIT_SERVER_NAME,
+  SubmissionBox,
+  buildSubmitTools,
+  qualifiedToolName,
+  submitInputShape,
+} from './submit-tools.js';
 import {
   CANARY_KEY,
   GOOD_WITNESS,
@@ -37,8 +44,10 @@ import {
   assistant,
   requestFor,
   result,
+  shapeValidator,
   stubTransport,
   type Script,
+  type StubOptions,
 } from './test-stubs.js';
 
 const tmpDirs: string[] = [];
@@ -61,9 +70,14 @@ const submits = (input: unknown, res = result('success')): Script =>
 
 function makePort(
   script: Script,
-  overrides: Partial<AnthropicModelPortConfig> & { key?: string | undefined } = {},
+  overrides: Partial<AnthropicModelPortConfig> & {
+    key?: string | undefined;
+    stubOptions?: StubOptions;
+  } = {},
 ) {
-  const stub = stubTransport(script);
+  const { stubOptions, ...portOverrides } = overrides;
+  overrides = portOverrides;
+  const stub = stubTransport(script, stubOptions);
   const logs: ModelLogEntry[] = [];
   const { key: given, ...rest } = overrides;
   const key = 'key' in overrides ? given : CANARY_KEY;
@@ -122,6 +136,64 @@ describe('safety envelope passed to the Agent SDK', () => {
       expect(o.disallowedTools).toEqual([...DENIED_BUILTIN_TOOLS]);
     });
   }
+
+  it('also denies by name shells, tool search, messaging, subagents, tasks and web tools', () => {
+    for (const t of [
+      'PowerShell',
+      'ToolSearch',
+      'Monitor',
+      'SendMessage',
+      'Agent',
+      'Task',
+      'TaskCreate',
+      'TaskGet',
+      'TaskList',
+      'TaskOutput',
+      'TaskStop',
+      'TaskUpdate',
+      'WebSearch',
+      'WebFetch',
+      'NotebookEdit',
+      'RemoteTrigger',
+      'CronCreate',
+      'EnterWorktree',
+    ]) {
+      expect(DENIED_BUILTIN_TOOLS as readonly string[]).toContain(t);
+    }
+  });
+
+  it('marks the submit tools always loaded, so tool search can never hide them', async () => {
+    const set = buildSubmitTools(['submit_witness', 'submit_patch'], new SubmissionBox());
+    for (const d of set.definitions) expect(d._meta?.['anthropic/alwaysLoad']).toBe(true);
+    // The server registers each tool with the flag, and every schema converts to JSON Schema
+    // (a tool whose schema does not convert is silently dropped by the runtime).
+    const registered = (
+      set.server.instance as unknown as {
+        _registeredTools: Record<string, { enabled: boolean; _meta?: Record<string, unknown> }>;
+      }
+    )._registeredTools;
+    for (const name of ['submit_witness', 'submit_patch']) {
+      expect(registered[name]?._meta?.['anthropic/alwaysLoad']).toBe(true);
+      expect(registered[name]?.enabled).toBe(true);
+    }
+    for (const promptId of PromptId.options) {
+      const { port, stub } = makePort(async function* () {
+        await Promise.resolve();
+        yield result('success');
+      });
+      await port.runTurn(requestFor(promptId));
+      const server = stub.calls[0]!.options.mcpServers![SUBMIT_SERVER_NAME] as typeof set.server;
+      const tools = (
+        server.instance as unknown as {
+          _registeredTools: Record<string, { enabled: boolean; _meta?: Record<string, unknown> }>;
+        }
+      )._registeredTools;
+      for (const name of ROLE_TOOLS[ROLE_OF_PROMPT[promptId]]) {
+        expect(tools[name]?._meta?.['anthropic/alwaysLoad'], `${promptId} ${name}`).toBe(true);
+        expect(tools[name]?.enabled, `${promptId} ${name}`).toBe(true);
+      }
+    }
+  });
 
   it('runs in a fresh empty cwd that is removed afterwards, with home pointed at it', async () => {
     const { port, stub } = makePort(submits(GOOD_WITNESS));
@@ -259,6 +331,8 @@ describe('API key handling', () => {
         await Promise.resolve();
         yield assistant('m1', 1, 1);
       },
+      // A clean submission, so record mode writes a file the scan below covers.
+      submits(GOOD_WITNESS),
     ];
     const logs: ModelLogEntry[] = [];
     for (const mode of ['live', 'record'] as const) {
@@ -279,8 +353,9 @@ describe('API key handling', () => {
     expect(all).not.toContain(CANARY_KEY);
     expect(all).not.toContain('CANARY');
     expect(all).toContain('[redacted]');
-    // The failures surfaced as typed errors, not as quiet "no submission" outcomes.
-    expect(outputs.filter((o) => o.startsWith('ModelCallError'))).toHaveLength(8);
+    // The failures surfaced as typed errors, not as quiet "no submission" outcomes. A submission
+    // that echoes the key is refused too (one per mode), never passed on redacted.
+    expect(outputs.filter((o) => o.startsWith('ModelCallError'))).toHaveLength(10);
   });
 
   it('a key straddling the 500-character clip in any error path leaves no fragment', async () => {
@@ -439,7 +514,7 @@ describe('budgets, caps and cost', () => {
     expect((await port.runTurn(requestFor('defense'))).outcome).toBe('budget-exhausted');
   });
 
-  it('enforces the wall-clock timeout by aborting the turn', async () => {
+  it('enforces the wall-clock timeout by aborting the turn, as a call error, not a turn cap', async () => {
     const { port, stub } = makePort(
       async function* (h) {
         yield assistant('m1', 1, 1);
@@ -449,9 +524,100 @@ describe('budgets, caps and cost', () => {
       },
       { timeoutMs: 20 },
     );
-    const out = await port.runTurn(requestFor('defense'));
-    expect(out.outcome).toBe('turn-cap');
+    const err = await port.runTurn(requestFor('defense')).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ModelCallError);
+    expect((err as Error).message).toMatch(/wall-clock/);
     expect(stub.calls[0]!.options.abortController!.signal.aborted).toBe(true);
+  });
+
+  it('a provider that hangs and ignores the abort still ends at the cap as a call error', async () => {
+    const { port, stub } = makePort(
+      async function* () {
+        yield assistant('m1', 1, 1);
+        // Never resolves and never looks at the signal.
+        await new Promise<void>(() => undefined);
+      },
+      { timeoutMs: 20 },
+    );
+    const err = await port.runTurn(requestFor('defense')).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ModelCallError);
+    expect(stub.calls[0]!.options.abortController!.signal.aborted).toBe(true);
+  });
+
+  it('a transport failure after the agent submitted keeps the submission', async () => {
+    const { port } = makePort(async function* (h) {
+      yield assistant('m1', 10, 10);
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      throw new Error('socket hang up');
+    });
+    const out = await port.runTurn(requestFor('defense'));
+    expect(out).toMatchObject({ outcome: 'submitted', submission: GOOD_WITNESS });
+  });
+
+  it('a timeout after the agent submitted keeps the submission', async () => {
+    const { port } = makePort(
+      async function* (h) {
+        yield assistant('m1', 10, 10);
+        await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+        await new Promise<void>(() => undefined);
+      },
+      { timeoutMs: 20 },
+    );
+    const out = await port.runTurn(requestFor('defense'));
+    expect(out).toMatchObject({ outcome: 'submitted', submission: GOOD_WITNESS });
+  });
+
+  it('hung defense turns never dismiss a candidate: the stage fails instead', async () => {
+    const cf = makeCaseFile();
+    const store = new LoggingCaseStore([]);
+    await openAt(store, cf, BIG_BUDGET, PATH_TO.defense);
+    const sink = new FakeEventSink();
+    const { port } = makePort(
+      async function* (h) {
+        yield assistant('m1', 1, 1);
+        await new Promise<void>((resolve) => {
+          h.options.abortController!.signal.addEventListener('abort', () => resolve());
+        });
+      },
+      { timeoutMs: 20 },
+    );
+    const outcomes: string[] = [];
+    const defense: StageHandler = {
+      async run(ctx) {
+        for (let i = 0; i < 2; i++) {
+          const r = await ctx.runAgentValidated(
+            { ...requestFor('defense'), actor: 'defense' },
+            SUBMISSIONS.defense,
+          );
+          outcomes.push(r.outcome);
+        }
+        // Reached only if the outage came back as an agent outcome; the handler would then
+        // treat two empty turns as no witness.
+        return { kind: 'advance', next: 'prosecution' };
+      },
+    };
+    const orch = new Orchestrator({
+      store,
+      sink,
+      model: port,
+      handlers: { defense },
+      config: { killSwitch: () => false, maxStageAttempts: 1, now: () => NOW },
+    });
+    await expect(orch.run(cf.id)).rejects.toBeInstanceOf(ModelCallError);
+    expect(outcomes).toEqual([]);
+    expect(await store.stage(cf.id)).toBe('defense');
+    expect(await store.getVerdict(cf.id)).toBeNull();
+    const types = assertSchemaValid(sink.events(cf.id)).map((e) => e.type);
+    expect(types).not.toContain('exhibit-inadmissible');
+  });
+
+  it('only an agent that used its turns without submitting is turn-cap', async () => {
+    const { port } = makePort(async function* () {
+      await Promise.resolve();
+      yield assistant('m1', 1, 1);
+      yield result('error_max_turns');
+    });
+    expect((await port.runTurn(requestFor('defense'))).outcome).toBe('turn-cap');
   });
 
   it('the kill switch aborts a running turn and throws KillSwitchError', async () => {
@@ -599,5 +765,167 @@ describe('malformed agent output', () => {
     const rejected = events.filter((e) => e.type === 'exhibit-inadmissible');
     expect(rejected).toHaveLength(1);
     expect(rejected[0]!.payload).toMatchObject({ rejectedBy: 'schema' });
+  });
+
+  const shapeOf = (strict: boolean) => (toolName: string) => {
+    if (toolName !== qualifiedToolName('submit_witness')) return undefined;
+    return strict ? WitnessSubmission.shape : submitInputShape('submit_witness');
+  };
+  const malformed = { template: 42, params: 'not a list' };
+
+  it('a runtime that validates the advertised schema before the hook lets a malformed first call through to capture', async () => {
+    let first: unknown[] = [];
+    let second: unknown[] = [];
+    const { port } = makePort(
+      async function* (h) {
+        first = await h.callTool(qualifiedToolName('submit_witness'), malformed);
+        second = await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+        yield result('success');
+      },
+      { stubOptions: { preValidate: shapeValidator(shapeOf(false)) } },
+    );
+    const out = await port.runTurn(requestFor('defense'));
+    expect(out).toMatchObject({ outcome: 'submitted', submission: malformed });
+    expect(JSON.stringify(first)).toContain('"continue":false');
+    expect(JSON.stringify(second)).toContain('Already submitted');
+  });
+
+  it('even a call the runtime bounces on validation is the one recorded, and ends the turn', async () => {
+    // The stub really validates: the strict contract shape rejects this input.
+    expect(shapeValidator(shapeOf(true))(qualifiedToolName('submit_witness'), malformed)).toMatch(
+      /InputValidationError/,
+    );
+    let first: unknown[] = [];
+    let second: unknown[] = [];
+    const { port } = makePort(
+      async function* (h) {
+        first = await h.callTool(qualifiedToolName('submit_witness'), malformed);
+        // A quiet retry with a fixed submission must not replace the first.
+        second = await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+        yield result('success');
+      },
+      { stubOptions: { preValidate: shapeValidator(shapeOf(true)) } },
+    );
+    const out = await port.runTurn(requestFor('defense'));
+    expect(out).toMatchObject({ outcome: 'submitted', submission: malformed });
+    expect(JSON.stringify(first)).toContain('"continue":false');
+    expect(JSON.stringify(second)).toContain('"continue":false');
+  });
+
+  it('a submit tool that ran without the PreToolUse hook still ends the turn after it', async () => {
+    const box = new SubmissionBox();
+    const set = buildSubmitTools(['submit_witness'], box);
+    // The runtime ran the handler directly (no PreToolUse): the handler keeps the raw args.
+    await set.definitions[0]!.handler(malformed, {});
+    expect(box.submission).toEqual(malformed);
+    const hook = set.hooks.PostToolUse[0]!.hooks[0]!;
+    const out = await hook(
+      {
+        hook_event_name: 'PostToolUse',
+        tool_name: qualifiedToolName('submit_witness'),
+        tool_input: malformed,
+        tool_response: {},
+        tool_use_id: 't',
+        session_id: 's',
+        transcript_path: '',
+        cwd: '',
+      } as never,
+      't',
+      { signal: new AbortController().signal },
+    );
+    expect(out).toMatchObject({ continue: false });
+  });
+});
+
+describe('agent submissions are never rewritten', () => {
+  const TOKENISH = {
+    template:
+      'GET /api/items?id={{id}}&token=abc123&key=zzz HTTP/1.1\nAuthorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln\nx-api-key: abcdef0123456789\nCookie: access_token=qwertyuiop',
+    params: [
+      { name: 'id', values: ['1', 'api_key=hunter2hunter2', 'sk-ant-not-the-real-key-000'] },
+    ],
+  };
+
+  it('passes a witness with bearer, header and URL token text through byte-identical, live, recorded and replayed', async () => {
+    const live = makePort(submits(TOKENISH));
+    const out = await live.port.runTurn(requestFor('defense'));
+    expect(JSON.stringify(out.submission)).toBe(JSON.stringify(TOKENISH));
+
+    const dir = tmp();
+    const req = requestFor('defense', 'token case');
+    const rec = makePort(submits(TOKENISH), {
+      mode: 'record',
+      recordings: new FileRecordingStore(dir),
+    });
+    const recorded = await rec.port.runTurn(req);
+    expect(JSON.stringify(recorded.submission)).toBe(JSON.stringify(TOKENISH));
+    const files = readdirSync(join(dir, 'defense'));
+    const body = JSON.parse(readFileSync(join(dir, 'defense', files[0]!), 'utf8')) as {
+      result: { submission: unknown };
+    };
+    expect(JSON.stringify(body.result.submission)).toBe(JSON.stringify(TOKENISH));
+
+    const replay = new AnthropicModelPort({
+      mode: 'replay',
+      modelTable: DEFAULT_MODEL_TABLE,
+      timeoutMs: 5_000,
+      recordings: new FileRecordingStore(dir),
+      env: () => ({}),
+    });
+    const replayed = await replay.runTurn(req);
+    expect(JSON.stringify(replayed.submission)).toBe(JSON.stringify(TOKENISH));
+  });
+
+  it('refuses a submission that contains the API key, and records nothing', async () => {
+    for (const mode of ['live', 'record'] as const) {
+      const dir = tmp();
+      const { port, logs } = makePort(
+        submits({ template: `GET /?q=x${CANARY_KEY}y`, params: [] }),
+        { mode, recordings: new FileRecordingStore(dir) },
+      );
+      const err = await port.runTurn(requestFor('defense')).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ModelCallError);
+      const text = `${(err as Error).message} ${(err as Error).stack ?? ''} ${logs.map((l) => l.message).join(' ')}`;
+      expect(text).not.toContain(CANARY_KEY);
+      expect(readdirSync(dir, { recursive: true })).toEqual([]);
+    }
+  });
+
+  it('a recording store refuses to write a submission that contains a secret', async () => {
+    const dir = tmp();
+    const store = new FileRecordingStore(dir);
+    const req = requestFor('defense');
+    await expect(
+      store.write(
+        req,
+        {
+          outcome: 'submitted',
+          submission: { template: CANARY_KEY, params: [] },
+          cost: {
+            stage: 'defense',
+            attempt: 1,
+            inputTokens: 1,
+            outputTokens: 1,
+            usd: 0,
+            wallMs: 1,
+          },
+        },
+        [CANARY_KEY],
+      ),
+    ).rejects.toBeInstanceOf(ModelCallError);
+    expect(readdirSync(dir, { recursive: true })).toEqual([]);
+  });
+});
+
+describe('record mode needs an explicit store', () => {
+  it('the port refuses record mode without a recording store', () => {
+    expect(
+      () =>
+        new AnthropicModelPort({
+          mode: 'record',
+          modelTable: DEFAULT_MODEL_TABLE,
+          timeoutMs: 5_000,
+        }),
+    ).toThrow(ModelConfigError);
   });
 });

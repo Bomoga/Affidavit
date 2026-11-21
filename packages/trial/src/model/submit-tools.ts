@@ -25,27 +25,64 @@ export function qualifiedToolName(name: SubmitToolName): string {
 /**
  * Built-in agent tools, listed so they are also disallowed by name. `tools: []` already removes
  * every built-in; this list is a second lock in case a runtime version adds one back by default.
+ * It covers every tool input type in the SDK 0.3.318 `sdk-tools.d.ts`, plus the runtime tools
+ * that have no input type there (shells, tool search, messaging, task output).
  */
 export const DENIED_BUILTIN_TOOLS = [
   'Agent',
+  'Artifact',
   'AskUserQuestion',
   'Bash',
   'BashOutput',
+  'ClaudeDesign',
+  'Config',
+  'CronCreate',
+  'CronDelete',
+  'CronList',
   'Edit',
+  'EnterPlanMode',
+  'EnterWorktree',
   'ExitPlanMode',
+  'ExitWorktree',
   'Glob',
   'Grep',
   'KillShell',
   'ListMcpResources',
+  'ListMcpResourcesTool',
   'LSP',
+  'Monitor',
   'MultiEdit',
   'NotebookEdit',
+  'NotebookRead',
+  'OfferChromeSetup',
+  'PowerShell',
+  'Projects',
+  'ProposeGoal',
+  'ProposeSkills',
+  'PushNotification',
   'Read',
   'ReadMcpResource',
+  'ReadMcpResourceDir',
+  'ReadMcpResourceTool',
+  'ReadNotifications',
+  'RefreshMcpTools',
+  'RemoteTrigger',
+  'ReportFindings',
+  'ScheduleWakeup',
+  'SendFeedback',
+  'SendMessage',
+  'ShowOnboardingRolePicker',
   'Skill',
   'SlashCommand',
   'Task',
+  'TaskCreate',
+  'TaskGet',
+  'TaskList',
+  'TaskOutput',
+  'TaskStop',
+  'TaskUpdate',
   'TodoWrite',
+  'ToolSearch',
   'WebFetch',
   'WebSearch',
   'Workflow',
@@ -78,7 +115,7 @@ function ballotShape(): AnyZodRawShape {
  * Input shapes from the contract schemas. Prosecution's submission is not a contract object yet
  * (CR-T8), so its tool advertises the contract `ParamSpace` and its description adds `indices`.
  */
-function inputShape(name: SubmitToolName): AnyZodRawShape {
+function contractShape(name: SubmitToolName): AnyZodRawShape {
   switch (name) {
     case 'submit_witness':
       return WitnessSubmission.shape;
@@ -89,6 +126,24 @@ function inputShape(name: SubmitToolName): AnyZodRawShape {
     case 'submit_counterexample':
       return { choices: ParamSpace };
   }
+}
+
+/** Any JSON value, from the contract schemas (zod is not a dependency of this package). */
+const ANY_JSON = ParamSpace.element.shape.values.element as unknown as Composable;
+
+/**
+ * The input shape a submit tool advertises. Each field is its contract schema OR any JSON value,
+ * and optional, so a runtime that validates tool input before the PreToolUse hook can never bounce
+ * a malformed first call back to the agent for a quiet retry: every call reaches the hook, which
+ * records it raw. The contract schema still leads each field, so the agent sees the real shape;
+ * the orchestrator validates the submission against the contract afterwards.
+ */
+export function submitInputShape(name: SubmitToolName): AnyZodRawShape {
+  const out: Record<string, Composable> = {};
+  for (const [key, field] of Object.entries(contractShape(name) as Record<string, Composable>)) {
+    out[key] = field.or(ANY_JSON).optional();
+  }
+  return out as unknown as AnyZodRawShape;
 }
 
 const DESCRIPTIONS: Readonly<Record<SubmitToolName, string>> = {
@@ -134,15 +189,26 @@ export interface SubmitToolSet {
   /** Exactly the qualified submit tool names, for `allowedTools`. */
   readonly allowedTools: string[];
   readonly server: McpSdkServerConfigWithInstance;
-  readonly hooks: { PreToolUse: HookCallbackMatcher[] };
+  readonly hooks: {
+    PreToolUse: HookCallbackMatcher[];
+    PostToolUse: HookCallbackMatcher[];
+    PostToolUseFailure: HookCallbackMatcher[];
+  };
   /** The tool definitions, so a stubbed transport can call their handlers. */
   readonly definitions: readonly SdkMcpToolDefinition[];
 }
 
+const STOP = { continue: false, stopReason: 'submission recorded' } as const;
+
 /**
- * Builds the submit tools for one turn. The PreToolUse hook sees every tool call before it runs:
- * it keeps the first call to an allowed submit tool and stops the turn, and refuses every other
- * call (a second submission, or any tool that is not on the list).
+ * Builds the submit tools for one turn. The first call to an allowed submit tool is terminal on
+ * every path the runtime can take:
+ * - PreToolUse (the primary path) keeps it raw, refuses to run it, and stops the turn;
+ * - if a runtime bounced it on input validation before PreToolUse, PostToolUseFailure keeps it
+ *   raw and stops the turn;
+ * - if a runtime ran the handler without the hook, the handler keeps it and PostToolUse stops
+ *   the turn.
+ * Every other call (a second submission, or any tool not on the list) is refused.
  */
 export function buildSubmitTools(
   names: readonly SubmitToolName[],
@@ -150,24 +216,52 @@ export function buildSubmitTools(
 ): SubmitToolSet {
   const allowed = names.map(qualifiedToolName);
   const definitions = names.map((name) =>
-    tool(name, DESCRIPTIONS[name], inputShape(name), (args: unknown) => {
-      // Reached only if a runtime ran the tool without the hook; the hook is the primary path.
-      const kept = box.offer(args);
-      return Promise.resolve({
-        content: [{ type: 'text', text: kept ? RECORDED : 'Already submitted. Stop now.' }],
-        ...(kept ? {} : { isError: true }),
-      });
-    }),
+    tool(
+      name,
+      DESCRIPTIONS[name],
+      submitInputShape(name),
+      (args: unknown) => {
+        const kept = box.offer(args);
+        return Promise.resolve({
+          content: [{ type: 'text', text: kept ? RECORDED : 'Already submitted. Stop now.' }],
+          ...(kept ? {} : { isError: true }),
+        });
+      },
+      // Never deferred behind tool search: `tools: []` removes the search tool, so a deferred
+      // submit tool could never be found.
+      { alwaysLoad: true },
+    ),
   ) as SdkMcpToolDefinition[];
 
   const deny = (reason: string, stop: boolean): HookJSONOutput => ({
-    ...(stop ? { continue: false, stopReason: 'submission recorded' } : {}),
+    ...(stop ? STOP : {}),
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
       permissionDecision: 'deny',
       permissionDecisionReason: reason,
     },
   });
+
+  const afterCall: HookCallbackMatcher = {
+    onFailure: 'block',
+    hooks: [
+      (input) => {
+        if (input.hook_event_name === 'PostToolUseFailure') {
+          if (!allowed.includes(input.tool_name)) return Promise.resolve({});
+          // Bounced before PreToolUse (for example on input validation): the raw call is the
+          // submission, and there is no second try.
+          box.offer(input.tool_input);
+          return Promise.resolve(STOP);
+        }
+        if (input.hook_event_name === 'PostToolUse') {
+          if (!allowed.includes(input.tool_name)) return Promise.resolve({});
+          box.offer(input.tool_input);
+          return Promise.resolve(STOP);
+        }
+        return Promise.resolve({});
+      },
+    ],
+  };
 
   const preToolUse: HookCallbackMatcher = {
     onFailure: 'block',
@@ -187,8 +281,13 @@ export function buildSubmitTools(
 
   return {
     allowedTools: allowed,
-    server: createSdkMcpServer({ name: SUBMIT_SERVER_NAME, version: '1.0.0', tools: definitions }),
-    hooks: { PreToolUse: [preToolUse] },
+    server: createSdkMcpServer({
+      name: SUBMIT_SERVER_NAME,
+      version: '1.0.0',
+      tools: definitions,
+      alwaysLoad: true,
+    }),
+    hooks: { PreToolUse: [preToolUse], PostToolUse: [afterCall], PostToolUseFailure: [afterCall] },
     definitions,
   };
 }

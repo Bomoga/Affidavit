@@ -47,7 +47,11 @@ To turn it on (the composition root in apps/worker still has to call `createMode
 export ANTHROPIC_API_KEY="<from the secrets store>"
 export AFFIDAVIT_TRIAL_IMPL=real
 export AFFIDAVIT_MODEL_MODE=live   # or record, or replay (no key needed)
+# record also needs an explicit output dir; there is no default:
+# export AFFIDAVIT_RECORD_DIR=fixtures/models
 ```
+
+With `AFFIDAVIT_ENV=production`, record and replay are refused at startup; only live runs. The worker image must contain no Claude Code managed-settings file: `settingSources: []` still reads it.
 
 **Set a monthly spend limit on the key in the Anthropic Console before the first run.** The per-case budget is a second guard, not the only one. Optional: `AFFIDAVIT_MODEL_TIMEOUT_MS`, `AFFIDAVIT_MODEL_FIXTURES_DIR`, `AFFIDAVIT_MODEL_CONFIG`, and one `ANTHROPIC_MODEL_<PROMPT>` per prompt id (see the guide).
 
@@ -57,8 +61,10 @@ Invariants, each covered by a test in `src/model/anthropic.test.ts` with a stubb
 - The key is read from `ANTHROPIC_API_KEY` on each call and never appears in an error, log, result, event, or recording.
 - A missing key throws `ModelUnconfiguredError` from `preflight`, before the orchestrator charges; the run halts with reason `model-unconfigured`.
 - Unknown model ids, a model that does not match the table, or a system prompt that is not the packaged one fail closed before any call.
-- The first submission is captured raw and ends the turn; a malformed one becomes `exhibit-inadmissible`, never a silent retry.
-- Provider failures throw `ModelCallError`, never "no submission", so an outage cannot dismiss a candidate.
+- Submit tools are `alwaysLoad`, and their advertised schemas accept any JSON per field, so a validating runtime cannot bounce a call.
+- The first submission is captured raw and ends the turn (PreToolUse, PostToolUseFailure or PostToolUse, whichever the runtime reaches); a malformed one becomes `exhibit-inadmissible`, never a silent retry.
+- Submissions are never rewritten or pattern-redacted. One containing the exact key value throws `ModelCallError` and is not recorded.
+- Provider failures (timeout, abort, hung or broken stream, no result) throw `ModelCallError` unless the agent already submitted; only an agent that used its turns is `turn-cap`. An outage cannot dismiss a candidate.
 
 ## Intended libraries (notes for later, not installed yet)
 

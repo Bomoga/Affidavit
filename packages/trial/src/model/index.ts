@@ -10,7 +10,9 @@ export {
 } from './errors.js';
 export {
   DEFAULT_MODEL_TIMEOUT_MS,
+  DEPLOY_ENV_VAR,
   MODEL_FIXTURES_ENV_VAR,
+  RECORD_DIR_ENV_VAR,
   MODEL_MODE_ENV_VAR,
   MODEL_TIMEOUT_ENV_VAR,
   createModelPortFromEnv,
@@ -29,13 +31,14 @@ export {
 export type { KnownModelId, ModelTable } from './models.js';
 export { DEFAULT_RECORDINGS_DIR, FileRecordingStore, inputSha256 } from './recordings.js';
 export type { ModelRecording, RecordingStore } from './recordings.js';
-export { REDACTED, redact, redactDeep } from './redact.js';
+export { REDACTED, containsSecret, redact, redactDeep } from './redact.js';
 export {
   DENIED_BUILTIN_TOOLS,
   SUBMIT_SERVER_NAME,
   SubmissionBox,
   buildSubmitTools,
   qualifiedToolName,
+  submitInputShape,
 } from './submit-tools.js';
 export { sdkTransport } from './transport.js';
 export type { AgentTransport } from './transport.js';

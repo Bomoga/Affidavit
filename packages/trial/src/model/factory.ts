@@ -12,7 +12,12 @@ type Env = Readonly<Record<string, string | undefined>>;
 
 export const MODEL_MODE_ENV_VAR = 'AFFIDAVIT_MODEL_MODE';
 export const MODEL_TIMEOUT_ENV_VAR = 'AFFIDAVIT_MODEL_TIMEOUT_MS';
+/** Where replay reads recordings from; defaults to `fixtures/models/`. */
 export const MODEL_FIXTURES_ENV_VAR = 'AFFIDAVIT_MODEL_FIXTURES_DIR';
+/** Where record mode writes. Required for record mode; there is no default. */
+export const RECORD_DIR_ENV_VAR = 'AFFIDAVIT_RECORD_DIR';
+/** The deployment environment. In `production` only live mode is allowed. */
+export const DEPLOY_ENV_VAR = 'AFFIDAVIT_ENV';
 
 /** Per-turn wall-clock cap when none is configured. A placeholder until real runs tune it. */
 export const DEFAULT_MODEL_TIMEOUT_MS = 300_000;
@@ -45,14 +50,27 @@ export function createModelPortFromEnv(
   overrides: Partial<AnthropicModelPortConfig> = {},
 ): AnthropicModelPort {
   const mode = modelModeFrom(env);
-  const dir = env[MODEL_FIXTURES_ENV_VAR];
+  if (mode !== 'live' && env[DEPLOY_ENV_VAR] === 'production') {
+    throw new ModelConfigError(
+      `${MODEL_MODE_ENV_VAR}=${mode} is refused when ${DEPLOY_ENV_VAR}=production; only live runs there`,
+    );
+  }
+  let recordings: FileRecordingStore | undefined;
+  if (mode === 'record') {
+    const dir = env[RECORD_DIR_ENV_VAR];
+    if (dir === undefined || dir.trim() === '') {
+      throw new ModelConfigError(`${MODEL_MODE_ENV_VAR}=record needs ${RECORD_DIR_ENV_VAR} set`);
+    }
+    recordings = new FileRecordingStore(dir);
+  } else if (mode === 'replay') {
+    const dir = env[MODEL_FIXTURES_ENV_VAR];
+    recordings = dir !== undefined && dir !== '' ? new FileRecordingStore(dir) : undefined;
+  }
   return new AnthropicModelPort({
     mode,
     modelTable: resolveModelTable(env),
     timeoutMs: timeoutFrom(env),
-    ...(mode !== 'live' && dir !== undefined && dir !== ''
-      ? { recordings: new FileRecordingStore(dir) }
-      : {}),
+    ...(recordings === undefined ? {} : { recordings }),
     ...overrides,
   });
 }

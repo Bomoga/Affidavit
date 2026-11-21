@@ -1,5 +1,6 @@
 /**
- * Secret scrubbing for anything the model port logs, throws, records, or returns.
+ * Secret scrubbing for anything the model port logs or throws, and for every recorded field
+ * except the agent submission (see `containsSecret`).
  *
  * The configured key is removed by value. Anything shaped like an Anthropic key, and the value of
  * any header, assignment, bearer token, or URL parameter that carries a credential, is removed by
@@ -70,6 +71,26 @@ export function redactDeep(value: unknown, secrets: readonly (string | undefined
     return out;
   }
   return value;
+}
+
+/**
+ * True when any string or key in a JSON-like value contains one of the exact secret values.
+ * This is the only check applied to an agent submission: submissions are never rewritten, since
+ * the Judge must run exactly what the agent sent, so pattern-shaped text (a bearer token or a
+ * `?token=` parameter in a witness) passes through untouched.
+ */
+export function containsSecret(value: unknown, secrets: readonly (string | undefined)[]): boolean {
+  const live = secrets.filter((s): s is string => s !== undefined && s.length > 0);
+  if (live.length === 0) return false;
+  const walk = (v: unknown): boolean => {
+    if (typeof v === 'string') return live.some((s) => v.includes(s));
+    if (Array.isArray(v)) return v.some(walk);
+    if (v !== null && typeof v === 'object') {
+      return Object.entries(v as Record<string, unknown>).some(([k, x]) => walk(k) || walk(x));
+    }
+    return false;
+  };
+  return walk(value);
 }
 
 /** A short, redacted description of something thrown, for an error message. */

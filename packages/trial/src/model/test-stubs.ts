@@ -32,32 +32,86 @@ export interface Harness {
 
 export type Script = (h: Harness) => AsyncGenerator<SDKMessage, void, unknown>;
 
-export function stubTransport(script: Script) {
+/**
+ * Mimics a runtime that validates tool input before any PreToolUse hook. Returns an error
+ * message to bounce the call (the runtime then fires PostToolUseFailure, not PreToolUse), or
+ * undefined to let it through.
+ */
+export type PreValidate = (toolName: string, input: unknown) => string | undefined;
+
+export interface StubOptions {
+  preValidate?: PreValidate;
+}
+
+/** A validator that checks each field against the advertised input shape, as the runtime does. */
+export function shapeValidator(shapeOf: (toolName: string) => object | undefined): PreValidate {
+  return (toolName, input) => {
+    const shape = shapeOf(toolName) as
+      Record<string, { safeParse(v: unknown): { success: boolean } }> | undefined;
+    if (shape === undefined) return undefined;
+    if (typeof input !== 'object' || input === null) return 'input must be an object';
+    const rec = input as Record<string, unknown>;
+    for (const [key, schema] of Object.entries(shape)) {
+      if (!schema.safeParse(rec[key]).success) return `InputValidationError: ${key} is invalid`;
+    }
+    return undefined;
+  };
+}
+
+export function stubTransport(script: Script, stubOptions: StubOptions = {}) {
   const calls: StubCall[] = [];
   const transport = (params: { prompt: string; options: Options }): AsyncIterable<SDKMessage> => {
     const { options } = params;
     const cwd = options.cwd;
     const cwdEmpty = cwd !== undefined && existsSync(cwd) && readdirSync(cwd).length === 0;
     calls.push({ prompt: params.prompt, options, cwdEmpty });
+    let n = 0;
+    const fire = async (
+      event: 'PreToolUse' | 'PostToolUse' | 'PostToolUseFailure',
+      extra: Record<string, unknown>,
+      outs: HookJSONOutput[],
+    ): Promise<void> => {
+      for (const m of options.hooks?.[event] ?? []) {
+        for (const hook of m.hooks) {
+          const id = `t${n++}`;
+          const hookInput = {
+            hook_event_name: event,
+            tool_use_id: id,
+            session_id: 's',
+            transcript_path: '',
+            cwd: options.cwd ?? '',
+            ...extra,
+          } as HookInput;
+          outs.push(await hook(hookInput, id, { signal: new AbortController().signal }));
+        }
+      }
+    };
     const harness: Harness = {
       options,
       async callTool(name, input) {
         const outs: HookJSONOutput[] = [];
-        for (const m of options.hooks?.PreToolUse ?? []) {
-          for (const hook of m.hooks) {
-            const hookInput = {
-              hook_event_name: 'PreToolUse',
-              tool_name: name,
-              tool_input: input,
-              tool_use_id: `t${outs.length}`,
-              session_id: 's',
-              transcript_path: '',
-              cwd: options.cwd ?? '',
-            } as HookInput;
-            outs.push(
-              await hook(hookInput, `t${outs.length}`, { signal: new AbortController().signal }),
-            );
-          }
+        const invalid = stubOptions.preValidate?.(name, input);
+        if (invalid !== undefined) {
+          // Bounced before any PreToolUse hook, as a validating runtime would.
+          await fire(
+            'PostToolUseFailure',
+            { tool_name: name, tool_input: input, error: invalid },
+            outs,
+          );
+          return outs;
+        }
+        await fire('PreToolUse', { tool_name: name, tool_input: input }, outs);
+        const denied = outs.some(
+          (o) =>
+            (o as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput
+              ?.permissionDecision === 'deny',
+        );
+        if (!denied) {
+          await fire(
+            'PostToolUse',
+            { tool_name: name, tool_input: input, tool_response: { content: [] } },
+            outs,
+          );
         }
         return outs;
       },
