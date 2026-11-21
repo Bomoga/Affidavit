@@ -9,7 +9,7 @@ export type {
   WorkerConfig,
 } from './config.js';
 export { buildHandlers, prepareCores } from './handlers.js';
-export type { Components, Cores } from './handlers.js';
+export type { Components, Cores, PreparedCores } from './handlers.js';
 export { CaseFileMismatchError, IntakeRefusedError, NoSourceError } from './real/intake.js';
 export type { Discover } from './real/intake.js';
 export { PrerequisiteError, checkPrerequisites, realHostProbe } from './real/prereqs.js';

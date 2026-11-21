@@ -24,6 +24,7 @@ import {
   realIntakeCores,
   type Discover,
 } from './intake.js';
+import type { RealJudgeHostProbe } from '@affidavit/judge';
 import { PrerequisiteError, checkPrerequisites, realHostProbe, type HostProbe } from './prereqs.js';
 import { TrialHaltedError, realTrialCores } from './trial.js';
 
@@ -40,27 +41,55 @@ const realEnv: Record<string, string> = {
   AFFIDAVIT_JURY_ENABLED: 'false',
   AFFIDAVIT_INTAKE_WORK_ROOT: '/srv/affidavit/intake',
   AFFIDAVIT_REPO_SOURCES: JSON.stringify({ [REPO]: `https://bot:${SECRET}@git.example/r.git` }),
-  AFFIDAVIT_TOOLRUNNER: 'gvisor',
   AFFIDAVIT_JUDGE_WORK_ROOT: '/srv/affidavit/judge',
   AFFIDAVIT_WITNESS_RUNNER_IMAGE: `sha256:${'a'.repeat(64)}`,
+  AFFIDAVIT_PATCH_APPLY_IMAGE: `sha256:${'d'.repeat(64)}`,
   AFFIDAVIT_EVIDENCE_DIR: '/srv/affidavit/evidence',
   AFFIDAVIT_SIGNER_SOCKET: '/run/affidavit/signer.sock',
 };
 
-function probe(overrides: Partial<HostProbe> = {}, missingDirs: string[] = []): HostProbe {
+interface Host {
+  probe: HostProbe;
+  judge: RealJudgeHostProbe;
+}
+
+/** Both host probes, healthy unless told otherwise. */
+function host(
+  o: {
+    platform?: NodeJS.Platform;
+    missing?: string[];
+    dockerInfo?: string[] | null;
+    daemonConfig?: string[] | null;
+    socket?: boolean;
+    missingImages?: string[];
+  } = {},
+): Host {
+  const missing = o.missing ?? [];
+  const platform = o.platform ?? 'linux';
+  const runtimes = ['runc', 'runsc', 'runsc-affidavit'];
   return {
-    platform: 'linux',
-    isDirectory: (p) => Promise.resolve(!missingDirs.includes(p)),
-    isSocket: () => Promise.resolve(true),
-    isRegularFile: (p) => Promise.resolve(!missingDirs.includes(p)),
-    dockerRuntimes: () => Promise.resolve(['runc', 'runsc', 'runsc-affidavit']),
-    imagePresent: () => Promise.resolve(true),
-    ...overrides,
+    probe: {
+      platform,
+      isDirectory: (p) => Promise.resolve(!missing.includes(p)),
+      isRegularFile: (p) => Promise.resolve(!missing.includes(p)),
+      dockerRuntimes: () => Promise.resolve(o.dockerInfo === undefined ? runtimes : o.dockerInfo),
+    },
+    judge: {
+      platform,
+      isDirectory: (p) => Promise.resolve(!missing.includes(p)),
+      isSocket: () => Promise.resolve(o.socket ?? true),
+      realpath: (p) => Promise.resolve(missing.includes(p) ? null : p),
+      dockerRuntimes: () =>
+        Promise.resolve(o.daemonConfig === undefined ? runtimes : o.daemonConfig),
+      imagePresent: (id) => Promise.resolve(!(o.missingImages ?? []).includes(id)),
+      pins: () => [{ app: 'nodegoat', commit: 'pinned', bundleSha256: 'c'.repeat(64) }],
+      pinBundle: () => Promise.resolve({} as Awaited<ReturnType<RealJudgeHostProbe['pinBundle']>>),
+    },
   };
 }
 
-async function refusal(env: Record<string, string>, p: HostProbe): Promise<PrerequisiteError> {
-  const err = await checkPrerequisites(loadConfig(env), p).then(
+async function refusal(env: Record<string, string>, h: Host): Promise<PrerequisiteError> {
+  const err = await checkPrerequisites(loadConfig(env), h.probe, h.judge).then(
     () => null,
     (e: unknown) => e,
   );
@@ -70,11 +99,10 @@ async function refusal(env: Record<string, string>, p: HostProbe): Promise<Prere
   expect(e.message).toContain('nothing was started');
   return e;
 }
-
 describe('real wiring config', () => {
   it('loads every real setting with conservative defaults', () => {
     const c = loadConfig(realEnv);
-    expect(c.intakeSettings?.toolRunner).toBe('gvisor');
+    expect(c.intakeSettings?.toolRunner).toBe('docker');
     expect(c.trialSettings?.killSwitch).toBe(false);
     expect(c.trialSettings?.turnBudget).toEqual({
       maxInputTokens: 100_000,
@@ -113,93 +141,170 @@ describe('real wiring config', () => {
 
 describe('startup prerequisites', () => {
   it('passes when every host fact is present', async () => {
-    await expect(checkPrerequisites(loadConfig(realEnv), probe())).resolves.toBeUndefined();
+    const h = host();
+    await expect(
+      checkPrerequisites(loadConfig(realEnv), h.probe, h.judge),
+    ).resolves.toBeUndefined();
   });
 
-  const cases: [string, HostProbe, Record<string, string>, string][] = [
+  const RUNNER = realEnv.AFFIDAVIT_WITNESS_RUNNER_IMAGE!;
+  const APPLY = realEnv.AFFIDAVIT_PATCH_APPLY_IMAGE!;
+  const BUNDLE = {
+    AFFIDAVIT_NODEGOAT_BUNDLE: '/srv/bundles/nodegoat.tar',
+    AFFIDAVIT_DEPENDENCY_BUNDLE_ROOT: '/srv/bundles',
+  };
+  const cases: [string, Host, Record<string, string>, string[]][] = [
     [
       'a non-Linux host',
-      probe({ platform: 'win32' }),
+      host({ platform: 'win32' }),
       {},
-      'needs a Linux sandbox host with gVisor',
+      ['the real Judge needs a Linux sandbox host with gVisor (this host is win32)'],
     ],
     [
       'an unreachable Docker daemon',
-      probe({ dockerRuntimes: () => Promise.resolve(null) }),
+      host({ dockerInfo: null }),
       {},
-      'the Docker daemon cannot be reached',
+      ['the Docker daemon cannot be reached'],
+    ],
+    [
+      'an unreadable Docker daemon config',
+      host({ daemonConfig: null }),
+      {},
+      ['the Docker daemon config cannot be read (dockerDaemonConfig'],
     ],
     [
       'no runsc runtime',
-      probe({ dockerRuntimes: () => Promise.resolve(['runc', 'runsc-affidavit']) }),
+      host({ daemonConfig: ['runc', 'runsc-affidavit'] }),
       {},
-      'Docker has no "runsc" runtime',
+      ['Docker has no "runsc" runtime'],
     ],
     [
       'no audit runtime',
-      probe({ dockerRuntimes: () => Promise.resolve(['runc', 'runsc']) }),
+      host({ daemonConfig: ['runc', 'runsc'] }),
       {},
-      'Docker has no "runsc-affidavit" runtime',
+      ['Docker has no "runsc-affidavit" runtime'],
     ],
     [
       'no intake work root',
-      probe({}, ['/srv/affidavit/intake']),
+      host({ missing: ['/srv/affidavit/intake'] }),
       {},
-      'AFFIDAVIT_INTAKE_WORK_ROOT is not an existing directory',
+      ['AFFIDAVIT_INTAKE_WORK_ROOT is not an existing directory'],
     ],
     [
       'no trace root',
-      probe({}, [DEFAULT_TRACE_ROOT]),
+      host({ missing: [DEFAULT_TRACE_ROOT] }),
       {},
-      `the syscall trace directory ${DEFAULT_TRACE_ROOT} does not exist`,
+      ['the syscall trace directory (traceRoot) does not exist'],
     ],
     [
       'no judge work root',
-      probe({}, ['/srv/affidavit/judge']),
+      host({ missing: ['/srv/affidavit/judge'] }),
       {},
-      'AFFIDAVIT_JUDGE_WORK_ROOT is not an existing directory',
+      ['workRoot (AFFIDAVIT_JUDGE_WORK_ROOT) is not an existing directory'],
     ],
     [
       'no evidence directory',
-      probe({}, ['/srv/affidavit/evidence']),
+      host({ missing: ['/srv/affidavit/evidence'] }),
       {},
-      'AFFIDAVIT_EVIDENCE_DIR is not an existing directory',
+      [
+        'evidenceRoot (AFFIDAVIT_EVIDENCE_DIR) is not an existing directory',
+        'the evidence store is rooted somewhere other than evidenceRoot',
+      ],
     ],
     [
       'no signer socket',
-      probe({ isSocket: () => Promise.resolve(false) }),
+      host({ socket: false }),
       {},
-      'AFFIDAVIT_SIGNER_SOCKET is not a listening unix socket',
-    ],
-    [
-      'a NodeGoat bundle that is not there',
-      probe({}, ['/srv/affidavit/nodegoat-bundle.tar']),
-      { AFFIDAVIT_NODEGOAT_BUNDLE: '/srv/affidavit/nodegoat-bundle.tar' },
-      'AFFIDAVIT_NODEGOAT_BUNDLE is set but is not an existing regular file',
+      ['signerSocket (AFFIDAVIT_SIGNER_SOCKET) is not a listening unix socket'],
     ],
     [
       'no witness runner image',
-      probe({ imagePresent: () => Promise.resolve(false) }),
+      host({ missingImages: [RUNNER] }),
       {},
-      'the AFFIDAVIT_WITNESS_RUNNER_IMAGE image is not present',
+      ['the runnerImage (AFFIDAVIT_WITNESS_RUNNER_IMAGE) image is not present locally'],
+    ],
+    [
+      'no patch-apply image',
+      host({ missingImages: [APPLY] }),
+      {},
+      ['the applyImage (AFFIDAVIT_PATCH_APPLY_IMAGE) image is not present locally'],
+    ],
+    [
+      'a NodeGoat bundle that is not a regular file',
+      host({ missing: [BUNDLE.AFFIDAVIT_NODEGOAT_BUNDLE] }),
+      BUNDLE,
+      ['AFFIDAVIT_NODEGOAT_BUNDLE is set but is not an existing regular file'],
+    ],
+    [
+      'a NodeGoat tree that is not there',
+      host({ missing: ['/srv/trees/nodegoat-safe'] }),
+      {
+        AFFIDAVIT_NODEGOAT_DIR: '/srv/trees/nodegoat',
+        AFFIDAVIT_NODEGOAT_SAFE_DIR: '/srv/trees/nodegoat-safe',
+      },
+      ['AFFIDAVIT_NODEGOAT_SAFE_DIR is set but is not an existing directory'],
     ],
     [
       'an evidence store inside the judge work root',
-      probe(),
+      host(),
       { AFFIDAVIT_EVIDENCE_DIR: '/srv/affidavit/judge/evidence' },
-      'AFFIDAVIT_JUDGE_WORK_ROOT and AFFIDAVIT_EVIDENCE_DIR must not contain one another',
+      ['workRoot and evidenceRoot must not contain one another'],
     ],
     [
       'an evidence store inside the intake work root',
-      probe(),
+      host(),
       { AFFIDAVIT_EVIDENCE_DIR: '/srv/affidavit/intake/evidence' },
-      'AFFIDAVIT_INTAKE_WORK_ROOT and AFFIDAVIT_EVIDENCE_DIR must not contain one another',
+      ['AFFIDAVIT_INTAKE_WORK_ROOT and AFFIDAVIT_EVIDENCE_DIR must not contain one another'],
     ],
   ];
 
-  it.each(cases)('refuses %s with a precise message', async (_name, p, extra, expected) => {
-    const e = await refusal({ ...realEnv, ...extra }, p);
-    expect(e.problems).toEqual([expect.stringContaining(expected)]);
+  it.each(cases)('refuses %s with a precise message', async (_name, h, extra, expected) => {
+    const e = await refusal({ ...realEnv, ...extra }, h);
+    expect(e.problems).toHaveLength(expected.length);
+    expected.forEach((s, i) => expect(e.problems[i]).toContain(s));
+  });
+
+  it('passes a configured NodeGoat bundle and trees to the Judge check', async () => {
+    const h = host();
+    const env = {
+      ...realEnv,
+      ...BUNDLE,
+      AFFIDAVIT_NODEGOAT_DIR: '/srv/trees/nodegoat',
+      AFFIDAVIT_NODEGOAT_SAFE_DIR: '/srv/trees/nodegoat-safe',
+    };
+    await expect(checkPrerequisites(loadConfig(env), h.probe, h.judge)).resolves.toBeUndefined();
+  });
+
+  it('refuses Judge settings at load by variable name', () => {
+    const load = (extra: Record<string, string | undefined>) => {
+      try {
+        loadConfig({ ...realEnv, ...extra });
+        return '';
+      } catch (e) {
+        expect(e).toBeInstanceOf(ConfigError);
+        return (e as Error).message;
+      }
+    };
+    expect(load({ AFFIDAVIT_PATCH_APPLY_IMAGE: undefined })).toContain(
+      'AFFIDAVIT_PATCH_APPLY_IMAGE is required',
+    );
+    expect(load({ AFFIDAVIT_PATCH_APPLY_IMAGE: 'latest' })).toContain(
+      'AFFIDAVIT_PATCH_APPLY_IMAGE must be a local image ID',
+    );
+    expect(load({ AFFIDAVIT_NODEGOAT_BUNDLE: '/srv/bundles/nodegoat.tar' })).toContain(
+      'AFFIDAVIT_NODEGOAT_BUNDLE needs AFFIDAVIT_DEPENDENCY_BUNDLE_ROOT',
+    );
+    expect(load({ AFFIDAVIT_SWEEP_ORPHANS: 'yes' })).toContain('AFFIDAVIT_SWEEP_ORPHANS must be');
+  });
+
+  it('leaves the orphan sweep off unless asked', () => {
+    expect(loadConfig(realEnv).judgeSettings?.sweepOrphans).toBe(false);
+    expect(
+      loadConfig({ ...realEnv, AFFIDAVIT_SWEEP_ORPHANS: '1' }).judgeSettings?.sweepOrphans,
+    ).toBe(true);
+    expect(
+      loadConfig({ ...realEnv, AFFIDAVIT_SWEEP_ORPHANS: 'force' }).judgeSettings?.sweepOrphans,
+    ).toBe('force');
   });
 
   it('takes the NodeGoat bundle as a regular file only: not a directory, not a symlink', async () => {
@@ -225,25 +330,35 @@ describe('startup prerequisites', () => {
 
   it('lists every missing piece at once', async () => {
     const e = await refusal(
-      realEnv,
-      probe({
+      { ...realEnv, AFFIDAVIT_TOOLRUNNER: 'gvisor' },
+      host({
         platform: 'darwin',
-        isDirectory: () => Promise.resolve(false),
-        isSocket: () => Promise.resolve(false),
-        dockerRuntimes: () => Promise.resolve(['runc']),
-        imagePresent: () => Promise.resolve(false),
+        missing: [
+          '/srv/affidavit/intake',
+          DEFAULT_TRACE_ROOT,
+          '/srv/affidavit/judge',
+          '/srv/affidavit/evidence',
+        ],
+        dockerInfo: ['runc'],
+        daemonConfig: ['runc'],
+        socket: false,
+        missingImages: [RUNNER, APPLY],
       }),
     );
     const expected = [
-      'Linux sandbox host',
+      'AFFIDAVIT_TOOLRUNNER=gvisor needs a Linux sandbox host',
+      'Docker has no "runsc" runtime (run docker/sandbox/install-gvisor.sh',
+      'AFFIDAVIT_INTAKE_WORK_ROOT',
+      'the real Judge needs a Linux sandbox host',
       '"runsc" runtime',
       '"runsc-affidavit" runtime',
-      'AFFIDAVIT_INTAKE_WORK_ROOT',
-      DEFAULT_TRACE_ROOT,
+      'traceRoot',
       'AFFIDAVIT_JUDGE_WORK_ROOT',
       'AFFIDAVIT_EVIDENCE_DIR',
-      'AFFIDAVIT_SIGNER_SOCKET',
+      'the evidence store is rooted somewhere other than evidenceRoot',
       'AFFIDAVIT_WITNESS_RUNNER_IMAGE',
+      'AFFIDAVIT_PATCH_APPLY_IMAGE',
+      'AFFIDAVIT_SIGNER_SOCKET',
     ];
     expect(e.problems).toHaveLength(expected.length);
     expected.forEach((s, i) => expect(e.problems[i]).toContain(s));
@@ -257,32 +372,43 @@ describe('startup prerequisites', () => {
       AFFIDAVIT_INTAKE_WORK_ROOT: '/srv/affidavit/intake',
       AFFIDAVIT_REPO_SOURCES: realEnv.AFFIDAVIT_REPO_SOURCES!,
     };
-    const p = probe({ platform: 'win32', dockerRuntimes: () => Promise.resolve(['runc']) });
-    await expect(checkPrerequisites(loadConfig(env), p)).resolves.toBeUndefined();
+    const h = host({ platform: 'win32', dockerInfo: ['runc'] });
+    await expect(checkPrerequisites(loadConfig(env), h.probe, h.judge)).resolves.toBeUndefined();
   });
 
   it('prepareCores refuses before building anything, and skips checks for injected parts', async () => {
     const config = loadConfig(realEnv);
+    const bad = host({ platform: 'win32' });
     await expect(
-      prepareCores(config, { env: realEnv, probe: probe({ platform: 'win32' }), log: () => {} }),
+      prepareCores(config, {
+        env: realEnv,
+        probe: bad.probe,
+        judgeProbe: bad.judge,
+        log: () => {},
+      }),
     ).rejects.toBeInstanceOf(PrerequisiteError);
     const logs: string[] = [];
-    const cores = await prepareCores(config, {
+    const broken = host({ platform: 'win32', dockerInfo: null, daemonConfig: null });
+    const prepared = await prepareCores(config, {
       env: realEnv,
-      probe: probe({ platform: 'win32', dockerRuntimes: () => Promise.resolve(null) }),
+      probe: broken.probe,
+      judgeProbe: broken.judge,
       discover: () => Promise.reject(new Error('unused')),
       judge: fakeJudge(),
       log: (m) => logs.push(m),
     });
-    expect(Object.keys(cores).sort()).toEqual(
+    expect(Object.keys(prepared.cores).sort()).toEqual(
       ['arraign', 'defense', 'intake', 'jury', 'map', 'prosecution', 'remedy', 'verify'].sort(),
     );
+    await prepared.close();
     // The key is named, never valued, and only when it is missing.
     expect(logs).toEqual([expect.stringContaining('ANTHROPIC_API_KEY is not set')]);
     logs.length = 0;
+    const ok = host();
     await prepareCores(config, {
       env: { ...realEnv, ANTHROPIC_API_KEY: SECRET },
-      probe: probe(),
+      probe: ok.probe,
+      judgeProbe: ok.judge,
       discover: () => Promise.reject(new Error('unused')),
       judge: fakeJudge(),
       log: (m) => logs.push(m),
@@ -290,7 +416,6 @@ describe('startup prerequisites', () => {
     expect(logs).toEqual([]);
   });
 });
-
 /** A StageEnv over in-memory state, for one stage job. */
 function stageEnv(stage: CaseStage, at: { stage: CaseStage }) {
   const events: TrialEvent[] = [];

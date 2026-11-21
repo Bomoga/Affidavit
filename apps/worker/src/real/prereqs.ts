@@ -7,26 +7,24 @@ import { execFile } from 'node:child_process';
 import { lstat, stat } from 'node:fs/promises';
 import { isAbsolute, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
-import { AUDIT_RUNTIME, DEFAULT_TRACE_ROOT, PLAIN_RUNTIME } from '@affidavit/sandbox';
+import {
+  checkRealJudgePrerequisites,
+  realJudgeHostProbe,
+  type RealJudgeHostProbe,
+} from '@affidavit/judge';
+import { PLAIN_RUNTIME } from '@affidavit/sandbox';
 import type { WorkerConfig } from '../config.js';
+import { realJudgeConfig } from './components.js';
 
 const exec = promisify(execFile);
-
-/** The two gVisor runtimes `docker/sandbox/` registers (sandbox-runner.md, Host setup). */
-const PLAIN_RUNSC = PLAIN_RUNTIME;
-const AUDIT_RUNSC = AUDIT_RUNTIME;
-/** Where the audit runtime writes syscall traces (setup-runsc-audit.sh). */
-const TRACE_ROOT = DEFAULT_TRACE_ROOT;
 
 export interface HostProbe {
   platform: NodeJS.Platform;
   isDirectory(path: string): Promise<boolean>;
-  isSocket(path: string): Promise<boolean>;
   /** A regular file itself, not a symlink to one (lstat). */
   isRegularFile(path: string): Promise<boolean>;
   /** Registered Docker runtimes, or null when the Docker daemon cannot be reached. */
   dockerRuntimes(): Promise<string[] | null>;
-  imagePresent(ref: string): Promise<boolean>;
 }
 
 export const realHostProbe: HostProbe = {
@@ -34,11 +32,6 @@ export const realHostProbe: HostProbe = {
   isDirectory: (p) =>
     stat(p).then(
       (s) => s.isDirectory(),
-      () => false,
-    ),
-  isSocket: (p) =>
-    stat(p).then(
-      (s) => s.isSocket(),
       () => false,
     ),
   isRegularFile: (p) =>
@@ -57,14 +50,6 @@ export const realHostProbe: HostProbe = {
       return null;
     }
   },
-  async imagePresent(ref) {
-    try {
-      await exec('docker', ['image', 'inspect', '--format', '{{.Id}}', ref], { timeout: 20_000 });
-      return true;
-    } catch {
-      return false;
-    }
-  },
 };
 
 export class PrerequisiteError extends Error {
@@ -81,67 +66,41 @@ function inside(child: string, parent: string): boolean {
   return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
 }
 
-/** Throws PrerequisiteError listing everything missing for the configured real implementations. */
+/**
+ * Throws PrerequisiteError listing everything missing for the configured real implementations:
+ * the worker's own checks (intake, NodeGoat inputs) plus, for the Judge, Lane 2's
+ * `checkRealJudgePrerequisites` on the same `RealJudgeConfig` `createRealJudge` will get, so one
+ * error lists all of it. Field and variable names only, never values.
+ */
 export async function checkPrerequisites(
   config: WorkerConfig,
   probe: HostProbe = realHostProbe,
+  judgeProbe: RealJudgeHostProbe = realJudgeHostProbe,
 ): Promise<void> {
   const problems: string[] = [];
   const intake = config.intakeSettings;
   const judge = config.judgeSettings;
-  const needsGvisor = intake?.toolRunner === 'gvisor' || judge !== null;
-  const needsDocker = intake !== null || judge !== null;
 
-  if (needsGvisor && probe.platform !== 'linux') {
-    problems.push(
-      `${judge ? 'AFFIDAVIT_JUDGE_IMPL=real' : 'AFFIDAVIT_TOOLRUNNER=gvisor'} needs a Linux sandbox host with gVisor (this host is ${probe.platform})`,
-    );
-  }
-  let runtimes: string[] | null = [];
-  if (needsDocker) {
-    runtimes = await probe.dockerRuntimes();
-    if (runtimes === null)
+  if (intake) {
+    if (intake.toolRunner === 'gvisor' && probe.platform !== 'linux') {
+      problems.push(
+        `AFFIDAVIT_TOOLRUNNER=gvisor needs a Linux sandbox host with gVisor (this host is ${probe.platform})`,
+      );
+    }
+    const runtimes = await probe.dockerRuntimes();
+    if (runtimes === null) {
       problems.push('the Docker daemon cannot be reached (docker info failed)');
-  }
-  if (runtimes !== null && needsGvisor) {
-    if (!runtimes.includes(PLAIN_RUNSC)) {
+    } else if (intake.toolRunner === 'gvisor' && !runtimes.includes(PLAIN_RUNTIME)) {
       problems.push(
-        `Docker has no "${PLAIN_RUNSC}" runtime (run docker/sandbox/install-gvisor.sh as root)`,
+        `Docker has no "${PLAIN_RUNTIME}" runtime (run docker/sandbox/install-gvisor.sh as root)`,
       );
     }
-    if (judge && !runtimes.includes(AUDIT_RUNSC)) {
-      problems.push(
-        `Docker has no "${AUDIT_RUNSC}" runtime (run docker/sandbox/setup-runsc-audit.sh as root)`,
-      );
+    if (intake.workRoot !== '' && !(await probe.isDirectory(intake.workRoot))) {
+      problems.push('AFFIDAVIT_INTAKE_WORK_ROOT is not an existing directory');
     }
-  }
-
-  if (intake && intake.workRoot !== '' && !(await probe.isDirectory(intake.workRoot))) {
-    problems.push('AFFIDAVIT_INTAKE_WORK_ROOT is not an existing directory');
   }
 
   if (judge) {
-    if (!(await probe.isDirectory(TRACE_ROOT))) {
-      problems.push(
-        `the syscall trace directory ${TRACE_ROOT} does not exist (run docker/sandbox/setup-runsc-audit.sh as root)`,
-      );
-    }
-    if (!(await probe.isDirectory(judge.workRoot))) {
-      problems.push('AFFIDAVIT_JUDGE_WORK_ROOT is not an existing directory');
-    }
-    if (!(await probe.isDirectory(judge.evidenceDir))) {
-      problems.push('AFFIDAVIT_EVIDENCE_DIR is not an existing directory');
-    }
-    // The witness runner must have no writable path to the evidence store (root CLAUDE.md).
-    if (
-      judge.workRoot !== '' &&
-      judge.evidenceDir !== '' &&
-      (inside(judge.workRoot, judge.evidenceDir) || inside(judge.evidenceDir, judge.workRoot))
-    ) {
-      problems.push(
-        'AFFIDAVIT_JUDGE_WORK_ROOT and AFFIDAVIT_EVIDENCE_DIR must not contain one another (the witness jail gets no path to the evidence store)',
-      );
-    }
     if (
       intake &&
       intake.workRoot !== '' &&
@@ -152,25 +111,21 @@ export async function checkPrerequisites(
         'AFFIDAVIT_INTAKE_WORK_ROOT and AFFIDAVIT_EVIDENCE_DIR must not contain one another',
       );
     }
-    if (!(await probe.isSocket(judge.signerSocket))) {
-      problems.push(
-        'AFFIDAVIT_SIGNER_SOCKET is not a listening unix socket (start apps/signer, see its CLAUDE.md)',
-      );
-    }
     if (judge.nodegoatBundle !== null && !(await probe.isRegularFile(judge.nodegoatBundle))) {
       problems.push(
         'AFFIDAVIT_NODEGOAT_BUNDLE is set but is not an existing regular file (the bundle tar itself, not a directory or a symlink; the Judge checks its sha256 against pins.json)',
       );
     }
-    if (
-      runtimes !== null &&
-      judge.runnerImage !== '' &&
-      !(await probe.imagePresent(judge.runnerImage))
-    ) {
-      problems.push(
-        'the AFFIDAVIT_WITNESS_RUNNER_IMAGE image is not present (build it with `pnpm --filter @affidavit/judge runner-image`)',
-      );
+    for (const [name, dir] of [
+      ['AFFIDAVIT_NODEGOAT_DIR', judge.nodegoatDir],
+      ['AFFIDAVIT_NODEGOAT_SAFE_DIR', judge.nodegoatSafeDir],
+    ] as const) {
+      if (dir !== null && !(await probe.isDirectory(dir))) {
+        problems.push(`${name} is set but is not an existing directory`);
+      }
     }
+    const report = await checkRealJudgePrerequisites(realJudgeConfig(judge), judgeProbe);
+    problems.push(...report.problems);
   }
   if (problems.length > 0) throw new PrerequisiteError(problems);
 }

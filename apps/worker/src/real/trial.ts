@@ -45,6 +45,8 @@ import {
 import type { TrialSettings } from '../config.js';
 
 /** The orchestrator stopped before the stage moved the case. */
+const TERMINAL: readonly CaseStage[] = ['verdict', 'dismissed', 'escalated'];
+
 export class TrialHaltedError extends Error {
   constructor(
     readonly stage: CaseStage,
@@ -74,6 +76,8 @@ export interface TrialWiring {
   maxStageAttempts: number;
   /** The global kill switch (config and file). */
   killSwitch: () => boolean | Promise<boolean>;
+  /** Called once this job's transition lands the case in a terminal stage. */
+  caseEnded?: (caseId: string) => Promise<void>;
 }
 
 export function realTrialCores(w: TrialWiring): Partial<Record<CaseStage, StageCore>> {
@@ -168,6 +172,11 @@ export function realTrialCores(w: TrialWiring): Partial<Record<CaseStage, StageC
     );
     if (outcome.status === 'halted' && !ports.advanced()) {
       throw new TrialHaltedError(env.job.stage, outcome.reason);
+    }
+    if (w.caseEnded && TERMINAL.includes(await env.store.stage(env.job.caseId))) {
+      // Best effort: a teardown failure must not undo a written verdict; the Judge keeps the case
+      // tracked and retries the teardown on its next boot or release.
+      await w.caseEnded(env.job.caseId).catch(() => undefined);
     }
   };
 

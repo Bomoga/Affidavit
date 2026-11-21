@@ -25,6 +25,7 @@
     "@affidavit/judge": "workspace:*",
     "@affidavit/prompts": "workspace:*",
     "@affidavit/sandbox": "workspace:*",
+    "@affidavit/signer": "workspace:*",
     "@affidavit/testing": "workspace:*",
     "@affidavit/trial": "workspace:*",
     "@opentelemetry/api": "1.10.0",

@@ -192,6 +192,9 @@ importers:
       '@affidavit/sandbox':
         specifier: workspace:*
         version: link:../../packages/sandbox
+      '@affidavit/signer':
+        specifier: workspace:*
+        version: link:../signer
       '@affidavit/testing':
         specifier: workspace:*
         version: link:../../packages/testing

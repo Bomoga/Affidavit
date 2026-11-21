@@ -3,11 +3,19 @@
  * (or Lane 1's discovery), constructed with the settings its own CLAUDE.md asks for.
  */
 import { join } from 'node:path';
-import type { EvidenceStore, JudgePort, ModelPort, ToolRunnerPort } from '@affidavit/contracts';
+import type { ModelPort, ToolRunnerPort } from '@affidavit/contracts';
 import { corpus } from '@affidavit/corpus';
 import { arraignConfigFrom, discoverCase, loadToolManifest, repoRoot } from '@affidavit/discovery';
 import { FsEvidenceStore } from '@affidavit/evidence';
-import { BootedTargets, DEFAULT_POLICY, JailExecutor, Judge } from '@affidavit/judge';
+import {
+  createRealJudge,
+  directorySources,
+  type RealJudge,
+  type RealJudgeConfig,
+  type RealJudgeHostProbe,
+  type SourceDirectory,
+} from '@affidavit/judge';
+import { SignerClient } from '@affidavit/signer';
 import { GvisorToolRunner } from '@affidavit/sandbox';
 import { LocalDockerToolRunner } from '@affidavit/testing';
 import { createModelPortFromEnv } from '@affidavit/trial';
@@ -46,23 +54,61 @@ export function buildDiscover(s: IntakeSettings, env: Env, runner?: ToolRunnerPo
 }
 
 /**
- * Lane 2's Judge on the gVisor witness jail. The executor's targets are `BootedTargets`, which
- * refuses to run a witness for a variant it has not booted (never a run with no target, which
- * would fail and look like evidence). Nothing boots a case's targets yet, and a discovery case
- * file names no `imageDigest`, so today every witness fails closed with an infrastructure error;
- * see docs/lanes/lane1/real-wiring.md, "What still blocks a real verdict". `verifyPatch` needs a
- * PatchWorkbench and a RescanPort, which are not wired either, so it fails closed the same way.
+ * Maps the worker's Judge settings onto Lane 2's `RealJudgeConfig` (field names in
+ * docs/lanes/lane2/real-judge-host.md). Builds only plain objects: the evidence store and the
+ * signer client open nothing until used. NodeGoat's trees and bundle are keyed by the corpus pin.
  */
-export function buildJudge(s: JudgeSettings): { judge: JudgePort; evidence: EvidenceStore } {
-  const targets = new BootedTargets();
-  const executor = new JailExecutor({ workRoot: s.workRoot, runnerImage: s.runnerImage, targets });
+export function realJudgeConfig(s: JudgeSettings): RealJudgeConfig {
+  const nodegoat = corpus.apps.find((a) => a.id === 'nodegoat');
+  const trees: SourceDirectory[] = [];
+  if (nodegoat && s.nodegoatDir !== null) {
+    trees.push({
+      repo: nodegoat.repo,
+      commit: nodegoat.pin.commit,
+      variant: 'vulnerable',
+      dir: s.nodegoatDir,
+    });
+  }
+  if (nodegoat && s.nodegoatSafeDir !== null) {
+    trees.push({
+      repo: nodegoat.repo,
+      commit: nodegoat.pin.commit,
+      variant: 'safe',
+      dir: s.nodegoatSafeDir,
+    });
+  }
+  const bundles =
+    nodegoat && s.nodegoatBundle !== null && s.dependencyBundleRoot !== null
+      ? [
+          {
+            app: 'nodegoat',
+            repo: nodegoat.repo,
+            path: s.nodegoatBundle,
+            storeRoot: s.dependencyBundleRoot,
+          },
+        ]
+      : [];
   return {
-    judge: new Judge(executor, DEFAULT_POLICY),
-    // Held for bundle sealing; no stage seals a bundle yet. The jail is never given this path.
+    workRoot: s.workRoot,
+    runnerImage: s.runnerImage,
+    applyImage: s.applyImage,
+    evidenceRoot: s.evidenceDir,
+    // The jail is never given this path; it is held for bundle sealing.
     evidence: new FsEvidenceStore(s.evidenceDir),
+    signerSocket: s.signerSocket,
+    signer: new SignerClient(s.signerSocket),
+    sources: directorySources(trees),
+    dependencyBundles: bundles,
+    sweepOrphans: s.sweepOrphans,
+    ...(s.leaseDir === null ? {} : { leaseDir: s.leaseDir }),
+    // No RescanPort yet: verifyPatch fails closed and createRealJudge reports it as a note.
   };
 }
 
+/** Lane 2's real Judge (CR-11). Its own startup check runs first and lists what is missing. */
+export function buildJudge(s: JudgeSettings, probe?: RealJudgeHostProbe): Promise<RealJudge> {
+  return createRealJudge(realJudgeConfig(s), probe === undefined ? {} : { probe });
+}
 /** `createModelPortFromEnv` from @affidavit/trial: mode, model table and timeout fail at startup. */
 export function buildModel(env: Env, killSwitch: () => boolean | Promise<boolean>): ModelPort {
   return createModelPortFromEnv(env, { killSwitch });

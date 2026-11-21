@@ -7,11 +7,11 @@ placeholder. Never put a real secret in this file, a commit, a shell history fil
 
 ## What each switch turns on
 
-| Switch                       | `real` means                                                                                                                                                                        |
-| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `AFFIDAVIT_INTAKE_IMPL=real` | intake, map and arraign run `discoverCase` (`packages/discovery/src/pipeline`) on the case's pinned repo and commit, and refuse to go on unless it reproduces the stored case file. |
-| `AFFIDAVIT_TRIAL_IMPL=real`  | defense, prosecution, remedy and verify run `@affidavit/trial`'s `Orchestrator` and handlers on `createModelPortFromEnv`. The jury must be off (no jury handler yet, L3-11).        |
-| `AFFIDAVIT_JUDGE_IMPL=real`  | the Judge is `Judge(JailExecutor, DEFAULT_POLICY)` from `@affidavit/judge`, with the evidence store and the signer socket checked at startup.                                       |
+| Switch                       | `real` means                                                                                                                                                                                                                                                                                            |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `AFFIDAVIT_INTAKE_IMPL=real` | intake, map and arraign run `discoverCase` (`packages/discovery/src/pipeline`) on the case's pinned repo and commit, and refuse to go on unless it reproduces the stored case file.                                                                                                                     |
+| `AFFIDAVIT_TRIAL_IMPL=real`  | defense, prosecution, remedy and verify run `@affidavit/trial`'s `Orchestrator` and handlers on `createModelPortFromEnv`. The jury must be off (no jury handler yet, L3-11).                                                                                                                            |
+| `AFFIDAVIT_JUDGE_IMPL=real`  | the Judge is Lane 2's `createRealJudge` (`packages/judge/src/jail/real.ts`): `Judge` on the gVisor `JailExecutor`, `CaseTargets` booting each case's vulnerable and safe variants, the jailed patch workbench, `FsEvidenceStore` and `SignerClient`. Host steps: `docs/lanes/lane2/real-judge-host.md`. |
 
 Each switch is independent. Unset or `fake` keeps the scripted fake for that part.
 
@@ -83,13 +83,21 @@ The budget defaults are conservative starting caps, not measured numbers ([metri
 
 ### For Judge `real`
 
-| Name                             | Purpose                                                                                                                                                                                                           | Required | Example placeholder                  |
-| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- | ------------------------------------ |
-| `AFFIDAVIT_JUDGE_WORK_ROOT`      | absolute, existing directory for witness attempt directories                                                                                                                                                      | yes      | `/srv/affidavit/judge`               |
-| `AFFIDAVIT_WITNESS_RUNNER_IMAGE` | local image ID (`sha256:<64 hex>`) from `pnpm --filter @affidavit/judge runner-image`                                                                                                                             | yes      | `sha256:<64 hex>`                    |
-| `AFFIDAVIT_EVIDENCE_DIR`         | absolute, existing evidence store directory; must not contain or sit inside either work root                                                                                                                      | yes      | `/srv/affidavit/evidence`            |
-| `AFFIDAVIT_SIGNER_SOCKET`        | the listening unix socket of `apps/signer`                                                                                                                                                                        | yes      | `/run/affidavit/signer.sock`         |
-| `AFFIDAVIT_NODEGOAT_BUNDLE`      | the NodeGoat dependency bundle tar file (PR #55). Startup checks it is a regular file, not a directory or a symlink; the Judge checks its sha256 against `pins.json` and fails closed on a null pin or a mismatch | no       | `/srv/affidavit/nodegoat-bundle.tar` |
+Mapped onto `RealJudgeConfig` (field in brackets); Lane 2's check names the field and the variable.
+
+| Name                               | Purpose                                                                                                                                                                                                                          | Required        | Example placeholder          |
+| ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------- | ---------------------------- |
+| `AFFIDAVIT_JUDGE_WORK_ROOT`        | quota'd, existing directory for witness attempts, builds and patch workspaces (`workRoot`)                                                                                                                                       | yes             | `/srv/affidavit/judge`       |
+| `AFFIDAVIT_WITNESS_RUNNER_IMAGE`   | witness runner image ID from `pnpm --filter @affidavit/judge runner-image` (`runnerImage`)                                                                                                                                       | yes             | `sha256:<64 hex>`            |
+| `AFFIDAVIT_PATCH_APPLY_IMAGE`      | patch-apply image ID from `pnpm --filter @affidavit/judge patch-apply-image` (`applyImage`)                                                                                                                                      | yes             | `sha256:<64 hex>`            |
+| `AFFIDAVIT_EVIDENCE_DIR`           | existing evidence store directory (`evidenceRoot`, `FsEvidenceStore`); neither inside nor containing a work root, after symlinks are resolved                                                                                    | yes             | `/srv/affidavit/evidence`    |
+| `AFFIDAVIT_SIGNER_SOCKET`          | the listening unix socket of `apps/signer` (`signerSocket`, `SignerClient`); not under a work root, the evidence store or a bundle store                                                                                         | yes             | `/run/affidavit/signer.sock` |
+| `AFFIDAVIT_NODEGOAT_DIR`           | verified NodeGoat checkout (`fetch-pinned.mjs nodegoat`), the vulnerable tree for `sources`                                                                                                                                      | for NodeGoat    | `/srv/corpus/nodegoat`       |
+| `AFFIDAVIT_NODEGOAT_SAFE_DIR`      | verified safe tree (`fetch-pinned.mjs nodegoat safe`)                                                                                                                                                                            | for NodeGoat    | `/srv/corpus/nodegoat-safe`  |
+| `AFFIDAVIT_NODEGOAT_BUNDLE`        | the NodeGoat dependency bundle tar (`dependencyBundles[].path`). Startup checks it is a regular file, not a directory or a symlink; the Judge checks its sha256 against `pins.json` and fails closed on a null pin or a mismatch | for NodeGoat    | `/srv/bundles/<sha256>.tar`  |
+| `AFFIDAVIT_DEPENDENCY_BUNDLE_ROOT` | the bundle store the tar must resolve inside (`dependencyBundles[].storeRoot`); required with the bundle                                                                                                                         | with the bundle | `/srv/bundles`               |
+| `AFFIDAVIT_SWEEP_ORPHANS`          | startup sweep of case networks left by workers proven dead (`sweepOrphans`): unset or `0` off (default), `1` on, `force` also removes runs no lease claims (operator only)                                                       | no              | `0`                          |
+| `AFFIDAVIT_JUDGE_LEASE_DIR`        | worker lease directory shared by every worker on the host (`leaseDir`, default `<workRoot>/leases`)                                                                                                                              | no              | `/srv/affidavit/leases`      |
 
 ## Host prerequisites
 
@@ -101,7 +109,8 @@ Checked at startup; each line is one possible `PrerequisiteError` entry.
 - The `runsc-affidavit` audit runtime and its trace directory (`docker/sandbox/setup-runsc-audit.sh`, as root), for the Judge.
 - The intake work root, the Judge work root and the evidence directory exist; the evidence directory is outside both work roots (the witness jail gets no path to the evidence store).
 - The signer is running and its socket exists.
-- The witness runner image is built locally.
+- The witness runner and patch-apply images are built locally.
+- The NodeGoat trees exist, when set. The Judge part of the list is Lane 2's `checkRealJudgePrerequisites`, run on the same config `createRealJudge` gets, so one error lists everything.
 - The NodeGoat bundle tar is a regular file (not a directory, not a symlink), when `AFFIDAVIT_NODEGOAT_BUNDLE` is set. Its sha256 is checked by the Judge, not at startup.
 
 ## To run a real case
@@ -112,7 +121,7 @@ The only secret input is `ANTHROPIC_API_KEY`. The database passwords are generat
 2. Set a monthly spend limit on the key in the Anthropic Console.
 3. Generate one password per role for this run (for example `openssl rand -hex 24`, three times), start Postgres from `docker/compose.yaml`, and provision it with `@affidavit/db` (`bootstrapRoles`, `setRolePassword` for `affidavit_owner`, `affidavit_app` and `affidavit_worker`, `applyMigrations`, `provisionTenant`). Keep the passwords in the shell only.
 4. Create the intake work root, Judge work root and evidence directory (separate trees).
-5. Build the witness runner image (`pnpm --filter @affidavit/judge runner-image`) and set `AFFIDAVIT_WITNESS_RUNNER_IMAGE` to the printed ID.
+5. Build the witness runner and patch-apply images (`pnpm --filter @affidavit/judge runner-image` and `patch-apply-image`) and set `AFFIDAVIT_WITNESS_RUNNER_IMAGE` and `AFFIDAVIT_PATCH_APPLY_IMAGE` to the printed IDs. For NodeGoat, follow `docs/lanes/lane2/real-judge-host.md` steps 4 and 5 (trees, and the human-built, pinned dependency bundle).
 6. Start `apps/signer` and set `AFFIDAVIT_SIGNER_SOCKET`.
 7. Export the variables above, with `AFFIDAVIT_JURY_ENABLED=false`, and `export ANTHROPIC_API_KEY="<from the secrets store>"` in that shell only.
 8. Start the worker (`node --import tsx apps/worker/src/main.ts`). It refuses with a list if anything is missing.
@@ -130,10 +139,10 @@ The only secret input is `ANTHROPIC_API_KEY`. The database passwords are generat
 
 These are outside this lane's packages or need the lead; each is tracked in `contract-requests.md`.
 
-- The Judge has no booted targets. `BootedTargets` refuses a variant it has not booted, and a case file must name the booted image in `target.imageDigest`; discovery case files name none, and the case file is immutable once opened. Until a per-case boot step exists (CR-11), every witness fails closed as an infrastructure error, the Defense stage fails, and the case is flagged for review, never dismissed.
-- `verifyPatch` needs a `PatchWorkbench` and a `RescanPort`; neither is wired (CR-11).
-- No stage seals an evidence bundle, so the signer and the evidence store are checked but not used yet (CR-11).
+- Targets now boot per case (`CaseTargets`, #61); a boot failure is a failed Defense attempt and then a review flag, never a dismissal. Booted targets are released when a trial stage lands the case in a terminal stage and on shutdown; a case flagged for review keeps its targets until the worker stops (no hook from the review flag yet). Targets live in process memory, so a restart boots them again.
+- `verifyPatch` needs Lane 1's `RescanPort`, which does not exist yet (only `FakeRescan`): without it `verifyPatch` fails closed, so Remedy cannot be verified and the case is flagged for review. Startup logs this as a `real Judge:` note.
+- No stage seals an evidence bundle; `createRealJudge` holds the evidence store and signer client for it (CR-11, second half).
 - No single-stage entry in the trial package (CR-7). The worker runs `Orchestrator.run` per stage job and stops it after one transition. The trial workspace (admitted witness, patch) and the cost ledger are in process memory, so a worker restart mid-trial fails the next stage and flags it for review.
 - No jury handler (L3-11), so the jury must be disabled.
-- NodeGoat: ingestion returns `incomplete` until PR #54, and the target cannot build without the dependency bundle until PR #55.
+- NodeGoat: ingestion returns `incomplete` until PR #54. `pins.json` has `bundleSha256: null` for NodeGoat, so until a human builds, reviews and pins the bundle, a configured bundle is refused at startup, and without one every NodeGoat case is `unsupported` at build.
 - CR-1: a case file's safe variant does not say which corpus safe variant it means, so a differential run cannot name the exact safe code it compared against.

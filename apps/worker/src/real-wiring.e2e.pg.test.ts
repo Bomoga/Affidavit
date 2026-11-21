@@ -213,6 +213,7 @@ describePg('worker real wiring, injected fakes, real Postgres and Graphile Worke
     }),
     AFFIDAVIT_JUDGE_WORK_ROOT: '/srv/affidavit/judge',
     AFFIDAVIT_WITNESS_RUNNER_IMAGE: `sha256:${'b'.repeat(64)}`,
+    AFFIDAVIT_PATCH_APPLY_IMAGE: `sha256:${'e'.repeat(64)}`,
     AFFIDAVIT_EVIDENCE_DIR: '/srv/affidavit/evidence',
     AFFIDAVIT_SIGNER_SOCKET: '/run/affidavit/signer.sock',
   });

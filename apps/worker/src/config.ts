@@ -46,8 +46,19 @@ export interface JudgeSettings {
   evidenceDir: string;
   /** The signer's unix socket. The worker holds no signing key. */
   signerSocket: string;
-  /** Lane 2's offline dependency bundle for NodeGoat (PR #55). Optional, passed through. */
+  /** Patch-apply image ID (`pnpm --filter @affidavit/judge patch-apply-image`). */
+  applyImage: string;
+  /** NodeGoat dependency bundle tar (PR #55), verified by the Judge against pins.json. */
   nodegoatBundle: string | null;
+  /** The bundle store the tar must resolve inside; required with `nodegoatBundle`. */
+  dependencyBundleRoot: string | null;
+  /** Verified NodeGoat checkouts (`fetch-pinned.mjs nodegoat` and `nodegoat safe`). */
+  nodegoatDir: string | null;
+  nodegoatSafeDir: string | null;
+  /** Startup sweep of case networks left by dead workers: off (default), on, or force. */
+  sweepOrphans: boolean | 'force';
+  /** Worker lease directory shared by every worker on the host (default `<workRoot>/leases`). */
+  leaseDir: string | null;
 }
 
 export interface WorkerConfig {
@@ -270,13 +281,52 @@ function judgeSettings(env: Env, problems: string[]): JudgeSettings {
   } else if (!/^sha256:[0-9a-f]{64}$/.test(runnerImage)) {
     problems.push('AFFIDAVIT_WITNESS_RUNNER_IMAGE must be a local image ID (sha256:<64 hex>)');
   }
+  const nodegoatBundle = optionalPathVar(env, 'AFFIDAVIT_NODEGOAT_BUNDLE', problems);
+  const dependencyBundleRoot = optionalPathVar(env, 'AFFIDAVIT_DEPENDENCY_BUNDLE_ROOT', problems);
+  if (nodegoatBundle !== null && dependencyBundleRoot === null) {
+    problems.push(
+      'AFFIDAVIT_NODEGOAT_BUNDLE needs AFFIDAVIT_DEPENDENCY_BUNDLE_ROOT (the bundle store it must resolve inside)',
+    );
+  }
   return {
     workRoot: pathVar(env, 'AFFIDAVIT_JUDGE_WORK_ROOT', 'witness attempt directories', problems),
     runnerImage: runnerImage ?? '',
     evidenceDir: pathVar(env, 'AFFIDAVIT_EVIDENCE_DIR', 'the evidence store directory', problems),
     signerSocket: pathVar(env, 'AFFIDAVIT_SIGNER_SOCKET', 'the signer service socket', problems),
-    nodegoatBundle: optionalPathVar(env, 'AFFIDAVIT_NODEGOAT_BUNDLE', problems),
+    applyImage: imageIdVar(
+      env,
+      'AFFIDAVIT_PATCH_APPLY_IMAGE',
+      '`pnpm --filter @affidavit/judge patch-apply-image`',
+      problems,
+    ),
+    nodegoatBundle,
+    dependencyBundleRoot,
+    nodegoatDir: optionalPathVar(env, 'AFFIDAVIT_NODEGOAT_DIR', problems),
+    nodegoatSafeDir: optionalPathVar(env, 'AFFIDAVIT_NODEGOAT_SAFE_DIR', problems),
+    sweepOrphans: sweepVar(env, problems),
+    leaseDir: optionalPathVar(env, 'AFFIDAVIT_JUDGE_LEASE_DIR', problems),
   };
+}
+
+function imageIdVar(env: Env, name: string, how: string, problems: string[]): string {
+  const raw = env[name];
+  if (raw === undefined || raw === '') {
+    problems.push(`${name} is required (the image ID printed by ${how})`);
+    return '';
+  }
+  if (!/^sha256:[0-9a-f]{64}$/.test(raw)) {
+    problems.push(`${name} must be a local image ID (sha256:<64 hex>)`);
+  }
+  return raw;
+}
+
+function sweepVar(env: Env, problems: string[]): boolean | 'force' {
+  const raw = env['AFFIDAVIT_SWEEP_ORPHANS'];
+  if (raw === undefined || raw === '' || raw === '0') return false;
+  if (raw === '1') return true;
+  if (raw === 'force') return 'force';
+  problems.push('AFFIDAVIT_SWEEP_ORPHANS must be unset, "0", "1" or "force"');
+  return false;
 }
 
 /** Validates the environment. Throws ConfigError listing every problem, none of them a secret. */
@@ -379,7 +429,11 @@ export function describeConfig(config: WorkerConfig): Record<string, unknown> {
         }
       : {}),
     ...(config.judgeSettings
-      ? { nodegoatBundle: config.judgeSettings.nodegoatBundle !== null }
+      ? {
+          nodegoatBundle: config.judgeSettings.nodegoatBundle !== null,
+          nodegoatTrees: config.judgeSettings.nodegoatDir !== null,
+          sweepOrphans: config.judgeSettings.sweepOrphans,
+        }
       : {}),
   };
 }

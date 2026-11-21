@@ -48,7 +48,7 @@ describe('config', () => {
 
 describe('handler selection', () => {
   it('wires a core for every non-terminal stage with fakes', async () => {
-    const cores = await prepareCores(loadConfig(base));
+    const { cores } = await prepareCores(loadConfig(base));
     const expected = CaseStage.options.filter(
       (s) => !['verdict', 'dismissed', 'escalated'].includes(s),
     );

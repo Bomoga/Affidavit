@@ -7,6 +7,7 @@ import {
   type StageHandler,
   type StageHooks,
 } from '@affidavit/db';
+import type { RealJudge, RealJudgeHostProbe } from '@affidavit/judge';
 import { resolveModelTable, type ModelTable } from '@affidavit/trial';
 import type { Env, WorkerConfig } from './config.js';
 import { fakeIntakeCores, fakeJudge, fakeTrialCores } from './fakes/stages.js';
@@ -17,6 +18,12 @@ import { realTrialCores } from './real/trial.js';
 
 export type Cores = Partial<Record<CaseStage, StageCore>>;
 
+export interface PreparedCores {
+  cores: Cores;
+  /** Releases what the real components hold (the Judge's booted targets and lease). */
+  close(): Promise<void>;
+}
+
 /**
  * Seams for the real wiring. Anything injected here replaces the component built from config,
  * and the host prerequisites of a replaced component are not checked. Tests inject fakes through
@@ -25,6 +32,8 @@ export type Cores = Partial<Record<CaseStage, StageCore>>;
 export interface Components {
   env?: Env;
   probe?: HostProbe;
+  /** Host facts for Lane 2's real Judge check (createRealJudge). */
+  judgeProbe?: RealJudgeHostProbe;
   /** Replaces the discovery pipeline (and its tool runner) for AFFIDAVIT_INTAKE_IMPL=real. */
   discover?: Discover;
   /** Replaces createModelPortFromEnv for AFFIDAVIT_TRIAL_IMPL=real. */
@@ -45,7 +54,7 @@ const API_KEY_VAR = 'ANTHROPIC_API_KEY';
 export async function prepareCores(
   config: WorkerConfig,
   components: Components = {},
-): Promise<Cores> {
+): Promise<PreparedCores> {
   const env = components.env ?? process.env;
   const log = components.log ?? ((m: string) => console.error(`[worker] ${m}`));
 
@@ -56,14 +65,26 @@ export async function prepareCores(
       judgeSettings: components.judge ? null : config.judgeSettings,
     },
     components.probe ?? realHostProbe,
+    components.judgeProbe,
   );
 
-  let judge: JudgePort;
+  let judge: JudgePort = fakeJudge();
+  let realJudge: RealJudge | null = null;
   if (config.judge === 'real') {
-    judge = components.judge ?? buildJudge(requireSettings(config.judgeSettings, 'judge')).judge;
-  } else {
-    judge = fakeJudge();
+    if (components.judge) judge = components.judge;
+    else {
+      realJudge = await buildJudge(
+        requireSettings(config.judgeSettings, 'judge'),
+        components.judgeProbe,
+      );
+      judge = realJudge.judge;
+      for (const note of realJudge.notes) log(`real Judge: ${note}`);
+    }
   }
+  // A case that reaches a terminal stage gives its booted targets back.
+  const caseEnded = realJudge
+    ? (caseId: string) => realJudge.release(caseId)
+    : () => Promise.resolve();
 
   let intake: Cores = fakeIntakeCores;
   if (config.intake === 'real') {
@@ -93,11 +114,15 @@ export async function prepareCores(
       settings: s,
       maxStageAttempts: config.maxStageAttempts,
       killSwitch,
+      caseEnded,
     });
   } else {
     trial = fakeTrialCores({ judge, juryEnabled: config.juryEnabled });
   }
-  return { ...intake, ...trial };
+  return {
+    cores: { ...intake, ...trial },
+    close: () => (realJudge ? realJudge.close() : Promise.resolve()),
+  };
 }
 
 function requireSettings<T>(settings: T | null, what: string): T {
