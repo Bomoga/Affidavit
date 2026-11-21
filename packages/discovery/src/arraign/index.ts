@@ -4,7 +4,9 @@
  * for everything it filters out.
  *
  * Everything here is a pure function of its arguments: no clock, no randomness, no I/O. The same
- * inputs give the same output, whatever the input order.
+ * inputs give the same output, whatever the order of candidates, reachability answers or
+ * negative controls (when several controls match one candidate, the one with the lowest id wins;
+ * two reachability answers for one candidate are refused).
  *
  * Root rule F3: a candidate whose score is at or above the escalation floor is never dismissed
  * here. If a dismissal rule matches it anyway, it is held for review (`review`) instead.
@@ -280,6 +282,7 @@ function dismissalFor(
   tree: string,
   config: ArraignConfig,
 ): { reason: Dismissal['reason']; detail: string } | undefined {
+  // `controls` is sorted, so when several match the choice does not depend on input order.
   const nc = controls.find(
     (n) =>
       treeKey(n.tree) === tree &&
@@ -311,13 +314,26 @@ function dismissalFor(
 
 export function arraign(input: ArraignInput): ArraignResult {
   const config = checkConfig(input.config);
-  const controls = (input.negativeControls ?? []).map(checkControl);
+  const controls = (input.negativeControls ?? [])
+    .map(checkControl)
+    .sort(
+      (a, b) =>
+        cmp(a.id, b.id) ||
+        cmp(treeKey(a.tree), treeKey(b.tree)) ||
+        cmp(a.file, b.file) ||
+        a.range.startLine - b.range.startLine ||
+        a.range.endLine - b.range.endLine,
+    );
   if (controls.length > 0 && input.tree === undefined) {
     throw new RangeError('negative controls need the scanned tree (input.tree)');
   }
   const tree = input.tree ? treeKey(checkTree(input.tree, 'input.tree')) : '';
   const byId = new Map<string, CandidateReachability>();
-  for (const r of input.reachability) byId.set(r.candidateId, r);
+  for (const r of input.reachability) {
+    // Two answers for one candidate would make the result depend on their order.
+    if (byId.has(r.candidateId)) throw new Error(`duplicate reachability for ${r.candidateId}`);
+    byId.set(r.candidateId, r);
+  }
   const seen = new Set<string>();
   const toTrial: Arraigned[] = [];
   const dismissed: Dismissal[] = [];

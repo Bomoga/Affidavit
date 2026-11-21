@@ -79,7 +79,10 @@ export interface AssembleResult {
   labelId?: string;
   /** Corpus safe variant attached, if any. */
   safeVariantId?: string;
-  /** Files whose slice was withheld because they did not parse cleanly. */
+  /**
+   * Files whose slice was withheld: no grammar, a parse failure or timeout, a syntax error, or a
+   * hygiene bound exceeded (`CleanFile.withheldReason` says which).
+   */
   withheld: string[];
 }
 
@@ -175,7 +178,7 @@ function wanted(a: Arraigned, path: ReachPath | undefined): Want[] {
  *
  * The path is checked (real path inside the real workspace), then opened, then the open handle is
  * compared (device and inode) with a stat of the checked path, so a file swapped in between the
- * check and the open is refused. This narrows the race; it does not close every one. The
+ * check and the open is refused. A file with more than one hard link is refused too. This narrows the race; it does not close every one. The
  * workspace must not be writable by repo-controlled processes while a case file is assembled.
  * `hooks.afterCheck` exists for tests only.
  */
@@ -212,6 +215,8 @@ export async function readWorkspaceFile(
   try {
     const st = await handle.stat();
     if (st.dev !== checked.dev || st.ino !== checked.ino) return undefined;
+    // A hard link can give a workspace name to a file outside it; refuse it like a symlink.
+    if (st.nlink !== 1) return undefined;
     if (!st.isFile() || st.size > MAX_SOURCE_BYTES) return undefined;
     const buf = Buffer.alloc(st.size);
     const { bytesRead } = await handle.read(buf, 0, st.size, 0);
