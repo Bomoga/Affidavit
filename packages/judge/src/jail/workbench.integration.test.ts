@@ -33,7 +33,7 @@ const LOCK = (packages: Record<string, unknown> = {}) =>
     requires: true,
     packages: { '': { name: 'tiny', version: '1.0.0' }, ...packages },
   })}\n`;
-/** A dev-only entry from outside the npm registry: the fetch may never install it. */
+/** A dev-only entry from outside the npm registry: the suite build refuses it. */
 const GIT_DEV = {
   'node_modules/tool': { version: 'git+https://example.test/tool.git', dev: true },
 };
@@ -144,9 +144,10 @@ describe.runIf(onSandboxHost)(
         if (!out.ok) throw new Error(`prepare failed: ${out.stage}: ${out.detail}`);
         try {
           expect(
-            await targets.endpoint({ variant: 'patched' } as Parameters<
-              typeof targets.endpoint
-            >[0]),
+            await targets.endpoint({
+              variant: 'patched',
+              target: out.prepared.target,
+            } as Parameters<typeof targets.endpoint>[0]),
           ).toBeDefined();
           expect(await wb.runSuite(cf, out.prepared)).toEqual({ passed });
         } finally {

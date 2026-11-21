@@ -5,6 +5,13 @@ the first ones run against a real target: OWASP NodeGoat built and booted with t
 recipes, not a stub. Sources are in `packages/judge/witnesses/`, in the L2-05 format
 (`witness-protocol.md`).
 
+**Blocked (2026-11-20).** Since the lead decision on PR #18 (deny-all egress, no exception for a
+build-time dependency fetch), NodeGoat cannot be built: its install downloads packages, so
+`bootVariant` throws `TargetBootError` (build `unsupported`, dependency fetch). The witnesses and
+the sandbox-host tests below are unchanged and cannot run until dependencies can be supplied
+without egress, which needs a new lead decision. The evidence section records the 2026-11-17 run
+on the earlier tip, which still had the fetch step; it does not describe the current code.
+
 | Witness                                        | Corpus label                                        | Class     | Family                                                                                                 |
 | ---------------------------------------------- | --------------------------------------------------- | --------- | ------------------------------------------------------------------------------------------------------ |
 | `nodegoat-idor-allocations.witness.ts`         | `nodegoat-idor-allocations-userid`                  | idor      | 3 (attacker, victim) pairs of seeded accounts: user1 reads user2, user2 reads user1, user1 reads admin |
@@ -21,6 +28,13 @@ the attacker's own allocations and every parameter fails.
 **NoSQL injection.** Logged in as user1, the witness requests user1's own allocations with an
 injected `threshold` and passes only when another user's allocations come back. On the safe variant
 (NodeGoat's own fix, `parseInt` on the threshold) the query stays scoped to user1.
+
+**Positive control for the `$where` safe variant.** "Fails on safe" only means something if the
+safe variant works. A control witness makes the same login and the same allocations request with
+thresholds the safe code accepts (`0`, `50`, `99`) and must pass on both variants: user1 logs in
+(302) and sees "Asset Allocations for John Doe". A broken login, seed or allocations page on the
+safe variant fails the control, so it cannot pass for a fixed bug. The control passes on both
+variants, so it is itself rejected by `differential`, as it should be.
 
 Both witnesses use only NodeGoat's seeded synthetic accounts (`artifacts/db-reset.js`) and talk
 only to `target`; the jail gives them no other route.
@@ -42,7 +56,10 @@ L1-13 work for Lane 1; the replacement text is in `nodegoat.integration.test.ts`
   sidecar images. It throws `TargetBootError` (`build` or `boot`, `unsupported` or `failed`) when
   the target cannot boot, after removing the network.
 - `BootedTargets` is a `TargetProvider` over booted variants. A variant that was not booted throws,
-  so a witness never runs without its target (which would fail and look like evidence).
+  so a witness never runs without its target (which would fail and look like evidence). It serves
+  a target only when the case file's `imageDigest` for that variant is the booted image ID; a case
+  file with no digest, or one naming another image, throws, so evidence is always tied to the image
+  it ran against.
 
 Booting from a case file's pinned digest (rather than from source) and the real `PatchWorkbench`
 for verifyPatch build on this and are the next step.

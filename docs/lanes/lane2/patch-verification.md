@@ -9,7 +9,7 @@ Static checks run first, so a bad patch never costs a build.
 | Step | Check                                                                                                                                                                                                         | Fails with                                                                               |
 | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
 | 1    | Patch exhibit parses, belongs to this case, is authored by `remedy`, `sha256` is the SHA-256 of `diff`, `code` equals `diff`, diff within `maxSourceBytes`; witness parses and fits the case                  | `schema`                                                                                 |
-| 1b   | Every counterexample that parses as an Exhibit carries a readable params header (see "Counterexample params header"); a missing or bad header refuses the whole patch | `schema` |
+| 1b   | Every counterexample that parses as an Exhibit carries a readable params header (see "Counterexample params header"); a missing or bad header refuses the whole patch                                         | `schema`                                                                                 |
 | 2    | Diff is a plain git diff of text files with safe paths and exact file names, no line over 2000 characters (see below), and the declared `filesTouched` and `linesChanged` equal what the diff contains        | `schema`                                                                                 |
 | 3    | Added plus removed lines at most `maxPatchLinesChanged` (100), files at most `maxPatchFiles` (5)                                                                                                              | `diff-too-large`                                                                         |
 | 4    | The patch does not weaken the target's test suite (see "Suite guard")                                                                                                                                         | `suite-fails`                                                                            |
@@ -57,7 +57,7 @@ What is reported for each submitted counterexample:
 
 | Counterexample                                                                     | `survived`                                          |
 | ---------------------------------------------------------------------------------- | --------------------------------------------------- |
-| Parses as an Exhibit, but its params header is missing or bad                     | patch refused with `schema`; entry `false`          |
+| Parses as an Exhibit, but its params header is missing or bad                      | patch refused with `schema`; entry `false`          |
 | Malformed, another case, wrong kind, or over `maxSourceBytes`                      | `false` (not used)                                  |
 | Readable but inadmissible (for example it also passes on `safe`, or is unstable)   | `false` (not used)                                  |
 | Admissible, and fails every parameter on `patched` with clean runs                 | `false`                                             |
@@ -154,15 +154,15 @@ Each line is at most 2000 characters (step 2), and every pattern in `literal.ts`
 - write `workspacePath` only from that jailed apply step: the host never writes into it, and nothing later (build, suite, witness, target) gets a writable handle to it;
 - make one patched build, from `PatchPlan.code`, and run the witness, the counterexamples and the suite against it. `PatchPlan.code` may have no files, when the patch only adds tests; the build is then the vulnerable commit rebuilt as is;
 - in `runSuite`, run the vulnerable commit's own suite (its test files, test script and runner config, all unchanged in that build) with a fixed `npm test` in the recipe's working directory, never a command from the patched manifest;
-- run that suite in a second build of the same patched tree with devDependencies (`buildTarget(..., { devDependencies: true })`). The target that witnesses attack is built as the app ships (`--omit=dev` unless it has a `build` script), and the suite image is never booted or attacked. With devDependencies the lockfile check covers dev-only entries too, so the fetch still reaches only the npm registry;
+- run that suite in a second build of the same patched tree with devDependencies (`buildTarget(..., { devDependencies: true })`). The target that witnesses attack is built as the app ships (`--omit=dev` unless it has a `build` script), and the suite image is never booted or attacked. With devDependencies the lockfile check and the no-download rule cover dev-only entries too, so any devDependency to install makes the suite build `unsupported` (deny-all egress, lead decision 2026-11-20);
 - decide whether the suite can be built from the vulnerable commit, never from the patched one. When the vulnerable commit's recipe with devDependencies is refused, `runSuite` returns `{ unavailable: reason }`; when only the patched tree is refused, that is `build` (`suite-fails`), so a patch cannot make its suite unavailable;
 - in `runAddedTests`, run only `PatchPlan.tests` on top of that build, in a separate run, and return null when there are none or they are not run.
 
 ## Unavailable suite
 
-When the vulnerable commit's suite cannot be built in the sandbox, the Judge does not reject the patch for it, but `suitePassed` stays false (never true for a suite that did not run). `Judge.verifyPatchReport` returns the `VerifyResult` plus `suite: { state: 'passed' | 'failed' | 'not-run' } | { state: 'unavailable', reason }`. Failing patch tests (`runAddedTests`) still reject with `suite-fails`. Contracts v1.0 have no field for this; a `suite` status on `VerifyResult` is proposed for v1.1.
+When the vulnerable commit's suite cannot be built in the sandbox, the Judge rejects the patch with `suite-fails` (fail closed, lead decision 2026-11-20 on PR #46): a patch is never accepted without its suite having run and passed. `suitePassed` stays false. An earlier version reported the suite unavailable without holding it against the patch, which let a patch through unchecked. `Judge.verifyPatchReport` returns the `VerifyResult` plus `suite: { state: 'passed' | 'failed' | 'not-run' } | { state: 'unavailable', reason }`. Failing patch tests (`runAddedTests`) still reject with `suite-fails`. Contracts v1.0 have no field for this; a `suite` status on `VerifyResult` is proposed for v1.1.
 
-NodeGoat is the first case: its devDependencies take `grunt-if` from a GitHub tarball (unpinned `master`), which the fetch proxy cannot reach, and its `npm test` runs `test/unit/*.js`, which the repository does not have.
+NodeGoat is the first case: its devDependencies take `grunt-if` from a GitHub tarball (unpinned `master`), which deny-all egress cannot reach (and since PR #18 NodeGoat cannot be built at all), and its `npm test` runs `test/unit/*.js`, which the repository does not have.
 
 ## What is real and what is scripted
 

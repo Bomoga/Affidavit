@@ -11,9 +11,24 @@ const target = (url: string): BootedTarget =>
     recipe: { workdir: '/app' },
   }) as unknown as BootedTarget;
 
-const req = (variant: ExecutionRequest['variant']) => ({ variant }) as ExecutionRequest;
+const DIGEST = `sha256:${'a'.repeat(64)}`;
+/** `imageDigest: null` leaves the digest out of the case file's target. */
+const req = (variant: ExecutionRequest['variant'], imageDigest: string | null = DIGEST) =>
+  ({
+    variant,
+    target: { variant, ...(imageDigest === null ? {} : { imageDigest }) },
+  }) as ExecutionRequest;
 
 describe('BootedTargets', () => {
+  it("serves a target only when the case file's imageDigest is the booted image", async () => {
+    const t = new BootedTargets({ vulnerable: target('http://target:4000') });
+    expect((await t.endpoint(req('vulnerable'))).url).toBe('http://target:4000');
+    await expect(t.endpoint(req('vulnerable', `sha256:${'b'.repeat(64)}`))).rejects.toThrow(
+      /is not the booted vulnerable image/,
+    );
+    await expect(t.endpoint(req('vulnerable', null))).rejects.toThrow(/no imageDigest/);
+  });
+
   it('serves the registered variant and throws for one that has no target', async () => {
     const t = new BootedTargets({ vulnerable: target('http://target:4000') });
     expect((await t.endpoint(req('vulnerable'))).url).toBe('http://target:4000');

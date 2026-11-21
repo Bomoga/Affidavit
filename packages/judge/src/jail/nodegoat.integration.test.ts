@@ -17,6 +17,11 @@ import { JailedPatchWorkbench, buildPatchApplyImage } from './workbench.js';
 // sandbox host and AFFIDAVIT_NODEGOAT_DIR (the L1-08 corpus checkout:
 // `node packages/corpus/scripts/fetch-pinned.mjs nodegoat`). Run with
 // `pnpm --filter @affidavit/judge test:sandbox-host`; skipped in plain `pnpm test`.
+//
+// Blocked: since the lead decision on PR #18 (2026-11-20, deny-all egress with no exception for
+// a build-time fetch), NodeGoat cannot be built. Every test here fails in beforeAll with
+// TargetBootError (build unsupported, dependency fetch) until dependencies can be supplied
+// without egress. The expectations below are what must hold once it boots again.
 const onSandboxHost = process.env.AFFIDAVIT_SANDBOX_HOST === '1';
 const nodegoat = process.env.AFFIDAVIT_NODEGOAT_DIR;
 
@@ -101,6 +106,31 @@ witness<{ pair: { attacker: { userName: string; password: string }; victim: { us
   },
 );
 `;
+
+/**
+ * Positive control for the `$where` safe variant: the same login and the same allocations request
+ * as the injection witness, with a threshold the safe code accepts. It must pass on both variants:
+ * user1 logs in (302) and sees their own allocations page, so the seed and session work.
+ */
+const BENIGN_WHERE = `import { expect } from 'vitest';
+import { witness } from '@affidavit/witness';
+witness<{ threshold: string }>(async ({ threshold }, { target }) => {
+  const base = target!.url;
+  const login = await fetch(\`\${base}/login\`, {
+    method: 'POST', redirect: 'manual',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ userName: 'user1', password: 'User1_123' }).toString(),
+  });
+  expect(login.status).toBe(302);
+  const cookie = login.headers.getSetCookie().map((c) => c.split(';')[0]).join('; ');
+  const res = await fetch(\`\${base}/allocations/2?threshold=\${encodeURIComponent(threshold)}\`, {
+    headers: { cookie }, redirect: 'manual',
+  });
+  expect(res.status).toBe(200);
+  expect(await res.text()).toContain('Asset Allocations for John Doe');
+});
+`;
+const BENIGN_PARAMS: ParamSpace = [{ name: 'threshold', values: ['0', '50', '99'] }];
 
 /** A real `git diff` of one file changed from `from` to `to`, made with the host's git. */
 function realDiff(file: string, from: string, to: string): string {
@@ -288,6 +318,24 @@ describe.runIf(onSandboxHost && nodegoat !== undefined)(
       );
     });
 
+    it('positive control for the $where safe variant: login, seed and the benign query work', async () => {
+      // Without this, a safe variant whose login, seed or allocations page were broken would also
+      // make the injection witness fail there, and "fails on safe" would prove nothing.
+      const cf = caseFor('injection', gateCaseFile().id, booted.vulnerable!, booted.safeNosqli!);
+      const w = witnessFor(cf.id, 'injection', BENIGN_WHERE, BENIGN_PARAMS);
+      const r = await judgeFor(booted.safeNosqli!).runWitness(cf, w, ['vulnerable', 'safe']);
+      expect(r.runs.map((x) => [x.variant, x.passed])).toEqual([
+        ['vulnerable', true],
+        ['vulnerable', true],
+        ['vulnerable', true],
+        ['safe', true],
+        ['safe', true],
+        ['safe', true],
+      ]);
+      // It passes on both, so it is (correctly) not admissible evidence of anything.
+      expect(r).toMatchObject({ admissible: false, rejectedBy: 'differential' });
+    });
+
     describe('verifyPatch with the real workbench', () => {
       let applyImage = '';
       beforeAll(async () => {
@@ -296,8 +344,9 @@ describe.runIf(onSandboxHost && nodegoat !== undefined)(
 
       /**
        * NodeGoat's suite cannot be built in the sandbox: its devDependencies take `grunt-if` from
-       * a GitHub tarball (unpinned master), and the fetch only reaches the npm registry. (Its
-       * `npm test` also points at `test/unit/*.js`, which the repository does not have.)
+       * a GitHub tarball (unpinned master), and no build step has a route out (deny-all egress,
+       * lead decision 2026-11-20). (Its `npm test` also points at `test/unit/*.js`, which the
+       * repository does not have.) An unavailable suite rejects the patch with `suite-fails`.
        */
       const NO_SUITE = {
         state: 'unavailable',
@@ -319,7 +368,7 @@ describe.runIf(onSandboxHost && nodegoat !== undefined)(
         });
       };
 
-      it("verifies NodeGoat's own $where fix: the whole family flips; the suite is unavailable", async () => {
+      it("rejects NodeGoat's own $where fix with suite-fails: the family flips, but the suite is unavailable", async () => {
         const cf = caseFor('injection', gateCaseFile().id, booted.vulnerable!, booted.safeNosqli!);
         const w = witnessFor(
           cf.id,
@@ -341,10 +390,10 @@ describe.runIf(onSandboxHost && nodegoat !== undefined)(
           rescanClean: true,
           counterexamples: [],
         });
-        expect(r.rejectedBy).toBeUndefined();
+        expect(r.rejectedBy).toBe('suite-fails');
       });
 
-      it("verifies NodeGoat's own IDOR fix: every (attacker, victim) pair flips", async () => {
+      it("rejects NodeGoat's own IDOR fix with suite-fails: every pair flips, but the suite is unavailable", async () => {
         const cf = caseFor('idor', 'case-nodegoat-idor-001', booted.vulnerable!, booted.safeIdor!);
         const w = witnessFor(
           cf.id,
@@ -362,7 +411,7 @@ describe.runIf(onSandboxHost && nodegoat !== undefined)(
         );
         expect(suite).toEqual(NO_SUITE);
         expect(r).toMatchObject({ familyFlipped: true, suitePassed: false });
-        expect(r.rejectedBy).toBeUndefined();
+        expect(r.rejectedBy).toBe('suite-fails');
       });
 
       it('rejects a patch that changes the file but not the bug: the family does not flip', async () => {

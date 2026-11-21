@@ -89,10 +89,27 @@ export class BootedTargets implements TargetProvider {
     this.#byVariant.delete(variant);
   }
 
+  /**
+   * The endpoint of the booted target for `req.variant`, served only when the case file names that
+   * exact image (`req.target.imageDigest` equals the booted image ID). A case file with no digest,
+   * or one built from other code, gets an error, never a target, so evidence is always tied to
+   * the image it ran against.
+   */
   endpoint(req: ExecutionRequest): Promise<TargetEndpoint> {
     const t = this.#byVariant.get(req.variant);
     if (t === undefined) {
       return Promise.reject(new Error(`no booted target for the ${req.variant} variant`));
+    }
+    const digest = req.target.imageDigest;
+    if (digest === undefined) {
+      return Promise.reject(
+        new Error(`the case file names no imageDigest for the ${req.variant} variant`),
+      );
+    }
+    if (digest !== t.imageId) {
+      return Promise.reject(
+        new Error(`imageDigest ${digest} is not the booted ${req.variant} image ${t.imageId}`),
+      );
     }
     return Promise.resolve(t.endpoint);
   }
