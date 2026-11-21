@@ -14,14 +14,18 @@
     "format:check": "prettier --check .",
     "test": "vitest run",
     "test:sandbox-host": "AFFIDAVIT_SANDBOX_HOST=1 vitest run --no-file-parallelism src/gvisor src/boot",
-    "containment": "tsx src/containment/cli.ts"
+    "containment": "tsx src/containment/cli.ts",
+    "bundle:build": "tsx scripts/build-dependency-bundle.ts"
   },
   "dependencies": {
     "@affidavit/contracts": "workspace:*",
-    "dockerode": "5.0.1"
+    "dockerode": "5.0.1",
+    "tar-stream": "3.2.2"
   },
   "devDependencies": {
+    "@affidavit/corpus": "workspace:*",
     "@affidavit/testing": "workspace:*",
-    "@types/dockerode": "4.0.2"
+    "@types/dockerode": "4.0.2",
+    "@types/tar-stream": "3.1.5"
   }
 }

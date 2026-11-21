@@ -5,7 +5,7 @@ import { PromptId, StageCost } from '@affidavit/contracts';
 import { canonicalJson, sha256Hex } from '../canonical.js';
 import type { ModelTurnRequest, ModelTurnResult } from '../orchestrator.js';
 import { JudgeIneligibleRecordingError, ModelCallError, NoModelRecordingError } from './errors.js';
-import { containsSecret, redactDeep } from './redact.js';
+import { containsSecret, detectCredential, redactDeep } from './redact.js';
 
 /** Where recorded agent outputs live by default: `fixtures/models/` at the repo root (Lane 3). */
 export const DEFAULT_RECORDINGS_DIR = resolve(
@@ -93,7 +93,12 @@ export class FileRecordingStore implements RecordingStore {
   constructor(
     readonly dir: string = DEFAULT_RECORDINGS_DIR,
     /** `allowSecrets`: record a submission verbatim even if it holds credential-shaped text. */
-    private readonly options: { allowSecrets?: boolean } = {},
+    private readonly options: {
+      allowSecrets?: boolean;
+      /** Work budget for the credential scan; past it the recording is refused. */
+      scanBudgetMs?: number;
+      now?: () => number;
+    } = {},
   ) {}
 
   private path(req: ModelTurnRequest, hash: string): string {
@@ -129,16 +134,26 @@ export class FileRecordingStore implements RecordingStore {
     // A witness can quote credentials from the target repo (a hardcoded JWT, a cloud key). The
     // submission is never rewritten, so instead of committing them verbatim the recording is
     // refused unless the operator opted in. The message names no value.
-    if (
-      !this.options.allowSecrets &&
-      submission !== undefined &&
-      canonicalJson(redactDeep(submission, secrets)) !== canonicalJson(submission)
-    ) {
-      return Promise.reject(
-        new ModelCallError(
-          'refusing to record a submission that contains credential-shaped text; set AFFIDAVIT_RECORD_ALLOW_SECRETS=1 to record it verbatim',
-        ),
-      );
+    if (!this.options.allowSecrets && submission !== undefined) {
+      const scan = detectCredential(submission, {
+        ...(this.options.scanBudgetMs === undefined ? {} : { budgetMs: this.options.scanBudgetMs }),
+        ...(this.options.now === undefined ? {} : { now: this.options.now }),
+      });
+      if (scan === 'credential') {
+        return Promise.reject(
+          new ModelCallError(
+            'refusing to record a submission that contains credential-shaped text; set AFFIDAVIT_RECORD_ALLOW_SECRETS=1 to record it verbatim',
+          ),
+        );
+      }
+      if (scan === 'over-budget') {
+        // Fails closed: a submission that cannot be scanned in time is not recorded.
+        return Promise.reject(
+          new ModelCallError(
+            'refusing to record a submission that could not be scanned for credentials within the work budget',
+          ),
+        );
+      }
     }
     const stored = redactDeep(rest, secrets) as ModelTurnResult;
     if ('submission' in result) stored.submission = submission;

@@ -66,6 +66,16 @@ importers:
       graphile-worker:
         specifier: 0.18.0
         version: 0.18.0(supports-color@7.2.0)(typescript@6.0.3)
+    devDependencies:
+      '@affidavit/testing':
+        specifier: workspace:*
+        version: link:../../packages/testing
+      '@types/pg':
+        specifier: 8.23.1
+        version: 8.23.1
+      pg:
+        specifier: 8.23.1
+        version: 8.23.1
 
   apps/cli:
     dependencies:
@@ -309,13 +319,22 @@ importers:
       dockerode:
         specifier: 5.0.1
         version: 5.0.1(supports-color@7.2.0)
+      tar-stream:
+        specifier: 3.2.2
+        version: 3.2.2(bare-buffer@3.7.1)
     devDependencies:
+      '@affidavit/corpus':
+        specifier: workspace:*
+        version: link:../corpus
       '@affidavit/testing':
         specifier: workspace:*
         version: link:../testing
       '@types/dockerode':
         specifier: 4.0.2
         version: 4.0.2
+      '@types/tar-stream':
+        specifier: 3.1.5
+        version: 3.1.5
 
   packages/testing:
     dependencies:
