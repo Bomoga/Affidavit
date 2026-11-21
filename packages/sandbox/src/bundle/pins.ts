@@ -1,7 +1,10 @@
-import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { createReadStream, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 import { SHA256_HEX } from './integrity.js';
+import type { DependencyBundleRef } from './open.js';
 
 /** One app's pinned dependency bundle, set by a human after building and reviewing it. */
 export interface DependencyBundlePin {
@@ -45,6 +48,40 @@ export function readDependencyBundlePins(file = PINS_FILE): DependencyBundlePin[
     if (typeof o.note !== 'string') throw new Error(`pins[${i}].note is missing`);
     return { app: o.app, commit: o.commit, bundleSha256: sha, note: o.note };
   });
+}
+
+const HUMAN_STEP =
+  'a human must run packages/sandbox/scripts/build-dependency-bundle.ts on a networked host, ' +
+  'review the manifest (and bundle-exclusions.json), and set bundleSha256 in ' +
+  'docker/sandbox/dependency-bundles/pins.json';
+
+/**
+ * A ref to a bundle file for `buildTarget` / `bootVariant`, checked against the pin before it is
+ * returned: throws (fail closed) when the app has no pin, the pin is null, or the file's sha256
+ * differs. The bundle's directory becomes the allowed root. `openDependencyBundle` checks the
+ * digest again when the build reads it.
+ */
+export async function pinnedDependencyBundle(input: {
+  app: string;
+  commit: string;
+  path: string;
+  pinsFile?: string;
+}): Promise<DependencyBundleRef> {
+  const pinned = pinnedBundleSha256(input.app, input.commit, input.pinsFile);
+  if (pinned === null) {
+    throw new Error(
+      `no pinned dependency bundle for ${input.app} at ${input.commit}: ${HUMAN_STEP}`,
+    );
+  }
+  const hash = createHash('sha256');
+  await pipeline(createReadStream(input.path), hash);
+  const actual = hash.digest('hex');
+  if (actual !== pinned) {
+    throw new Error(
+      `dependency bundle sha256 ${actual} does not match the pinned ${pinned} (${input.path}): ${HUMAN_STEP}`,
+    );
+  }
+  return { path: input.path, sha256: pinned, allowedRoot: dirname(input.path) };
 }
 
 /** The pinned digest for an app at a commit, or null when none is pinned. */

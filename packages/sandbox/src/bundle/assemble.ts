@@ -19,11 +19,19 @@ import {
   type LockfilePlan,
   type PlannedPackage,
 } from './plan.js';
+import { pruneExcludedDev, validateExclusions, type ExcludedDevPackage } from './prune.js';
 
 export interface AssembleInput {
   app: string;
   commit: string;
   lockText: string;
+  /** The target's package.json; needed only with `excludedDev`. */
+  pkgText?: string;
+  /**
+   * Reviewed dev packages to leave out (`bundle-exclusions.json`). The dev section is planned from
+   * the lockfile with these pruned, and records the list under its digest.
+   */
+  excludedDev?: readonly ExcludedDevPackage[];
   /**
    * The tarball bytes for a planned package, or null when none was obtained. Supplied by the
    * human-run builder script (which is the only code that touches the network); tests pass a
@@ -49,16 +57,28 @@ export async function assembleBundle(input: AssembleInput): Promise<AssembleResu
   const read = planLockfile(input.lockText);
   if (!read.ok) throw new Error(read.reason);
   const { plan } = read;
+  const excluded = validateExclusions(input.excludedDev ?? [], 'excludedDev');
+  let devPlan = plan;
+  if (excluded.length > 0) {
+    if (input.pkgText === undefined) throw new Error('excludedDev needs the package.json text');
+    const pruned = pruneExcludedDev(input.lockText, input.pkgText, excluded);
+    if (!pruned.ok) throw new Error(pruned.reason);
+    const devRead = planLockfile(pruned.lockText);
+    if (!devRead.ok) throw new Error(devRead.reason);
+    devPlan = devRead.plan;
+  }
   const maxUnpacked =
     input.maxUnpackedPackageBytes ?? DEPENDENCY_BUNDLE_CAPS.maxUnpackedPackageBytes;
   const tarballs = new Map<string, Buffer>();
   const sections = {} as Record<BundleSection, BundleSectionRecord>;
   for (const name of BUNDLE_SECTIONS) {
-    const problems = [...plan.problems[name]];
+    const sectionPlan = name === 'dev' ? devPlan : plan;
+    const list = name === 'dev' && excluded.length > 0 ? { excluded } : {};
+    const problems = [...sectionPlan.problems[name]];
     const packages: BundlePackage[] = [];
     const mine = new Map<string, Buffer>();
     // A section the lockfile already rules out is not fetched at all.
-    const toFetch = problems.length > 0 ? [] : sectionPackages(plan, [name]);
+    const toFetch = problems.length > 0 ? [] : sectionPackages(sectionPlan, [name]);
     for (const p of toFetch) {
       const label = `${p.path} (${p.name}@${p.version})`;
       const data = await input.tarballFor(p);
@@ -98,9 +118,10 @@ export async function assembleBundle(input: AssembleInput): Promise<AssembleResu
       sections[name] = makeSection({
         status: 'unsupported',
         reason: problemSummary(name, problems, 50),
+        ...list,
       });
     } else {
-      sections[name] = makeSection({ status: 'ok', packages });
+      sections[name] = makeSection({ status: 'ok', packages, ...list });
       for (const [h, d] of mine) tarballs.set(h, d);
     }
   }

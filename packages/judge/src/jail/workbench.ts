@@ -6,12 +6,15 @@ import type { CaseFile, PatchExhibit } from '@affidavit/contracts';
 import {
   buildTarget,
   deriveRecipe,
+  openDependencyBundle,
   removeBuildDir,
   removeCaseNetwork,
   runJailed,
   stageTree,
   validateMounts,
   type CaseNetwork,
+  type DependencyBundleManifest,
+  type DependencyBundleRef,
   type Mount,
 } from '@affidavit/sandbox';
 import { renderDiff, type ParsedDiff } from '../patch/diff.js';
@@ -97,6 +100,12 @@ export interface JailedPatchWorkbenchOptions {
   vulnerableSource: (caseFile: CaseFile) => string;
   /** The provider the Judge's executor uses; the patched target is registered here while verified. */
   targets: BootedTargets;
+  /**
+   * The case target's pinned dependency bundle (L2-04c; `pinnedDependencyBundle` checks it against
+   * pins.json). Both builds install from it: the patched target with its production section, the
+   * suite image with production and dev. Without it, a target with dependencies is unsupported.
+   */
+  dependencyBundle?: DependencyBundleRef;
 }
 
 interface Workspace {
@@ -248,10 +257,24 @@ export class JailedPatchWorkbench implements PatchWorkbench {
         if (change !== null) return { ok: false, stage: 'suite', detail: `${rel}: ${change}` };
       }
 
+      const bundleRef = this.opts.dependencyBundle;
+      const bundleOpt = bundleRef === undefined ? {} : { dependencyBundle: bundleRef };
+      // The suite precheck reads the bundle's manifest, verified against the pin the same way a
+      // build verifies it; a bundle that does not verify is `build`.
+      let manifest: DependencyBundleManifest | undefined;
+      if (bundleRef !== undefined) {
+        const opened = await openDependencyBundle(bundleRef, join(dir, 'bundle'));
+        if (!opened.ok) {
+          return { ok: false, stage: 'build', detail: `dependency bundle: ${opened.reason}` };
+        }
+        manifest = opened.bundle.manifest;
+      }
+
       let target: BootedTarget;
       try {
         target = await bootVariant(join(tree, 'code'), caseFile.bootHints, {
           workRoot: this.opts.workRoot,
+          ...bundleOpt,
         });
       } catch (err) {
         if (err instanceof TargetBootError) {
@@ -265,6 +288,7 @@ export class JailedPatchWorkbench implements PatchWorkbench {
         let suite: Workspace['suite'];
         const vulnerableSuite = await deriveRecipe(staged, caseFile.bootHints, {
           devDependencies: true,
+          ...(manifest === undefined ? {} : { bundle: manifest }),
         });
         if (!vulnerableSuite.ok) {
           suite = { unavailable: `the suite cannot be built: ${vulnerableSuite.reason}` };
@@ -272,6 +296,7 @@ export class JailedPatchWorkbench implements PatchWorkbench {
           const built = await buildTarget(join(tree, 'code'), caseFile.bootHints, {
             workRoot: this.opts.workRoot,
             devDependencies: true,
+            ...bundleOpt,
           });
           if (!built.ok) {
             return {

@@ -58,9 +58,11 @@ describe('no egress exception for the split build', () => {
       }
     };
     walk(srcRoot);
+    // Network imports, fetch and host spawns of npm and friends are checked by the AST-based
+    // guard in egress-guard.test.ts (review of #55: a text grep here passed trivially). This
+    // test keeps the import boundary: nothing in src/ pulls in the networked script.
     for (const f of files) {
       const text = readFileSync(f, 'utf8');
-      expect(text, f).not.toMatch(/['"]cache['"],\s*['"]add['"]|npm cache add --/);
       expect(text, f).not.toMatch(/from ['"][./]*scripts\//);
     }
     expect(Object.keys(sandbox)).not.toContain('buildDependencyBundle');

@@ -4,6 +4,7 @@ import tar from 'tar-stream';
 import { RESOLVED } from '../boot/lockfile.js';
 import { SHA256_HEX, SHA512_HEX, canonicalSha256, parseIntegrity } from './integrity.js';
 import { BUNDLE_SECTIONS, type BundleSection } from './plan.js';
+import { validateExclusions, type ExcludedDevPackage } from './prune.js';
 
 /**
  * A dependency bundle is one uncompressed tar, addressed by its sha256:
@@ -32,10 +33,14 @@ export interface BundlePackage {
   sha512: string;
 }
 
-/** A section either lists its packages or says why it could not be built. */
+/**
+ * A section either lists its packages or says why it could not be built. The dev section may also
+ * carry `excluded`: the reviewed dev packages left out on purpose (see `prune.ts`). It is under the
+ * section digest, so changing the list changes the bundle sha256.
+ */
 export type BundleSectionRecord =
-  | { status: 'ok'; sha256: string; packages: BundlePackage[] }
-  | { status: 'unsupported'; sha256: string; reason: string };
+  | { status: 'ok'; sha256: string; packages: BundlePackage[]; excluded?: ExcludedDevPackage[] }
+  | { status: 'unsupported'; sha256: string; reason: string; excluded?: ExcludedDevPackage[] };
 
 export interface DependencyBundleManifest {
   schema: typeof BUNDLE_SCHEMA;
@@ -63,13 +68,17 @@ export function sectionDigest(section: BundleSectionRecord): string {
 }
 
 export function makeSection(
-  input: { status: 'ok'; packages: BundlePackage[] } | { status: 'unsupported'; reason: string },
+  input: (
+    { status: 'ok'; packages: BundlePackage[] } | { status: 'unsupported'; reason: string }
+  ) & { excluded?: ExcludedDevPackage[] },
 ): BundleSectionRecord {
+  const { excluded, ...base } = input;
   const sorted =
-    input.status === 'ok'
-      ? { ...input, packages: [...input.packages].sort((a, b) => (a.path < b.path ? -1 : 1)) }
-      : input;
-  const withPlaceholder: BundleSectionRecord = { ...sorted, sha256: '' };
+    base.status === 'ok'
+      ? { ...base, packages: [...base.packages].sort((a, b) => (a.path < b.path ? -1 : 1)) }
+      : base;
+  const withList = excluded !== undefined && excluded.length > 0 ? { ...sorted, excluded } : sorted;
+  const withPlaceholder: BundleSectionRecord = { ...withList, sha256: '' };
   return { ...withPlaceholder, sha256: sectionDigest(withPlaceholder) };
 }
 
@@ -113,6 +122,16 @@ export function parseBundleManifest(
     if (!isObj(s) || typeof s.sha256 !== 'string' || !SHA256_HEX.test(s.sha256)) {
       return fail(`section ${name} is malformed`);
     }
+    let excluded: ExcludedDevPackage[] | undefined;
+    if (s.excluded !== undefined) {
+      if (name !== 'dev') return fail(`section ${name} may not exclude packages`);
+      try {
+        excluded = validateExclusions(s.excluded, `section ${name} excluded`);
+      } catch (e) {
+        return fail((e as Error).message);
+      }
+      if (excluded.length === 0) return fail(`section ${name} has an empty excluded list`);
+    }
     let rec: BundleSectionRecord;
     if (s.status === 'unsupported') {
       if (!nonEmpty(s.reason)) return fail(`section ${name} has no reason`);
@@ -150,6 +169,7 @@ export function parseBundleManifest(
     } else {
       return fail(`section ${name} has an unknown status`);
     }
+    if (excluded !== undefined) rec = { ...rec, excluded };
     if (sectionDigest(rec) !== rec.sha256) return fail(`section ${name} digest does not match`);
     sections[name] = rec;
   }

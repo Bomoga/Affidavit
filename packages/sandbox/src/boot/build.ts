@@ -29,6 +29,7 @@ import {
   type OpenedBundle,
 } from '../bundle/open.js';
 import type { BundleSection } from '../bundle/plan.js';
+import { pruneExcludedDev, type ExcludedDevPackage } from '../bundle/prune.js';
 
 const exec = promisify(execFile);
 
@@ -102,6 +103,30 @@ export interface BundleUse {
   /** The digest of each section the install step mounted. */
   sections: Partial<Record<BundleSection, string>>;
   packages: number;
+  /** The reviewed dev exclusions pruned before the install (security relevant; human reviewed). */
+  excludedDev?: ExcludedDevPackage[];
+}
+
+/**
+ * Prunes reviewed dev exclusions from a staged tree's package.json and package-lock.json, so the
+ * offline `npm ci` never looks for them. Returns the lockfile paths removed; throws when the list
+ * does not apply to this lockfile (fail closed).
+ */
+export async function applyDevExclusions(
+  tree: string,
+  excluded: readonly ExcludedDevPackage[],
+): Promise<string[]> {
+  const pkgPath = join(tree, 'package.json');
+  const lockPath = join(tree, 'package-lock.json');
+  const pruned = pruneExcludedDev(
+    await readFile(lockPath, 'utf8'),
+    await readFile(pkgPath, 'utf8'),
+    excluded,
+  );
+  if (!pruned.ok) throw new Error(pruned.reason);
+  await writeFile(lockPath, pruned.lockText);
+  await writeFile(pkgPath, pruned.pkgText);
+  return pruned.removed;
 }
 
 export type BuildOutcome = (
@@ -287,10 +312,19 @@ async function buildIn(
     if (bundle !== undefined) {
       const sections = recipe.install?.sections ?? [];
       const packages = await materializeNpmCache(bundle, sections, cacheDir);
+      const excludedDev = recipe.install?.excludedDev ?? [];
+      if (excludedDev.length > 0) {
+        try {
+          await applyDevExclusions(tree, excludedDev);
+        } catch (err) {
+          return { ok: false, unsupported: true, step: 'recipe', reason: (err as Error).message };
+        }
+      }
       bundleUse = {
         sha256: `sha256:${bundle.sha256}`,
         sections: Object.fromEntries(sections.map((s) => [s, bundle.manifest.sections[s].sha256])),
         packages,
+        ...(excludedDev.length > 0 ? { excludedDev } : {}),
       };
     }
 

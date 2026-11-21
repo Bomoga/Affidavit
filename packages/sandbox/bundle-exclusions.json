@@ -1,0 +1,26 @@
+{
+  "note": "Reviewed dev packages left out of dependency bundles. Security relevant: every entry is part of the dev section digest and the bundle sha256, and a human reviews this file with the bundle manifest before setting a pin. Each entry names the exact version the lockfile pins and why the test suite does not need it.",
+  "apps": [
+    {
+      "app": "nodegoat",
+      "commit": "c5cb68a7084e4ae7dcc60e6a98768720a81841e8",
+      "excludedDev": [
+        {
+          "name": "cypress",
+          "version": "3.3.1",
+          "reason": "Used only by the test:e2e, test:ci and cy:verify scripts and test/e2e; npm test runs grunt test (env:test, mochaTest:unit), which never loads it. Its install script downloads a binary, so it cannot be bundled."
+        },
+        {
+          "name": "nodemon",
+          "version": "1.19.1",
+          "reason": "Used only by the dev script and the Gruntfile concurrent task (run and default), not by grunt test. Its install script cannot run with lifecycle scripts disabled."
+        },
+        {
+          "name": "grunt-if",
+          "version": "0.2.0",
+          "reason": "Resolves to a GitHub tarball, not the npm registry. Only the testsecurity task uses it; grunt test does not. The Gruntfile loads it with loadNpmTasks, which logs a missing module and continues (the Gruntfile also sets force)."
+        }
+      ]
+    }
+  ]
+}

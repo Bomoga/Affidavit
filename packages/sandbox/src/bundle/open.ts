@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { copyFile, lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { isAbsolute, join, relative } from 'node:path';
 import tar from 'tar-stream';
 import {
@@ -9,7 +9,7 @@ import {
   type BundlePackage,
   type DependencyBundleManifest,
 } from './format.js';
-import { SHA256_HEX, integrityMismatch, parseIntegrity } from './integrity.js';
+import { SHA256_HEX, digestHex, integrityMismatch, parseIntegrity } from './integrity.js';
 import { inspectPackageTarball } from './inspect.js';
 import type { BundleSection } from './plan.js';
 
@@ -126,9 +126,29 @@ export async function openDependencyBundle(
   }
   if (size > caps.maxBundleBytes) return broken(`is over ${caps.maxBundleBytes} bytes`);
 
-  const storeDir = join(workDir, 'bundle-store');
-  await mkdir(storeDir, { recursive: true });
+  // Verified tarballs go to a fresh 0700 directory that only the host user can read, and it is
+  // removed on any refusal, so nothing from a bundle that fails verification is left behind.
+  await mkdir(workDir, { recursive: true });
+  const storeDir = await mkdtemp(join(workDir, 'bundle-store-'));
+  await chmod(storeDir, 0o700);
+  let result: BundleOpen;
+  try {
+    result = await readAndVerify(file, expected, storeDir, caps, broken);
+  } catch (err) {
+    await rm(storeDir, { recursive: true, force: true });
+    throw err;
+  }
+  if (!result.ok) await rm(storeDir, { recursive: true, force: true });
+  return result;
+}
 
+async function readAndVerify(
+  file: string,
+  expected: string,
+  storeDir: string,
+  caps: Readonly<DependencyBundleCaps>,
+  broken: (reason: string) => BundleOpen,
+): Promise<BundleOpen> {
   const hash = createHash('sha256');
   const extract = tar.extract();
   let parsing = true;
@@ -262,6 +282,9 @@ export async function openDependencyBundle(
           'target is unsupported',
       };
     }
+    if (read.info.name !== p.name) {
+      return broken(`tarball for ${p.path} is package ${String(read.info.name)}, not ${p.name}`);
+    }
     if (read.info.version !== undefined && read.info.version !== p.version) {
       return broken(`tarball for ${p.path} is version ${read.info.version}, not ${p.version}`);
     }
@@ -286,7 +309,16 @@ export async function materializeNpmCache(
     const section = bundle.manifest.sections[name];
     if (section.status !== 'ok') throw new Error(`bundle section ${name} is unsupported`);
     for (const p of section.packages) {
-      for (const h of parseIntegrity(p.integrity) ?? []) {
+      const verified = await readFile(join(bundle.storeDir, p.sha512));
+      const integrity = parseIntegrity(p.integrity) ?? [];
+      if (
+        digestHex('sha512', verified) !== p.sha512 ||
+        integrity.length === 0 ||
+        integrityMismatch(integrity, verified) !== null
+      ) {
+        throw new Error(`bundle tarball for ${p.path} changed after verification`);
+      }
+      for (const h of integrity) {
         const dir = join(
           cacheDir,
           '_cacache',
@@ -300,7 +332,8 @@ export async function materializeNpmCache(
         try {
           await lstat(dest);
         } catch {
-          await copyFile(join(bundle.storeDir, p.sha512), dest);
+          // The bytes written are the bytes just hashed: no window between verify and mount.
+          await writeFile(dest, verified, { mode: 0o644, flag: 'wx' });
         }
       }
       count++;

@@ -3,7 +3,13 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CaseFile, Witness, type BootHints, type ParamSpace } from '@affidavit/contracts';
-import { RUN_LABEL, removeCaseNetwork } from '@affidavit/sandbox';
+import {
+  RUN_LABEL,
+  pinnedDependencyBundle,
+  readDependencyBundlePins,
+  removeCaseNetwork,
+  type DependencyBundleRef,
+} from '@affidavit/sandbox';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Judge } from '../judge.js';
 import { DEFAULT_POLICY } from '../rules.js';
@@ -24,7 +30,9 @@ const nodegoat = process.env.AFFIDAVIT_NODEGOAT_DIR;
  * build-time fetch), NodeGoat builds only with a reviewed offline dependency bundle
  * (`lane2/L2-04c-dependency-bundle`), named by AFFIDAVIT_NODEGOAT_BUNDLE. Without it every test
  * here would fail in beforeAll with TargetBootError (build unsupported, dependency fetch), so the
- * suite is skipped, and the reason is in its title in the test output.
+ * suite is skipped, and the reason is in its title in the test output. With it set, beforeAll
+ * checks the file against pins.json (`pinnedDependencyBundle`) and fails closed on a null pin or
+ * a mismatch: a human builds the bundle, reviews the manifest and sets the pin.
  */
 const bundle = process.env.AFFIDAVIT_NODEGOAT_BUNDLE;
 const SKIP_REASON = !onSandboxHost
@@ -234,21 +242,32 @@ describe.skipIf(SKIP_REASON !== null)(
       return dir;
     }
 
+    let dependencyBundle: DependencyBundleRef | undefined;
     beforeAll(async () => {
       root = mkdtempSync(join(tmpdir(), 'affidavit-nodegoat-it-'));
       const workRoot = join(root, 'work');
       mkdirSync(workRoot);
+      const pin = readDependencyBundlePins().find((p) => p.app === 'nodegoat');
+      if (pin === undefined) throw new Error('pins.json has no nodegoat entry');
+      dependencyBundle = await pinnedDependencyBundle({
+        app: 'nodegoat',
+        commit: pin.commit,
+        path: bundle as string,
+      });
       runnerImage = await buildRunnerImage();
-      booted.vulnerable = await bootVariant(nodegoat as string, HINTS, { workRoot });
+      booted.vulnerable = await bootVariant(nodegoat as string, HINTS, {
+        workRoot,
+        dependencyBundle,
+      });
       booted.safeIdor = await bootVariant(
         variantSource('safe-idor', 'app/routes/allocations.js', IDOR_VULNERABLE, IDOR_SAFE),
         HINTS,
-        { workRoot },
+        { workRoot, dependencyBundle },
       );
       booted.safeNosqli = await bootVariant(
         variantSource('safe-nosqli', 'app/data/allocations-dao.js', NOSQLI_VULNERABLE, NOSQLI_SAFE),
         HINTS,
-        { workRoot },
+        { workRoot, dependencyBundle },
       );
     }, 1_800_000);
 
@@ -353,15 +372,20 @@ describe.skipIf(SKIP_REASON !== null)(
       }, 600_000);
 
       /**
-       * NodeGoat's suite cannot be built in the sandbox: its devDependencies take `grunt-if` from
-       * a GitHub tarball (unpinned master), and no build step has a route out (deny-all egress,
-       * lead decision 2026-11-20). (Its `npm test` also points at `test/unit/*.js`, which the
-       * repository does not have.) An unavailable suite rejects the patch with `suite-fails`.
+       * NodeGoat's suite cannot be built in the sandbox yet. The reviewed exclusions
+       * (bundle-exclusions.json) take out cypress, nodemon and `grunt-if` (a GitHub tarball), but
+       * three dev packages left in the bundle (domelementtype, entities, uuid) declare a `prepare`
+       * script, which the L2-04c review rule refuses, so the bundle's dev section is unsupported
+       * and no build step has a route out (deny-all egress, lead decision 2026-11-20). (Its
+       * `npm test` also points at `test/unit/*.js`, which the repository does not have.) An
+       * unavailable suite rejects the patch with `suite-fails`.
        */
-      const NO_SUITE = {
-        state: 'unavailable',
-        reason:
-          'the suite cannot be built: node_modules/grunt-if resolves outside the npm registry',
+      const expectNoSuite = (suite: unknown) => {
+        const s = suite as { state: string; reason: string };
+        expect(s.state).toBe('unavailable');
+        expect(s.reason).toMatch(
+          /^the suite cannot be built: the dependency bundle's dev section is unsupported: .*\(prepare\)/,
+        );
       };
 
       const verifierFor = (safe: BootedTarget) => {
@@ -371,6 +395,7 @@ describe.skipIf(SKIP_REASON !== null)(
           applyImage,
           vulnerableSource: () => nodegoat as string,
           targets,
+          ...(dependencyBundle === undefined ? {} : { dependencyBundle }),
         });
         return new Judge(new JailExecutor({ workRoot: root, runnerImage, targets }), POLICY, {
           workbench,
@@ -393,7 +418,7 @@ describe.skipIf(SKIP_REASON !== null)(
           w,
           [],
         );
-        expect(suite).toEqual(NO_SUITE);
+        expectNoSuite(suite);
         expect(r).toMatchObject({
           familyFlipped: true,
           suitePassed: false,
@@ -419,7 +444,7 @@ describe.skipIf(SKIP_REASON !== null)(
           w,
           [],
         );
-        expect(suite).toEqual(NO_SUITE);
+        expectNoSuite(suite);
         expect(r).toMatchObject({ familyFlipped: true, suitePassed: false });
         expect(r.rejectedBy).toBe('suite-fails');
       });

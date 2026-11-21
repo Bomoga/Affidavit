@@ -86,8 +86,20 @@ export function planLockfile(text: string): PlanRead {
     const problem = (why: string): void => {
       plan.problems[section].push(`${path} ${why}`);
     };
-    if (e.inBundle === true || e.bundled === true) return;
     if (skippedPrefixes.some((p) => path.startsWith(`${p}/`))) return;
+    if (e.inBundle === true || e.bundled === true) {
+      // Arrives inside its parent's tarball, so nothing is fetched for it; its scripts still
+      // count (review of #55). The tarball inspection checks the nested package.json as well.
+      if (e.hasInstallScript === true) {
+        const n = typeof e.name === 'string' ? e.name : nameFromPath(path);
+        const v = typeof e.version === 'string' ? e.version : '?';
+        problem(
+          `(${n}@${v}) has install scripts (bundled inside its parent); lifecycle scripts are ` +
+            'disabled, so it cannot be installed',
+        );
+      }
+      return;
+    }
     if (e.link === true) return problem('is a link');
     if (!path.split('/').includes('node_modules')) return problem('is a workspace package');
     if (e.optional === true && excludesLinux(e.os)) {

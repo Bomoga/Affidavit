@@ -5,4 +5,5 @@ export * from './inspect.js';
 export * from './open.js';
 export * from './pins.js';
 export * from './plan.js';
+export * from './prune.js';
 export * from './assemble.js';

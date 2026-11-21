@@ -33,6 +33,8 @@ import {
   digestHex,
   parseIntegrity,
   planLockfile,
+  pruneExcludedDev,
+  readBundleExclusions,
   sectionPackages,
   type BundleSection,
   type PlannedPackage,
@@ -76,14 +78,26 @@ async function main(): Promise<void> {
       maxBuffer: 64 * 1024 * 1024,
     })
   ).stdout;
+  const pkgText = (await exec('git', ['show', `${commit}:package.json`], { cwd: checkout })).stdout;
+  // The reviewed exclusion list (packages/sandbox/bundle-exclusions.json). Security relevant: it
+  // goes into the dev section and its digest, and is printed below for the reviewer.
+  const excludedDev = readBundleExclusions(appId, commit);
 
   const read = planLockfile(lockText);
   if (!read.ok) throw new Error(read.reason);
   const plan = read.plan;
-  const fetchable: BundleSection[] = (['production', 'dev'] as const).filter(
-    (s) => plan.problems[s].length === 0,
-  );
-  const wanted = sectionPackages(plan, fetchable);
+  let devPlan = plan;
+  if (excludedDev.length > 0) {
+    const pruned = pruneExcludedDev(lockText, pkgText, excludedDev);
+    if (!pruned.ok) throw new Error(pruned.reason);
+    const devRead = planLockfile(pruned.lockText);
+    if (!devRead.ok) throw new Error(devRead.reason);
+    devPlan = devRead.plan;
+  }
+  const planFor = (s: BundleSection) => (s === 'dev' ? devPlan : plan);
+  const wanted = (['production', 'dev'] as const)
+    .filter((s) => planFor(s).problems[s].length === 0)
+    .flatMap((s) => sectionPackages(planFor(s), [s]));
 
   const tmp = await mkdtemp(join(tmpdir(), 'affidavit-bundle-build-'));
   try {
@@ -155,7 +169,10 @@ async function main(): Promise<void> {
 
     await mkdir(out, { recursive: true });
     const partial = join(out, `.partial-${process.pid}.tar`);
-    const built = await assembleBundleFile({ app: appId, commit, lockText, tarballFor }, partial);
+    const built = await assembleBundleFile(
+      { app: appId, commit, lockText, pkgText, excludedDev, tarballFor },
+      partial,
+    );
     const final = join(out, `${built.sha256}.tar`);
     await rename(partial, final);
     const npmVersion = (await exec(process.execPath, [cli, '--version'], { env })).stdout.trim();
@@ -181,6 +198,10 @@ async function main(): Promise<void> {
           ? `${name}: ok, ${s.packages.length} packages, section sha256 ${s.sha256}`
           : `${name}: unsupported: ${s.reason}`,
       );
+    }
+    if (excludedDev.length > 0) {
+      console.log(`dev excludes ${excludedDev.length} reviewed packages (in the section digest):`);
+      for (const e of excludedDev) console.log(`  ${e.name}@${e.version}: ${e.reason}`);
     }
     console.log(
       'Review the manifest, then set bundleSha256 in docker/sandbox/dependency-bundles/pins.json.',
