@@ -93,6 +93,9 @@ write('trials/nodegoat-sqli-001.events.json', [
   ev('remedy', 'remedy', 'exhibit-submitted', { exhibitId: 'exhibit-patch-001', kind: 'patch' }),
   ev('remedy', 'remedy', 'stage-exited', { to: 'verify' }),
   ev('verify', 'judge', 'stage-entered', { from: 'remedy' }),
+  // v1.1 (CR-1): the Judge's passing check of the patch. No counterexample was admitted in this
+  // trial, so the result lists none (a result naming one would not count as a complete check).
+  ev('verify', 'judge', 'verify-result', { result: { ...verify, counterexamples: [] } }),
   ev('verify', 'judge', 'stage-exited', { to: 'verdict' }),
   ev('verdict', 'stenographer', 'verdict-written', { verdict }),
 ]);

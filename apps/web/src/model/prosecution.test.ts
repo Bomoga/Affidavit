@@ -2,6 +2,7 @@ import { TrialEvent, type VerifyResult } from '@affidavit/contracts';
 import { readFixtureJson } from '@affidavit/testing';
 import { describe, expect, it } from 'vitest';
 import { withProsecution } from '../testing/prosecution.js';
+import { withVerify, withoutVerify } from '../testing/verify.js';
 import { buildCaseView } from './caseView.js';
 
 const GATE = TrialEvent.array().parse(readFixtureJson('trials/nodegoat-sqli-001.events.json'));
@@ -68,7 +69,7 @@ describe('prosecution on the docket', () => {
 describe('patch acceptance matches trial', () => {
   const WITH_CX = withProsecution(GATE, { counterexampleId: CX });
   const stamp = (events: readonly TrialEvent[], r: VerifyResult) =>
-    buildCaseView(events, { verifyResults: [r] }).stamp;
+    buildCaseView(withVerify(events, [r])).stamp;
 
   it('accepts when every admitted counterexample has exactly one result and none survived', () => {
     expect(stamp(WITH_CX, verifyResult({ counterexamples: [cx(CX, false)] }))).toBe('VERIFIED');
@@ -91,12 +92,18 @@ describe('patch acceptance matches trial', () => {
   });
 
   it('still withholds the stamp when a counterexample exists and no result is supplied', () => {
+    expect(buildCaseView(withoutVerify(WITH_CX)).stamp).toBeNull();
+    // The recorded check predates the counterexample, so it does not cover it.
     expect(buildCaseView(WITH_CX).stamp).toBeNull();
   });
 
-  it('keeps the gate fixture UNVERIFIED until a verify-result event exists (CR-1)', () => {
-    const view = buildCaseView(GATE);
+  it('keeps the gate fixture UNVERIFIED without a verify-result event (CR-1)', () => {
+    const view = buildCaseView(withoutVerify(GATE));
     expect(view.status).toBe('unverified');
     expect(view.stamp).toBeNull();
+  });
+
+  it('stamps the gate fixture VERIFIED from its recorded Judge verify-result (CR-1)', () => {
+    expect(buildCaseView(GATE).stamp).toBe('VERIFIED');
   });
 });

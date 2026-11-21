@@ -76,6 +76,36 @@ describe('ownBootedTarget (the patched network is never leaked)', () => {
     expect(removed).toEqual([net]);
   });
 
+  it('also removes the suite image when registering the patched target throws after its build', async () => {
+    const { removed, remove } = recorder();
+    const images: string[] = [];
+    const targets = new BootedTargets({ patched: target('http://old:4000') });
+    await expect(
+      ownBootedTarget(
+        net,
+        (onFailure) => {
+          onFailure(() => (images.push('sha256:suite'), Promise.resolve()));
+          targets.set('patched', target('http://new:4000'));
+          return Promise.resolve({ ok: true as const });
+        },
+        remove,
+      ),
+    ).rejects.toThrow(/already registered/);
+    expect(images).toEqual(['sha256:suite']);
+    expect(removed).toEqual([net]);
+    // Handed over: the suite image is kept for runSuite and removed by release.
+    const kept: string[] = [];
+    await ownBootedTarget(
+      net,
+      (onFailure) => {
+        onFailure(() => (kept.push('x'), Promise.resolve()));
+        return Promise.resolve({ ok: true });
+      },
+      remove,
+    );
+    expect(kept).toEqual([]);
+  });
+
   it('removes it on a refused outcome and keeps it only when handed over', async () => {
     const { removed, remove } = recorder();
     expect(await ownBootedTarget(net, () => Promise.resolve({ ok: false }), remove)).toEqual({

@@ -115,7 +115,7 @@ Known gaps: app code can still tell a suite run from a witness run by its enviro
 
 ## `literal-only-patch`
 
-The plan rejects a patch "whose only change is special-casing a literal value from the witness's parameters". "Only" cannot be checked statically against an author who pads the patch with an unrelated hunk, so the Judge is stricter: any added code line that special-cases a witness value rejects the patch. Counterexample values are checked too, only once the counterexample is admitted (passes on vulnerable, fails on safe), and by length (`findExactLiteralUses`, after the build). A value of 4 characters or more (the family check's substring threshold) is a hit anywhere in an added code line, including inside a longer string, a regex literal or a template literal, so `if (p === "..%2fetc%2fpasswd") return 403;`, `const BAD = '..%2fetc%2fpasswd'; if (p === BAD)` and `/^(?:..%2fetc%2fpasswd)$/` are all rejected. A shorter value, and a number, is a hit only as a whole literal on any kind of added line (conditional, declaration, assignment, array member, `case`), so a short value cannot veto a patch by appearing inside another literal or an identifier. A counterexample that was not admitted contributes nothing (review, 2026-11-20). Known gap, shared with the family check: a value split across literals (`'..%2f' + 'etc%2fpasswd'`) is not caught. The family's values keep the full check described above. A real fix does not need the exploit's own payload.
+The plan rejects a patch "whose only change is special-casing a literal value from the witness's parameters". "Only" cannot be checked statically against an author who pads the patch with an unrelated hunk, so the Judge is stricter: any added code line that special-cases a witness value rejects the patch. Everything below, up to the counterexample subsection, is the check on the witness family's values. A real fix does not need the exploit's own payload.
 
 Comment text is stripped before the check, never the whole line: complete `/* ... */` spans anywhere (string-aware, and a span holding a quote or backtick is kept, since the line may continue a string from an earlier line), and a `//` or `# ` comment only when it starts the line. So `/**/ if (id === "1'--") return;` and `*/ if (threshold === 3)` are both caught.
 
@@ -132,7 +132,7 @@ Known gaps (the family rerun in step 7 is the dynamic half of the same rule, and
 - range equality such as `t >= 3 && t <= 3`, or `Math.abs(t - 3) < 1`;
 - a number or payload built at run time from pieces (`'1' + "'--"`, `30 + 7`), or held in a variable or array declared on another line;
 - membership through a structure other than an inline array literal (an object map, a `switch` on a computed key);
-- a constant on another line (`const BAD = 1337;` then `if (id === BAD)`);
+- a constant on another line (`const BAD = 1337;` then `if (id === BAD)`) holding a family value (a counterexample's new value is caught there, see below);
 - a string split across literals or lines (`'0\' || ' + "'1'=='1"`);
 - a case change before the compare (`t.toLowerCase() === 'select'` against an upper-case payload);
 - a BigInt literal (`1337n`), and comparisons through a function (`Object.is(+id, 1337)`);
@@ -140,7 +140,18 @@ Known gaps (the family rerun in step 7 is the dynamic half of the same rule, and
 - a JSON or other data file of payload values added by the patch and used through `.includes`;
 - a `/` the regex-literal heuristic misreads can keep a real comment as code (a false positive, never a miss).
 
-Considered and not done: flagging every added numeric literal equal to a parameter number above 2, wherever it appears. It would catch the constant-on-another-line case, but parameter numbers often coincide with values a real fix uses (HTTP statuses such as `403`, limits, ports), so it would refuse correct fixes. The family rerun covers the dynamic side.
+Considered and not done for the family: flagging every added numeric literal equal to a parameter number above 2, wherever it appears. It would catch the constant-on-another-line case, but parameter numbers often coincide with values a real fix uses (HTTP statuses such as `403`, limits, ports), so it would refuse correct fixes. The family rerun covers the dynamic side.
+
+### Counterexample values
+
+Prosecution's counterexamples can add values the family never had. Those are checked too, with a separate rule (`findExactLiteralUses`, run after the build, review 2026-11-20):
+
+- only values of a counterexample that was admitted (passes on vulnerable, fails on safe); a counterexample that was not admitted contributes nothing;
+- only values that are not already in the family's own params. A counterexample that reuses family values (an index pick, a parameter it did not choose) adds nothing here, because those values already had the family check above; giving them a second, stricter check would let Prosecution veto a correct patch (for example `rows.length !== 1` or `rows[0]` with family values `1` and `0`);
+- a new string value of 4 characters or more is a hit anywhere in an added code line, including a longer string, a regex literal or a template literal: `if (p === "..%2fetc%2fpasswd") return 403;`, `const BAD = '..%2fetc%2fpasswd'; if (p === BAD)` and `/^(?:..%2fetc%2fpasswd)$/` are all rejected;
+- a shorter new value, and a new number, is a hit only as a whole literal on any kind of added line (conditional, declaration, assignment, array member, `case`), never inside another literal or an identifier.
+
+Known gaps, accepted because an admitted counterexample with a nearby value then survives the patch (`counterexample-survives`): a value split across literals (`'..%2f' + 'etc%2fpasswd'`) or built in a `${}` template, a case-insensitive pattern (`/ADMIN/i` against `admin`), a value built with `String.fromCharCode` or decoded with `atob`, and a constant array of values declared elsewhere.
 
 Each line is at most 2000 characters (step 2), and every pattern in `literal.ts` and `diff.ts` is linear or bounded by that cap. The left-operand pattern in the number check used to restart at every position of a long run of identifier characters (quadratic: 128K characters took about 18 s in review); it now starts only where a run starts.
 

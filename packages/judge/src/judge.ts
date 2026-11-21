@@ -349,7 +349,8 @@ export class Judge implements JudgePort {
         },
         this.#policy,
       );
-      // The vulnerable commit's own suite, on the same build the witness ran against. The
+      // The vulnerable commit's own suite, on a separate devDependencies build of the same patched
+      // tree (never booted or attacked); the witness ran against the target build. The
       // patch's own tests are an extra check: a failure counts, a pass is never required.
       // A suite that cannot be built in the sandbox fails closed: the patch is rejected with
       // `suite-fails` (lead decision 2026-11-20, PR #46), and `verifyPatchReport` says why.
@@ -388,7 +389,14 @@ export class Judge implements JudgePort {
           results.push({ exhibitId, survived: false });
           continue;
         }
-        admittedParams.push(...space);
+        // Only the counterexample's genuinely new values: one the family already has (an index
+        // pick, an unchosen parameter) had the family's own check, and must not get a second,
+        // different one that Prosecution could use to veto a correct patch.
+        const familyValues = new Set(params.flatMap((q) => q.values.map((v) => canonicalJson(v))));
+        for (const q of space) {
+          const fresh = q.values.filter((v) => !familyValues.has(canonicalJson(v)));
+          if (fresh.length > 0) admittedParams.push({ name: q.name, values: fresh });
+        }
         const attempts = await this.#attempts(cf, [['patched', prepared.target]], code, space);
         const survived = counterexampleSurvives(
           { exhibitId, familySize: familySize(space), attempts },

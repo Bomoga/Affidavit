@@ -1,5 +1,14 @@
 # Contracts changelog
 
+## v1.1 (2026-11-20)
+
+Additive minor bump under `docs/implementation-plan.md` section 3.4, approved by the lead. No v1.0 member is renamed, removed or reordered, and every v1.0 event still parses.
+
+- **CR-1, `verify-result` trial event** (`docs/lanes/lane3/contract-requests.md`): `'verify-result'` is appended at the end of `TrialEventType`, and `TrialEvent` gains `event('verify-result', z.object({ result: VerifyResult }))`. It is emitted by actor `judge` in stage `verify`, once per `JudgePort.verifyPatch` call, so appeals produce one per round. A client that reads only the stream can now see the Judge's patch check instead of trusting the verdict's claim.
+- `src/samples.ts` gains `trialEventSamples` (exported), one valid sample per event type added after v1.0, since the registry holds one sample per schema. The round-trip tests parse it and reject a payload with no result, a non-`VerifyResult` result, a result missing a required field, and the payload under another event type.
+- JSON Schema export is registry-based, so the `TrialEvent` schema picks up the new member with no exporter change.
+- Fixtures: `fixtures/trials/nodegoat-sqli-001.events.json` gains a passing `verify-result` for `exhibit-patch-001` between the `verify` stage-entered and stage-exited events (seq 17); the two events after it are renumbered to 18 and 19. Its `counterexamples` list is empty because that trial admits no counterexample.
+
 ## v1.0 (2026-11-05)
 
 First frozen version for Phase 1. Every top-level boundary object carries `schemaVersion: 1`. Changes follow `docs/implementation-plan.md` section 3.4.
