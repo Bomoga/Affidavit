@@ -312,11 +312,14 @@ export function findLiteralSpecialCases(
 }
 
 /**
- * The check for values from admitted counterexamples (Prosecution's proven inputs): an added code
- * line (of any kind: conditional, declaration, assignment, array or object member, `case`) is a
- * hit when it holds a string literal whose decoded content equals a value exactly, or a number
- * literal equal to a parameter number. No substring matching, so a short or common value that
- * merely appears inside other code or a longer literal cannot veto a patch.
+ * The check for values from admitted counterexamples (Prosecution's proven inputs), by length. A
+ * string value of MIN_CONTAINS characters or more is a hit anywhere in an added code line (inside
+ * a longer string, a regex or a template literal), as in the family check: a value that long is
+ * specific. A shorter value, and a number, is a hit only as a whole literal (decoded string
+ * content equal to it, or a number literal equal to it) on any kind of added line: conditional,
+ * declaration, assignment, array or object member, `case`. So a short value cannot veto a patch by
+ * appearing inside other code. Known gap, shared with the family check: a value split across
+ * literals (`'..%2f' + 'etc%2fpasswd'`) is not caught.
  */
 export function findExactLiteralUses(lines: readonly DiffLine[], params: ParamSpace): LiteralHit[] {
   const { strings, numbers } = paramLiterals(params);
@@ -330,7 +333,12 @@ export function findExactLiteralUses(lines: readonly DiffLine[], params: ParamSp
   for (const { path, text } of lines) {
     if (isTestFile(path)) continue;
     const code = stripComments(text);
-    let value: string | number | undefined = stringLiterals(code).find((l) => wanted.has(l));
+    const literals = stringLiterals(code);
+    let value: string | number | undefined =
+      // Long values (MIN_CONTAINS or more): anywhere in the code, regex and template literals and
+      // longer strings included, as in the family check. Short ones: whole literals only.
+      strings.find((s) => s.length >= MIN_CONTAINS && code.includes(s)) ??
+      literals.find((l) => wanted.has(l));
     if (value === undefined && numbers.length > 0) {
       // Number tokens outside string literals only: digits inside a longer string never count.
       const bare = code.replace(/(['"`])(?:\\.|(?!\1)[^\\])*\1/g, '""');
