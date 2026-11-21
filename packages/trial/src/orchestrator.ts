@@ -17,7 +17,7 @@ import {
 } from '@affidavit/contracts';
 import { digestOf } from './canonical.js';
 import type { SubmissionSpec } from './envelope.js';
-import { ModelUnconfiguredError } from './model/errors.js';
+import { ModelCallError, ModelUnconfiguredError } from './model/errors.js';
 import { hasPreflight } from './model/preflight.js';
 import { assertAllowedTools, type ModelRole } from './roles.js';
 import { buildVerdict, finalizeVerdict } from './verdict.js';
@@ -105,6 +105,23 @@ export interface OrchestratorDeps {
    * case whose verdict write failed can be repaired by a new Orchestrator instance.
    */
   workspace?: TrialWorkspace;
+  /**
+   * Gives back the unspent part of a turn's up-front charge when a model call failed and the
+   * port reported what it actually spent (CR-T1). Optional: without it the up-front charge
+   * stands, which over-counts but never under-counts. The composition root wires it once the
+   * case store can credit a charge.
+   */
+  settlement?: BudgetSettlement;
+}
+
+/**
+ * Credits a case budget with the unspent part of an up-front charge (CR-T1). `refund` holds
+ * non-negative amounts for the stage and attempt of the failed call. `reservationSeq` is the seq
+ * of the `cost-charged` event that recorded the charge being settled: an implementation must give
+ * back at most once per (caseId, reservationSeq), so a replayed settle cannot mint budget.
+ */
+export interface BudgetSettlement {
+  release(caseId: CaseId, refund: StageCost, reservationSeq: number): Promise<BudgetState>;
 }
 
 /**
@@ -298,7 +315,9 @@ export class Orchestrator {
       attempt,
       runAgent: (req) => this.runAgent(caseId, stage, attempt, req),
       runAgentValidated: (req, spec) => this.runAgentValidated(caseId, stage, attempt, req, spec),
-      record: (type, payload, actor) => this.emit(caseId, stage, type, payload, actor),
+      record: async (type, payload, actor) => {
+        await this.emit(caseId, stage, type, payload, actor);
+      },
       costs: () => [...this.ledger(caseId)],
       runInfo: () => {
         const i = this.info(caseId);
@@ -423,7 +442,13 @@ export class Orchestrator {
       wallMs: 0,
     };
     const remaining = await store.chargeBudget(caseId, reservation);
-    await this.emit(caseId, stage, 'cost-charged', { cost: reservation, remaining }, role);
+    const reservationSeq = await this.emit(
+      caseId,
+      stage,
+      'cost-charged',
+      { cost: reservation, remaining },
+      role,
+    );
     if (overdrawn(remaining)) {
       throw new BudgetExhaustedError(
         `the charge for ${stage} attempt ${attempt} exceeds what is left of the case budget`,
@@ -434,7 +459,21 @@ export class Orchestrator {
     info.promptVersions[promptId.data] = req.promptVersion;
     info.modelIds[promptId.data] = req.model;
     const started = now();
-    const result = await model.runTurn(turn);
+    let result: ModelTurnResult;
+    try {
+      result = await model.runTurn(turn);
+    } catch (err) {
+      await this.settleFailedCall(
+        caseId,
+        stage,
+        attempt,
+        reservation,
+        reservationSeq,
+        err,
+        started,
+      );
+      throw err;
+    }
     const actual: StageCost = {
       ...result.cost,
       stage,
@@ -464,6 +503,64 @@ export class Orchestrator {
       throw new BudgetExhaustedError(`the model reported its turn budget exhausted in ${stage}`);
     }
     return result;
+  }
+
+  /**
+   * A call that failed after its up-front charge. When the port reported what the call spent
+   * (`ModelCallError.cost`), that figure goes in the ledger, so the verdict reports what calls
+   * cost rather than what was reserved, and the unspent part of the charge is given back through
+   * `settlement` when one is wired. When the spend is unknown (a timeout, an abort, a broken
+   * stream, any other error), nothing changes: the whole charge stands.
+   */
+  private async settleFailedCall(
+    caseId: CaseId,
+    stage: CaseStage,
+    attempt: number,
+    reservation: StageCost,
+    reservationSeq: number,
+    err: unknown,
+    started: number,
+  ): Promise<void> {
+    if (!(err instanceof ModelCallError) || err.cost === undefined) return;
+    const now = this.deps.config.now ?? Date.now;
+    const actual: StageCost = {
+      ...err.cost,
+      stage,
+      attempt,
+      wallMs: err.cost.wallMs || Math.max(0, now() - started),
+    };
+    this.ledger(caseId).push(actual);
+    // A failed call that spent more than its charge is charged the difference, as on success.
+    const overage: StageCost = {
+      stage,
+      attempt,
+      inputTokens: Math.max(0, actual.inputTokens - reservation.inputTokens),
+      outputTokens: Math.max(0, actual.outputTokens - reservation.outputTokens),
+      usd: Math.max(0, Math.round((actual.usd - reservation.usd) * 1e6) / 1e6),
+      wallMs: 0,
+    };
+    if (overage.inputTokens > 0 || overage.outputTokens > 0 || overage.usd > 0) {
+      const after = await this.deps.store.chargeBudget(caseId, overage);
+      const role = MODEL_ROLE_FOR_STAGE[stage] ?? EVENT_ACTOR_FOR_STAGE[stage];
+      await this.emit(caseId, stage, 'cost-charged', { cost: overage, remaining: after }, role);
+    }
+    const settlement = this.deps.settlement;
+    if (settlement === undefined) return;
+    const refund: StageCost = {
+      stage,
+      attempt,
+      inputTokens: Math.max(0, reservation.inputTokens - actual.inputTokens),
+      outputTokens: Math.max(0, reservation.outputTokens - actual.outputTokens),
+      usd: Math.max(0, Math.round((reservation.usd - actual.usd) * 1e6) / 1e6),
+      wallMs: 0,
+    };
+    if (refund.inputTokens === 0 && refund.outputTokens === 0 && refund.usd === 0) return;
+    try {
+      await settlement.release(caseId, refund, reservationSeq);
+    } catch {
+      // A refund that cannot be written leaves the whole charge in place: the budget over-counts
+      // and never under-counts. The call's own error is the one the job reports.
+    }
   }
 
   private async escalate(
@@ -545,7 +642,7 @@ export class Orchestrator {
     type: T,
     payload: EventPayload<T>,
     actor: Role = EVENT_ACTOR_FOR_STAGE[stage],
-  ): Promise<void> {
+  ): Promise<number> {
     const { store, sink, config } = this.deps;
     const at = new Date((config.now ?? Date.now)()).toISOString();
     // Parse before emitting so a malformed event is a bug here, not a surprise downstream.
@@ -566,5 +663,6 @@ export class Orchestrator {
       this.dismissals.set(caseId, event.payload.dismissal);
       await this.deps.workspace?.saveDismissal(caseId, event.payload.dismissal);
     }
+    return event.seq;
   }
 }

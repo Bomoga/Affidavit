@@ -389,6 +389,8 @@ export function assistant(
   inputTokens: number,
   outputTokens: number,
   error?: string,
+  /** Text content, as the runtime puts the provider's error text on a synthetic message. */
+  text?: string,
 ): SDKMessage {
   return {
     type: 'assistant',
@@ -400,7 +402,7 @@ export function assistant(
         cache_read_input_tokens: 0,
         cache_creation_input_tokens: 0,
       },
-      content: [],
+      content: text === undefined ? [] : [{ type: 'text', text }],
     },
     parent_tool_use_id: null,
     ...(error === undefined ? {} : { error }),
@@ -419,6 +421,7 @@ export function result(
     errors?: string[];
     isError?: boolean;
     text?: string;
+    apiErrorStatus?: number;
   } = {},
 ): SDKMessage {
   const input = opts.input ?? 100;
@@ -449,6 +452,7 @@ export function result(
     permission_denials: [],
     errors: opts.errors ?? [],
     result: opts.text ?? '',
+    ...(opts.apiErrorStatus === undefined ? {} : { api_error_status: opts.apiErrorStatus }),
     uuid: '00000000-0000-0000-0000-000000000002',
     session_id: 's',
   } as unknown as SDKMessage;

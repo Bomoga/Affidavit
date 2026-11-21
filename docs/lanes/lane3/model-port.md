@@ -61,9 +61,26 @@ The key is read from `ANTHROPIC_API_KEY` on every call and goes only into the ag
 
 ## Budgets and caps
 
-The orchestrator still charges the whole turn budget before the call. The port also passes `maxTurns` and `maxBudgetUsd` to the SDK, aborts mid-turn when streamed token usage passes the token budget, enforces the wall-clock cap, and polls the kill switch (`abortAll()` aborts every turn in flight). Usage and cost come back from the SDK result. When a turn is cut off before a result arrives, the cost is reported as the whole turn budget, because the real figure is unknown.
+The orchestrator still charges the whole turn budget before the call. A failed call whose spend the runtime reported (a result arrived, or the provider refused the request before any token) carries that spend on `ModelCallError.cost`; the orchestrator records it in the ledger and gives back the unspent part through `OrchestratorDeps.settlement` when one is wired (CR-T1, Lane 1 has to wire it). A failure with unknown spend keeps the whole charge. The port also passes `maxTurns` and `maxBudgetUsd` to the SDK, aborts mid-turn when streamed token usage passes the token budget, enforces the wall-clock cap, and polls the kill switch (`abortAll()` aborts every turn in flight). Usage and cost come back from the SDK result. When a turn is cut off before a result arrives, the cost is reported as the whole turn budget, because the real figure is unknown.
 
 Provider failures throw `ModelCallError`, never "no submission" or "turn cap", unless the agent had already submitted: a wall-clock timeout, an abort, a hung stream (the port stops waiting at the cap even if the stream ignores the abort), a transport error, a stream with no result, an execution error, or any assistant `error` code from the provider (`overloaded`, `rate_limit`, `server_error`, `billing_error`, `max_output_tokens` and the rest; `authentication_failed` is `model-unconfigured` instead), whatever the result's `is_error` says. Only an agent that used all its turns without submitting is `turn-cap`, and only a clean finish without a submission is `no-submission`. So an outage can never dismiss a candidate (F3).
+
+## Diagnosing a provider error (L3-16)
+
+A provider failure now reads like `agent turn failed: provider error invalid_request (HTTP 400): <provider message>`. The class comes from the runtime's closed set, the status from the result's `api_error_status`, and the message from the runtime's synthetic assistant message (or the result text). The message is redacted whole (the key by value and every credential pattern in `redact.ts`), flattened to one line, withheld when it shares a 24-character run with the user message (case content), and only then clipped to 300 characters. The request body is never included. The same line goes to the port log at `warn`, and the worker logs the error message.
+
+The key must be printable ASCII with no spaces. A key with a trailing newline or CR, a space, pasted quotes, or any other character fails `preflight` with `model-unconfigured` before any charge, because the runtime would refuse it as a header value and report `invalid_request` after the charge.
+
+What the message means for the first real run's `invalid_request`:
+
+| Message contains                                    | Cause                                                                                                                | First fix                                                                    |
+| --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `Invalid API key`, `Invalid X-Api-Key header value` | The key reached the runtime in a shape it refuses (now caught by `preflight`)                                        | Export the bare key                                                          |
+| `organization has been disabled`                    | The Console organization or key is disabled                                                                          | Fix the organization in the Console                                          |
+| `tools.` or `input_schema`                          | The API refused a submit tool schema (draft-07 `$schema`, `definitions`, recursive `$ref`, `propertyNames`, `anyOf`) | Simplify the advertised schema in `submit-tools.ts` (`submitInputShape`)     |
+| `thinking`, `effort`, `temperature`, `tool_choice`  | A parameter the model refuses. The port sets none of these; the runtime chooses them                                 | Set `thinking`/`effort` explicitly in the port options, or try another model |
+| `prompt is too long`, `messages.`, `surrogate`      | The user message (case file) is too long or not valid text                                                           | Check the case file slices and the turn token cap                            |
+| `model`                                             | Unlikely: an unknown model is a 404 and the runtime reports it as `model_not_found`                                  | Check `ANTHROPIC_MODEL_*` and `AFFIDAVIT_MODEL_CONFIG`                       |
 
 ## Record and replay
 

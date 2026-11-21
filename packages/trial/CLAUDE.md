@@ -65,6 +65,8 @@ Invariants, each covered by a test in `src/model/anthropic.test.ts` with a stubb
 - The first submission is captured raw and ends the turn (PreToolUse, PostToolUseFailure or PostToolUse, whichever the runtime reaches); a malformed one becomes `exhibit-inadmissible`, never a silent retry.
 - Submissions are never rewritten or pattern-redacted. One containing the exact key value throws `ModelCallError` and is not recorded.
 - Provider failures (timeout, abort, hung or broken stream, no result, any assistant `error` code other than `authentication_failed`) throw `ModelCallError` unless the agent already submitted; only an agent that used its turns is `turn-cap`. An outage cannot dismiss a candidate.
+- A provider error carries its class, HTTP status and the provider's message, redacted whole, withheld if it quotes the user message, then clipped to 300 characters (`provider-errors.test.ts`). A key that is not printable ASCII without spaces fails `preflight` before any charge.
+- `ModelCallError.cost` is the reported spend of a failed call, or undefined when unknown. The orchestrator gives back the unspent part of the up-front charge through the optional `settlement` dep (CR-T1; Lane 1 wires it). Unknown spend keeps the whole charge.
 
 ## Intended libraries (notes for later, not installed yet)
 

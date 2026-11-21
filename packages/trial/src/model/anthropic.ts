@@ -6,7 +6,12 @@ import { PromptId, type CaseStage, type StageCost } from '@affidavit/contracts';
 import { getPrompt } from '@affidavit/prompts';
 import { KillSwitchError, type ModelTurnRequest, type ModelTurnResult } from '../orchestrator.js';
 import { ROLE_TOOLS, assertAllowedTools } from '../roles.js';
-import { ModelCallError, ModelConfigError, ModelUnconfiguredError } from './errors.js';
+import {
+  ModelCallError,
+  ModelConfigError,
+  ModelUnconfiguredError,
+  type ProviderFailure,
+} from './errors.js';
 import { isKnownModelId, type ModelTable } from './models.js';
 import type { PreflightModelPort } from './preflight.js';
 import { FileRecordingStore, type RecordingStore } from './recordings.js';
@@ -114,6 +119,58 @@ function resultUsage(result: SDKResultMessage): Usage {
 
 const toInt = (n: number): number => (Number.isFinite(n) && n > 0 ? Math.ceil(n) : 0);
 
+/** A key the HTTP runtime will accept as a header value: printable ASCII, no spaces. */
+const KEY_SHAPE = /^[\x21-\x7e]+$/;
+
+/** Longest provider message an error carries, after redaction. */
+export const PROVIDER_MESSAGE_MAX = 300;
+/** A provider message sharing a run this long with the user message is not shown. */
+const QUOTE_WINDOW = 24;
+
+const flatten = (text: string): string =>
+  // eslint-disable-next-line no-control-regex
+  text.replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' ').trim();
+
+/**
+ * The provider's own error text, made safe for an error message and a log line: redacted whole
+ * (the key by value and every credential pattern), flattened to one line, refused when it quotes
+ * the case content in the user message, and only then clipped. Never the request body.
+ */
+export function sanitizeProviderMessage(
+  text: string,
+  secrets: readonly string[],
+  userMessage: string,
+): string | undefined {
+  const clean = flatten(redact(text, secrets));
+  if (clean === '') return undefined;
+  const shown =
+    clean.length > PROVIDER_MESSAGE_MAX ? `${clean.slice(0, PROVIDER_MESSAGE_MAX)}...` : clean;
+  const user = flatten(userMessage);
+  for (let i = 0; i + QUOTE_WINDOW <= clean.length && i < PROVIDER_MESSAGE_MAX; i++) {
+    if (user.includes(clean.slice(i, i + QUOTE_WINDOW))) {
+      return '[provider message withheld: it quoted the request]';
+    }
+  }
+  return shown;
+}
+
+/** The text blocks of a runtime message, which for a provider error hold the provider's text. */
+function messageText(content: unknown): string {
+  if (!Array.isArray(content)) return '';
+  const parts: string[] = [];
+  for (const block of content as unknown[]) {
+    const b = block as { type?: unknown; text?: unknown } | null;
+    if (b !== null && b.type === 'text' && typeof b.text === 'string') parts.push(b.text);
+  }
+  return parts.join(' ');
+}
+
+function describeProvider(p: ProviderFailure): string {
+  const status = p.status === undefined ? '' : ` (HTTP ${p.status})`;
+  const said = p.message === undefined ? '' : `: ${p.message}`;
+  return `provider error ${p.errorClass}${status}${said}`;
+}
+
 /**
  * ModelPort on the Claude Agent SDK. One `runTurn` is one agent session that can do exactly one
  * thing: call the role's submit tool. The agent has no shell, no file tools, no network tools, no
@@ -205,6 +262,16 @@ export class AnthropicModelPort implements PreflightModelPort {
     if (key === undefined || key.trim() === '') {
       throw new ModelUnconfiguredError(`${API_KEY_ENV_VAR} is not set`);
     }
+    // The runtime refuses a key that is not a valid HTTP header value before it sends anything,
+    // and reports that as `invalid_request`, after the orchestrator has charged the turn. A key
+    // with a trailing newline or CR (a CRLF env file, `$(cat key)`), a space, pasted quotes, or
+    // any non-ASCII character is refused here instead, before any charge. The message names the
+    // problem, never the value.
+    if (!KEY_SHAPE.test(key)) {
+      throw new ModelUnconfiguredError(
+        `${API_KEY_ENV_VAR} contains whitespace, a line break, or a character that is not printable ASCII; set it to the bare key`,
+      );
+    }
     return key;
   }
 
@@ -230,6 +297,8 @@ export class AnthropicModelPort implements PreflightModelPort {
     let overBudget = false;
     let authFailed = false;
     let providerError: string | undefined;
+    // The provider's own words for the first error, kept raw here and sanitized before use.
+    let providerText: string | undefined;
     let result: SDKResultMessage | undefined;
     const seen = new Map<string, Usage>();
 
@@ -317,6 +386,10 @@ export class AnthropicModelPort implements PreflightModelPort {
             // from the closed snake_case set goes into the message.
             const code = String(msg.error);
             providerError = /^[a-z_]{1,40}$/.test(code) ? code : 'unrecognised';
+            // The runtime puts the provider's error text (for an API error, the status and the
+            // provider's message) in the content of this synthetic assistant message.
+            const text = messageText((msg.message as { content?: unknown }).content);
+            if (text !== '') providerText = text;
           }
           const u = msg.message.usage;
           seen.set(msg.message.id, {
@@ -377,6 +450,27 @@ export class AnthropicModelPort implements PreflightModelPort {
       wallMs,
     };
 
+    // What a failed call spent, for the orchestrator to settle its up-front charge against.
+    // Known when the runtime reported a result. Also known, as zero, when the provider refused
+    // the request before producing a single token and the stream then ended cleanly: a refused
+    // request is not billed. Unknown (undefined) for a timeout, an abort or a broken stream, so
+    // the whole up-front charge stands there.
+    const refusedBeforeUsage =
+      result === undefined &&
+      providerError !== undefined &&
+      !timedOut &&
+      !overBudget &&
+      streamError === undefined &&
+      used.inputTokens === 0 &&
+      used.outputTokens === 0;
+    const failureCost: StageCost | undefined =
+      result !== undefined ? cost : refusedBeforeUsage ? { ...cost, usd: 0 } : undefined;
+    const callError = (message: string, provider?: ProviderFailure): ModelCallError =>
+      new ModelCallError(message, {
+        ...(failureCost === undefined ? {} : { cost: failureCost }),
+        ...(provider === undefined ? {} : { provider }),
+      });
+
     // Only the agent's own behaviour maps to an outcome. A provider failure (wall-clock timeout,
     // a hung or broken stream, a stream with no result, an execution error) is a call error
     // unless the agent had already submitted, so an outage can never read as "no submission"
@@ -385,24 +479,44 @@ export class AnthropicModelPort implements PreflightModelPort {
       if (overBudget) return 'budget-exhausted';
       if (!box.captured) {
         if (timedOut) {
-          throw new ModelCallError('agent turn hit the wall-clock cap before any submission');
+          throw callError('agent turn hit the wall-clock cap before any submission');
         }
         if (providerError !== undefined) {
-          throw new ModelCallError(`agent turn failed: provider error ${providerError}`);
+          const status =
+            result?.subtype === 'success' && Number.isInteger(result.api_error_status)
+              ? (result.api_error_status as number)
+              : undefined;
+          const raw =
+            providerText ??
+            (result?.is_error === true
+              ? result.subtype === 'success'
+                ? result.result
+                : result.errors.join('; ')
+              : undefined);
+          const message =
+            raw === undefined ? undefined : sanitizeProviderMessage(raw, secrets, req.user);
+          const provider: ProviderFailure = {
+            errorClass: providerError,
+            ...(status === undefined ? {} : { status }),
+            ...(message === undefined ? {} : { message }),
+          };
+          const text = `agent turn failed: ${describeProvider(provider)}`;
+          this.log('warn', `model turn ${promptId} on ${req.model}: ${text}`, secrets);
+          throw callError(text, provider);
         }
         if (streamError !== undefined) {
-          throw new ModelCallError(`agent turn failed: ${describeThrown(streamError, secrets)}`);
+          throw callError(`agent turn failed: ${describeThrown(streamError, secrets)}`);
         }
       }
       if (exceeds(used) || result?.subtype === 'error_max_budget_usd') return 'budget-exhausted';
       if (box.captured) return 'submitted';
-      if (result === undefined) throw new ModelCallError('agent stream ended without a result');
+      if (result === undefined) throw callError('agent stream ended without a result');
       // The agent used every turn it had and never called its submit tool.
       if (result.subtype === 'error_max_turns') return 'turn-cap';
       if (result.subtype === 'error_during_execution' || result.is_error) {
         const detail = result.subtype === 'success' ? result.result : result.errors.join('; ');
         // Redacted whole, then clipped: never the other way round.
-        throw new ModelCallError(`agent turn failed: ${clipRedacted(detail, secrets)}`);
+        throw callError(`agent turn failed: ${clipRedacted(detail, secrets)}`);
       }
       return 'no-submission';
     })();
