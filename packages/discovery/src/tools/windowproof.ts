@@ -28,7 +28,10 @@ import type { ToolInvocation } from './invocations.js';
  *     5) and runs the rules on the decoded text, so a gate word may only appear after decoding.
  *     measureText therefore also searches every line's decoded forms for the gate words, to the
  *     same depth: each base64 run at all four alignments, each hex run at both, percent escapes in
- *     place, with a few characters of context on each side (a word half raw, half decoded). Its
+ *     place, with a few characters of context on each side (a word half raw, half decoded).
+ *     Segments that touch (only `=` padding or percent escapes between them), which gitleaks
+ *     decodes in the same pass, are also searched joined; a group of more than
+ *     MAX_JOINED_SEGMENTS gives no proof. Its
  *     minimum run lengths are shorter than gitleaks' own, which only decodes more. A line too long
  *     to search (over PROOF_CAPS.line, which fails the proof anyway) or a decode budget that runs
  *     out gives no proof.
@@ -176,19 +179,68 @@ function gatesIn(text: string, found: Set<string>): void {
   }
 }
 
+/** Most segments in one joined group (see `decodings`); more gives no proof. */
+export const MAX_JOINED_SEGMENTS = 8;
+/** Text between two segments that gitleaks can consume or decode in the same pass. */
+const JOIN_GAP = /^(?:=|%[0-9A-Fa-f]{2})*$/;
+const pctDecode = (s: string): string =>
+  s.replace(PCT, (h) => String.fromCharCode(parseInt(h.slice(1), 16)));
+const b64Decode = (s: string): string => Buffer.from(s, 'base64').toString('latin1');
+
 /**
  * Every decoding gitleaks could make of a segment of `text`, each with CONTEXT characters of the
  * text around it. Base64 runs are decoded at all four alignments (gitleaks' segment may start
  * anywhere in a longer run) and hex runs at both; percent escapes are decoded in place.
+ *
+ * gitleaks replaces every segment of a line in one pass, so segments that touch (only `=` padding
+ * or percent escapes between them) also decode to one text. Such a group is searched joined three
+ * ways: each segment decoded from its start with the gap between decoded too, the decoded
+ * segments with nothing between them, and the whole group as one base64 run with the padding
+ * stripped. Separate segments need no join: the text between them is raw and holds no letter of
+ * the alphabet, so no gate word and no new segment can cross it. A group of more than
+ * MAX_JOINED_SEGMENTS segments returns undefined (no proof), which also bounds the work.
  */
-function decodings(text: string): string[] {
+function decodings(text: string): string[] | undefined {
   const out = new Set<string>();
   const around = (start: number, end: number, decoded: string): void => {
     out.add(
       text.slice(Math.max(0, start - CONTEXT), start) + decoded + text.slice(end, end + CONTEXT),
     );
   };
-  for (const m of text.matchAll(B64_RUN)) {
+  const runs = [...text.matchAll(B64_RUN)];
+  for (let i = 0; i < runs.length;) {
+    let j = i;
+    while (j + 1 < runs.length) {
+      const cur = runs[j] as RegExpExecArray;
+      const next = runs[j + 1] as RegExpExecArray;
+      if (!JOIN_GAP.test(text.slice(cur.index + cur[0].length, next.index))) break;
+      j++;
+    }
+    if (j > i) {
+      if (j - i + 1 > MAX_JOINED_SEGMENTS) return undefined;
+      const group = runs.slice(i, j + 1);
+      const first = group[0] as RegExpExecArray;
+      const lastRun = group[group.length - 1] as RegExpExecArray;
+      const start = first.index;
+      const end = lastRun.index + lastRun[0].length;
+      let withGaps = '';
+      let bare = '';
+      group.forEach((m, k) => {
+        const d = b64Decode(m[0]);
+        bare += d;
+        withGaps += d;
+        const next = group[k + 1];
+        if (next) withGaps += pctDecode(text.slice(m.index + m[0].length, next.index));
+      });
+      around(start, end, withGaps);
+      around(start, end, bare);
+      const whole = text.slice(start, end);
+      around(start, end, b64Decode(whole.replace(/=|%[0-9A-Fa-f]{2}/g, '')));
+      around(start, end, b64Decode(pctDecode(whole).replace(/=/g, '')));
+    }
+    i = j + 1;
+  }
+  for (const m of runs) {
     for (let off = 0; off < 4 && m[0].length - off >= 6; off++) {
       const start = m.index + off;
       around(
@@ -204,7 +256,7 @@ function decodings(text: string): string[] {
       around(m.index + off, m.index + m[0].length, Buffer.from(seg, 'hex').toString('latin1'));
     }
   }
-  const pct = text.replace(PCT, (h) => String.fromCharCode(parseInt(h.slice(1), 16)));
+  const pct = pctDecode(text);
   if (pct !== text) out.add(pct);
   return [...out];
 }
@@ -217,7 +269,9 @@ function searchDecoded(
   budget: { left: number },
 ): boolean {
   if (depth === 0 || found.size === GATES.length) return true;
-  for (const d of decodings(text)) {
+  const all = decodings(text);
+  if (all === undefined) return false;
+  for (const d of all) {
     budget.left -= d.length;
     if (budget.left < 0) return false;
     gatesIn(d, found);

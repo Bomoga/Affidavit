@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -132,6 +133,60 @@ describe('measureText, gate words in decoded text (gitleaks decodes base64, hex,
     const tight = await measureText(file(`${b64('x'.repeat(200))}\n`), { decodeBudgetBytes: 10 });
     expect(tight.decodeIncomplete).toBe(true);
     expect(statsProveCoverage(tight)).toBe(false);
+  });
+});
+
+describe('measureText, segments gitleaks decodes together on one line', () => {
+  // Delta review of 57709f5: gitleaks replaces every segment of a line in one pass, so two
+  // padded segments side by side decode to one text that no single segment holds.
+  const b64Lines = `${b64('a'.repeat(60))}\n`.repeat(20);
+
+  it('two padded base64 segments that join into a private key header', async () => {
+    const line =
+      '  integrity: LS0tLS1CRUdJTiBSU0EgUFJJVg==QVRFIEtFWS0tLS0tTUlJRXZRSUJBREFOQmdrcWhraUc5dzBCQVFFRkFBU0M=';
+    const s = await measureText(file(`${line}\n${b64Lines}`));
+    expect(s.gates).toEqual(['private']);
+    expect(statsProveCoverage(s)).toBe(false);
+  });
+
+  it('ZXlK split across two padded segments, in a file with CRLF line endings', async () => {
+    const line = `  x: ${b64('aaaZX')}${b64('lKaaaa')}`;
+    expect(line).toContain('=');
+    const s = await measureText(file(`${line}\r\n${b64Lines.replace(/\n/g, '\r\n')}`));
+    expect(s.gates).toEqual(['ZXlK']);
+    expect(statsProveCoverage(s)).toBe(false);
+  });
+
+  it('a lockfile integrity line (one long segment, nothing adjacent) is still provable', async () => {
+    const hash = createHash('sha512').update('left-pad').digest('base64');
+    const body = `    "lodash": {\n      "version": "4.17.21",\n      "integrity": "sha512-${hash}",\n      "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz"\n    },\n`;
+    const s = await measureText(file(body.repeat(200)));
+    expect(s).toMatchObject({ gates: [], decodeIncomplete: false });
+    expect(statsProveCoverage(s)).toBe(true);
+  });
+
+  it('more than 8 segments joined on a line gives no proof', async () => {
+    const s = await measureText(file(`v=${'QUFBQUFB='.repeat(9)}\n`));
+    expect(s.decodeIncomplete).toBe(true);
+    expect(statsProveCoverage(s)).toBe(false);
+  });
+
+  it('1 MB of small adjacent segments fails closed well under a second', async () => {
+    const line = 'QUFBQUFB='.repeat(450);
+    const body = `${line}\n`.repeat(Math.ceil((1024 * 1024) / (line.length + 1)));
+    const t0 = performance.now();
+    const s = await measureText(file(body));
+    expect(performance.now() - t0).toBeLessThan(1_000);
+    expect(s.decodeIncomplete).toBe(true);
+  });
+
+  it('1 MB of small separate segments stays well under a second', async () => {
+    const line = 'QUFBQUFB '.repeat(450);
+    const body = `${line}\n`.repeat(Math.ceil((1024 * 1024) / (line.length + 1)));
+    const t0 = performance.now();
+    const s = await measureText(file(body));
+    expect(performance.now() - t0).toBeLessThan(1_000);
+    expect(s.gates).toEqual([]);
   });
 });
 
