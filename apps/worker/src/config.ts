@@ -408,10 +408,18 @@ export function loadConfig(env: Env = process.env): WorkerConfig {
 }
 
 /**
+ * Real intake runs Semgrep only: OSV-Scanner (dependency findings) needs a temp directory the gVisor
+ * jail does not give it, and the case file has no field saying a scanner did not run (CR-14).
+ */
+export const DEPENDENCY_SCAN_WARNING =
+  'intake: dependency scan not run (OSV-Scanner is not part of real intake, so a case file holds no dependency findings and does not say so; docs/lanes/lane1/contract-requests.md CR-14)';
+
+/**
  * Settings that start but weaken a guarantee, to log once at startup. Names only, never values.
  */
 export function startupWarnings(config: WorkerConfig): string[] {
   const out: string[] = [];
+  if (config.intakeSettings) out.push(DEPENDENCY_SCAN_WARNING);
   if (config.intakeSettings?.toolRunner === 'docker') {
     out.push(
       'AFFIDAVIT_TOOLRUNNER=docker: scanners run on untrusted repository content under plain Docker (runc), without gVisor isolation; unset it or use gvisor on a Linux sandbox host (docs/lanes/lane1/real-wiring.md)',

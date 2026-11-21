@@ -14,7 +14,8 @@ export interface ToolRunOptions {
   outputDir: string;
   /**
    * Host path of a scratch dir that is new and empty for this run, never shared between runs or
-   * cases. Its `tmp` (and `semgrep-home`) subdirs are mounted writable.
+   * cases. Its `scratchSubdirs` are mounted writable, never at `/tmp` for Semgrep or gitleaks:
+   * the gVisor jail reserves `/tmp` (read-only) and sets `TMPDIR` and `HOME` to `/scratch`.
    */
   scratchDir: string;
   /** Host path of OUR Semgrep rules. Mounted read-only at /rules. Required for semgrep. */
@@ -28,6 +29,11 @@ export interface ToolRunOptions {
   gitleaksConfigFile?: string | undefined;
   /** Host path of a vendored OSV database laid out as <dir>/<ecosystem>/all.zip. Mounted read-only. */
   osvDatabaseDir?: string | undefined;
+  /**
+   * Host path of the Semgrep liveness canary (canary.yaml and canary.js). Mounted read-only at
+   * /canary. Defaults to packages/discovery/canary/semgrep in this repo.
+   */
+  semgrepCanaryDir?: string | undefined;
 }
 
 export interface ToolInvocation {
@@ -74,10 +80,48 @@ function baseMounts(o: ToolRunOptions, extra: Mount[]): Mount[] {
   return [
     { hostPath: o.sourceDir, containerPath: '/src', readOnly: true },
     { hostPath: o.outputDir, containerPath: '/out', readOnly: false },
-    { hostPath: joinHost(o.scratchDir, 'tmp'), containerPath: '/tmp', readOnly: false },
     ...extra,
   ];
 }
+
+/**
+ * Semgrep's temp directory (`<scratch>/tmp`) for runners that set no `TMPDIR`. Not `/tmp`: the
+ * gVisor jail reserves `/tmp` and refuses a mount there.
+ */
+export const SEMGREP_FALLBACK_TMP = '/var/tmp';
+
+/** Exit code of the Semgrep wrapper when it has no writable temp directory. Never an ok code. */
+export const SEMGREP_NO_TMP_EXIT = 97;
+
+/**
+ * Uses `TMPDIR` when the runner set one (the gVisor jail sets `/scratch`, a tmpfs that never
+ * touches the host) and `/var/tmp` otherwise (plain Docker, where `/tmp` is on the read-only root),
+ * and exits 97 unless that directory exists and one byte can really be written there. `[ -w ]`
+ * alone is not enough: the image's shell reports any directory writable for root, a read-only
+ * mount included (seen on the pinned image under plain Docker), so the wrapper also writes and
+ * removes a probe file. Without a writable temp directory semgrep-core finds nothing and Semgrep
+ * still exits 0 with an empty report (seen on the pinned image), so this wrapper must not be
+ * dropped. A temp directory that fills up during the run is caught by the liveness canary
+ * (`SEMGREP_CANARY`) or by Semgrep's own failure exit. The script is a constant; Semgrep's
+ * arguments reach it only as positional parameters.
+ */
+export const SEMGREP_TMPDIR_WRAPPER = `t="\${TMPDIR:-${SEMGREP_FALLBACK_TMP}}"; p="$t/.affidavit-tmp-probe"; [ -d "$t" ] && [ -w "$t" ] && (printf x > "$p") 2>/dev/null && rm -f "$p" || { rm -f "$p" 2>/dev/null; exit ${SEMGREP_NO_TMP_EXIT}; }; exec env TMPDIR="$t" "$@"`;
+
+/**
+ * The liveness canary (`packages/discovery/canary/semgrep`), mounted read-only at /canary next to
+ * every Semgrep scan. runTool requires exactly one match of `ruleId` on `uri` and removes every
+ * result of that rule before the report is read, so a canary never becomes a candidate.
+ */
+export const SEMGREP_CANARY = {
+  ruleId: 'affidavit.canary.semgrep-scanned',
+  uri: '/canary/canary.js',
+  line: 1,
+  mount: '/canary',
+  config: '/canary/canary.yaml',
+} as const;
+
+/** Host path of the canary directory in this repo. */
+export const canaryRoot = (): string => join(repoRoot(), 'packages', 'discovery', 'canary');
 
 function configMount(o: ToolRunOptions): Mount {
   const hostPath = o.configDir ?? join(repoRoot(), 'docker', 'tools', 'config');
@@ -113,12 +157,17 @@ export function buildInvocation(
       const outputFile = 'semgrep.sarif';
       return {
         image,
-        // The image has no entrypoint, so argv starts with the binary. Only our own rules are used:
+        // The image has no entrypoint, so argv starts with a constant /bin/sh wrapper that only sets
+        // TMPDIR (SEMGREP_TMPDIR_WRAPPER), then the binary. Only our own rules are used:
         // no registry config, no auto, metrics and version check off.
         // --no-git-ignore: never run git in /src (a hostile .git/config can execute commands) and
         //   ignore .gitignore. --disable-nosem: inline "nosemgrep" cannot hide a finding.
         // --x-ignore-semgrepignore-files: .semgrepignore at any depth is not honored.
         args: [
+          'sh',
+          '-c',
+          SEMGREP_TMPDIR_WRAPPER,
+          'sh',
           'semgrep',
           'scan',
           '--metrics=off',
@@ -134,14 +183,29 @@ export function buildInvocation(
           '--max-target-bytes=0',
           '--config',
           '/rules',
+          // The liveness canary: its own rule and its own target, never part of /src or /rules.
+          '--config',
+          SEMGREP_CANARY.config,
           '--sarif',
           '--output',
           `/out/${outputFile}`,
           '/src',
+          SEMGREP_CANARY.uri,
         ],
         mounts: baseMounts(o, [
           { hostPath: rules, containerPath: '/rules', readOnly: true },
           {
+            hostPath: o.semgrepCanaryDir ?? join(canaryRoot(), 'semgrep'),
+            containerPath: SEMGREP_CANARY.mount,
+            readOnly: true,
+          },
+          {
+            hostPath: joinHost(o.scratchDir, 'tmp'),
+            containerPath: SEMGREP_FALLBACK_TMP,
+            readOnly: false,
+          },
+          {
+            // HOME of plain Docker's root user. Under gVisor HOME is /scratch and this stays unused.
             hostPath: joinHost(o.scratchDir, 'semgrep-home'),
             containerPath: '/root/.semgrep',
             readOnly: false,
@@ -179,8 +243,11 @@ export function buildInvocation(
           '-r',
           '/src',
         ],
-        // osv-scanner looks for its offline database under $TMPDIR/osv-scalibr.
+        // osv-scanner looks for its offline database under $TMPDIR/osv-scalibr. Known gap: the gVisor
+        // jail refuses mounts under /tmp, so OSV-Scanner runs only on plain Docker until the tool
+        // runner can give it a temp directory (PR #45). Real intake does not run it.
         mounts: baseMounts(o, [
+          { hostPath: joinHost(o.scratchDir, 'tmp'), containerPath: '/tmp', readOnly: false },
           { hostPath: db, containerPath: '/tmp/osv-scalibr', readOnly: true },
           configMount(o),
         ]),
@@ -220,9 +287,10 @@ export function buildInvocation(
           '--report-path',
           `/out/${outputFile}`,
         ],
+        // No temp directory: gitleaks writes none (checked on the pinned image, archives included).
         mounts: baseMounts(o, [configMount(o)]),
         outputFile,
-        scratchSubdirs: ['tmp'],
+        scratchSubdirs: [],
       };
     }
     default:

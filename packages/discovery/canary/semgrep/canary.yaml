@@ -1,0 +1,13 @@
+# Liveness canary for Semgrep runs (L1-18). Not part of the production rule pack.
+#
+# runTool passes this rule and canary.js (mounted read-only at /canary) next to every Semgrep scan.
+# The run counts only when Semgrep reports exactly this one match on /canary/canary.js: a Semgrep
+# that ran but analysed nothing (no writable temp directory, a full tmpfs) still exits 0 with an
+# empty, valid report, and this is how such a run is told apart from a clean one. Canary results
+# are removed from the report before anything reads it, so they never become candidates.
+rules:
+  - id: affidavit.canary.semgrep-scanned
+    languages: [javascript]
+    severity: INFO
+    message: liveness canary
+    pattern: affidavitSemgrepCanary("scanned")

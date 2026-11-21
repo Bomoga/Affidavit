@@ -2,6 +2,43 @@
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { SEMGREP_CANARY } from './invocations.js';
+
+/** One result of the Semgrep liveness canary, as the pinned Semgrep reports it. */
+export function canaryResult(
+  uri: string = SEMGREP_CANARY.uri,
+  line: number = SEMGREP_CANARY.line,
+): Record<string, unknown> {
+  return {
+    ruleId: SEMGREP_CANARY.ruleId,
+    message: { text: 'liveness canary' },
+    locations: [
+      {
+        physicalLocation: { artifactLocation: { uri }, region: { startLine: line, endLine: line } },
+      },
+    ],
+  };
+}
+
+/**
+ * Adds the canary's result (and its rule) to the first run of a Semgrep SARIF document, as a real
+ * scan with the canary mounted produces. Takes and returns JSON text or an object.
+ */
+export function withSemgrepCanary(doc: string): string;
+export function withSemgrepCanary<T extends object>(doc: T): T;
+export function withSemgrepCanary(doc: string | object): string | object {
+  const d = (typeof doc === 'string' ? JSON.parse(doc) : doc) as {
+    runs?: { results?: unknown[]; tool?: { driver?: { rules?: unknown[] } } }[];
+  };
+  const run = d.runs?.[0];
+  if (run !== undefined) {
+    run.results = [...(run.results ?? []), canaryResult()];
+    const driver = run.tool?.driver;
+    if (Array.isArray(driver?.rules))
+      driver.rules = [...driver.rules, { id: SEMGREP_CANARY.ruleId }];
+  }
+  return typeof doc === 'string' ? JSON.stringify(d) : d;
+}
 
 const tmpDirs: string[] = [];
 

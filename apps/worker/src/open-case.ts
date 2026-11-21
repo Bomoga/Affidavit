@@ -6,8 +6,11 @@
  * queued, never dismissed; see real/open.ts). Wiring only. Prints the case ids, or why no trial
  * case was opened; never a source URL.
  *
- *   pnpm --filter @affidavit/worker open-case -- --tenant <id> --repo <id> --commit <40 hex>
+ *   (from apps/worker) node --import tsx src/open-case.ts --tenant <id> --repo <id> --commit <hex>
  *     [--candidate <candidate id>] [--case-id <id>]
+ *
+ * --repo is a key of AFFIDAVIT_REPO_SOURCES (for NodeGoat, the corpus id repo-nodegoat). Not the
+ * pnpm script form: it passes a literal "--" through, which parseArgs rejects.
  *
  * Needs AFFIDAVIT_INTAKE_IMPL=real and its settings (docs/lanes/lane1/real-wiring.md).
  */

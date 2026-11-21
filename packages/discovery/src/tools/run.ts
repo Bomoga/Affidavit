@@ -1,7 +1,13 @@
 import { lstat, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { basename, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import type { ToolRunnerPort } from '@affidavit/contracts';
-import { buildInvocation, type ToolInvocation, type ToolRunOptions } from './invocations.js';
+import {
+  SEMGREP_CANARY,
+  SEMGREP_NO_TMP_EXIT,
+  buildInvocation,
+  type ToolInvocation,
+  type ToolRunOptions,
+} from './invocations.js';
 import { findOsvLockfiles } from './lockfiles.js';
 import { isEmptyExit, isOkExit, type ToolManifest, type ToolName } from './manifest.js';
 import {
@@ -9,6 +15,7 @@ import {
   gitDirExtraContent,
   prepareOutput,
   prepareScratch,
+  shareForJailRead,
   type QuarantinedSnapshot,
 } from './quarantine.js';
 import { findGitleaksUnscannable, type Unscannable } from './unscannable.js';
@@ -413,7 +420,10 @@ async function execute(
 ): Promise<Exec> {
   const inv = buildInvocation(manifest, name, options);
   await prepareScratch(options.scratchDir, inv.scratchSubdirs);
-  await prepareOutput(options.outputDir);
+  // The report file is pre-created by the worker (0666, its own), so the jail's user can write it
+  // and the worker can read and rewrite it; the jail's user must also be able to read /src.
+  await prepareOutput(options.outputDir, inv.outputFile);
+  await shareForJailRead(options.sourceDir);
   // The runner's returned outputPath is deliberately not compared with options.outputDir: the
   // runners in use return a directory fixed at construction and ignore the /out mount. What counts
   // is that the tool wrote its report into the mount, which readJsonReport verifies.
@@ -426,9 +436,109 @@ async function execute(
     throw new ToolFailedError(name, -1, `the runner threw: ${why}`, quarantined, pass);
   }
   if (!isOkExit(manifest, name, res.exitCode)) {
-    throw new ToolFailedError(name, res.exitCode, 'unexpected exit code', quarantined, pass);
+    const why =
+      name === 'semgrep' && res.exitCode === SEMGREP_NO_TMP_EXIT
+        ? 'no writable temp directory in the jail, so the wrapper did not start Semgrep'
+        : 'unexpected exit code';
+    throw new ToolFailedError(name, res.exitCode, why, quarantined, pass);
   }
   return { inv, exitCode: res.exitCode };
+}
+
+/** A run directory's parent is not a private directory of the worker. */
+export class UnsafeRunDirError extends Error {
+  constructor(dir: string, why: string) {
+    super(`the parent of ${dir} must be a 0700 directory owned by this user: ${why}`);
+    this.name = 'UnsafeRunDirError';
+  }
+}
+
+/**
+ * The output and scratch directories are 0755 and 0777 so the jail's user can use them, and under
+ * plain Docker a root process in the container can leave files there (even setuid ones). That is
+ * safe only when nobody else on the host can reach them: their parent must be a real directory
+ * (not a link), owned by the worker, mode 0700 (what `mkdtemp` makes). The `-quarantine` and
+ * `-windows` siblings share that parent. POSIX only: Windows has no such modes.
+ */
+async function assertPrivateParent(dir: string): Promise<void> {
+  if (process.platform === 'win32' || typeof process.getuid !== 'function') return;
+  const parent = dirname(dir);
+  let st;
+  try {
+    st = await lstat(parent);
+  } catch (e) {
+    throw new UnsafeRunDirError(dir, `cannot stat it (${(e as NodeJS.ErrnoException).code})`);
+  }
+  if (!st.isDirectory()) throw new UnsafeRunDirError(dir, 'it is not a directory');
+  if (st.uid !== process.getuid()) throw new UnsafeRunDirError(dir, `it is owned by uid ${st.uid}`);
+  if ((st.mode & 0o777) !== 0o700) {
+    throw new UnsafeRunDirError(dir, `its mode is ${(st.mode & 0o777).toString(8)}`);
+  }
+}
+
+interface SarifResultLike {
+  ruleId?: unknown;
+  locations?: {
+    physicalLocation?: { artifactLocation?: { uri?: unknown }; region?: { startLine?: unknown } };
+  }[];
+}
+
+/**
+ * Requires exactly one match of the liveness canary rule on the canary file, then removes every
+ * result and rule entry of the canary rule from the report (rewritten in place, so nothing
+ * downstream ever sees it). Semgrep with no usable temp directory, or one that filled up, exits 0
+ * with a valid, empty report; without this check such a run would read as "no findings".
+ * Throws ToolOutputMissingError, never a partial result: a scan that cannot show it ran is no scan.
+ */
+async function checkAndStripSemgrepCanary(
+  file: string,
+  doc: unknown,
+  q: readonly string[],
+): Promise<void> {
+  const runs = (doc as { runs: unknown[] }).runs;
+  let hits = 0;
+  for (const run of runs) {
+    if (run === null || typeof run !== 'object') continue;
+    const r = run as {
+      results?: unknown;
+      tool?: { driver?: { rules?: unknown }; extensions?: unknown };
+    };
+    if (Array.isArray(r.results)) {
+      r.results = (r.results as SarifResultLike[]).filter((res) => {
+        if (res?.ruleId !== SEMGREP_CANARY.ruleId) return true;
+        const loc = res.locations;
+        const uri = loc?.[0]?.physicalLocation?.artifactLocation?.uri;
+        if (
+          loc?.length === 1 &&
+          typeof uri === 'string' &&
+          uri.replace(/^file:\/\//, '') === SEMGREP_CANARY.uri &&
+          loc[0]?.physicalLocation?.region?.startLine === SEMGREP_CANARY.line
+        ) {
+          hits += 1;
+        }
+        return false;
+      });
+    }
+    const dropRule = (rules: unknown): unknown =>
+      Array.isArray(rules)
+        ? rules.filter((x) => (x as { id?: unknown } | null)?.id !== SEMGREP_CANARY.ruleId)
+        : rules;
+    if (r.tool?.driver !== undefined) r.tool.driver.rules = dropRule(r.tool.driver.rules);
+    if (Array.isArray(r.tool?.extensions)) {
+      for (const ext of r.tool.extensions as { rules?: unknown }[]) {
+        if (ext !== null && typeof ext === 'object') ext.rules = dropRule(ext.rules);
+      }
+    }
+  }
+  if (hits !== 1) {
+    throw new ToolOutputMissingError(
+      'semgrep',
+      file,
+      `the liveness canary matched ${hits} times instead of once, so Semgrep cannot be shown to have scanned anything (a full or unusable temp directory?)`,
+      q,
+    );
+  }
+  await writeFile(file, JSON.stringify(doc));
 }
 
 /**
@@ -462,6 +572,8 @@ export async function runTool(
   const q = snapshot.removed;
   const outputDir = resolve(options.outputDir);
   const scratchDir = resolve(options.scratchDir);
+  await assertPrivateParent(outputDir);
+  await assertPrivateParent(scratchDir);
   await assertSnapshotClean(snapshot.dir);
   const run = await execute(
     runner,
@@ -489,6 +601,10 @@ export async function runTool(
         q,
       );
     }
+    // Drop the pre-created report file if the tool left it empty, so `empty` means no report.
+    const placeholder = join(outputDir, run.inv.outputFile);
+    const left = await lstat(placeholder).catch(() => null);
+    if (left?.isFile() === true && left.size === 0) await rm(placeholder, { force: true });
     return {
       ...base,
       empty: true,
@@ -504,6 +620,8 @@ export async function runTool(
 
   const file = join(outputDir, run.inv.outputFile);
   const doc = await readJsonReport(name, file, q, 'snapshot', maxBytes);
+  // Before anything else reads it: prove Semgrep analysed something, and drop the canary.
+  if (name === 'semgrep') await checkAndStripSemgrepCanary(file, doc, q);
   const reports: ToolReport[] = [{ file, origin: 'snapshot' }];
   const notifications: ToolNotification[] = [];
   let binaryMediaFiles: string[] = [];

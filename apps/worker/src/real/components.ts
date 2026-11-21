@@ -8,6 +8,7 @@ import { corpus } from '@affidavit/corpus';
 import {
   DiscoveryRescan,
   arraignConfigFrom,
+  canaryRoot,
   discoverCase,
   loadToolManifest,
   repoRoot,
@@ -22,30 +23,55 @@ import {
   type SourceDirectory,
 } from '@affidavit/judge';
 import { SignerClient } from '@affidavit/signer';
-import { GvisorToolRunner } from '@affidavit/sandbox';
+import { DEFAULT_LIMITS, GvisorToolRunner, type Limits } from '@affidavit/sandbox';
 import { LocalDockerToolRunner } from '@affidavit/testing';
 import { createModelPortFromEnv } from '@affidavit/trial';
 import type { Env, IntakeSettings, JudgeSettings } from '../config.js';
 import type { Discover } from './intake.js';
 
+/** The image references the gVisor tool runner may run: each enabled tool's pinned reference. */
+export function toolImageAllowlist(): string[] {
+  return loadToolManifest()
+    .tools.filter((t) => t.enabled)
+    .map((t) => t.reference)
+    .filter((r): r is string => r !== null);
+}
+
 /** Scanners through ToolRunnerPort: Lane 2's gVisor runner, or plain local Docker. */
 export function buildToolRunner(s: IntakeSettings): ToolRunnerPort {
   if (s.toolRunner === 'docker') return new LocalDockerToolRunner(s.workRoot);
-  const images = loadToolManifest()
-    .tools.map((t) => t.image)
-    .filter((i): i is string => i !== null);
+  // The pinned references (`image@sha256:...`), exactly what discovery passes to `run`: a bare
+  // image name would match no run, and a tag would let the registry pick the bytes.
+  const images = toolImageAllowlist();
   return new GvisorToolRunner({
     outputDir: s.workRoot,
-    // Workspaces, our Semgrep rules and our tool configs: nothing else can be mounted.
+    // Workspaces, our Semgrep rules, the Semgrep liveness canary and our tool configs: nothing
+    // else can be mounted.
     allowedRoots: [
       s.workRoot,
       join(repoRoot(), 'packages', 'discovery', 'rules'),
+      canaryRoot(),
       join(repoRoot(), 'docker', 'tools', 'config'),
     ],
     imageAllowlist: images,
     timeoutMs: s.toolTimeoutMs,
+    limits: TOOL_LIMITS,
   });
 }
+
+/**
+ * Jail limits for scanner runs. The jail's `/scratch` (Semgrep's `TMPDIR` and `HOME`) is a tmpfs
+ * of `scratchMb`; the sandbox default of 64 MiB is sized for witnesses. Scanners get 512 MiB, and
+ * twice the default memory because a tmpfs is counted against the memory limit. A run that fills
+ * the tmpfs anyway is caught by discovery's Semgrep liveness canary (it fails, never reads as
+ * clean); one that exceeds memory is OOM-killed (exit 137) and fails. Design bounds, not
+ * measurements ([metric] until real runs on large repositories).
+ */
+export const TOOL_LIMITS: Readonly<Limits> = {
+  ...DEFAULT_LIMITS,
+  memoryMb: 2048,
+  scratchMb: 512,
+};
 
 export function buildDiscover(s: IntakeSettings, env: Env, runner?: ToolRunnerPort): Discover {
   const deps = {
