@@ -417,10 +417,3 @@ describe('output size policy', () => {
     );
   });
 });
-
-describe('Judge.verifyPatch', () => {
-  it('is not implemented until L2-07', async () => {
-    const judge = new Judge(new ScriptedExecutor(differentialTarget(3)));
-    await expect(judge.verifyPatch()).rejects.toThrow(/L2-07/);
-  });
-});

@@ -12,12 +12,21 @@ import {
   startJailedService,
   type CaseNetwork,
 } from '@affidavit/sandbox';
-import { Witness, type ParamSpace } from '@affidavit/contracts';
+import { Exhibit, Witness, type ParamSpace } from '@affidavit/contracts';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import type { EvidenceVariant } from '../executor.js';
-import { Judge } from '../judge.js';
+import type { ExecutionRequest } from '../executor.js';
+import { counterexampleParamsHeader } from '../counterexample.js';
+import { Judge, counterexampleExhibitId, patchExhibitId } from '../judge.js';
 import { DEFAULT_POLICY } from '../rules.js';
-import { gateCaseFile, gateWitness } from '../test-helpers.js';
+import {
+  GATE_PATCH_DIFF,
+  PATCHED,
+  RecordingRescan,
+  ScriptedWorkbench,
+  gateCaseFile,
+  gateWitness,
+  patchExhibit,
+} from '../test-helpers.js';
 import { JailExecutor, type JailExecutorOptions, type TargetEndpoint } from './executor.js';
 import { buildRunnerImage } from './harness.js';
 import { runWitnessJail } from './jail.js';
@@ -26,12 +35,24 @@ import { runWitnessJail } from './jail.js';
 // `pnpm --filter @affidavit/judge test:sandbox-host`; skipped in plain `pnpm test`.
 const onSandboxHost = process.env.AFFIDAVIT_SANDBOX_HOST === '1';
 
-/** A stand-in target: the vulnerable variant breaks on a quote, the safe one rejects it. */
-const stubTarget = (vulnerable: boolean) => `
+/**
+ * Stand-in targets, keyed by name. The vulnerable variant breaks on a quote and the safe one
+ * rejects it. `patched` is a correct fix; `patched-partial` blocks one payload and still breaks
+ * on the others, like a fix that special-cases the witness's input.
+ */
+const BREAKS_ON = {
+  vulnerable: `id.includes("'")`,
+  safe: 'false',
+  patched: 'false',
+  'patched-partial': `id.includes("'") && id !== "1'--"`,
+} as const;
+type StubName = keyof typeof BREAKS_ON;
+
+const stubTarget = (name: StubName) => `
 require('http').createServer((req, res) => {
   const id = new URL(req.url, 'http://x').searchParams.get('id') ?? '';
   if (req.url === '/health') return res.end('ok');
-  if (${vulnerable} && id.includes("'")) { res.statusCode = 500; return res.end('SQL syntax error'); }
+  if (${BREAKS_ON[name]}) { res.statusCode = 500; return res.end('SQL syntax error'); }
   if (!/^[0-9]+$/.test(id)) { res.statusCode = 400; return res.end('bad id'); }
   res.end('item ' + id);
 }).listen(4000);
@@ -71,14 +92,18 @@ const POLICY = { ...DEFAULT_POLICY, hardTimeoutMs: 30_000, timeBudgetMs: 20_000 
 describe.runIf(onSandboxHost)('witness jail on a sandbox host', { timeout: 300_000 }, () => {
   let workRoot = '';
   let runnerImage = '';
-  const endpoints = new Map<EvidenceVariant, TargetEndpoint>();
+  const endpoints = new Map<StubName, TargetEndpoint>();
+  /** Which stub the patched target is; the commit stands in for "the patch that was built". */
+  let patchedStub: StubName = 'patched';
+  const stubFor = (req: ExecutionRequest): StubName =>
+    req.variant === 'patched' ? patchedStub : req.variant;
   const nets: CaseNetwork[] = [];
   let tracesBefore = 0;
 
   const executorOpts = (over: Partial<JailExecutorOptions> = {}): JailExecutorOptions => ({
     workRoot,
     runnerImage,
-    targets: { endpoint: (req) => Promise.resolve(endpoints.get(req.variant) ?? null) },
+    targets: { endpoint: (req) => Promise.resolve(endpoints.get(stubFor(req)) ?? null) },
     ...over,
   });
   const judge = (over: Partial<JailExecutorOptions> = {}) =>
@@ -105,12 +130,12 @@ describe.runIf(onSandboxHost)('witness jail on a sandbox host', { timeout: 300_0
     workRoot = mkdtempSync(join(tmpdir(), 'affidavit-jail-it-'));
     runnerImage = await buildRunnerImage();
     tracesBefore = readdirSync(DEFAULT_TRACE_ROOT).length;
-    for (const variant of ['vulnerable', 'safe'] as const) {
+    for (const variant of Object.keys(BREAKS_ON) as StubName[]) {
       const net = await createCaseNetwork();
       nets.push(net);
       const svc = await startJailedService(net, {
         image: PROBE_IMAGE,
-        command: ['node', '-e', stubTarget(variant === 'vulnerable')],
+        command: ['node', '-e', stubTarget(variant)],
         alias: 'target',
         readiness: [
           'node',
@@ -194,6 +219,85 @@ describe.runIf(onSandboxHost)('witness jail on a sandbox host', { timeout: 300_0
     expect(r.familyResults).toEqual(
       PAYLOADS.map((_, paramIndex) => ({ paramIndex, passed: true })),
     );
+  });
+
+  describe('L2-07: verifyPatch in the jail', () => {
+    const verify = async (stub: StubName, counterexamples: Exhibit[] = []) => {
+      patchedStub = stub;
+      const workbench = new ScriptedWorkbench();
+      const rescan = new RecordingRescan();
+      const judge = new Judge(new JailExecutor(executorOpts()), POLICY, { workbench, rescan });
+      const r = await judge.verifyPatch(
+        gateCaseFile(),
+        patchExhibit(GATE_PATCH_DIFF),
+        witness(SQLI_WITNESS),
+        counterexamples,
+      );
+      expect(workbench.released).toBe(1);
+      expect(rescan.paths).toEqual([PATCHED.workspacePath]);
+      return r;
+    };
+    /** A counterexample as Lane 3 builds it: its params header (CR-T8), then the code. */
+    const counter = (code: string, params = witness(SQLI_WITNESS).params): Exhibit =>
+      Exhibit.parse({
+        schemaVersion: 1,
+        id: 'exhibit-counter-it',
+        caseId: gateCaseFile().id,
+        author: 'prosecution',
+        kind: 'counterexample',
+        code: `${counterexampleParamsHeader(params)}\n${code}`,
+        sha256: '9'.repeat(64),
+      });
+
+    it('flips the whole witness family on a patched target', async () => {
+      expect(await verify('patched')).toEqual({
+        schemaVersion: 1,
+        patchExhibitId: patchExhibitId(patchExhibit(GATE_PATCH_DIFF)),
+        familyFlipped: true,
+        suitePassed: true,
+        rescanClean: true,
+        counterexamples: [],
+      });
+    });
+
+    it('uses only admissible counterexamples against the patch', async () => {
+      // The SQLi family as a counterexample is admissible (passes vulnerable, fails safe) and
+      // beats the partial fix. The health check passes on every variant, so it is not used.
+      const sqli = counter(SQLI_WITNESS);
+      const health = counter(
+        `${HEADER} witness(async (_p, { target }) => {
+           expect((await fetch(target!.url + '/health')).ok).toBe(true);
+         });`,
+      );
+      const params = witness(SQLI_WITNESS).params;
+      const r = await verify('patched-partial', [sqli, health]);
+      expect(r.counterexamples).toEqual([
+        { exhibitId: counterexampleExhibitId(sqli, params), survived: true },
+        { exhibitId: counterexampleExhibitId(health, params), survived: false },
+      ]);
+    });
+
+    it('runs a counterexample over the params in its header, not the Defense family', async () => {
+      // Over the whole family the SQLi counterexample beats the partial fix. Over a header that
+      // keeps only the payload the partial fix blocks, it does not, which shows the header is
+      // what ran. A new value of the same parameter beats it again.
+      const blocked: ParamSpace = [{ name: 'payload', values: ["1'--"] }];
+      const fresh: ParamSpace = [{ name: 'payload', values: ["1'--", "9' AND '1'='1"] }];
+      const onlyBlocked = counter(SQLI_WITNESS, blocked);
+      const withNew = counter(SQLI_WITNESS, fresh);
+      const r = await verify('patched-partial', [onlyBlocked, withNew]);
+      expect(r.counterexamples).toEqual([
+        { exhibitId: counterexampleExhibitId(onlyBlocked, blocked), survived: false },
+        { exhibitId: counterexampleExhibitId(withNew, fresh), survived: true },
+      ]);
+    });
+
+    it('does not flip when the patch only blocks one payload', async () => {
+      expect(await verify('patched-partial')).toMatchObject({
+        familyFlipped: false,
+        rejectedBy: 'differential',
+      });
+    });
   });
 
   it('creates case networks with IPv6 off and only IPv4 subnets', () => {

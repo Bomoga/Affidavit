@@ -31,17 +31,21 @@ function settle(stream: TrialStream, pred = done): Promise<StreamSnapshot> {
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
 
+/** Index of the verify stage-exited in the fixture: everything before it stays as recorded. */
+const B = GATE.findIndex((e) => e.type === 'stage-exited' && e.stage === 'verify');
+
 /** The order `packages/trial` emits: verdict-written, then stage-exited, then stage-entered. */
 function trialOrder(): TrialEvent[] {
-  const base = GATE.slice(0, 17);
-  const verdict = GATE[18] as TrialEvent;
-  const exited = GATE[17] as TrialEvent;
-  const entered = { ...(GATE[16] as TrialEvent), stage: 'verdict', payload: { from: 'verify' } };
+  const base = GATE.slice(0, B);
+  const verdict = GATE.find((e) => e.type === 'verdict-written') as TrialEvent;
+  const exited = GATE[B] as TrialEvent;
+  const enteredAt = GATE.find((e) => e.type === 'stage-entered' && e.stage === 'verify');
+  const entered = { ...(enteredAt as TrialEvent), stage: 'verdict', payload: { from: 'verify' } };
   return [
     ...base,
-    { ...verdict, stage: 'verify', seq: 17 },
-    { ...exited, seq: 18 },
-    { ...entered, seq: 19 },
+    { ...verdict, stage: 'verify', seq: B },
+    { ...exited, seq: B + 1 },
+    { ...entered, seq: B + 2 },
   ] as TrialEvent[];
 }
 
@@ -77,18 +81,18 @@ describe("trial's real event order", () => {
   });
 
   it('stays live after the verdict until the terminal stage is entered', async () => {
-    const s = stream(holdOpen(trialOrder().slice(0, 18)));
+    const s = stream(holdOpen(trialOrder().slice(0, B + 1)));
     s.start();
     await tick();
     await tick();
     expect(s.getSnapshot().status).toBe('live');
-    expect(s.getSnapshot().events).toHaveLength(18);
+    expect(s.getSnapshot().events).toHaveLength(B + 1);
     s.stop();
   });
 
   it('completes when the terminal stage-entered arrives before the verdict', async () => {
     const o = trialOrder();
-    const swapped = [...o.slice(0, 17), o[19], o[18], o[17]].map((e, seq) => ({
+    const swapped = [...o.slice(0, B), o[B + 2], o[B + 1], o[B]].map((e, seq) => ({
       ...e,
       seq,
     })) as TrialEvent[];
@@ -96,16 +100,16 @@ describe("trial's real event order", () => {
     s.start();
     const final = await settle(s);
     expect(final.status).toBe('complete');
-    expect(final.events).toHaveLength(20);
+    expect(final.events).toHaveLength(B + 3);
   });
 
   it('completes when the connection closes cleanly after the verdict', async () => {
-    const o = trialOrder().slice(0, 18);
+    const o = trialOrder().slice(0, B + 1);
     const s = stream(createFakeTransport({ events: o, scripts: [{ messages: o }] }));
     s.start();
     const final = await settle(s);
     expect(final.status).toBe('complete');
-    expect(final.events).toHaveLength(18);
+    expect(final.events).toHaveLength(B + 1);
   });
 });
 

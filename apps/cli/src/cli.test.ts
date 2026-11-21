@@ -152,6 +152,26 @@ describe('sanitize and renderEvent', () => {
     });
     expect(CONTROL.test(renderEvent(esc))).toBe(false);
   });
+
+  it('renders a verify-result event and neutralizes a hostile patch id in it', () => {
+    const base = TrialEvent.parse(events.find((e) => e.type === 'verify-result'));
+    if (base.type !== 'verify-result') throw new Error('fixture');
+    expect(renderEvent(base)).toContain('exhibit-patch-001 familyFlipped=true suitePassed=true');
+    const hostile = TrialEvent.parse({
+      ...base,
+      payload: {
+        result: {
+          ...base.payload.result,
+          patchExhibitId: `${ESC}]0;pwned${BEL}patch
+${'y'.repeat(5000)}`,
+        },
+      },
+    });
+    const line = renderEvent(hostile);
+    expect(CONTROL.test(line)).toBe(false);
+    expect(line).not.toContain('pwned');
+    expect(line.length).toBeLessThanOrEqual(240);
+  });
 });
 
 describe('argument parsing and exit codes', () => {
@@ -220,7 +240,8 @@ describe('argument parsing and exit codes', () => {
         return [Number(seq), type, stage, actor];
       }),
     ).toEqual(events.map((e) => [e.seq, e.type, e.stage, e.actor]));
-    expect(events).toHaveLength(19);
+    expect(events).toHaveLength(20);
+    expect(events.filter((e) => e.type === 'verify-result')).toHaveLength(1);
     expect(h.started).toHaveLength(1);
     expect(h.started[0]?.target.repo).toBe('github.com/example/app');
     expect(h.started[0]?.tenantId).toBe('tenant-cli');

@@ -180,6 +180,7 @@ describe('verify stage writes the verdict (jury disabled)', () => {
         patch,
         result: PASS,
         reason: 'x',
+        verifyResults: [{ ...PASS, patchExhibitId: patch.id }],
       });
     }
     const orch = new Orchestrator({
@@ -221,6 +222,32 @@ describe('verify stage writes the verdict (jury disabled)', () => {
     expect(t.events().find((e) => e.type === 'escalated')?.payload).toMatchObject({
       escalation: { reason: 'no-admissible-witness-above-floor' },
     });
+  });
+
+  it('records one verify-result per verifyPatch call, as the Judge, inside verify (CR-1)', async () => {
+    const t = await verifyOnly({ accepted: true });
+    await t.orch.run(CF.id);
+    const events = t.events();
+    const results = events.filter((e) => e.type === 'verify-result');
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ actor: 'judge', stage: 'verify' });
+    expect(results[0]?.payload).toEqual({ result: { ...PASS, patchExhibitId: t.patch.id } });
+    const i = events.indexOf(results[0] as (typeof events)[number]);
+    expect(events[i - 1]).toMatchObject({ type: 'stage-entered', stage: 'verify' });
+    const after = events.slice(i + 1).map((e) => e.type);
+    expect(after.indexOf('verdict-written')).toBeLessThan(after.indexOf('stage-exited'));
+  });
+
+  it('records no verify-result when Remedy never called verifyPatch', async () => {
+    const t = await verifyOnly({});
+    await t.orch.run(CF.id);
+    expect(t.events().some((e) => e.type === 'verify-result')).toBe(false);
+  });
+
+  it('records a verify-result even when the case escalates for want of a witness', async () => {
+    const t = await verifyOnly({ witness: false, accepted: true });
+    expect((await t.orch.run(CF.id)).stage).toBe('escalated');
+    expect(t.events().filter((e) => e.type === 'verify-result')).toHaveLength(1);
   });
 
   it('is refused by a store wired with the jury enabled', async () => {
@@ -336,5 +363,26 @@ describe('a full trial on fakes records what actually ran', () => {
       rejectedBy: 'literal-only-patch',
     });
     expect((await t.store.getVerdict(CF.id))?.outcome).toBe('proven-unfixed');
+    // The failing check is on the record too, as the Judge returned it (CR-1).
+    const results = t.events.filter((e) => e.type === 'verify-result');
+    expect(results.map((e) => e.payload.result.rejectedBy)).toEqual(['literal-only-patch']);
+  });
+
+  it('streams the Judge VerifyResult for the patch between verify entered and exited (CR-1)', async () => {
+    const t = await trial([witnessTurn]);
+    const verify = t.events.filter((e) => e.stage === 'verify');
+    expect(verify[0]?.type).toBe('stage-entered');
+    expect(verify.at(-1)?.type).toBe('stage-exited');
+    const results = verify.filter((e) => e.type === 'verify-result');
+    expect(results).toHaveLength(1);
+    expect(results[0]?.actor).toBe('judge');
+    const patch = t.events.find(
+      (e) => e.type === 'exhibit-submitted' && e.payload.kind === 'patch',
+    );
+    if (patch?.type !== 'exhibit-submitted') throw new Error('no patch submitted');
+    expect(results[0]?.payload.result).toEqual(PASS);
+    // The verdict cites the patch the Judge checked.
+    const v = await t.store.getVerdict(CF.id);
+    expect(v?.exhibits).toContain(patch.payload.exhibitId);
   });
 });
