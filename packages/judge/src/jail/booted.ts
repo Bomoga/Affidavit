@@ -6,6 +6,7 @@ import {
   removeCaseNetwork,
   type BootRecipe,
   type CaseNetwork,
+  type DependencyBundleRef,
 } from '@affidavit/sandbox';
 import type { ExecutionRequest } from '../executor.js';
 import type { TargetEndpoint, TargetProvider } from './executor.js';
@@ -19,6 +20,12 @@ export interface BootedTarget {
   sidecarImages: Readonly<Record<string, string>>;
   /** The recipe the target was built and booted with (working directory, command). */
   recipe: BootRecipe;
+  /**
+   * `sha256:<hex>` of the pinned dependency bundle the image was built from, when one was used.
+   * An input of `imageId`; it goes into `BundleManifest.toolVersions` through
+   * `dependencyBundleToolVersions` so replay builds with the same bundle.
+   */
+  dependencyBundleSha256?: string;
 }
 
 export class TargetBootError extends Error {
@@ -41,9 +48,12 @@ export class TargetBootError extends Error {
 export async function bootVariant(
   srcDir: string,
   hints: BootHints,
-  opts: { workRoot: string },
+  opts: { workRoot: string; dependencyBundle?: DependencyBundleRef },
 ): Promise<BootedTarget> {
-  const build = await buildTarget(srcDir, hints, { workRoot: opts.workRoot });
+  const build = await buildTarget(srcDir, hints, {
+    workRoot: opts.workRoot,
+    ...(opts.dependencyBundle === undefined ? {} : { dependencyBundle: opts.dependencyBundle }),
+  });
   if (!build.ok) {
     throw new TargetBootError('build', build.unsupported ? 'unsupported' : 'failed', build.reason);
   }
@@ -56,6 +66,9 @@ export async function bootVariant(
       imageId: build.imageId,
       sidecarImages: boot.sidecarImages,
       recipe: build.recipe,
+      ...(build.dependencyBundle === undefined
+        ? {}
+        : { dependencyBundleSha256: build.dependencyBundle.sha256 }),
     };
   } catch (err) {
     await removeCaseNetwork(net);

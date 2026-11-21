@@ -9,6 +9,8 @@ PR #18 asked for two exceptions. Both were declined:
 - **No dependency fetch.** An earlier version of this PR let `npm ci --ignore-scripts` reach `registry.npmjs.org` through a per-build CONNECT proxy. That is gone (`fetch.ts`, the proxy, the egress bridge and the `fetch` and `egress` run spec options were removed). Deny-all egress has no exception. A target whose install would download anything is `unsupported` at the recipe step, per plan.md (Lane 2, item 3: a target that cannot boot without real egress is marked unsupported rather than granted an exception). `buildGvisorRunArgs` now refuses any run spec key it does not know, so no caller can add a route out.
 - **No `js-yaml`.** The compose precheck reads the small YAML subset compose files use with our own key scanner (`yaml-keys.ts`) and refuses anything outside it.
 
+**Update 2026-11-20 (L2-04c):** the lead chose the first option below, a pinned dependency bundle. See "Dependency bundles" further down. Without a bundle, everything in this paragraph still holds; with one, NodeGoat's production dependencies install offline in the jail.
+
 **Consequence, stated plainly: NodeGoat cannot be built any more.** It installs its dependencies at build time (its lockfile lists packages, and its Dockerfile runs `npm install`), so both the vulnerable and the safe variant are `unsupported` with reason "needs a dependency fetch at build time". The L2-04 done-when ("NodeGoat vulnerable and safe variants boot, report healthy, and return their digests") is not met, and the L2-07 workbench and L2-10 NodeGoat witnesses cannot run against a booted NodeGoat until there is a way to supply dependencies without egress. Nothing in the jail was weakened to get around this. Options for the lead (not implemented): a dependency set prepared offline by a human and mounted read-only after review, or a corpus that vendors `node_modules` under review. Either is a new decision.
 
 What still builds: a target with no dependencies at all (nothing in the lockfile to download, nothing declared in `package.json`; with no `build` script, dev-only entries do not count).
@@ -50,6 +52,61 @@ Outcome reasons end up in evidence and the courtroom UI. Errors from `execFile` 
 The final-stage base must match `node`, `node:<tag>`, `node@sha256:<digest>` or the same under `library/` (`baseImageProblem` in `images.ts`). Anything else is `unsupported` at step `base`, before any pull. The base runs repository code in step 3, and it is the root of the assembled image. An allowlist of the official image keeps that root to one known publisher.
 
 After pinning, `docker image inspect --format '{{json .Config.OnBuild}}'` must be empty. An `ONBUILD RUN` in a base would run during step 4 with BuildKit and no gVisor. A non-empty list is `unsupported`; an unreadable answer throws.
+
+## Dependency bundles (L2-04c, lead decision 2026-11-20)
+
+NodeGoat gets its dependencies through a pinned dependency bundle, built outside the jail from the corpus lockfile and mounted read only into the build. There is still no egress exception and no proxy: the network is used by one human-run step on a host, and by nothing else.
+
+### Building a bundle (human-run, networked host, never in a jail)
+
+```
+node packages/corpus/scripts/fetch-pinned.mjs nodegoat
+pnpm --filter @affidavit/sandbox bundle:build --app nodegoat \
+  --checkout packages/corpus/data/src/nodegoat --out <bundle dir>
+```
+
+`packages/sandbox/scripts/build-dependency-bundle.ts` is the only Lane 2 code that fetches dependencies. It is not exported from `@affidavit/sandbox`, the Judge and worker never call it, and a test (`deny-all.test.ts`) checks that nothing under `src/` runs `npm cache add` or imports from `scripts/`. It refuses to run inside a container. It:
+
+1. Takes the app's commit from the corpus loader (`getApp`) and checks the checkout's `HEAD` is that commit, then reads `package-lock.json` from git at that commit (the committed bytes, not the work tree).
+2. Plans two sections with `planLockfile`: `production` and `dev`. A section with any package that is a link or workspace, comes from git, a file or another host, has no resolved URL or integrity hash, or that the lockfile marks `hasInstallScript`, is written as `unsupported` with every such package named, and nothing is fetched for it. An optional package whose `os` rules out Linux (NodeGoat's `fsevents`) is skipped, as npm skips it on Linux.
+3. Runs `npm cache add --ignore-scripts` for each resolved URL into an empty temporary cache, with empty user and global npm config and the public registry. Nothing is installed or unpacked and no script runs.
+4. Checks every hash in each package's lockfile `integrity` against the tarball, and inspects each tarball's `package.json` and `binding.gyp` (`inspectPackageTarball`, gunzip in memory, nothing written). A package with `preinstall`, `install`, `postinstall` or an implicit node-gyp build makes its section `unsupported`, by name.
+5. Writes `<out>/<sha256>.tar` and `<out>/<sha256>.json`. The tar holds `manifest.json` and `tarballs/<sha512>.tgz`, regular files only, sorted, with fixed metadata, so the same lockfile gives the same bytes (checked: two runs gave the same digest). The manifest lists, per section, every package's path, name, version, resolved URL, lockfile integrity and tarball sha512, plus a sha256 per section. The bundle's own sha256 cannot be inside it; it is the file name and is in the `.json` next to it.
+
+A human reviews the manifest and then sets `bundleSha256` in `docker/sandbox/dependency-bundles/pins.json`.
+
+**Lockfile hashes.** 257 of NodeGoat's production packages are pinned in its lockfile by sha1 only (an old lockfile). The builder checks those sha1 values, and the bundle then pins every tarball by sha512 and the whole bundle by sha256. The trust root for those packages is still the lockfile's sha1. This is a known weakness of the corpus lockfile, recorded here for review, not worked around.
+
+### Using a bundle in the split build
+
+`buildTarget(src, hints, { workRoot, dependencyBundle: { path, sha256, allowedRoot } })`:
+
+| Step | What runs | Where | Network |
+| --- | --- | --- | --- |
+| 0. Bundle | `openDependencyBundle`: the path must be a regular file (not a link) under `allowedRoot`, within the size cap. One pass computes the sha256 of the whole file while its tar entries are parsed; nothing is used unless the sha256 equals the pin (fail closed, `failed` at step `bundle`). Then the manifest and its section digests are validated, each tarball must match its sha512 name and every lockfile hash, and each is inspected again for install scripts | Host (our code) | none |
+| 2. Recipe | As before, but `bundleCoverageProblem` replaces the no-download rule: every package the staged lockfile installs must be in the bundle, pinned identically (path, version, resolved, integrity). A patch that changes a dependency is caught here | Host (our code) | none |
+| 3a. Install | Only the sections the recipe needs (`production`, plus `dev` for a build script or a suite image) are laid out as an npm content cache (`_cacache/content-v2/<algo>/..`, paths derived only from verified digests) and mounted read only at `/affidavit-deps`. The jail copies it to `/scratch` and runs `npm ci --offline --ignore-scripts --no-audit --no-fund` (production adds `--omit=dev` and `NODE_ENV=production`) | gVisor, as nobody | none (`--network none`) |
+| 4. Assemble | Unchanged: `docker build --network none` (`assembleBuildArgs`), no registry, no proxy, no build args | BuildKit, no RUN step | none |
+
+Refused while reading a bundle: a digest mismatch, a symlink, hardlink, directory or other non-file entry, an absolute path, a `..` path, any name other than `manifest.json` and `tarballs/<128 hex>.tgz`, duplicate entries, more than `maxEntries` (20 000) entries, a bundle over `maxBundleBytes` (1 GiB), a tarball over `maxTarballBytes` (64 MiB), a manifest over 16 MiB, a tarball that unpacks past 256 MiB. These caps are configuration, not measurements. A tampered bundle is `failed` (`unsupported: false`); an intact bundle holding a package that needs a lifecycle script is `unsupported`, naming it.
+
+### Production and dev sections
+
+The runtime image mounts only `production`, so dev packages never reach an image that is attacked. The patch workbench's suite build (`devDependencies: true`) mounts `production` and `dev`. Each section is hashed on its own, and `BuildOutcome.dependencyBundle` reports the bundle sha256 and the digest of each section mounted.
+
+**NodeGoat's dev section is unsupported**, with the packages named: `cypress` and `nodemon` have install scripts, and `grunt-if` comes from a GitHub tarball. So NodeGoat's suite build stays unavailable, honestly, until the corpus offers a suite that does not need those. The production section (396 packages) is complete.
+
+### Digest as an evidence input
+
+`BuildOutcome.dependencyBundle.sha256` (and `BootedTarget.dependencyBundleSha256` in the Judge) is an input of the image. The contract has no dedicated field and contracts are not edited here, so `dependencyBundleToolVersions({ vulnerable, safe })` gives `BundleManifest.toolVersions` entries `dependency-bundle:<variant> = sha256:<hex>`. **Gap:** `packages/evidence` has no `BundleManifest` builder or `replay` yet (its `index.ts` exports nothing), so there is no clean slot to implement this in. When L2-08 lands, `replay` must read those keys, build with the same pinned bundle, and refuse to replay if the bundle digest differs. `targetDigests` stays the image ID; a different bundle gives different node_modules layers and so a different image.
+
+**Not wired yet:** the patch workbench (`packages/judge/src/jail/workbench.ts`) still builds without a bundle; it was being changed in parallel on PR #46 and was left alone. Passing `dependencyBundle` to its `bootVariant` and suite `buildTarget` calls (and the manifest to its suite `deriveRecipe` precheck) is a follow-up.
+
+### What has run where
+
+- Windows, no gVisor (this PR): unit tests for planning, inspection, bundle writing and opening (every refusal above), coverage, the install command and the build args. `offline-install.test.ts` runs the host's real npm against a materialized bundle cache with registry and proxies pointed at a closed port: a devDependency resolves for the suite build, the runtime build gets production only, and a missing section fails instead of fetching. `buildTarget` refusing a wrong digest at step `bundle` also runs here (it fails before any jail step).
+- NodeGoat, on this Windows host with network, run by the Lane 2 agent: the builder produced `ab739bc524ecb38cad5865491b50bbcbe373803bde611881d3f2ce0594c21a89` (5 822 464 bytes, production section `311eb5b271a6c8363ec4e7ffba38ab48682283baf59e39800ce90a153b8a8df0`, 396 packages; dev unsupported as above), twice, with the same digest. Opening it verified, coverage against NodeGoat's lockfile passed for production, and host `npm ci --offline --ignore-scripts --omit=dev` from it installed 395 packages (express, mongodb, swig, forever, needle present) with no network. **That digest is not pinned:** `pins.json` keeps `null` until a human rebuilds it on a networked host, gets the same digest, and reviews the manifest.
+- Sandbox host: `bundle.integration.test.ts` (a target whose dependency comes only from the bundle builds and boots healthy; the suite build resolves a devDependency; a wrong digest is refused; NodeGoat builds and boots from its pinned bundle when `AFFIDAVIT_NODEGOAT_DIR`, `AFFIDAVIT_NODEGOAT_BUNDLE` and a pin are set) is written but **has not run**. The in-jail `npm ci` has not run on NodeGoat's `node:12-alpine` (npm 6) base; that npm reads the cache the same way (content by integrity) but this is unverified.
 
 ## Boot
 
