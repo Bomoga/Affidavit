@@ -40,6 +40,8 @@ export interface SseConfig {
   holeWaitMs: number;
   /** Concurrent streams per tenant. */
   maxStreamsPerTenant: number;
+  /** Most events read from the store per query; a full page is followed at once by the next. */
+  pageSize: number;
 }
 
 export interface ApiConfig {
@@ -71,6 +73,7 @@ export const DEFAULT_SSE: SseConfig = {
   maxStreamMs: 30 * 60_000,
   holeWaitMs: 5000,
   maxStreamsPerTenant: 16,
+  pageSize: 500,
 };
 
 const TENANT_RE = /^[A-Za-z0-9._:-]{1,128}$/;

@@ -49,18 +49,34 @@ export function githubConfig(overrides: Partial<ApiConfig> = {}): ApiConfig {
   });
 }
 
+/** Cookie names in github mode with an https redirect URL (Secure on). */
+export const SESSION_COOKIE_NAME = '__Host-affidavit_session';
+export const CSRF_COOKIE_NAME = '__Host-affidavit_csrf';
+
 /**
  * A fake of the two GitHub endpoints the OAuth exchange calls. An authorization code `code-<id>`
- * signs in GitHub user `<id>`. It refuses a token exchange without the right client secret.
+ * signs in GitHub user `<id>`. It refuses a token exchange without the right client secret or
+ * without a PKCE verifier. Token exchange bodies are pushed to `bodies`.
  */
-export function fakeGithubFetch(calls: string[] = []): typeof fetch {
+export function fakeGithubFetch(
+  calls: string[] = [],
+  bodies: Record<string, unknown>[] = [],
+): typeof fetch {
   return (input, init) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
     calls.push(url);
     if (url === 'https://github.com/login/oauth/access_token') {
-      const body = JSON.parse(init?.body as string) as { code: string; client_secret: string };
+      const body = JSON.parse(init?.body as string) as {
+        code: string;
+        client_secret: string;
+        code_verifier?: unknown;
+      };
+      bodies.push(body);
       if (body.client_secret !== CLIENT_SECRET) {
         return Promise.resolve(new Response('{"error":"bad"}', { status: 401 }));
+      }
+      if (typeof body.code_verifier !== 'string' || body.code_verifier.length < 43) {
+        return Promise.resolve(Response.json({ error: 'invalid_grant' }));
       }
       const m = /^code-([0-9]+)$/.exec(body.code);
       if (!m) return Promise.resolve(Response.json({ error: 'bad_verification_code' }));
@@ -114,15 +130,18 @@ export async function signIn(app: FastifyInstance, githubUserId: number): Promis
     cookies: { affidavit_oauth_state: stateCookie },
   });
   if (cb.statusCode !== 204) throw new Error(`callback ${cb.statusCode}`);
-  const session = cookieValue(cb, 'affidavit_session');
+  const session = cookieValue(cb, SESSION_COOKIE_NAME);
   const csrfRes = await app.inject({
     method: 'GET',
     url: '/auth/csrf',
-    cookies: { affidavit_session: session },
+    cookies: { [SESSION_COOKIE_NAME]: session },
   });
-  const csrfCookie = cookieValue(csrfRes, 'affidavit_csrf');
+  const csrfCookie = cookieValue(csrfRes, CSRF_COOKIE_NAME);
   const { token } = csrfRes.json<{ token: string }>();
-  return { cookies: { affidavit_session: session, affidavit_csrf: csrfCookie }, csrf: token };
+  return {
+    cookies: { [SESSION_COOKIE_NAME]: session, [CSRF_COOKIE_NAME]: csrfCookie },
+    csrf: token,
+  };
 }
 
 export interface ParsedSse {
@@ -132,18 +151,23 @@ export interface ParsedSse {
   events: TrialEventT[];
 }
 
-/** Parses an SSE body with the standard field rules (data, id; comments ignored). */
+/**
+ * Parses an SSE body with the standard field rules (data, id; comments ignored). Only default
+ * (`message`) events are trial events; a named event such as `session-ended` is skipped.
+ */
 export function parseSse(body: string): ParsedSse {
   const ids: string[] = [];
   const events: TrialEventT[] = [];
   for (const block of body.split(/\r\n\r\n|\n\n|\r\r/)) {
     let id: string | undefined;
+    let type = 'message';
     const data: string[] = [];
     for (const line of block.split(/\r\n|\n|\r/)) {
       if (line.startsWith('id:')) id = line.slice(3).replace(/^ /, '');
+      else if (line.startsWith('event:')) type = line.slice(6).replace(/^ /, '');
       else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
     }
-    if (data.length === 0) continue;
+    if (data.length === 0 || type !== 'message') continue;
     events.push(TrialEvent.parse(JSON.parse(data.join('\n'))));
     ids.push(id ?? '');
   }

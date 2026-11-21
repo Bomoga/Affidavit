@@ -24,7 +24,15 @@ export interface StreamDeps {
   now: () => number;
   sleep: (ms: number, signal: AbortSignal) => Promise<void>;
   onInvalid?: () => void;
+  /**
+   * Re-checked before every store read. False (logout, expiry, eviction) ends the stream with a
+   * final `session-ended` event.
+   */
+  sessionLive?: () => Promise<boolean>;
 }
+
+/** The last message of a stream whose session ended. A named event, so no trial-event handler sees it. */
+export const SESSION_ENDED_MESSAGE = 'event: session-ended\ndata: {"error":"session-ended"}\n\n';
 
 export function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
@@ -45,7 +53,9 @@ export function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
  * held back until the hole fills, or for at most `holeWaitMs` (a seq allocated by a writer that
  * died is never filled), after which the hole is skipped. The stream ends cleanly once the case
  * has been at a terminal stage for `terminalGraceMs` with nothing new, after `maxStreamMs`, when
- * the case stops being visible, or when the client goes away (`signal`).
+ * the case stops being visible, or when the client goes away (`signal`). When the session behind
+ * the stream ends it closes with SESSION_ENDED_MESSAGE. The store is read at most
+ * `config.pageSize` events at a time; a full page is followed at once by the next.
  */
 export async function* trialEventStream(
   cases: TenantCases,
@@ -62,14 +72,22 @@ export async function* trialEventStream(
   let holeSince: number | null = null;
   let terminalQuietSince: number | null = null;
   while (!signal.aborted) {
-    const batch = await cases.events(caseId, last);
+    if (deps.sessionLive && !(await deps.sessionLive())) {
+      if (!signal.aborted) yield SESSION_ENDED_MESSAGE;
+      return;
+    }
+    const batch = await cases.events(caseId, last, config.pageSize);
     if (batch === null || signal.aborted) return;
     let progressed = false;
+    let heldBack = false;
     for (const raw of batch) {
       if (raw.seq <= last) continue;
       if (raw.seq !== last + 1) {
         holeSince ??= deps.now();
-        if (deps.now() - holeSince < config.holeWaitMs) break;
+        if (deps.now() - holeSince < config.holeWaitMs) {
+          heldBack = true;
+          break;
+        }
       }
       holeSince = null;
       const parsed = SseTrialEvent.safeParse(raw);
@@ -84,6 +102,9 @@ export async function* trialEventStream(
       lastWrite = deps.now();
       progressed = true;
     }
+    if (deps.now() - started >= config.maxStreamMs) return;
+    // A full page means more may be stored already: read the next page without waiting.
+    if (batch.length >= config.pageSize && !heldBack) continue;
     const stage = await cases.stage(caseId);
     if (stage === null) return;
     if (TERMINAL_STAGES.includes(stage) && holeSince === null) {

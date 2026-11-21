@@ -18,7 +18,7 @@ function sessionCookie(app: FastifyInstance, payload: object): string {
 }
 
 function sidOf(s: Session): string {
-  const value = s.cookies['affidavit_session']!.split('.')[0]!;
+  const value = s.cookies['__Host-affidavit_session']!.split('.')[0]!;
   return (JSON.parse(Buffer.from(value, 'base64url').toString()) as { i: string }).i;
 }
 
@@ -56,17 +56,17 @@ describe('server-side sessions', () => {
       t: githubTenantId(1),
       s: '1',
     });
-    expect(await probe(app, { affidavit_session: forged })).toBe(401);
+    expect(await probe(app, { '__Host-affidavit_session': forged })).toBe(401);
     await app.close();
   });
 
   it('a tampered cookie is rejected', async () => {
     const { app } = await setup();
     const s = await signIn(app, 1);
-    const [value, sig] = s.cookies['affidavit_session']!.split('.');
+    const [value, sig] = s.cookies['__Host-affidavit_session']!.split('.');
     const flipped = `${value}.${sig!.slice(0, -1)}${sig!.endsWith('A') ? 'B' : 'A'}`;
-    expect(await probe(app, { affidavit_session: flipped })).toBe(401);
-    expect(await probe(app, { affidavit_session: value! })).toBe(401);
+    expect(await probe(app, { '__Host-affidavit_session': flipped })).toBe(401);
+    expect(await probe(app, { '__Host-affidavit_session': value! })).toBe(401);
     await app.close();
   });
 
@@ -99,7 +99,7 @@ describe('server-side sessions', () => {
     const sidA = sidOf(a);
     // A cookie signed by the server that pairs A's session id with B's tenant is refused.
     const mixed = sessionCookie(app, { v: 2, i: sidA, t: githubTenantId(202), s: '202' });
-    expect(await probe(app, { affidavit_session: mixed })).toBe(401);
+    expect(await probe(app, { '__Host-affidavit_session': mixed })).toBe(401);
     // The store refuses a revoke from the wrong tenant.
     expect(await sessions.revoke(sidA, githubTenantId(202))).toBe(false);
     // B logging out ends B's session only.
@@ -124,7 +124,7 @@ describe('server-side sessions', () => {
       url: `/auth/github/callback?code=code-5&state=${state}`,
       cookies: { affidavit_oauth_state: stateCookie },
     });
-    const c = cb.cookies.find((x) => x.name === 'affidavit_session')!;
+    const c = cb.cookies.find((x) => x.name === '__Host-affidavit_session')!;
     expect(c.httpOnly).toBe(true);
     expect(c.secure).toBe(true);
     expect(c.sameSite).toBe('Lax');

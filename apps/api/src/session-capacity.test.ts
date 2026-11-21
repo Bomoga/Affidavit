@@ -98,7 +98,7 @@ describe('session capacity over HTTP', () => {
     expect(res.statusCode).toBe(503);
     expect(res.headers['retry-after']).toBe('60');
     expect(res.json()).toEqual({ error: 'sessions-full' });
-    expect(res.cookies.find((c) => c.name === 'affidavit_session')).toBeUndefined();
+    expect(res.cookies.find((c) => c.name === '__Host-affidavit_session')).toBeUndefined();
     for (const s of [a, b]) {
       expect((await app.inject({ method: 'GET', url: PROBE, cookies: s.cookies })).statusCode).toBe(
         404,

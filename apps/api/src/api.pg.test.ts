@@ -18,7 +18,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { githubTenantId } from './auth.js';
 import { fixtureEvents } from './intake.js';
 import { PgCaseBackend } from './pg-backend.js';
-import { githubConfig, makeApp, parseSse, signIn, type Session } from './test-helpers.js';
+import { FAST_SSE, githubConfig, makeApp, parseSse, signIn, type Session } from './test-helpers.js';
 
 /**
  * The API on real Postgres through the affidavit_app role (RLS on). Follows the packages/db
@@ -171,9 +171,24 @@ describePg('API over Postgres with RLS', () => {
     }
   });
 
-  it('a signed-in user whose tenant is not provisioned cannot open a case', async () => {
-    const u = await signIn(app, UNPROVISIONED);
-    const res = await app.inject({
+  it('a user whose tenant is not provisioned gets no session (the tenants row is checked)', async () => {
+    const backend = new PgCaseBackend(pool);
+    expect(await backend.isProvisioned(githubTenantId(A))).toBe(true);
+    expect(await backend.isProvisioned(githubTenantId(UNPROVISIONED))).toBe(false);
+    await expect(signIn(app, UNPROVISIONED)).rejects.toThrow('callback 403');
+  });
+
+  it('POST /cases still refuses an unprovisioned tenant that somehow holds a session', async () => {
+    // Defence in depth: a backend that lets everyone sign in, over the same RLS pool.
+    const inner = new PgCaseBackend(pool);
+    const lax = {
+      forTenant: (t: string) => inner.forTenant(t),
+      isProvisioned: () => Promise.resolve(true),
+      close: () => Promise.resolve(),
+    };
+    const { app: laxApp } = await makeApp(githubConfig(), { backend: lax });
+    const u = await signIn(laxApp, UNPROVISIONED);
+    const res = await laxApp.inject({
       method: 'POST',
       url: '/cases',
       cookies: u.cookies,
@@ -182,5 +197,25 @@ describePg('API over Postgres with RLS', () => {
     });
     expect(res.statusCode).toBe(403);
     expect(res.json()).toEqual({ error: 'tenant-not-provisioned' });
+    await laxApp.close();
+  });
+
+  it('reads the event log in pages', async () => {
+    const sink = new PgEventSink(pool, githubTenantId(A));
+    const id = CaseId.parse(caseA);
+    expect((await sink.events(id, -1, 3)).map((e) => e.seq)).toEqual([0, 1, 2]);
+    expect((await sink.events(id, 2, 3)).map((e) => e.seq)).toEqual([3, 4, 5]);
+    await expect(sink.events(id, -1, 0)).rejects.toThrow('limit');
+    const { app: paged } = await makeApp(githubConfig({ sse: { ...FAST_SSE, pageSize: 3 } }), {
+      backend: new PgCaseBackend(pool),
+    });
+    const s = await signIn(paged, A);
+    const res = await paged.inject({
+      method: 'GET',
+      url: `/cases/${caseA}/events`,
+      cookies: s.cookies,
+    });
+    expect(parseSse(res.body).events).toEqual(expected);
+    await paged.close();
   });
 });

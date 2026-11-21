@@ -178,7 +178,7 @@ describe('github auth', () => {
     let now = Date.parse('2026-11-20T00:00:00Z');
     const { app } = await makeApp(githubConfig(), { now: () => now });
     const s = await signIn(app, 9);
-    const session = s.cookies['affidavit_session']!;
+    const session = s.cookies['__Host-affidavit_session']!;
     const [value] = session.split('.');
     const forgedValue = Buffer.from(
       JSON.stringify({ v: 1, t: 'github-1', s: '1', e: now + 1e9 }),
@@ -187,7 +187,7 @@ describe('github auth', () => {
       const res = await app.inject({
         method: 'GET',
         url: '/cases/case-x',
-        cookies: { affidavit_session: bad },
+        cookies: { '__Host-affidavit_session': bad },
       });
       expect(res.statusCode).toBe(401);
     }
@@ -211,7 +211,7 @@ describe('github auth', () => {
       headers: { 'x-csrf-token': s.csrf },
     });
     expect(res.statusCode).toBe(204);
-    expect(String(res.headers['set-cookie'])).toMatch(/affidavit_session=;/);
+    expect(String(res.headers['set-cookie'])).toMatch(/__Host-affidavit_session=;/);
     await app.close();
   });
 

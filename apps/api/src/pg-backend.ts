@@ -69,11 +69,22 @@ export class PgCaseBackend implements CaseBackend {
         return view;
       },
       stage,
-      events: async (caseId, afterSeq) => {
+      events: async (caseId, afterSeq, limit) => {
         if ((await stage(caseId)) === null) return null;
-        return sink.events(CaseIdSchema.parse(caseId), afterSeq);
+        return sink.events(CaseIdSchema.parse(caseId), afterSeq, limit);
       },
     };
+  }
+
+  /** Reads the tenant's own row under RLS (the app role sees only the tenant it set). */
+  async isProvisioned(tenantId: string): Promise<boolean> {
+    const row = await withTenant(this.pool, tenantId, (tx) =>
+      tx.query.tenants.findFirst({
+        columns: { tenantId: true },
+        where: (t, { eq }) => eq(t.tenantId, tenantId),
+      }),
+    );
+    return row !== undefined;
   }
 
   async close(): Promise<void> {

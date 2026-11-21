@@ -41,6 +41,11 @@ export interface MemoryBackendOptions {
    * one event every `replayMs`, standing in for the worker. Dev only.
    */
   replayMs?: number;
+  /**
+   * Tenants that count as provisioned for sign-in. Absent: every tenant is (dev, tests). The
+   * Postgres backend reads the `tenants` table instead.
+   */
+  provisionedTenants?: readonly string[];
 }
 
 /**
@@ -152,12 +157,18 @@ export class MemoryCaseBackend implements CaseBackend {
         return Promise.resolve(view);
       },
       stage: (caseId) => Promise.resolve(this.find(tenantId, caseId)?.stage ?? null),
-      events: (caseId, afterSeq) => {
+      events: (caseId, afterSeq, limit) => {
         const c = this.find(tenantId, caseId);
         if (!c) return Promise.resolve(null);
-        return Promise.resolve(c.events.filter((e) => e.seq > afterSeq));
+        const after = c.events.filter((e) => e.seq > afterSeq);
+        return Promise.resolve(limit === undefined ? after : after.slice(0, limit));
       },
     };
+  }
+
+  isProvisioned(tenantId: string): Promise<boolean> {
+    const list = this.options.provisionedTenants;
+    return Promise.resolve(list === undefined || list.includes(tenantId));
   }
 
   close(): Promise<void> {

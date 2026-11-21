@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { createHmac, randomBytes } from 'node:crypto';
 import { Readable } from 'node:stream';
 import fastifyCookie from '@fastify/cookie';
 import fastifyCors from '@fastify/cors';
@@ -77,15 +77,29 @@ function scrub(message: string, secrets: readonly string[]): string {
   return m.slice(0, 300);
 }
 
-/** A repo URL the API will store: https, a host, no credentials, bounded. */
-function isAcceptableRepoUrl(raw: string): boolean {
+/**
+ * The only repo URL a tenant may submit: `https://github.com/<owner>/<repo>` with an optional
+ * `.git`, matched on the raw string (no URL normalisation), so no other host, port, userinfo,
+ * query, fragment, percent-encoding, extra path segment, unicode or IDN form gets through. The
+ * worker clones this later, so anything else (a metadata address, an internal host, a local path)
+ * is refused here. Owner: GitHub's rule (alphanumeric or single inner hyphens, 1 to 39). Repo:
+ * letters, digits, `.`, `_`, `-`, 1 to 100, not `.` or `..`.
+ */
+const GITHUB_REPO_URL_RE =
+  /^https:\/\/github\.com\/([A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38})\/([A-Za-z0-9._-]{1,104})$/;
+
+export function isAcceptableRepoUrl(raw: string): boolean {
   if (raw.length > MAX_REPO_URL) return false;
-  try {
-    const u = new URL(raw);
-    return u.protocol === 'https:' && u.hostname !== '' && !u.username && !u.password;
-  } catch {
-    return false;
-  }
+  const m = GITHUB_REPO_URL_RE.exec(raw);
+  if (!m) return false;
+  const repo = m[2]!.endsWith('.git') ? m[2]!.slice(0, -4) : m[2]!;
+  return (
+    repo.length >= 1 &&
+    repo.length <= 100 &&
+    repo !== '.' &&
+    repo !== '..' &&
+    !repo.endsWith('.git')
+  );
 }
 
 export function authFromConfig(config: ApiConfig, deps: GithubAuthDeps = {}): AuthProvider {
@@ -100,6 +114,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     authFromConfig(config, {
       ...(options.fetch ? { fetch: options.fetch } : {}),
       ...(options.sessions ? { sessions: options.sessions } : {}),
+      isProvisioned: (tenantId) => backend.isProvisioned(tenantId),
       now,
     });
   const secrets = secretsOf(config);
@@ -157,19 +172,34 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     errorResponseBuilder: () => new ApiError(429, 'rate-limited'),
   });
 
-  await app.register(fastifyCookie, {
-    // Dev auth sets no cookies of its own; a per-process key keeps the plugins consistent.
-    secret: config.sessionSecret ?? randomBytes(32).toString('hex'),
-  });
+  // Dev auth sets no cookies of its own; a per-process key keeps the plugins consistent.
+  const cookieSecret = config.sessionSecret ?? randomBytes(32).toString('hex');
+  await app.register(fastifyCookie, { secret: cookieSecret });
+  const csrfUserInfo = auth.csrfUserInfo?.bind(auth);
   await app.register(fastifyCsrf, {
     sessionPlugin: '@fastify/cookie',
-    cookieKey: 'affidavit_csrf',
-    cookieOpts: { signed: true, httpOnly: true, secure: true, sameSite: 'strict', path: '/' },
+    cookieKey: auth.cookies?.csrfName ?? 'affidavit_csrf',
+    cookieOpts: {
+      signed: true,
+      httpOnly: true,
+      secure: auth.cookies?.secure ?? true,
+      sameSite: 'strict',
+      path: '/',
+    },
     // Header only: a token in the query string would end up in logs and histories.
     getToken: (req) => {
       const v = req.headers['x-csrf-token'];
       return typeof v === 'string' ? v : undefined;
     },
+    // Tokens are bound to the session id, so one minted for another session never verifies.
+    ...(csrfUserInfo
+      ? {
+          getUserInfo: csrfUserInfo,
+          csrfOpts: {
+            hmacKey: createHmac('sha256', cookieSecret).update('affidavit-csrf-v1').digest(),
+          },
+        }
+      : {}),
   });
 
   // Only JSON bodies (the webhook scope below adds its own raw parser).
@@ -346,6 +376,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         now,
         sleep: abortableSleep,
         onInvalid: () => req.log.warn('stored event failed the contract and was not sent'),
+        // Logout, expiry and eviction end an open stream too, not only new requests.
+        sessionLive: () => auth.sessionLive(req),
       }),
       { objectMode: false },
     );

@@ -15,12 +15,20 @@ export interface TenantCases {
   create(caseFile: CaseFile, budget: Budget): Promise<void>;
   get(caseId: string): Promise<CaseView | null>;
   stage(caseId: string): Promise<CaseStage | null>;
-  /** Events with seq greater than `afterSeq`, in seq order; null when the case is not visible. */
-  events(caseId: string, afterSeq: number): Promise<TrialEvent[] | null>;
+  /**
+   * Events with seq greater than `afterSeq`, in seq order, at most `limit` of them when given;
+   * null when the case is not visible.
+   */
+  events(caseId: string, afterSeq: number, limit?: number): Promise<TrialEvent[] | null>;
 }
 
 export interface CaseBackend {
   forTenant(tenantId: string): TenantCases;
+  /**
+   * True when the tenant exists (was provisioned by the owner). Checked before a sign-in creates a
+   * session, so an unprovisioned user holds no session capacity.
+   */
+  isProvisioned(tenantId: string): Promise<boolean>;
   close(): Promise<void>;
 }
 

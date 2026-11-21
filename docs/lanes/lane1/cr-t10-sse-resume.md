@@ -4,7 +4,7 @@ Status: resolved by Lane 1 in L1-12 (`apps/api`). Raised by Lane 3 in `docs/lane
 
 ## The format
 
-- **`id:` field.** Every message carries `id: <seq>`, the `TrialEvent.seq` of the event in its `data:` field. `data:` is one line of JSON (one `TrialEvent`). There is no `event:` field.
+- **`id:` field.** Every message carries `id: <seq>`, the `TrialEvent.seq` of the event in its `data:` field. `data:` is one line of JSON (one `TrialEvent`). Trial events have no `event:` field. The one named event is a final `event: session-ended` (data `{"error":"session-ended"}`, no `id:`), sent when the session behind an open stream ends (logout, expiry, eviction); a client should stop on it rather than parse it as a `TrialEvent` (Lane 3 follow-up for `sseMessages`).
 - **Resume.** The client sends the last seq it has applied, as the `Last-Event-ID` header or as the `after` query parameter (`GET /cases/:id/events?after=12`). The server sends only events with a greater seq. If both are present the larger wins. With neither, the stream starts at seq 0. A malformed value (anything but a non-negative integer without leading zeros) is 400 `invalid-resume-position`.
 - **Contiguity.** Seqs are per case, start at 0 and are sent in order without gaps in normal operation. One exception: a writer that allocated a seq (`CaseStore.nextSeq`) and died before emitting leaves a permanent hole. The server holds events past a hole for 5 s, then skips it, so the client then sees one jump.
 - **End of stream.** The server closes cleanly once the case has been at a terminal stage for 2 s with nothing new, or after 30 minutes (the client resumes). A case the caller cannot see is a 404 before the stream starts.
