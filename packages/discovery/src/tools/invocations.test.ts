@@ -133,9 +133,10 @@ describe('tool invocations', () => {
 
   it('semgrep keeps a TMPDIR the runner set and falls back to its writable scratch mount', () => {
     // The script is a constant: no argument is spliced into it, they arrive as "$@".
-    // It refuses (exit 97) unless the directory exists and is writable.
+    // It refuses (exit 97) unless the directory exists and a probe byte can really be written
+    // there (`[ -w ]` is true for root even on a read-only mount).
     expect(SEMGREP_TMPDIR_WRAPPER).toBe(
-      `t="\${TMPDIR:-${SEMGREP_FALLBACK_TMP}}"; [ -d "$t" ] && [ -w "$t" ] || exit 97; exec env TMPDIR="$t" "$@"`,
+      `t="\${TMPDIR:-${SEMGREP_FALLBACK_TMP}}"; p="$t/.affidavit-tmp-probe"; [ -d "$t" ] && [ -w "$t" ] && (printf x > "$p") 2>/dev/null && rm -f "$p" || { rm -f "$p" 2>/dev/null; exit 97; }; exec env TMPDIR="$t" "$@"`,
     );
     expect(SEMGREP_NO_TMP_EXIT).toBe(97);
     expect(isOkExit(manifest, 'semgrep', SEMGREP_NO_TMP_EXIT)).toBe(false);

@@ -96,13 +96,16 @@ export const SEMGREP_NO_TMP_EXIT = 97;
 /**
  * Uses `TMPDIR` when the runner set one (the gVisor jail sets `/scratch`, a tmpfs that never
  * touches the host) and `/var/tmp` otherwise (plain Docker, where `/tmp` is on the read-only root),
- * and exits 97 unless that directory exists and is writable. Without a writable temp directory
- * semgrep-core finds nothing and Semgrep still exits 0 with an empty report (seen on the pinned
- * image), so this wrapper must not be dropped. A temp directory that fills up during the run is
- * caught by the liveness canary instead (`SEMGREP_CANARY`). The script is a constant; Semgrep's
+ * and exits 97 unless that directory exists and one byte can really be written there. `[ -w ]`
+ * alone is not enough: the image's shell reports any directory writable for root, a read-only
+ * mount included (seen on the pinned image under plain Docker), so the wrapper also writes and
+ * removes a probe file. Without a writable temp directory semgrep-core finds nothing and Semgrep
+ * still exits 0 with an empty report (seen on the pinned image), so this wrapper must not be
+ * dropped. A temp directory that fills up during the run is caught by the liveness canary
+ * (`SEMGREP_CANARY`) or by Semgrep's own failure exit. The script is a constant; Semgrep's
  * arguments reach it only as positional parameters.
  */
-export const SEMGREP_TMPDIR_WRAPPER = `t="\${TMPDIR:-${SEMGREP_FALLBACK_TMP}}"; [ -d "$t" ] && [ -w "$t" ] || exit ${SEMGREP_NO_TMP_EXIT}; exec env TMPDIR="$t" "$@"`;
+export const SEMGREP_TMPDIR_WRAPPER = `t="\${TMPDIR:-${SEMGREP_FALLBACK_TMP}}"; p="$t/.affidavit-tmp-probe"; [ -d "$t" ] && [ -w "$t" ] && (printf x > "$p") 2>/dev/null && rm -f "$p" || { rm -f "$p" 2>/dev/null; exit ${SEMGREP_NO_TMP_EXIT}; }; exec env TMPDIR="$t" "$@"`;
 
 /**
  * The liveness canary (`packages/discovery/canary/semgrep`), mounted read-only at /canary next to
