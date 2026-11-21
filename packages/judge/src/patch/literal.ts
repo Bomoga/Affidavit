@@ -311,31 +311,45 @@ export function findLiteralSpecialCases(
   return hits;
 }
 
-/** An added line that decides something: a branch, a comparison, a ternary or a membership test. */
-const CONDITIONAL = /\b(?:if|while|case|switch)\b|[=!]==?|\?|\.(?:includes|indexOf|has)\s*\(/;
-
 /**
- * The stricter check for values that come from counterexamples, which Prosecution chooses: an
- * added code line counts only when it is a conditional and holds the value as a whole string
- * literal (never a substring), or compares a parameter number. The Judge calls it only with the
- * params of counterexamples that were admitted (passed on vulnerable, failed on safe), so a
- * common value in an unproven counterexample cannot veto a sound patch.
+ * The check for values from admitted counterexamples (Prosecution's proven inputs), by length. A
+ * string value of MIN_CONTAINS characters or more is a hit anywhere in an added code line (inside
+ * a longer string, a regex or a template literal), as in the family check: a value that long is
+ * specific. A shorter value, and a number, is a hit only as a whole literal (decoded string
+ * content equal to it, or a number literal equal to it) on any kind of added line: conditional,
+ * declaration, assignment, array or object member, `case`. So a short value cannot veto a patch by
+ * appearing inside other code. Known gap, shared with the family check: a value split across
+ * literals (`'..%2f' + 'etc%2fpasswd'`) is not caught.
  */
-export function findCounterexampleSpecialCases(
-  lines: readonly DiffLine[],
-  params: ParamSpace,
-): LiteralHit[] {
+export function findExactLiteralUses(lines: readonly DiffLine[], params: ParamSpace): LiteralHit[] {
   const { strings, numbers } = paramLiterals(params);
+  // A quoted number (`'4242'`) counts as the number too: its decoded content is equal.
+  const wanted = new Set<string>([...strings, ...numbers.map(String)]);
+  const number = new RegExp(
+    String.raw`(?<![\w$.])(?<sign>-\s*)?(?<num>${NUM_BODY})(?![\w$.])`,
+    'g',
+  );
   const hits: LiteralHit[] = [];
   for (const { path, text } of lines) {
     if (isTestFile(path)) continue;
     const code = stripComments(text);
-    if (!CONDITIONAL.test(code)) continue;
     const literals = stringLiterals(code);
-    const value =
-      strings.find((s) => literals.includes(s)) ??
-      comparesNumber(code, numbers) ??
-      arrayMembership(code, numbers);
+    let value: string | number | undefined =
+      // Long values (MIN_CONTAINS or more): anywhere in the code, regex and template literals and
+      // longer strings included, as in the family check. Short ones: whole literals only.
+      strings.find((s) => s.length >= MIN_CONTAINS && code.includes(s)) ??
+      literals.find((l) => wanted.has(l));
+    if (value === undefined && numbers.length > 0) {
+      // Number tokens outside string literals only: digits inside a longer string never count.
+      const bare = code.replace(/(['"`])(?:\\.|(?!\1)[^\\])*\1/g, '""');
+      for (const m of bare.matchAll(number)) {
+        const n = numericValue(m.groups);
+        if (numbers.includes(n)) {
+          value = n;
+          break;
+        }
+      }
+    }
     if (value !== undefined) hits.push({ path, line: text, value });
   }
   return hits;

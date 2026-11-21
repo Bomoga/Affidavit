@@ -506,14 +506,59 @@ describe('Judge.verifyPatch', () => {
       ]);
     });
 
-    it("matches an admitted counterexample's value only as a whole literal in a conditional", async () => {
-      // "/etc/passwd" is admitted, but the patch only has it inside a longer literal.
+    describe("an admitted counterexample's values: substring when long, exact when short", () => {
       const admittedOnly = (req: ExecutionRequest) => req.variant === 'vulnerable';
-      const { verify } = counterOnly('counterexample source', admittedOnly);
-      const r = await verify(typeGuard(), [
-        counterexample({}, [{ name: 'threshold', values: ['/etc/passwd'] }]),
-      ]);
-      expect(r.rejectedBy).toBeUndefined();
+      const run = async (values: (string | number)[], lines: string[]) => {
+        const { verify } = counterOnly('counterexample source', admittedOnly);
+        return verify(patchExhibit(addLines(lines)), [
+          counterexample({}, [{ name: 'threshold', values }]),
+        ]);
+      };
+
+      it.each([
+        ['a conditional', [`            if (threshold === "..%2fetc%2fpasswd") return 403;`]],
+        [
+          'a declaration, then a comparison by name',
+          [
+            `            const BAD = '..%2fetc%2fpasswd';`,
+            `            if (threshold === BAD) return 403;`,
+          ],
+        ],
+        [
+          'a longer literal',
+          [`            if (path.includes("/x/..%2fetc%2fpasswd/")) return 403;`],
+        ],
+        ['a regex literal', ['            if (/^(?:..%2fetc%2fpasswd)$/i.test(p)) return 403;']],
+        ['a template literal', ['            if (p === `${base}..%2fetc%2fpasswd`) return 403;']],
+      ])('rejects a long admitted value in %s', async (_, lines) => {
+        expect((await run(['..%2fetc%2fpasswd'], lines)).rejectedBy).toBe('literal-only-patch');
+      });
+
+      it.each([
+        ['a declaration', [`            const ROLE = 'id';`]],
+        ['a switch case', [`            switch (key) { case "id": return 403; }`]],
+        ['an array member', [`            const deny = ['x', "id"];`]],
+      ])('rejects a short admitted value used exactly in %s', async (_, lines) => {
+        expect((await run(['id'], lines)).rejectedBy).toBe('literal-only-patch');
+      });
+
+      it('rejects an exact number literal equal to an admitted number', async () => {
+        const r = await run([4242], [`            const LIMIT = 4242;`]);
+        expect(r.rejectedBy).toBe('literal-only-patch');
+      });
+
+      it.each([
+        ['another literal', [`            if (state === "valid") return next();`]],
+        ['an identifier', [`            const idx = rows.findIndex(isOwn);`]],
+      ])('does not reject a short value that only appears inside %s', async (_, lines) => {
+        expect((await run(['id'], lines)).rejectedBy).toBeUndefined();
+      });
+
+      it('does not reject a number that only appears inside a longer number', async () => {
+        expect(
+          (await run([4242], [`            const LIMIT = 42420;`])).rejectedBy,
+        ).toBeUndefined();
+      });
     });
 
     it('returns exactly one result per submitted counterexample, in order', async () => {
