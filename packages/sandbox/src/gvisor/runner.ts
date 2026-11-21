@@ -19,6 +19,7 @@ import {
 import { validateMounts, type Mount } from './mounts.js';
 import type { CaseNetwork } from './network.js';
 import { parseTrace, type TraceObservations } from './trace.js';
+import { DEFAULT_CGROUP_DIRS, NO_USAGE, mergeUsage, sampleUsage, type RunUsage } from './usage.js';
 import { assertNoImageVolumes, parseContainerVolumes } from './volumes.js';
 
 const exec = promisify(execFile);
@@ -46,6 +47,8 @@ export interface GvisorOptions {
   /** Host paths whose access counts as a denied read or write even when it fails with ENOENT. */
   sensitivePaths?: readonly string[];
   maxTraceBytes?: number;
+  /** Where to look for a container's cgroup (tests); default `DEFAULT_CGROUP_DIRS`. */
+  cgroupDirs?: readonly ((id: string) => string)[];
 }
 
 export interface JailedRun {
@@ -57,6 +60,8 @@ export interface JailedRun {
   timedOut: boolean;
   oomKilled: boolean;
   trace: TraceObservations;
+  /** Peak memory and CPU time sampled from the cgroup while it ran (L2-11); see usage.ts. */
+  usage: RunUsage;
 }
 
 export interface JailedRunInput {
@@ -265,6 +270,7 @@ export async function runJailed(
   let traceOverflow = false;
   let killing = false;
   let containerId: string | null = null;
+  let usage: RunUsage = { ...NO_USAGE };
   let busy = false;
   // One watcher for both limits. A kill is retried on every tick until the client exits: a kill
   // sent before Docker has created the container fails, and must not leave the run unbounded.
@@ -276,8 +282,14 @@ export async function runJailed(
         timedOut = true;
         killing = true;
       }
+      containerId ??= (await inspect(name))?.id ?? null;
+      if (containerId !== null) {
+        usage = mergeUsage(
+          usage,
+          await sampleUsage(containerId, opts.cgroupDirs ?? DEFAULT_CGROUP_DIRS),
+        );
+      }
       if (opts.trace !== false && !traceOverflow) {
-        containerId ??= (await inspect(name))?.id ?? null;
         if (containerId !== null) {
           const size = await traceSize(traceRoot, await traceFiles(traceRoot, containerId));
           if (size > maxTraceBytes) {
@@ -344,6 +356,7 @@ export async function runJailed(
     timedOut,
     oomKilled: state.oomKilled,
     trace,
+    usage,
   };
 }
 

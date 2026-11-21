@@ -4,6 +4,7 @@ import {
   BUNDLE_FORMAT_KEY,
   CASEFILE_ENTRY_ID,
   buildBundle,
+  caseUsage,
   loadBundle,
   openBundle,
   storeBundle,
@@ -321,5 +322,44 @@ describe('egress log in exhibit records (L2-11)', () => {
       /variant this exhibit never runs on/,
     );
     await expect(buildBundle(withLog([{ ...entry, port: 70000 }]))).rejects.toThrow();
+  });
+});
+
+describe('run usage in exhibit records (L2-11)', () => {
+  const run = (variant: string, attempt: number, measured = true) => ({
+    variant,
+    attempt,
+    wallMs: 1000 * attempt,
+    cpuMs: measured ? 300 : null,
+    memoryPeakBytes: measured ? 50_000_000 * attempt : null,
+  });
+
+  it('carries usage under the exhibit digest and totals it per case, never guessing', async () => {
+    const [w, c, p] = records();
+    const exhibits = [
+      { ...w!, usage: [run('vulnerable', 1), run('safe', 2)] },
+      { ...c!, usage: [run('vulnerable', 3, false)] },
+      p!,
+    ] as ReturnType<typeof records>;
+    const { bytes } = await buildBundle(bundleInput({ exhibits }));
+    const opened = await openBundle(bytes);
+    expect(opened.exhibits.get('exhibit-witness-001')?.usage).toHaveLength(2);
+    expect(caseUsage([...opened.exhibits.values()])).toEqual({
+      runs: 3,
+      wallMs: 6000,
+      cpuMs: 600,
+      memoryPeakBytes: 100_000_000,
+      unmeasuredRuns: 1,
+      egressAttempts: 0,
+      recordsWithoutUsage: 1,
+    });
+  });
+
+  it('refuses usage for a variant the exhibit never runs on', async () => {
+    const [w, ...rest] = records();
+    const exhibits = [{ ...w!, usage: [run('patched', 1)] }, ...rest] as ReturnType<typeof records>;
+    await expect(buildBundle(bundleInput({ exhibits }))).rejects.toThrow(
+      /usage log names a variant this exhibit never runs on/,
+    );
   });
 });

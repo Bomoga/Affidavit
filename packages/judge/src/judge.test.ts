@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { CaseFile, Exhibit, Witness } from '@affidavit/contracts';
 import { createHash } from 'node:crypto';
-import { Judge, counterexampleExhibitId, witnessExhibitId } from './judge.js';
+import { Judge, counterexampleExhibitId, witnessExhibitId, type ExhibitRunLog } from './judge.js';
 import { DEFAULT_POLICY } from './rules.js';
 import {
   ScriptedExecutor,
@@ -418,7 +418,7 @@ describe('output size policy', () => {
   });
 });
 
-describe('Judge egress log (L2-11)', () => {
+describe('Judge run log (L2-11)', () => {
   const event = {
     syscall: 'connect',
     family: 'ipv4',
@@ -436,29 +436,41 @@ describe('Judge egress log (L2-11)', () => {
         ? { egressAttempts: 1, egress: [event] }
         : {}),
     }));
-    const calls: [string, unknown[]][] = [];
+    const calls: [string, ExhibitRunLog][] = [];
     const judge = new Judge(exec, DEFAULT_POLICY, undefined, {
-      record: (id, entries) => calls.push([id, [...entries]]),
+      record: (id, log) => calls.push([id, log]),
     });
     const result = await judge.runWitness(gateCaseFile(), gateWitness(), ['vulnerable']);
     expect(result.rejectedBy).toBe('no-egress');
-    expect(calls).toEqual([
-      [witnessExhibitId(gateWitness()), [{ ...event, variant: 'safe', attempt: 2 }]],
+    expect(calls.map(([id]) => id)).toEqual([witnessExhibitId(gateWitness())]);
+    const log = calls[0]![1];
+    expect(log.egress).toEqual([{ ...event, variant: 'safe', attempt: 2 }]);
+    // One usage entry per run; an executor that measures nothing reports nulls, not zeros.
+    expect(log.runs.map((u) => `${u.variant}:${u.attempt}`)).toEqual([
+      'vulnerable:1',
+      'vulnerable:2',
+      'vulnerable:3',
+      'safe:1',
+      'safe:2',
+      'safe:3',
     ]);
+    expect(log.runs[0]).toMatchObject({ cpuMs: null, memoryPeakBytes: null });
   });
 
   it('records an empty log for a clean exhibit, and nothing for one refused before running', async () => {
     const calls: [string, number][] = [];
-    const judge = new Judge(
-      new ScriptedExecutor(differentialTarget(3)),
-      DEFAULT_POLICY,
-      undefined,
-      {
-        record: (id, entries) => calls.push([id, entries.length]),
+    const usage = { cpuMs: 12, memoryPeakBytes: 4096 };
+    const exec = new ScriptedExecutor((req) => ({ ...differentialTarget(3)(req), usage }));
+    const logs: ExhibitRunLog[] = [];
+    const judge = new Judge(exec, DEFAULT_POLICY, undefined, {
+      record: (id, log) => {
+        calls.push([id, log.egress.length]);
+        logs.push(log);
       },
-    );
+    });
     await judge.runWitness(gateCaseFile(), gateWitness(), ['vulnerable']);
     await judge.runCounterexample(gateCaseFile(), gateWitness(), counterexample({ kind: 'patch' }));
     expect(calls).toEqual([[witnessExhibitId(gateWitness()), 0]]);
+    expect(logs[0]?.runs[0]).toMatchObject(usage);
   });
 });

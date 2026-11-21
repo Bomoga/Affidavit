@@ -40,17 +40,36 @@ export interface EgressEntry extends EgressEvent {
   attempt: Attempt;
 }
 
-/**
- * Receives the egress log of every exhibit the Judge ran (L2-11), so the caller can file it with
- * the exhibit in the evidence bundle. Called once per judged exhibit, after its runs, with every
- * entry in run order (empty when nothing tried to leave). An exhibit refused before any run gets
- * no call. For a patch, the log covers every run verifyPatch made: the family on both variants
- * and each counterexample's runs. The log is a record only: `no-egress` is decided from the
- * counts and the trace check, never from it.
- */
-export interface EgressRecorder {
-  record(exhibitId: ExhibitId, entries: readonly EgressEntry[]): void;
+/** Time and resources of one run. `cpuMs` and `memoryPeakBytes` are null when not measured. */
+export interface RunUsageEntry {
+  variant: ExecutionVariant;
+  attempt: Attempt;
+  wallMs: number;
+  cpuMs: number | null;
+  memoryPeakBytes: number | null;
 }
+
+/** What the Judge observed across every run of one exhibit, in run order. */
+export interface ExhibitRunLog {
+  /** Egress attempts gVisor listed (up to 50 per run; the result's count covers every one). */
+  egress: EgressEntry[];
+  /** One entry per run. */
+  runs: RunUsageEntry[];
+}
+
+/**
+ * Receives the run log of every exhibit the Judge ran (L2-11), so the caller can file it with
+ * the exhibit in the evidence bundle and total a case's sandbox time. Called once per judged
+ * exhibit, after its runs. An exhibit refused before any run gets no call. For a patch, the log
+ * covers every run verifyPatch made: the family on both variants and each counterexample's runs.
+ * The log is a record only: `no-egress` is decided from the counts and the trace check, never
+ * from it.
+ */
+export interface RunLogRecorder {
+  record(exhibitId: ExhibitId, log: ExhibitRunLog): void;
+}
+
+const emptyLog = (): ExhibitRunLog => ({ egress: [], runs: [] });
 
 /** What verifyPatch needs besides the executor: somewhere to build the patch, and Lane 1's re-scan. */
 export interface PatchVerification {
@@ -120,13 +139,13 @@ export class Judge implements JudgePort {
   readonly #executor: WitnessExecutor;
   readonly #policy: Readonly<JudgePolicy>;
   readonly #verify: PatchVerification | undefined;
-  readonly #recorder: EgressRecorder | undefined;
+  readonly #recorder: RunLogRecorder | undefined;
 
   constructor(
     executor: WitnessExecutor,
     policy: Readonly<JudgePolicy> = DEFAULT_POLICY,
     verify?: PatchVerification,
-    recorder?: EgressRecorder,
+    recorder?: RunLogRecorder,
   ) {
     if (policy.timeBudgetMs >= policy.hardTimeoutMs) {
       throw new Error('timeBudgetMs must be below hardTimeoutMs');
@@ -351,7 +370,7 @@ export class Judge implements JudgePort {
     const outcome = await deps.workbench.prepare(cf, p.data, plan);
     if (!outcome.ok) return reject(outcome.stage === 'apply' ? 'schema' : 'suite-fails');
     const prepared = outcome.prepared;
-    const egress: EgressEntry[] = [];
+    const log = emptyLog();
     try {
       checkPrepared(cf, prepared);
       const params = w.data.params;
@@ -368,7 +387,7 @@ export class Judge implements JudgePort {
             ],
             w.data.template,
             params,
-            egress,
+            log,
           ),
         },
         this.#policy,
@@ -405,13 +424,7 @@ export class Judge implements JudgePort {
           {
             exhibitId,
             familySize: familySize(space),
-            attempts: await this.#attempts(
-              cf,
-              this.#targets(cf, ['vulnerable']),
-              code,
-              space,
-              egress,
-            ),
+            attempts: await this.#attempts(cf, this.#targets(cf, ['vulnerable']), code, space, log),
           },
           this.#policy,
         );
@@ -427,13 +440,7 @@ export class Judge implements JudgePort {
           const fresh = q.values.filter((v) => !familyValues.has(canonicalJson(v)));
           if (fresh.length > 0) admittedParams.push({ name: q.name, values: fresh });
         }
-        const attempts = await this.#attempts(
-          cf,
-          [['patched', prepared.target]],
-          code,
-          space,
-          egress,
-        );
+        const attempts = await this.#attempts(cf, [['patched', prepared.target]], code, space, log);
         const survived = counterexampleSurvives(
           { exhibitId, familySize: familySize(space), attempts },
           this.#policy,
@@ -464,7 +471,7 @@ export class Judge implements JudgePort {
         counterexamples: results,
         ...(rejectedBy === undefined ? {} : { rejectedBy }),
       });
-      this.#recorder?.record(patchId, egress);
+      this.#recorder?.record(patchId, log);
       return { result, suite: suiteStatus };
     } finally {
       await deps.workbench.release(prepared);
@@ -509,7 +516,7 @@ export class Judge implements JudgePort {
     targets: readonly [ExecutionVariant, TargetRef][],
     template: string,
     params: ParamSpace,
-    egress?: EgressEntry[],
+    log?: ExhibitRunLog,
   ): Promise<ObservedAttempt[]> {
     const attempts: ObservedAttempt[] = [];
     for (const [variant, target] of targets) {
@@ -526,7 +533,16 @@ export class Judge implements JudgePort {
           maxArtifactBytes: this.#policy.maxArtifactBytes,
         });
         attempts.push({ ...raw, variant, attempt });
-        for (const e of raw.egress ?? []) egress?.push({ ...e, variant, attempt });
+        if (log !== undefined) {
+          for (const e of raw.egress ?? []) log.egress.push({ ...e, variant, attempt });
+          log.runs.push({
+            variant,
+            attempt,
+            wallMs: Math.round(raw.durationMs),
+            cpuMs: raw.usage?.cpuMs ?? null,
+            memoryPeakBytes: raw.usage?.memoryPeakBytes ?? null,
+          });
+        }
       }
     }
     return attempts;
@@ -537,13 +553,13 @@ export class Judge implements JudgePort {
     targets: readonly [ExecutionVariant, TargetRef][],
     r: Runnable,
   ): Promise<ExhibitResult> {
-    const egress: EgressEntry[] = [];
-    const attempts = await this.#attempts(caseFile, targets, r.template, r.params, egress);
+    const log = emptyLog();
+    const attempts = await this.#attempts(caseFile, targets, r.template, r.params, log);
     const result = judgeEvidence(
       { exhibitId: r.exhibitId, familySize: familySize(r.params), attempts },
       this.#policy,
     );
-    this.#recorder?.record(r.exhibitId, egress);
+    this.#recorder?.record(r.exhibitId, log);
     return result;
   }
 }

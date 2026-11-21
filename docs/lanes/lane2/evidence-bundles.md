@@ -46,6 +46,13 @@ no log was recorded (bundles from before L2-11, or a Judge without a recorder); 
 tried to leave. Replay ignores it: it compares outcomes, and the count in the result already
 decides `no-egress`.
 
+Each record may also carry `usage` (L2-11): one entry per run with its variant, attempt, wall
+time, CPU time and peak memory (`cpuMs` and `memoryPeakBytes` null when not measured; see
+`sandbox-runner.md`, "Run usage"). `caseUsage(records)` totals a case: runs, wall time, measured
+CPU, the highest peak, how many runs were not measured, and egress attempts. It never fills in a
+missing measurement, so a total with unmeasured runs is a lower bound. The worker can use its
+`wallMs` for `StageCost`; CPU and memory have no `StageCost` field in contracts v1.0.
+
 The submission is stored exactly as submitted, even when malformed, so replay reaches the same
 `schema` rejection. A counterexample and a patch name the witness exhibit they ran against, so
 replay calls the Judge the same way. The record is filed under the id in its result
@@ -74,7 +81,7 @@ Before anything runs, and failing with `BundleIntegrityError` naming the exhibit
    present, equal the manifest's. Replay uses the manifest's digests.
 7. Each record holds the result for its own id, every reference resolves to a record of the right
    kind, `results` lists every record exactly once, and every exhibit the verdict cites is present.
-   An egress log names only variants its kind of exhibit runs on, and a witness or counterexample
+   An egress or usage log names only variants its kind of exhibit runs on, and a witness or counterexample
    log lists no more attempts than its result counted.
 
 Changing any byte of an exhibit fails step 4 with that exhibit's id. Rewriting a record and its

@@ -4,7 +4,7 @@ import type { Exhibit, ParamSpace, PatchExhibit, Witness } from '@affidavit/cont
 import { canonicalJson, sha256Hex } from './canonical.js';
 import { counterexampleParamsHeader } from './counterexample.js';
 import type { ExecutionRequest, RawAttempt } from './executor.js';
-import { Judge, counterexampleExhibitId, patchExhibitId } from './judge.js';
+import { Judge, counterexampleExhibitId, patchExhibitId, type ExhibitRunLog } from './judge.js';
 import { parseUnifiedDiff, renderDiff } from './patch/diff.js';
 import { DEFAULT_POLICY } from './rules.js';
 import {
@@ -865,7 +865,7 @@ describe('Judge.verifyPatch', () => {
   });
 });
 
-describe('verifyPatch egress log (L2-11)', () => {
+describe('verifyPatch run log (L2-11)', () => {
   it('records one log for the patch, covering the family and counterexample runs', async () => {
     const event = {
       syscall: 'sendto',
@@ -882,17 +882,17 @@ describe('verifyPatch egress log (L2-11)', () => {
         ? { egressAttempts: 1, egress: [event] }
         : {}),
     }));
-    const calls: [string, unknown[]][] = [];
+    const calls: [string, ExhibitRunLog][] = [];
     const judge = new Judge(
       exec,
       DEFAULT_POLICY,
       { workbench: new ScriptedWorkbench({}), rescan: new RecordingRescan(true) },
-      { record: (id, entries) => calls.push([id, [...entries]]) },
+      { record: (id, log) => calls.push([id, log]) },
     );
     await judge.verifyPatch(gateCaseFile(), patchExhibit(), witness(), [counterexample()]);
     expect(calls.map(([id]) => id)).toEqual([PATCH_ID]);
     // Family on patched attempt 1, then the counterexample's own patched attempt 1.
-    expect(calls[0]?.[1]).toEqual([
+    expect(calls[0]?.[1].egress).toEqual([
       { ...event, variant: 'patched', attempt: 1 },
       { ...event, variant: 'patched', attempt: 1 },
     ]);

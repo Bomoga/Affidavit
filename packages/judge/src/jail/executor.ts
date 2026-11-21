@@ -73,6 +73,7 @@ export class JailExecutor implements WitnessExecutor {
       egressAttempts: jailed.trace.egressAttempts,
       traceTampered: jailed.trace.tampered,
       egress: jailed.trace.egress,
+      usage: jailed.usage,
       artifact,
     };
   }

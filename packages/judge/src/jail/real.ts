@@ -21,7 +21,7 @@ import {
   readDependencyBundlePins,
   type DependencyBundleRef,
 } from '@affidavit/sandbox';
-import { Judge, type EgressRecorder, type PatchReport } from '../judge.js';
+import { Judge, type RunLogRecorder, type PatchReport } from '../judge.js';
 import { DEFAULT_POLICY, type JudgePolicy } from '../rules.js';
 import { JailExecutor } from './executor.js';
 import { localImagePresent } from './harness.js';
@@ -68,11 +68,11 @@ export interface RealJudgeConfig {
   rescan?: RescanPort;
   policy?: Readonly<JudgePolicy>;
   /**
-   * Receives each judged exhibit's egress log (L2-11) so the worker can file it in the bundle
-   * record (`egress` in `@affidavit/evidence`). Optional: without it the logs are dropped and only
-   * the counts in each result remain.
+   * Receives each judged exhibit's run log (L2-11: egress attempts, per-run time, CPU and peak
+   * memory) so the worker can file it in the bundle record (`egress` and `usage` in
+   * `@affidavit/evidence`). Optional: without it the logs are dropped and only the results remain.
    */
-  egressRecorder?: EgressRecorder;
+  runLogRecorder?: RunLogRecorder;
   /** Syscall trace directory of the audit runtime (default `/var/lib/affidavit-runsc`). */
   traceRoot?: string;
   /** Docker daemon config that registers the gVisor runtimes (default `/etc/docker/daemon.json`). */
@@ -520,7 +520,7 @@ export async function createRealJudge(
     executor,
     config.policy ?? DEFAULT_POLICY,
     config.rescan === undefined ? undefined : { workbench, rescan: config.rescan },
-    config.egressRecorder,
+    config.runLogRecorder,
   );
   return {
     judge: new CaseBoundJudge(judge, targets),

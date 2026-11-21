@@ -11,3 +11,4 @@ export * from './gvisor/cidr.js';
 export * from './gvisor/network.js';
 export * from './boot/index.js';
 export * from './bundle/index.js';
+export * from './gvisor/usage.js';

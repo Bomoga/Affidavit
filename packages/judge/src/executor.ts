@@ -1,5 +1,5 @@
 import type { CaseFile, ParamSpace, TargetRef } from '@affidavit/contracts';
-import type { EgressEvent } from '@affidavit/sandbox';
+import type { EgressEvent, RunUsage } from '@affidavit/sandbox';
 
 export type Attempt = 1 | 2 | 3;
 
@@ -51,6 +51,8 @@ export interface RawAttempt {
    * is still counted in `egressAttempts`. Optional: an executor without a trace lists none.
    */
   egress?: readonly EgressEvent[];
+  /** Peak memory and CPU time the executor measured (L2-11). Optional, like `egress`. */
+  usage?: RunUsage;
   /** Raw bytes of the result artifact (see artifact.ts), or null when the runner wrote none. */
   artifact: string | null;
 }
