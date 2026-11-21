@@ -26,7 +26,7 @@ The first two already hold in code and tests (L2-09): only `apps/signer` touches
 
 ## Rotation
 
-- **Planned:** one new key per year, or before a pilot with an outside party, whichever comes first. The old public key stays published, marked "retired, still valid for verdicts signed before <date>". The old private key is destroyed after the new one signs its first verdict.
+- **Planned:** one new key per year, or before a pilot with an outside party, whichever comes first. The old public key stays published, marked "retired": it signs nothing new, and its signatures stay valid because the key was never exposed (a signing date could not be proven anyway, see below). The old private key is destroyed after the new one signs its first verdict.
 - **On suspected compromise** (key file or password exposed, host compromised): stop the signer, generate a new key, publish it, and mark the old one **revoked** in `docs/keys/README.md`.
 
 One limit to know: verdicts are signed without a timestamp authority (nothing goes to Sigstore), so a signature cannot prove _when_ it was made. After a revocation, a signature by the old key could be a forgery made after the leak. So on compromise, every stored verdict signed by the revoked key is re-signed with the new key: the bundles are kept in the evidence store, and re-signing a manifest changes nothing in the bundle. The verifier should then refuse revoked keys outright. That last part (a revoked-keys list read by `verify`) is a small follow-up in `@affidavit/evidence` once this proposal is accepted.
