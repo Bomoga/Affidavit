@@ -73,9 +73,14 @@ describe('egress guard over src/', () => {
   it('every allowlist entry is still needed (no stale exceptions)', () => {
     for (const a of EGRESS_ALLOWLIST) {
       const text = readFileSync(join(SRC, a.file), 'utf8');
+      const within = (a as { within?: string }).within;
       expect(
-        findEgress(a.file, text, []).some((f) => f.what === a.what),
-        a.file,
+        findEgress(a.file, text, []).some(
+          (f) =>
+            f.what === a.what &&
+            (within === undefined || (f as { within?: string }).within === within),
+        ),
+        `${a.file}: ${a.what}`,
       ).toBe(true);
     }
   });
@@ -322,5 +327,122 @@ describe('egress guard self-test: each snippet must be caught', () => {
     const allow = [{ file: 'a.ts', what: 'import node:http', reason: 'listener' }];
     expect(findEgress('a.ts', code, allow)).toEqual([]);
     expect(findEgress('b.ts', code, allow)).not.toEqual([]);
+  });
+});
+
+/** Final delta review of #55: three claims the guard made and did not keep. */
+describe('egress guard self-test: final delta review', () => {
+  const read = (rel: string): string => readFileSync(join(SRC, rel), 'utf8');
+
+  // (1) Destructuring or aliasing process, Reflect, module or require is a finding.
+  const aliasing: [string, string][] = [
+    ['destructured process.binding', `const { binding } = process; binding('tcp_wrap');`],
+    ['destructured process.getBuiltinModule', `const { getBuiltinModule } = process;`],
+    ['destructured process.dlopen', `const { dlopen } = process;`],
+    ['process aliased', `const p = process; p.binding('tcp_wrap');`],
+    ['process comma-wrapped', `(0, process).binding('tcp_wrap');`],
+    ['process passed along', `use(process);`],
+    ['destructured Reflect.get', `const { get } = Reflect; get(o, 'k');`],
+    ['Reflect aliased', `const R = Reflect; R.get(o, 'k');`],
+    ['module aliased', `const m = module; m.require('node:https');`],
+    ['destructured module', `const { require: r } = module;`],
+    ['destructured require', `const { resolve } = require;`],
+  ];
+  it.each(aliasing)('catches %s', (_label, code) => {
+    expect(findEgress('snippet.ts', code, [])).not.toEqual([]);
+    expect(findEgress('gvisor/runner.ts', code, [])).not.toEqual([]);
+  });
+  it.each([
+    ['typeof process', `const hasProcess = typeof process !== 'undefined';`],
+    ['typeof module', `const cjs = typeof module === 'object';`],
+    ['process.env', `const h = process.env.HOME;`],
+    ['process.argv', `const a = process.argv[2];`],
+    ['Reflect.ownKeys', `const k = Reflect.ownKeys(o);`],
+  ])('allows %s', (_label, code) => {
+    expect(findEgress('snippet.ts', code, [])).toEqual([]);
+  });
+
+  // (2) dockerode is declared but unused: importing it anywhere is a finding.
+  it.each([
+    ['import', `import Docker from 'dockerode'; new Docker({ host: 'evil' });`],
+    ['type and value import', `import Docker, { type ContainerCreateOptions } from 'dockerode';`],
+    ['require', `const Docker = require('dockerode');`],
+    ['import()', `const { default: Docker } = await import('dockerode');`],
+    ['re-export', `export { default } from 'dockerode';`],
+  ])('catches a dockerode %s', (_label, code) => {
+    expect(findEgress('snippet.ts', code, [])).not.toEqual([]);
+    expect(findEgress('gvisor/runner.ts', code, [])).not.toEqual([]);
+  });
+
+  // (3) A docker or tar argv is an inline array literal or a const array literal in the same file.
+  const spawnIt = (body: string): string => `import { spawn } from 'node:child_process'; ${body}`;
+  it.each([
+    [
+      'a const array on the host network',
+      `const args = ['run', '--network', 'host', 'x']; spawn('docker', args);`,
+    ],
+    ['a parameter', `export function f(args: string[]) { spawn('docker', args); }`],
+    ['a let array', `let args = ['run', '--network', 'none', 'x']; spawn('docker', args);`],
+    ['a const of unknown origin', `const args = make(); spawn('docker', args);`],
+    ['an undeclared name', `spawn('docker', args);`],
+    [
+      'a spread of a const array on the host network',
+      `const NET = ['--network', 'host']; spawn('docker', ['run', ...NET, 'x']);`,
+    ],
+    [
+      'a const array pulling an image',
+      `const ARGS = ['pull', 'evil/image']; spawn('docker', ARGS);`,
+    ],
+    [
+      'a shadowed name: the inner const is checked',
+      `const args = ['ps']; export function f() { const args = ['run', '--network', 'host', 'x']; spawn('docker', args); }`,
+    ],
+    ['a tar const array', `const T = ['-x', '--to-command=sh']; spawn('tar', T);`],
+  ])('catches %s', (_label, body) => {
+    expect(findEgress('gvisor/runner.ts', spawnIt(body), [])).not.toEqual([]);
+  });
+  it.each([
+    ['a const array', `const ARGS = ['ps', '--quiet'] as const; spawn('docker', ARGS);`],
+    [
+      'a spread of a const array',
+      `const NET = ['--network', 'none']; spawn('docker', ['run', ...NET, img]);`,
+    ],
+    [
+      'nested const arrays',
+      `const NET = ['--rm', '--network', 'none']; const ARGS = ['run', ...NET, img]; spawn('docker', ARGS);`,
+    ],
+  ])('allows %s', (_label, body) => {
+    expect(findEgress('gvisor/runner.ts', spawnIt(body), [])).toEqual([]);
+  });
+
+  it('a reviewed exception covers one call site, not every finding with its label', () => {
+    expect(findEgress('boot/images.ts', read('boot/images.ts'))).toEqual([]);
+    const extra = `export async function more(r: string) { await exec('docker', ['pull', '--quiet', r]); }`;
+    expect(findEgress('boot/images.ts', `${read('boot/images.ts')}\n${extra}`)).not.toEqual([]);
+    const twice = read('boot/images.ts').replace(
+      "await exec('docker', ['pull', '--quiet', ref], { timeout: 600_000 });\n  const { stdout }",
+      "await exec('docker', ['pull', '--quiet', ref], { timeout: 600_000 });\n  await exec('docker', ['pull', '--quiet', ref]);\n  const { stdout }",
+    );
+    expect(twice).not.toBe(read('boot/images.ts'));
+    expect(findEgress('boot/images.ts', twice)).not.toEqual([]);
+  });
+
+  it('a variable named args in runner.ts is checked, not waved through by name', () => {
+    expect(findEgress('gvisor/runner.ts', read('gvisor/runner.ts'))).toEqual([]);
+    const host = `export function more() { const args = ['run', '--network', 'host', 'x']; spawn('docker', args); }`;
+    expect(findEgress('gvisor/runner.ts', `${read('gvisor/runner.ts')}\n${host}`)).not.toEqual([]);
+    const param = `export function more(args: string[]) { spawn('docker', args); }`;
+    expect(findEgress('gvisor/runner.ts', `${read('gvisor/runner.ts')}\n${param}`)).not.toEqual([]);
+  });
+
+  it('names the two exceptions that have network on purpose, with reasons', () => {
+    const byDesign = EGRESS_ALLOWLIST.filter(
+      (a) => (a as { networkByDesign?: boolean }).networkByDesign === true,
+    );
+    expect(byDesign.map((a) => [a.file, (a as { name?: string }).name])).toEqual([
+      ['boot/images.ts', 'pinImage pulls from Docker Hub'],
+      ['containment/plain-docker.ts', 'plain-Docker baseline on the default bridge'],
+    ]);
+    for (const a of byDesign) expect(a.reason.length).toBeGreaterThan(60);
   });
 });

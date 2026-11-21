@@ -7,6 +7,15 @@
 // can always write code a static check does not understand. The runtime boundary is gVisor with
 // `--network none` (or an internal-only case network) and no egress for anything the Judge or an
 // agent runs; the dependency bundle build is a human-run host step outside `src/`.
+//
+// Two reviewed exceptions have network on purpose, by design, and are human-review items for the
+// lead (an egress and supply-chain decision on the host, not a jail matter). Each is a named
+// `networkByDesign` entry in EGRESS_ALLOWLIST:
+// - `pinImage` (boot/images.ts) runs `docker pull` against Docker Hub on the host to pin an image
+//   by digest. That includes target-named compose sidecar images (boot/boot.ts calls it per
+//   sidecar), so a target's compose file chooses which public images the host pulls.
+// - The plain-Docker containment baseline (containment/plain-docker.ts) runs a probe container on
+//   Docker's default bridge, which has a route out, as the comparison case for the jail.
 import { readFileSync, readdirSync } from 'node:fs';
 import { builtinModules } from 'node:module';
 import { dirname, join } from 'node:path';
@@ -18,13 +27,25 @@ export interface EgressFinding {
   line: number;
   /** A short, stable label: `import node:https`, `use fetch`, `docker pull`, ... */
   what: string;
+  /** The name of the enclosing function, when there is one. */
+  within?: string;
 }
 
-/** A reviewed exception: one finding in one file, with why it does not reach the network. */
+/**
+ * A reviewed exception: one finding at one call site, with why it is acceptable. It covers at most
+ * `count` (default 1) findings with this label in this file, and only inside the function `within`
+ * when that is set, so a second call site with the same label is a finding.
+ */
 export interface EgressAllow {
   file: string;
   what: string;
   reason: string;
+  within?: string;
+  count?: number;
+  /** A short name for an exception that has network on purpose (see the header). */
+  name?: string;
+  /** True for the exceptions that reach a network by design: human-review items for the lead. */
+  networkByDesign?: true;
 }
 
 /**
@@ -123,8 +144,18 @@ export const EGRESS_ALLOWLIST: readonly EgressAllow[] = [
   {
     file: 'boot/images.ts',
     what: 'docker pull',
+    within: 'pinImage',
+    name: 'pinImage pulls from Docker Hub',
+    networkByDesign: true,
     reason:
-      'the Docker daemon pulls an official `node` base or a compose sidecar image on the host to pin it by digest (boot-recipes.md, Base); nothing the target, the Judge or an agent runs reaches this, and no container runs',
+      'NETWORK BY DESIGN, a human-review item for the lead: the Docker daemon pulls from Docker Hub on the host to pin an image by digest, both the official `node` base and target-named compose sidecar images (boot.ts calls pinImage per sidecar). No container runs and nothing the target, the Judge or an agent runs reaches this, but pulling target-named images from a public registry is an egress and supply-chain decision on the host, not a jail matter',
+  },
+  {
+    file: 'boot/images.ts',
+    what: 'docker pull',
+    within: 'pullPinned',
+    reason:
+      'pulls an image Lane 2 already pinned by digest (`name:tag@sha256:...`, checked before the call) so the daemon has it; no container runs',
   },
   {
     file: 'containment/plain-docker.ts',
@@ -135,12 +166,14 @@ export const EGRESS_ALLOWLIST: readonly EgressAllow[] = [
   {
     file: 'containment/plain-docker.ts',
     what: 'args <non-literal> buildProbeDockerArgs(name, JSON.stringify(req.args))',
+    name: 'plain-Docker baseline on the default bridge',
+    networkByDesign: true,
     reason:
-      'the plain-Docker containment baseline: a probe container on the default bridge, by design the comparison case; runs only in the containment suite, never in a build or a trial',
+      "NETWORK BY DESIGN, a human-review item for the lead: the plain-Docker containment baseline runs a probe container on Docker's default bridge, which has a route out, as the comparison case for the jail. It runs only in the containment suite (`pnpm containment`), never in a build, a boot or a trial",
   },
   {
     file: 'gvisor/runner.ts',
-    what: 'args <non-literal> args',
+    what: 'args <const> args = buildGvisorRunArgs(...)',
     reason:
       'buildGvisorRunArgs output: runsc, `--network none` or an internal case network, refusing unknown spec keys; tested in args.test.ts',
   },
@@ -185,6 +218,11 @@ const DECLARED: ReadonlySet<string> = new Set(
   ),
 );
 const BUILTINS = new Set(builtinModules);
+/**
+ * Declared packages host code may still not import. `dockerode` is declared but unused: a Docker API
+ * client can set its own host, network mode and pulls, none of which this lint can see.
+ */
+const BANNED_PACKAGES: ReadonlySet<string> = new Set(['dockerode']);
 
 const CHILD_FNS = new Set([
   'exec',
@@ -208,6 +246,8 @@ const BANNED_NAMES = new Set([
 const GLOBAL_NAMES = new Set(['globalThis', 'window', 'self', 'global']);
 const PROCESS_BANNED = new Set(['binding', '_linkedBinding', 'dlopen', 'getBuiltinModule']);
 const REFLECT_BANNED = new Set(['get', 'apply', 'construct']);
+/** Objects host code may use only as `x.member` or `typeof x`: never aliased or destructured. */
+const HOST_OBJECTS = new Set(['process', 'Reflect', 'module']);
 /** argv words a docker (or tar) call made from src/ may never carry. */
 const FORBIDDEN_ARG = /^(npm|npx|pnpm|yarn|install|ci|node-gyp|curl|wget|git)$/i;
 const TOOL_WORD = /(^|[\s;&|/`'"(])(npm|npx|pnpm|yarn|node-gyp|curl|wget|git)(?=$|[\s;&|'"`)])/i;
@@ -261,6 +301,7 @@ function moduleProblem(spec: string, sanctioned: boolean): string | null {
     return `import node:${bare}`;
   }
   const name = packageName(spec);
+  if (BANNED_PACKAGES.has(name)) return `import ${name} (banned)`;
   return DECLARED.has(name) ? null : `import ${name} (not a declared dependency)`;
 }
 
@@ -268,6 +309,92 @@ const plainString = (n: ts.Node | undefined): string | null =>
   n !== undefined && (ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n))
     ? n.text
     : null;
+
+/** Unwraps `(x)`, `x as T`, `<T>x` and `x satisfies T`. */
+const strip = (e: ts.Expression): ts.Expression => {
+  let x = e;
+  while (
+    ts.isParenthesizedExpression(x) ||
+    ts.isAsExpression(x) ||
+    ts.isSatisfiesExpression(x) ||
+    ts.isTypeAssertionExpression(x)
+  ) {
+    x = x.expression;
+  }
+  return x;
+};
+
+const bindsName = (b: ts.BindingName, text: string): boolean =>
+  ts.isIdentifier(b)
+    ? b.text === text
+    : b.elements.some((el) => !ts.isOmittedExpression(el) && bindsName(el.name, text));
+
+const declaresIn = (list: ts.ForInitializer | undefined, text: string): boolean =>
+  list !== undefined &&
+  ts.isVariableDeclarationList(list) &&
+  list.declarations.some((d) => bindsName(d.name, text));
+
+/**
+ * The nearest declaration of `id` in scope: a `const` declaration bound to that plain name, 'other'
+ * for a parameter, `let`, `var`, destructuring, function, class or loop variable, or undefined.
+ */
+function declarationOf(id: ts.Identifier): ts.VariableDeclaration | 'other' | undefined {
+  const text = id.text;
+  for (let n: ts.Node = id.parent; ; n = n.parent) {
+    if (ts.isFunctionLike(n) && n.parameters.some((p) => bindsName(p.name, text))) return 'other';
+    if (
+      (ts.isForStatement(n) || ts.isForOfStatement(n) || ts.isForInStatement(n)) &&
+      declaresIn(n.initializer, text)
+    ) {
+      return 'other';
+    }
+    if (ts.isCatchClause(n) && n.variableDeclaration !== undefined) {
+      if (bindsName(n.variableDeclaration.name, text)) return 'other';
+    }
+    const statements =
+      ts.isBlock(n) || ts.isSourceFile(n) || ts.isModuleBlock(n) || ts.isCaseOrDefaultClause(n)
+        ? n.statements
+        : undefined;
+    for (const st of statements ?? []) {
+      if (ts.isVariableStatement(st)) {
+        const isConst = (st.declarationList.flags & ts.NodeFlags.Const) !== 0;
+        for (const d of st.declarationList.declarations) {
+          if (!bindsName(d.name, text)) continue;
+          return isConst && ts.isIdentifier(d.name) ? d : 'other';
+        }
+      } else if (
+        (ts.isFunctionDeclaration(st) || ts.isClassDeclaration(st)) &&
+        st.name?.text === text
+      ) {
+        return 'other';
+      }
+    }
+    if (ts.isSourceFile(n)) return undefined;
+  }
+}
+
+/** The name of the function enclosing `node`, when it has one. */
+function enclosingName(node: ts.Node): string | undefined {
+  for (let n: ts.Node | undefined = node.parent; n !== undefined; n = n.parent) {
+    if ((ts.isFunctionDeclaration(n) || ts.isMethodDeclaration(n)) && n.name !== undefined) {
+      return n.name.getText();
+    }
+    if (
+      (ts.isArrowFunction(n) || ts.isFunctionExpression(n)) &&
+      ts.isVariableDeclaration(n.parent) &&
+      ts.isIdentifier(n.parent.name)
+    ) {
+      return n.parent.name.text;
+    }
+  }
+  return undefined;
+}
+
+/** One argv element: its node and its text when it is a plain string literal. */
+interface ArgWord {
+  node: ts.Node;
+  word: string | null;
+}
 
 /**
  * Parses one file with the TypeScript compiler and reports, allowlist style:
@@ -277,10 +404,15 @@ const plainString = (n: ts.Node | undefined): string | null =>
  *   in this package's `dependencies`; a module name that is not a plain string literal;
  * - any value reference to `fetch`, `XMLHttpRequest`, `WebSocket`, `EventSource`, `eval` or
  *   `Function`; any reference to `globalThis`, `window`, `self` or `global` other than `typeof`;
- *   `process.binding`, `process.dlopen`, `process.getBuiltinModule` (dot, bracket, destructured)
- *   and computed access on `process`; `Reflect.get`, `Reflect.apply`, `Reflect.construct`;
- * - in the sanctioned files, a spawn whose executable is not a literal in `ALLOWED_EXECUTABLES`,
- *   whose argv is not an array literal or has a spread, a package-manager or fetch-tool word, a
+ *   `process.binding`, `process.dlopen`, `process.getBuiltinModule` (dot or bracket) and computed
+ *   access on `process`; `Reflect.get`, `Reflect.apply`, `Reflect.construct`; any use of
+ *   `process`, `Reflect`, `module` or `require` other than `x.member`, `typeof x` or (for
+ *   `require`) a direct call, so destructuring or aliasing one is a finding;
+ * - `dockerode`, although declared;
+ * - in the sanctioned files, a spawn whose executable is not a literal in `ALLOWED_EXECUTABLES`;
+ *   whose argv is not an inline array literal or a `const` array literal in scope in the same file
+ *   (elements: literals, typed values, and spreads of other such `const` arrays), so a variable of
+ *   unknown origin is a finding; a package-manager or fetch-tool word, a
  *   docker subcommand outside the allowlist (no `pull`, `exec`, `cp`, `push`), a docker `build`,
  *   `run` or `create` without `--network none`, a `network create` without `--internal`, or a tar
  *   flag outside the allowlist (no `--to-command`, `-I`, `--use-compress-program`,
@@ -296,12 +428,25 @@ export function findEgress(
   const kind = SCRIPT_KINDS[extOf(file)] ?? ts.ScriptKind.TS;
   const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, kind);
   const findings: EgressFinding[] = [];
+  const used = new Map<EgressAllow, number>();
   const add = (node: ts.Node, what: string): void => {
-    if (allow.some((a) => a.file === file && a.what === what)) return;
+    const within = enclosingName(node);
+    const entry = allow.find(
+      (a) =>
+        a.file === file &&
+        a.what === what &&
+        (a.within === undefined || a.within === within) &&
+        (used.get(a) ?? 0) < (a.count ?? 1),
+    );
+    if (entry !== undefined) {
+      used.set(entry, (used.get(entry) ?? 0) + 1);
+      return;
+    }
     findings.push({
       file,
       line: sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1,
       what,
+      ...(within === undefined ? {} : { within }),
     });
   };
   const src = (n: ts.Node): string => n.getText(sf).replace(/\s+/g, ' ').slice(0, 80);
@@ -353,16 +498,64 @@ export function findEgress(
   };
   bind(sf);
 
-  const checkDocker = (
-    call: ts.CallExpression,
-    els: ts.NodeArray<ts.Expression>,
-    words: (string | null)[],
-  ): void => {
-    const at: ts.Node = els[0] ?? call;
+  /** A `const` array literal `id` names in scope, or undefined. */
+  const constArray = (id: ts.Identifier): ts.ArrayLiteralExpression | undefined => {
+    const d = declarationOf(id);
+    if (d === undefined || d === 'other' || d.initializer === undefined) return undefined;
+    const init = strip(d.initializer);
+    return ts.isArrayLiteralExpression(init) ? init : undefined;
+  };
+
+  /**
+   * The argv words of an inline array literal or a `const` array literal in scope, following
+   * spreads of other `const` arrays. Anything else is a finding at `at`, and null is returned.
+   */
+  const argvOf = (expr: ts.Expression, at: ts.Node, seen: Set<ts.Node>): ArgWord[] | null => {
+    const e = strip(expr);
+    if (ts.isArrayLiteralExpression(e)) {
+      if (seen.has(e)) {
+        add(at, 'args cycle');
+        return null;
+      }
+      seen.add(e);
+      const out: ArgWord[] = [];
+      for (const el of e.elements) {
+        if (!ts.isSpreadElement(el)) {
+          out.push({ node: el, word: plainString(el) });
+          continue;
+        }
+        const inner = strip(el.expression);
+        const arr = ts.isIdentifier(inner) ? constArray(inner) : undefined;
+        const sub = arr === undefined ? null : argvOf(arr, el, seen);
+        if (arr === undefined) add(el, `args spread ${src(el)}`);
+        if (sub === null) out.push({ node: el, word: null });
+        else out.push(...sub);
+      }
+      return out;
+    }
+    if (ts.isIdentifier(e)) {
+      const d = declarationOf(e);
+      if (d === undefined || d === 'other' || d.initializer === undefined) {
+        add(at, `args <unknown origin> ${e.text}`);
+        return null;
+      }
+      const init = strip(d.initializer);
+      if (ts.isArrayLiteralExpression(init)) return argvOf(init, at, seen);
+      const origin = ts.isCallExpression(init) ? `${src(init.expression)}(...)` : src(init);
+      add(at, `args <const> ${e.text} = ${origin}`);
+      return null;
+    }
+    add(at, `args <non-literal> ${src(e)}`);
+    return null;
+  };
+
+  const checkDocker = (call: ts.CallExpression, argv: ArgWord[]): void => {
+    const words = argv.map((a) => a.word);
+    const at: ts.Node = argv[0]?.node ?? call;
     const sub = words[0];
     if (sub === null || sub === undefined) {
-      const first = els[0];
-      add(at, `docker subcommand <non-literal> ${first === undefined ? '' : src(first)}`);
+      const first = argv[0];
+      add(at, `docker subcommand <non-literal> ${first === undefined ? '' : src(first.node)}`);
       return;
     }
     if (!DOCKER_SUBCOMMANDS.has(sub)) return add(at, `docker ${sub}`);
@@ -387,12 +580,12 @@ export function findEgress(
     }
   };
 
-  const checkTar = (els: ts.NodeArray<ts.Expression>, words: (string | null)[]): void => {
-    words.forEach((w, i) => {
-      if (w === null || !w.startsWith('-')) return;
-      if (TAR_SHORT.test(w) || TAR_LONG.has(w)) return;
-      add(els[i] as ts.Node, `tar flag ${w.split('=')[0] ?? w}`);
-    });
+  const checkTar = (argv: ArgWord[]): void => {
+    for (const { node, word: w } of argv) {
+      if (w === null || !w.startsWith('-')) continue;
+      if (TAR_SHORT.test(w) || TAR_LONG.has(w)) continue;
+      add(node, `tar flag ${w.split('=')[0] ?? w}`);
+    }
   };
 
   const checkSpawn = (call: ts.CallExpression): void => {
@@ -404,16 +597,11 @@ export function findEgress(
       add(call, `spawn ${cmd}`);
     }
     if (argsArg === undefined) return;
-    if (!ts.isArrayLiteralExpression(argsArg)) {
-      add(call, `args <non-literal> ${src(argsArg)}`);
-      return;
-    }
-    const els = argsArg.elements;
-    const words = els.map((el) => plainString(el));
-    els.forEach((el, i) => {
-      if (ts.isSpreadElement(el)) return add(el, `args spread ${src(el)}`);
-      const s = words[i];
-      if (s === null || s === undefined) return;
+    const argv = argvOf(argsArg, call, new Set());
+    if (argv === null) return;
+    const words = argv.map((a) => a.word);
+    argv.forEach(({ node: el, word: s }, i) => {
+      if (s === null) return;
       if (FORBIDDEN_ARG.test(s) || TOOL_WORD.test(s)) add(el, `args word ${s}`);
       const eq = /^--net(work)?=(.*)$/.exec(s);
       if (eq !== null && eq[2] !== 'none') add(el, `args --network ${eq[2]}`);
@@ -422,8 +610,8 @@ export function findEgress(
         if (next !== 'none') add(el, `args --network ${next ?? '<non-literal>'}`);
       }
     });
-    if (cmd === 'docker') checkDocker(call, els, words);
-    if (cmd === 'tar') checkTar(els, words);
+    if (cmd === 'docker') checkDocker(call, argv);
+    if (cmd === 'tar') checkTar(argv);
   };
 
   const isNameOnly = (node: ts.Identifier): boolean => {
@@ -503,6 +691,18 @@ export function findEgress(
       if (BANNED_NAMES.has(name)) add(node, `use ${name}`);
       if (GLOBAL_NAMES.has(name) && !ts.isTypeOfExpression(node.parent)) add(node, `use ${name}`);
       if (name === 'createRequire') add(node, 'use createRequire');
+      // process, Reflect, module: only `x.member`, `x[...]` (checked below) or `typeof x`.
+      const p = node.parent;
+      if (
+        HOST_OBJECTS.has(name) &&
+        !ts.isTypeOfExpression(p) &&
+        !(
+          (ts.isPropertyAccessExpression(p) || ts.isElementAccessExpression(p)) &&
+          p.expression === node
+        )
+      ) {
+        add(node, `alias of ${name}`);
+      }
       if (
         name === 'require' &&
         !(ts.isCallExpression(node.parent) && node.parent.expression === node)
@@ -538,7 +738,8 @@ export function findEgress(
         add(node, `use ${node.expression.text}.${key}`);
       }
     }
-    // Destructuring a banned name: `const { fetch: f } = x`, `const { binding } = process`.
+    // Renaming a banned name out of any object: `const { fetch: f } = x`. Destructuring process,
+    // Reflect, module or require at all is caught above as an alias of that object.
     if (ts.isBindingElement(node)) {
       const prop = node.propertyName ?? node.name;
       const name = ts.isIdentifier(prop) || ts.isStringLiteral(prop) ? prop.text : null;
