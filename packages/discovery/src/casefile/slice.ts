@@ -37,9 +37,15 @@ export const WITHHELD_MARKER = '/* slice withheld: the file did not parse cleanl
  */
 // eslint-disable-next-line no-misleading-character-class
 const BLANKISH = /[\u115f\u1160\u17b4\u17b5\u2800\u3164\uffa0]/u;
-const INVISIBLE =
-  // eslint-disable-next-line no-control-regex, no-misleading-character-class
-  /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u00ad\u061c\u115f\u1160\u17b4\u17b5\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufff9-\ufffb]/u;
+/**
+ * Code points that are invisible or have no fixed meaning: controls other than tab, newline and
+ * carriage return, every format character (bidi controls, zero-width characters, the tag block
+ * U+E0000 to U+E007F used for ASCII smuggling), private use, unassigned and lone surrogates,
+ * line and paragraph separators, and every default-ignorable code point (variation selectors,
+ * U+034F, Hangul fillers). Any of them makes a literal unproven, and they are escaped in output.
+ */
+const INVISIBLE_CLASS = String.raw`(?![\t\n\r])[\p{Cc}\p{Cf}\p{Co}\p{Cn}\p{Cs}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}]`;
+const INVISIBLE = new RegExp(INVISIBLE_CLASS, 'u');
 
 /** Member access such as `this.userId` or `req.session.user`: two or three dotted segments. */
 const MEMBER_CHAIN = /^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*){1,2}$/;
@@ -156,9 +162,9 @@ export function proseIdentifier(name: string): boolean {
 const hashName = (name: string): string =>
   `_x${createHash('sha256').update(name).digest('hex').slice(0, 10)}`;
 
-const UNSAFE_CHARS =
-  // eslint-disable-next-line no-control-regex, no-misleading-character-class
-  /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u00ad\u061c\u115f\u1160\u17b4\u17b5\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\u2800\u3164\ufeff\uffa0\ufff9-\ufffb]/g;
+/** Everything INVISIBLE matches, plus the blank-looking letters. Global, code point by code point. */
+// eslint-disable-next-line no-misleading-character-class
+const UNSAFE_CHARS = new RegExp(`${INVISIBLE_CLASS}|${BLANKISH.source}`, 'gu');
 
 /** Control, bidirectional and invisible characters become visible escapes (tab and newline stay). */
 export function escapeInvisible(s: string): string {
@@ -268,7 +274,7 @@ function replacement(
         ? undefined
         : `\`${PROSE_MARKER}\`${newlines(piece)}`;
     case 'jsx-text':
-      return provenCode(sp.text) ? undefined : `${PROSE_MARKER}${newlines(piece)}`;
+      return !forced && provenCode(sp.text) ? undefined : `${PROSE_MARKER}${newlines(piece)}`;
     case 'regex':
       return proseRegex(sp.text) ? `/${PROSE_MARKER}/${newlines(piece)}` : undefined;
     case 'identifier':
@@ -454,6 +460,9 @@ export async function cleanSource(
     i = j + 1;
   }
   for (const s of identifierRuns(res.spans, text)) forced.add(s);
+  // A literal whose text could not be decoded exactly (an ambiguous numeric escape, an unknown
+  // HTML entity) is never proven.
+  for (const s of res.spans) if (s.unproven) forced.add(s);
   // A template is judged with every literal nested in its substitutions:
   // `${'IGNORE'} ${'ALL'}` is one text, not one-word pieces. Spans come sorted by start (longer
   // first on ties) and properly nested, so the literals inside a template are the ones right after
