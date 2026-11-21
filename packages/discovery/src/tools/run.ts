@@ -9,6 +9,7 @@ import {
   gitDirExtraContent,
   prepareOutput,
   prepareScratch,
+  shareForJailRead,
   type QuarantinedSnapshot,
 } from './quarantine.js';
 import { findGitleaksUnscannable, type Unscannable } from './unscannable.js';
@@ -413,7 +414,10 @@ async function execute(
 ): Promise<Exec> {
   const inv = buildInvocation(manifest, name, options);
   await prepareScratch(options.scratchDir, inv.scratchSubdirs);
-  await prepareOutput(options.outputDir);
+  // The report file is pre-created by the worker (0666, its own), so the jail's user can write it
+  // and the worker can read and rewrite it; the jail's user must also be able to read /src.
+  await prepareOutput(options.outputDir, inv.outputFile);
+  await shareForJailRead(options.sourceDir);
   // The runner's returned outputPath is deliberately not compared with options.outputDir: the
   // runners in use return a directory fixed at construction and ignore the /out mount. What counts
   // is that the tool wrote its report into the mount, which readJsonReport verifies.
@@ -489,6 +493,10 @@ export async function runTool(
         q,
       );
     }
+    // Drop the pre-created report file if the tool left it empty, so `empty` means no report.
+    const placeholder = join(outputDir, run.inv.outputFile);
+    const left = await lstat(placeholder).catch(() => null);
+    if (left?.isFile() === true && left.size === 0) await rm(placeholder, { force: true });
     return {
       ...base,
       empty: true,

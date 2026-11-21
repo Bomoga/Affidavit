@@ -1,4 +1,4 @@
-import { lstat, mkdir, readdir, rename } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readdir, rename, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { listDir } from './walk.js';
 
@@ -172,19 +172,84 @@ async function requireNewOrEmpty(dir: string, fail: () => Error): Promise<void> 
   }
 }
 
+/*
+ * Modes. The scanners run as nobody (uid 65534) in the gVisor jail, and as root under plain
+ * Docker, while the worker that reads their reports is a third user. Every mode below is set with
+ * chmod, never left to the worker's umask (which is 077 on hardened hosts), so the same layout
+ * works under any umask. These directories sit inside a per-run directory made by mkdtemp (0700),
+ * so no other host user can reach them whatever their own mode.
+ */
+/** Mounted directories the jail only reads, and the scratch root (not mounted). */
+export const READ_DIR_MODE = 0o755;
+/** Per-run scratch subdirectories the jail writes into (fresh and empty for every run). */
+export const SCRATCH_DIR_MODE = 0o777;
+/** The report file, pre-created by the worker so it stays the worker's own and readable. */
+export const REPORT_FILE_MODE = 0o666;
+
 /** Creates the per-run scratch subdirectories. The scratch dir must not exist or must be empty. */
 export async function prepareScratch(
   scratchDir: string,
   subdirs: readonly string[],
 ): Promise<void> {
   await requireNewOrEmpty(scratchDir, () => new ScratchNotFreshError(scratchDir));
-  for (const sub of subdirs) await mkdir(join(scratchDir, sub), { recursive: true });
+  await mkdir(scratchDir, { recursive: true, mode: READ_DIR_MODE });
+  await chmod(scratchDir, READ_DIR_MODE);
+  for (const sub of subdirs) {
+    const dir = join(scratchDir, sub);
+    await mkdir(dir, { recursive: true, mode: SCRATCH_DIR_MODE });
+    await chmod(dir, SCRATCH_DIR_MODE);
+  }
 }
 
-/** Creates the output directory if needed. It must not exist or must be empty. */
-export async function prepareOutput(outputDir: string): Promise<void> {
+/**
+ * Creates the output directory if needed (it must not exist or must be empty) and, when
+ * `reportFile` is given, pre-creates that one empty report file. The directory is 0755, so the
+ * jail can create nothing else in it, and the report file is 0666 and owned by the worker: the
+ * scanner writes into it in place, and the worker can read it and rewrite it (path remapping)
+ * afterwards, whatever user the scanner ran as. A report still empty after the run is a missing
+ * report (`readJsonReport`).
+ */
+export async function prepareOutput(outputDir: string, reportFile?: string): Promise<void> {
   await requireNewOrEmpty(outputDir, () => new OutputNotFreshError(outputDir));
-  await mkdir(outputDir, { recursive: true });
+  await mkdir(outputDir, { recursive: true, mode: READ_DIR_MODE });
+  await chmod(outputDir, READ_DIR_MODE);
+  if (reportFile !== undefined) {
+    if (basename(reportFile) !== reportFile || reportFile === '..' || reportFile === '.') {
+      throw new Error(`report file must be a plain name: ${reportFile}`);
+    }
+    const file = join(outputDir, reportFile);
+    await writeFile(file, '', { flag: 'wx', mode: REPORT_FILE_MODE });
+    await chmod(file, REPORT_FILE_MODE);
+  }
+}
+
+/**
+ * Lets the jail's user read a snapshot the worker made: every directory the owner can enter and
+ * read gets read and enter for group and others too, and every regular file the owner can read
+ * gets read for group and others. Nothing gets write or execute it did not have, and what the
+ * owner cannot read stays unreadable (so gitleaks' `unreadable` check keeps its meaning). Symlinks
+ * are never followed or changed (chmod would follow them). Mutates modes only, so pass only a
+ * private scan copy, as for quarantineSnapshot.
+ */
+export async function shareForJailRead(dir: string): Promise<void> {
+  const st = await lstat(dir);
+  if (!st.isDirectory()) throw new Error(`not a directory: ${dir}`);
+  await shareEntry(dir, st.mode);
+}
+
+async function shareEntry(path: string, mode: number): Promise<void> {
+  const want = (mode & 0o500) === 0o500 ? mode | 0o055 : mode;
+  if ((want & 0o7777) !== (mode & 0o7777)) await chmod(path, want & 0o7777);
+  if ((mode & 0o500) !== 0o500) return; // the owner cannot list it: leave it as it is
+  for (const e of await listDir(path)) {
+    const child = join(path, e.name);
+    if (e.isDirectory) {
+      await shareEntry(child, (await lstat(child)).mode);
+    } else if (e.isFile) {
+      const m = (await lstat(child)).mode;
+      if ((m & 0o400) !== 0 && (m & 0o044) !== 0o044) await chmod(child, (m | 0o044) & 0o7777);
+    }
+  }
 }
 
 /**

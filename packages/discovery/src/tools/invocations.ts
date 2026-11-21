@@ -14,7 +14,8 @@ export interface ToolRunOptions {
   outputDir: string;
   /**
    * Host path of a scratch dir that is new and empty for this run, never shared between runs or
-   * cases. Its `tmp` (and `semgrep-home`) subdirs are mounted writable.
+   * cases. Its `scratchSubdirs` are mounted writable, never at `/tmp` for Semgrep or gitleaks:
+   * the gVisor jail reserves `/tmp` (read-only) and sets `TMPDIR` and `HOME` to `/scratch`.
    */
   scratchDir: string;
   /** Host path of OUR Semgrep rules. Mounted read-only at /rules. Required for semgrep. */
@@ -74,10 +75,24 @@ function baseMounts(o: ToolRunOptions, extra: Mount[]): Mount[] {
   return [
     { hostPath: o.sourceDir, containerPath: '/src', readOnly: true },
     { hostPath: o.outputDir, containerPath: '/out', readOnly: false },
-    { hostPath: joinHost(o.scratchDir, 'tmp'), containerPath: '/tmp', readOnly: false },
     ...extra,
   ];
 }
+
+/**
+ * Semgrep's temp directory (`<scratch>/tmp`) for runners that set no `TMPDIR`. Not `/tmp`: the
+ * gVisor jail reserves `/tmp` and refuses a mount there.
+ */
+export const SEMGREP_FALLBACK_TMP = '/var/tmp';
+
+/**
+ * Keeps `TMPDIR` when the runner set one (the gVisor jail sets `/scratch`, a tmpfs that never
+ * touches the host) and uses `/var/tmp` otherwise (plain Docker, where `/tmp` is on the read-only
+ * root). Without a writable temp directory semgrep-core finds nothing and Semgrep still exits 0
+ * with an empty report (seen on the pinned image), so this wrapper must not be dropped. The script
+ * is a constant; Semgrep's arguments reach it only as positional parameters.
+ */
+export const SEMGREP_TMPDIR_WRAPPER = `exec env TMPDIR="\${TMPDIR:-${SEMGREP_FALLBACK_TMP}}" "$@"`;
 
 function configMount(o: ToolRunOptions): Mount {
   const hostPath = o.configDir ?? join(repoRoot(), 'docker', 'tools', 'config');
@@ -113,12 +128,17 @@ export function buildInvocation(
       const outputFile = 'semgrep.sarif';
       return {
         image,
-        // The image has no entrypoint, so argv starts with the binary. Only our own rules are used:
+        // The image has no entrypoint, so argv starts with a constant /bin/sh wrapper that only sets
+        // TMPDIR (SEMGREP_TMPDIR_WRAPPER), then the binary. Only our own rules are used:
         // no registry config, no auto, metrics and version check off.
         // --no-git-ignore: never run git in /src (a hostile .git/config can execute commands) and
         //   ignore .gitignore. --disable-nosem: inline "nosemgrep" cannot hide a finding.
         // --x-ignore-semgrepignore-files: .semgrepignore at any depth is not honored.
         args: [
+          'sh',
+          '-c',
+          SEMGREP_TMPDIR_WRAPPER,
+          'sh',
           'semgrep',
           'scan',
           '--metrics=off',
@@ -142,6 +162,12 @@ export function buildInvocation(
         mounts: baseMounts(o, [
           { hostPath: rules, containerPath: '/rules', readOnly: true },
           {
+            hostPath: joinHost(o.scratchDir, 'tmp'),
+            containerPath: SEMGREP_FALLBACK_TMP,
+            readOnly: false,
+          },
+          {
+            // HOME of plain Docker's root user. Under gVisor HOME is /scratch and this stays unused.
             hostPath: joinHost(o.scratchDir, 'semgrep-home'),
             containerPath: '/root/.semgrep',
             readOnly: false,
@@ -179,8 +205,11 @@ export function buildInvocation(
           '-r',
           '/src',
         ],
-        // osv-scanner looks for its offline database under $TMPDIR/osv-scalibr.
+        // osv-scanner looks for its offline database under $TMPDIR/osv-scalibr. Known gap: the gVisor
+        // jail refuses mounts under /tmp, so OSV-Scanner runs only on plain Docker until the tool
+        // runner can give it a temp directory (PR #45). Real intake does not run it.
         mounts: baseMounts(o, [
+          { hostPath: joinHost(o.scratchDir, 'tmp'), containerPath: '/tmp', readOnly: false },
           { hostPath: db, containerPath: '/tmp/osv-scalibr', readOnly: true },
           configMount(o),
         ]),
@@ -220,9 +249,10 @@ export function buildInvocation(
           '--report-path',
           `/out/${outputFile}`,
         ],
+        // No temp directory: gitleaks writes none (checked on the pinned image, archives included).
         mounts: baseMounts(o, [configMount(o)]),
         outputFile,
-        scratchSubdirs: ['tmp'],
+        scratchSubdirs: [],
       };
     }
     default:

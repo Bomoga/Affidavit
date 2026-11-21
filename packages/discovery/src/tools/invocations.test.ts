@@ -2,7 +2,11 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { buildInvocation } from './invocations.js';
+import {
+  SEMGREP_FALLBACK_TMP,
+  SEMGREP_TMPDIR_WRAPPER,
+  buildInvocation,
+} from './invocations.js';
 import {
   ToolDisabledError,
   ToolOptionError,
@@ -64,7 +68,14 @@ describe('tool invocations', () => {
           expect(m.containerPath).not.toBe('/');
         }
         const writable = inv.mounts.filter((m) => !m.readOnly).map((m) => m.containerPath);
-        for (const p of writable) expect(['/out', '/tmp', '/root/.semgrep']).toContain(p);
+        const scratch = name === 'osv-scanner' ? ['/tmp'] : ['/var/tmp', '/root/.semgrep'];
+        for (const p of writable) expect(['/out', ...scratch]).toContain(p);
+      });
+
+      it('each writable scratch mount is a scratchSubdir of this run', () => {
+        for (const m of inv.mounts.filter((x) => !x.readOnly && x.containerPath !== '/out')) {
+          expect(inv.scratchSubdirs.map((s) => join(opts.scratchDir, s))).toContain(m.hostPath);
+        }
       });
 
       it('takes nothing from repo contents: option-like file names change no argv', () => {
@@ -92,7 +103,7 @@ describe('tool invocations', () => {
 
   it('semgrep uses only our own rules and never registry configs', () => {
     const { args } = buildInvocation(manifest, 'semgrep', opts);
-    expect(args[0]).toBe('semgrep');
+    expect(args.slice(0, 6)).toEqual(['sh', '-c', SEMGREP_TMPDIR_WRAPPER, 'sh', 'semgrep', 'scan']);
     expect(args).toContain('--metrics=off');
     expect(args).toContain('--disable-version-check');
     expect(args).not.toContain('auto');
@@ -105,6 +116,28 @@ describe('tool invocations', () => {
       expect(a).not.toMatch(/^https?:/);
       expect(a).not.toMatch(/semgrep\.dev/);
     }
+  });
+
+  it('semgrep and gitleaks mount nothing at or under /tmp, which the gVisor jail reserves', () => {
+    for (const name of ['semgrep', 'gitleaks'] as const) {
+      const { mounts } = buildInvocation(manifest, name, opts);
+      for (const m of mounts) expect(m.containerPath).not.toMatch(/^\/tmp(\/|$)/);
+    }
+  });
+
+  it('semgrep keeps a TMPDIR the runner set and falls back to its writable scratch mount', () => {
+    // The script is a constant: no argument is spliced into it, they arrive as "$@".
+    expect(SEMGREP_TMPDIR_WRAPPER).toBe(
+      `exec env TMPDIR="\${TMPDIR:-${SEMGREP_FALLBACK_TMP}}" "$@"`,
+    );
+    const { mounts, scratchSubdirs } = buildInvocation(manifest, 'semgrep', opts);
+    expect(mounts).toContainEqual({
+      hostPath: join(opts.scratchDir, 'tmp'),
+      containerPath: SEMGREP_FALLBACK_TMP,
+      readOnly: false,
+    });
+    expect(scratchSubdirs).toEqual(['tmp', 'semgrep-home']);
+    expect(buildInvocation(manifest, 'gitleaks', opts).scratchSubdirs).toEqual([]);
   });
 
   it('semgrep ignores every repo-controlled switch: git, nosemgrep, semgrepignore', () => {

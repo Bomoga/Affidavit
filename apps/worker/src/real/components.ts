@@ -28,12 +28,20 @@ import { createModelPortFromEnv } from '@affidavit/trial';
 import type { Env, IntakeSettings, JudgeSettings } from '../config.js';
 import type { Discover } from './intake.js';
 
+/** The image references the gVisor tool runner may run: each enabled tool's pinned reference. */
+export function toolImageAllowlist(): string[] {
+  return loadToolManifest()
+    .tools.filter((t) => t.enabled)
+    .map((t) => t.reference)
+    .filter((r): r is string => r !== null);
+}
+
 /** Scanners through ToolRunnerPort: Lane 2's gVisor runner, or plain local Docker. */
 export function buildToolRunner(s: IntakeSettings): ToolRunnerPort {
   if (s.toolRunner === 'docker') return new LocalDockerToolRunner(s.workRoot);
-  const images = loadToolManifest()
-    .tools.map((t) => t.image)
-    .filter((i): i is string => i !== null);
+  // The pinned references (`image@sha256:...`), exactly what discovery passes to `run`: a bare
+  // image name would match no run, and a tag would let the registry pick the bytes.
+  const images = toolImageAllowlist();
   return new GvisorToolRunner({
     outputDir: s.workRoot,
     // Workspaces, our Semgrep rules and our tool configs: nothing else can be mounted.
