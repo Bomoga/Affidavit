@@ -123,6 +123,11 @@ function detail(event: TrialEvent): string {
       const sev = v.severity ? ` ${sanitize(v.severity)}` : '';
       return `${sanitize(v.outcome)}${sev}: ${sanitize(v.summary)}`;
     }
+    case 'verify-result': {
+      const r = event.payload.result;
+      const rejected = r.rejectedBy ? ` rejected by ${sanitize(r.rejectedBy)}` : '';
+      return `${sanitize(r.patchExhibitId)} familyFlipped=${String(r.familyFlipped)} suitePassed=${String(r.suitePassed)} rescanClean=${String(r.rescanClean)}${rejected}`;
+    }
   }
 }
 

@@ -275,6 +275,25 @@
     "stage": "verify",
     "at": "2026-11-05T12:00:17.000Z",
     "actor": "judge",
+    "type": "verify-result",
+    "payload": {
+      "result": {
+        "schemaVersion": 1,
+        "patchExhibitId": "exhibit-patch-001",
+        "familyFlipped": true,
+        "suitePassed": true,
+        "rescanClean": true,
+        "counterexamples": []
+      }
+    }
+  },
+  {
+    "schemaVersion": 1,
+    "caseId": "case-nodegoat-sqli-001",
+    "seq": 18,
+    "stage": "verify",
+    "at": "2026-11-05T12:00:18.000Z",
+    "actor": "judge",
     "type": "stage-exited",
     "payload": {
       "to": "verdict"
@@ -283,9 +302,9 @@
   {
     "schemaVersion": 1,
     "caseId": "case-nodegoat-sqli-001",
-    "seq": 18,
+    "seq": 19,
     "stage": "verdict",
-    "at": "2026-11-05T12:00:18.000Z",
+    "at": "2026-11-05T12:00:19.000Z",
     "actor": "stenographer",
     "type": "verdict-written",
     "payload": {
@@ -294,10 +313,7 @@
         "caseId": "case-nodegoat-sqli-001",
         "outcome": "proven-fixed",
         "severity": "high",
-        "exhibits": [
-          "exhibit-witness-001",
-          "exhibit-patch-001"
-        ],
+        "exhibits": ["exhibit-witness-001", "exhibit-patch-001"],
         "ballots": [
           {
             "schemaVersion": 1,
@@ -306,9 +322,7 @@
             "mandate": "security",
             "inputVariant": "raw-results-only",
             "confidence": 0.8,
-            "citedExhibits": [
-              "exhibit-witness-001"
-            ],
+            "citedExhibits": ["exhibit-witness-001"],
             "question": "severity",
             "vote": "high"
           }

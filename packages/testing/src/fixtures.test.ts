@@ -59,6 +59,31 @@ describe('fixtures', () => {
     }
   });
 
+  it('the gate stream carries one passing Judge verify-result for its patch, inside verify (CR-1)', () => {
+    const events = TrialEvent.array().parse(
+      readFixtureJson('trials/nodegoat-sqli-001.events.json'),
+    );
+    const results = events.filter((e) => e.type === 'verify-result');
+    expect(results).toHaveLength(1);
+    const [r] = results;
+    expect(r?.actor).toBe('judge');
+    expect(r?.stage).toBe('verify');
+    const i = events.findIndex((e) => e.type === 'verify-result');
+    expect(events[i - 1]).toMatchObject({ type: 'stage-entered', stage: 'verify' });
+    expect(events[i + 1]).toMatchObject({ type: 'stage-exited', stage: 'verify' });
+    const patch = events.find((e) => e.type === 'exhibit-submitted' && e.payload.kind === 'patch');
+    if (r?.type !== 'verify-result' || patch?.type !== 'exhibit-submitted')
+      throw new Error('gate stream is missing its patch or verify-result');
+    expect(r.payload.result.patchExhibitId).toBe(patch.payload.exhibitId);
+    expect(r.payload.result).toMatchObject({
+      familyFlipped: true,
+      suitePassed: true,
+      rescanClean: true,
+      counterexamples: [],
+    });
+    expect(r.payload.result.rejectedBy).toBeUndefined();
+  });
+
   it('fixtures contain no em dashes', () => {
     for (const f of files) {
       expect(JSON.stringify(readFixtureJson(f))).not.toContain('—');

@@ -3,6 +3,7 @@ import { listFixtureFiles, readFixtureJson } from '@affidavit/testing';
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
 import { buildCaseView } from '../model/caseView.js';
+import { withVerify, withoutVerify } from '../testing/verify.js';
 import { CaseFile } from './CaseFile.js';
 import { getCaseEvents, listCaseSlugs } from './data.js';
 import { renderApp, settled } from './testUtils.js';
@@ -51,15 +52,15 @@ describe('case list route', () => {
 });
 
 describe('gate case view (nodegoat-sqli-001)', () => {
-  it('renders end to end, summary first, and honestly unverified until CR-1 lands', async () => {
+  it('renders end to end, summary first, and VERIFIED on the Judge verify-result (CR-1)', async () => {
     renderApp('/cases/nodegoat-sqli-001');
     const h1 = await settled();
-    expect(h1.textContent).toContain('not yet confirmed');
-    expect(screen.getByText('UNVERIFIED')).toBeTruthy();
-    expect(screen.queryByText('VERIFIED')).toBeNull();
+    expect(h1.textContent).toContain('Verified: weakness proven and fix confirmed');
+    expect(screen.getByText('VERIFIED')).toBeTruthy();
+    expect(screen.queryByText('UNVERIFIED')).toBeNull();
     expect(
-      screen.getByText('The record has no Judge result accepting a patch for this case.'),
-    ).toBeTruthy();
+      screen.queryByText('The record has no Judge result accepting a patch for this case.'),
+    ).toBeNull();
     const summary = screen.getByRole('heading', { name: 'Summary' });
     const exhibits = screen.getByRole('heading', { name: /Exhibits/ });
     expect(
@@ -89,7 +90,7 @@ describe('gate case view (nodegoat-sqli-001)', () => {
     expect(list.closest('[hidden]')).not.toBeNull();
     fireEvent.click(toggle);
     expect(list.closest('[hidden]')).toBeNull();
-    expect(within(list as HTMLElement).getAllByRole('listitem')).toHaveLength(19);
+    expect(within(list as HTMLElement).getAllByRole('listitem')).toHaveLength(20);
   });
 });
 
@@ -104,8 +105,17 @@ describe('VERIFIED stamp', () => {
     counterexamples: [],
   };
 
+  it('is withheld, with the reason, when the stream has no Judge verify-result', () => {
+    render(<CaseFile view={buildCaseView(withoutVerify(events))} />);
+    expect(screen.getByText('UNVERIFIED')).toBeTruthy();
+    expect(screen.queryByText('VERIFIED')).toBeNull();
+    expect(
+      screen.getByText('The record has no Judge result accepting a patch for this case.'),
+    ).toBeTruthy();
+  });
+
   it('shows only when the view model has Judge evidence for the patch', () => {
-    render(<CaseFile view={buildCaseView(events, { verifyResults: [accepted] })} />);
+    render(<CaseFile view={buildCaseView(withVerify(events, [accepted]))} />);
     expect(screen.getByText('VERIFIED')).toBeTruthy();
     expect(screen.queryByText('UNVERIFIED')).toBeNull();
   });

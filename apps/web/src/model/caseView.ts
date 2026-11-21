@@ -76,8 +76,8 @@ export interface CaseView {
   stampWithheld: string[];
   /**
    * The stamp is withheld only because no Judge patch verification is in the record, and the
-   * cited patch was never rejected. The fix has not failed; its check is just not recorded
-   * (until CR-1, the event stream cannot carry one). False in every other case.
+   * cited patch was never rejected. The fix has not failed; its check is just not recorded (no
+   * `verify-result` event from the Judge yet). False in every other case.
    */
   awaitingVerification: boolean;
   /** Plain-language summary first, technical exhibits after. */
@@ -87,16 +87,16 @@ export interface CaseView {
   humanReview?: { reason: Escalation['reason']; detail: string; nextSteps: string[] };
 }
 
-export interface CaseViewInput {
-  /**
-   * Judge patch verification results. Contracts v1.0 has no trial event that carries a
-   * `VerifyResult`, so the event stream alone can never show an accepted patch (see
-   * docs/lanes/lane3/contract-requests.md). Until it does, these come from outside the stream.
-   */
-  verifyResults?: readonly VerifyResult[];
+/**
+ * A `verify-result` counts as the Judge's patch check only when the Judge recorded it in the
+ * verify stage (contracts v1.1, CR-1). The same payload from any other actor or stage is shown on
+ * the docket but never backs the stamp.
+ */
+function isJudgeVerify(e: TrialEvent): e is Extract<TrialEvent, { type: 'verify-result' }> {
+  return e.type === 'verify-result' && e.actor === 'judge' && e.stage === 'verify';
 }
 
-function label(e: TrialEvent): string {
+function label(e: TrialEvent, acceptedVerify: ReadonlySet<TrialEvent>): string {
   switch (e.type) {
     case 'stage-entered':
       return `Stage started: ${e.stage}`;
@@ -132,6 +132,13 @@ function label(e: TrialEvent): string {
       return `Dismissed: ${e.payload.dismissal.reason}`;
     case 'verdict-written':
       return `Verdict written: ${e.payload.verdict.outcome}`;
+    case 'verify-result': {
+      const r = e.payload.result;
+      if (e.actor !== 'judge' || e.stage !== 'verify')
+        return `A patch check for ${r.patchExhibitId} was recorded by ${e.actor} in ${e.stage}, not by the Judge in verify`;
+      if (acceptedVerify.has(e)) return `The Judge confirmed the fix in patch ${r.patchExhibitId}`;
+      return `The Judge did not confirm patch ${r.patchExhibitId} (rule ${r.rejectedBy ?? 'not recorded'})`;
+    }
   }
 }
 
@@ -161,8 +168,12 @@ function isAccepted(v: VerifyResult, expectedCounterexamples: readonly string[])
  * it one click deeper. Appeals get a distinct entry kind with only the recorded round and
  * counterexample id; rendering them fully is L3-09 (see `AppealDocketDetail` in CaseFile).
  */
-function docketEntry(e: TrialEvent, exhibits: ReadonlyMap<string, ExhibitView>): DocketEntry {
-  const base = { seq: e.seq, at: e.at, stage: e.stage, label: label(e) };
+function docketEntry(
+  e: TrialEvent,
+  exhibits: ReadonlyMap<string, ExhibitView>,
+  acceptedVerify: ReadonlySet<TrialEvent>,
+): DocketEntry {
+  const base = { seq: e.seq, at: e.at, stage: e.stage, label: label(e, acceptedVerify) };
   switch (e.type) {
     case 'exhibit-submitted':
       return e.payload.kind === 'counterexample'
@@ -213,7 +224,11 @@ function stampBlockers(
   return out;
 }
 
-export function buildCaseView(input: readonly TrialEvent[], extra: CaseViewInput = {}): CaseView {
+/**
+ * Builds the case view from the event stream alone. The VERIFIED stamp rests on the Judge's own
+ * `verify-result` events, never on what the verdict claims.
+ */
+export function buildCaseView(input: readonly TrialEvent[]): CaseView {
   const bySeq = new Map<number, TrialEvent>();
   for (const e of input) if (!bySeq.has(e.seq)) bySeq.set(e.seq, e);
   const events = [...bySeq.values()].sort((a, b) => a.seq - b.seq);
@@ -222,6 +237,7 @@ export function buildCaseView(input: readonly TrialEvent[], extra: CaseViewInput
   let verdict: Verdict | undefined;
   let escalation: Escalation | undefined;
   let dismissed = false;
+  const verifyEvents: Extract<TrialEvent, { type: 'verify-result' }>[] = [];
 
   const ensure = (id: string): ExhibitView => {
     const prev = exhibits.get(id);
@@ -297,6 +313,9 @@ export function buildCaseView(input: readonly TrialEvent[], extra: CaseViewInput
       case 'dismissed':
         dismissed = true;
         break;
+      case 'verify-result':
+        if (isJudgeVerify(e)) verifyEvents.push(e);
+        break;
       default:
         break;
     }
@@ -307,15 +326,26 @@ export function buildCaseView(input: readonly TrialEvent[], extra: CaseViewInput
     .filter((x) => x.kind === 'counterexample' && x.admitted)
     .map((x) => x.id);
 
-  const acceptedPatches = new Set<string>(
-    (extra.verifyResults ?? [])
-      .filter(
-        (v) =>
-          isAccepted(v, admittedCounterexamples) &&
-          exhibits.get(v.patchExhibitId)?.kind === 'patch',
-      )
-      .map((v) => v.patchExhibitId as string),
-  );
+  // A Judge check counts only for an exhibit the record submitted as a patch. It never creates an
+  // exhibit, so a check naming a witness or an unknown id changes nothing.
+  const acceptedVerify = new Set<TrialEvent>();
+  const acceptedPatches = new Set<string>();
+  for (const e of verifyEvents) {
+    const r = e.payload.result;
+    const target = exhibits.get(r.patchExhibitId);
+    if (target?.kind !== 'patch') continue;
+    const ok = isAccepted(r, admittedCounterexamples);
+    if (ok) {
+      acceptedVerify.add(e);
+      acceptedPatches.add(target.id);
+    }
+    // The patch's own Judge ruling: admitted once any check accepts it, otherwise judged and not
+    // admitted, with the rule if the Judge named one.
+    const next: ExhibitView = { ...target, admitted: acceptedPatches.has(target.id), judged: true };
+    if (next.admitted) delete next.rejectedBy;
+    else if (r.rejectedBy !== undefined) next.rejectedBy = r.rejectedBy;
+    exhibits.set(target.id, next);
+  }
 
   let status: CaseStatus = 'in-progress';
   let headline = 'This case is still being tried.';
@@ -371,7 +401,7 @@ export function buildCaseView(input: readonly TrialEvent[], extra: CaseViewInput
   }
 
   const exhibitList = [...exhibits.values()];
-  const docket = events.map((e) => docketEntry(e, exhibits));
+  const docket = events.map((e) => docketEntry(e, exhibits, acceptedVerify));
 
   return {
     caseId: events[0]?.caseId ?? '',

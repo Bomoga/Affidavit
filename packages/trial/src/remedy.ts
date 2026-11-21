@@ -5,6 +5,7 @@ import type {
   ExhibitId,
   JudgePort,
   PromptId,
+  VerifyResult,
 } from '@affidavit/contracts';
 import type { UntrustedBlock } from '@affidavit/prompts';
 import { digestOf } from './canonical.js';
@@ -55,7 +56,12 @@ export function createRemedyHandler(deps: RemedyDeps): StageHandler {
 
       const expectedIds = counterexamples.map((c) => c.id);
       const feedback: string[] = [];
-      let last: PatchOutcome = { accepted: false, reason: 'no patch was submitted' };
+      let last: Omit<PatchOutcome, 'verifyResults'> = {
+        accepted: false,
+        reason: 'no patch was submitted',
+      };
+      // One entry per verifyPatch call, so verify can record each as a `verify-result` event.
+      const verifyResults: VerifyResult[] = [];
 
       for (let i = 0; i < config.maxIterations; i++) {
         const blocks: UntrustedBlock[] = [
@@ -119,6 +125,7 @@ export function createRemedyHandler(deps: RemedyDeps): StageHandler {
 
         await ctx.record('exhibit-submitted', { exhibitId: patch.id, kind: 'patch' }, 'remedy');
         const result = await judge.verifyPatch(caseFile, patch, admitted.witness, counterexamples);
+        verifyResults.push(result);
 
         if (isAccepted(result, expectedIds)) {
           await workspace.addExhibit(ctx.caseId, patch.id);
@@ -127,6 +134,7 @@ export function createRemedyHandler(deps: RemedyDeps): StageHandler {
             patch,
             result,
             reason: 'accepted by the Judge',
+            verifyResults,
           });
           return { kind: 'advance', next: 'verify' };
         }
@@ -143,7 +151,7 @@ export function createRemedyHandler(deps: RemedyDeps): StageHandler {
         last = { accepted: false, patch, result, reason: describeVerify(result, expectedIds) };
       }
 
-      await workspace.savePatchOutcome(ctx.caseId, last);
+      await workspace.savePatchOutcome(ctx.caseId, { ...last, verifyResults });
       return { kind: 'advance', next: 'verify' };
     },
   };
