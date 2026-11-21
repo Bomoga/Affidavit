@@ -210,31 +210,7 @@ export function decodeEscape(seq: string): string {
 interface NodeLike {
   type: string;
   text: string;
-  startIndex: number;
   children: (NodeLike | null)[];
-}
-
-/**
- * Where the text of one outermost JSX element is: its JSX text and entities, and every string or
- * template that is the whole of a `{...}` expression child, in nested child elements too (the
- * attributes are judged on their own). Iterative, so deep nesting cannot overflow the stack.
- */
-function jsxMembers(root: NodeLike, out: Set<number>): void {
-  const stack: NodeLike[] = [root];
-  for (let n = stack.pop(); n; n = stack.pop()) {
-    for (const c of n.children) {
-      if (!c) continue;
-      if (c.type === 'jsx_text' || c.type === 'html_character_reference') out.add(c.startIndex);
-      else if (c.type === 'jsx_element') stack.push(c);
-      else if (c.type === 'jsx_expression') {
-        const inner = c.children.filter((x) => x && x.type !== '{' && x.type !== '}');
-        const only = inner.length === 1 ? inner[0] : undefined;
-        if (only && (only.type === 'string' || only.type === 'template_string')) {
-          out.add(only.startIndex);
-        }
-      }
-    }
-  }
 }
 
 const NAMED_ENTITIES: Record<string, string> = {
@@ -332,13 +308,20 @@ export async function lexicalSpans(
   const cursor = tree.walk();
   const spans: LexicalSpan[] = [];
   let syntaxError = false;
-  let jsxOuterEnd = -1;
-  const jsxGroups: Set<number>[] = [];
+  // JSX text groups, tracked on the walk itself (no extra tree walk, no node objects): the top of
+  // the stack is the group the current node's text belongs to, or undefined inside attributes.
+  const jsxStack: { end: number; group: number | undefined }[] = [];
+  let nextGroup = 0;
   try {
     for (;;) {
       const t = cursor.nodeType;
       if (t === 'ERROR' || cursor.nodeIsMissing) syntaxError = true;
       const at = { start: cursor.startIndex, end: cursor.endIndex };
+      while (jsxStack.length > 0 && (jsxStack[jsxStack.length - 1]?.end ?? 0) <= at.start) {
+        jsxStack.pop();
+      }
+      const group = jsxStack[jsxStack.length - 1]?.group;
+      const before = spans.length;
       let descend = true;
       if (t === 'comment' || t === 'html_comment' || t === 'hash_bang_line') {
         spans.push({ kind: 'comment', ...at, text: '' });
@@ -375,12 +358,23 @@ export async function lexicalSpans(
       } else if (IDENTIFIER_TYPES.has(t)) {
         spans.push({ kind: 'identifier', ...at, text: cursor.nodeText });
         descend = false;
-      } else if (t === 'jsx_element' && at.start >= jsxOuterEnd) {
-        // An outermost JSX element: its text is one group, judged together in slice hygiene.
-        jsxOuterEnd = at.end;
-        const members = new Set<number>();
-        jsxMembers(cursor.currentNode as unknown as NodeLike, members);
-        jsxGroups.push(members);
+      }
+      const pushed = spans[before];
+      if (
+        group !== undefined &&
+        (pushed?.kind === 'jsx-text' || pushed?.kind === 'string' || pushed?.kind === 'template')
+      ) {
+        pushed.group = group;
+      }
+      if (t === 'jsx_element' && group === undefined) {
+        // A JSX element not inside another one's text: its text is one group, judged together.
+        jsxStack.push({ end: at.end, group: nextGroup++ });
+      } else if (
+        (t === 'jsx_opening_element' || t === 'jsx_self_closing_element') &&
+        group !== undefined
+      ) {
+        // Attributes are not part of the element's text; an element inside one is its own root.
+        jsxStack.push({ end: at.end, group: undefined });
       }
       if (descend && cursor.gotoFirstChild()) continue;
       let up = false;
@@ -406,15 +400,6 @@ export async function lexicalSpans(
       prev.text += s.text;
       if (s.unproven) prev.unproven = true;
     } else joined.push({ ...s });
-  }
-  const groupOf = new Map<number, number>();
-  jsxGroups.forEach((members, g) => {
-    for (const start of members) groupOf.set(start, g);
-  });
-  for (const s of joined) {
-    if (s.kind !== 'jsx-text' && s.kind !== 'string' && s.kind !== 'template') continue;
-    const g = groupOf.get(s.start);
-    if (g !== undefined) s.group = g;
   }
   return { spans: joined, syntaxError };
 }
