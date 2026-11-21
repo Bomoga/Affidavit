@@ -49,10 +49,28 @@ const TOKEN = String.raw`[A-Za-z0-9._~+/=-]{8}[A-Za-z0-9._~+/=-]*`;
  * starts with `.` or `[`, which the identifier part excludes, so the split is unique and the
  * bounded check stays linear. A real JWT is still caught by its own pattern.
  */
-const NONLITERAL = String.raw`(?!(?:[A-Za-z_$][\w$]{0,128}(?:\.[A-Za-z_$][\w$]{0,128}|\[[^\]\n]{0,128}\]){1,16}|[A-Za-z_]{1,256})(?![A-Za-z0-9._~+/=\[-]))`;
+const ROOTS = String.raw`(?:process\.env|import\.meta\.env|globalThis|window|config|request|req|headers|ctx|this|self|env|secrets|settings|options|opts|args|params|props|state)`;
+const ACCESSOR = String.raw`(?:\.[A-Za-z_$][\w$]{0,64}|\[[^\]\n]{0,128}\])`;
+/** Where an expression ends in code: `;`, `)`, `,`, `}`, `]`, a call, `||`, `??`, `&&`, end of line. */
+const CODE_END = String.raw`[ \t]{0,16}(?:[;),}\]\(]|\|\||\?\?|&&|\r?\n|$)`;
+/**
+ * Not a literal: only a member chain rooted at a known accessor (`process.env.KEY`,
+ * `config.apiKey`, `headers['x-api-key']`, `req.headers.authorization`) that ends where code
+ * ends. Anything else in a header or bearer position, letters-only and dotted opaque tokens
+ * included, is a credential. The root is a fixed word followed directly by an accessor or the
+ * end, and each accessor starts with `.` or `[`, so the check is linear.
+ */
+const NONLITERAL = String.raw`(?!${ROOTS}${ACCESSOR}{0,16}(?![\w$])(?=${CODE_END}))`;
 const TOKEN_LIT = `${NONLITERAL}${TOKEN}`;
-/** A quoted body that interpolates (`${...}`) is a template, not a literal. */
-const NO_TEMPLATE = String.raw`(?![^"'\x60\n]{0,256}\$\{)`;
+/** One literal character in a quoted body: anything but a quote, newline, or `${`. */
+const LIT = String.raw`(?:[^"'\x60\n$]|\$(?!\{))`;
+/**
+ * A quoted body is a placeholder, not a literal, when it is one interpolation (`"${PASSWORD}"`),
+ * one `$VAR`, a template literal starting with `${`, or has no run of 8 literal characters
+ * outside interpolations (`` `Bearer ${token}` ``). `"hunter2hunter2${x}"` is still a literal.
+ * The run search is a lazy bounded loop whose two branches start differently, so it is linear.
+ */
+const QUOTED_LITERAL = String.raw`(?!\$\{[^}\n]{0,128}\}["'\x60])(?!\$[A-Za-z_][\w]{0,64}["'\x60])(?!(?<=\x60)\$\{)(?=(?:\$\{[^}\n]{0,128}\}|${LIT}){0,256}?${LIT}{8})`;
 /** A base64url run, matched atomically (lookahead plus backreference) so it never backtracks. */
 const B64URL_RUN = (group: number) => `(?=([A-Za-z0-9_-]*))\\${group}`;
 /** A JWT header run (group 1), atomic, that never runs into the next `-eyJ` start. */
@@ -144,17 +162,25 @@ const PATTERNS: readonly Pattern[] = [
     `$1${REDACTED}`,
   ),
   // Password, secret, token, api key or authorization assigned a quoted literal of 8+
-  // characters. Only a leading `$` marks a placeholder (`"${PASSWORD}"`); `$` inside counts.
+  // characters (see QUOTED_LITERAL for what counts as a placeholder instead).
   p(
-    String.raw`(${KEYS}["']?[ \t]{0,16}[:=][ \t]{0,16})(["'\x60])(?![$])${NO_TEMPLATE}[^"'\x60\n]{8,256}\2`,
+    String.raw`(${KEYS}["']?[ \t]{0,16}[:=][ \t]{0,16})(["'\x60])${QUOTED_LITERAL}[^"'\x60\n]{8,256}\2`,
     'i',
     `$1$2${REDACTED}$2`,
   ),
   // A quoted literal too long for the bound above is a credential too: redact the whole run.
   p(
-    String.raw`(${KEYS}["']?[ \t]{0,16}[:=][ \t]{0,16})(["'\x60])(?![$])${NO_TEMPLATE}[^"'\x60\n]{257}[^"'\x60\n]*`,
+    String.raw`(${KEYS}["']?[ \t]{0,16}[:=][ \t]{0,16})(["'\x60])${QUOTED_LITERAL}[^"'\x60\n]{257}[^"'\x60\n]*`,
     'i',
     `$1$2${REDACTED}`,
+  ),
+  // A literal behind a placeholder makes the whole expression a credential: a fallback
+  // (`process.env.X || '...'`, `?? '...'`), a concatenation, or `.concat('...')`. The code part
+  // is a lazy bounded run that cannot cross a quote, so the first literal on the line is used.
+  p(
+    String.raw`(${KEYS}["']?[ \t]{0,16}[:=][ \t]{0,16}[^\n"'\x60;]{0,256}?(?:\|\||\?\?|\.concat\(|\+)[ \t]{0,16})(["'\x60])${QUOTED_LITERAL}[^"'\x60\n]{8,256}\2`,
+    'i',
+    `$1$2${REDACTED}$2`,
   ),
   // ...or an unquoted literal of 6+ characters that holds a digit or symbol, is not a `$var`,
   // and is not a member expression or call: `password: hunter22` and `PASSWORD = s3cr3t!` are

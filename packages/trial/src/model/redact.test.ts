@@ -32,6 +32,37 @@ describe('third-party credential forms', () => {
   }
 });
 
+describe("the #57 reviewer's code-versus-secret list", () => {
+  const FLAGGED = [
+    'Authorization: Bearer abcd1234.efgh5678.ijkl9012',
+    'access_token=ya29.a0AfH6SMBabcdef',
+    'Authorization: Basic dXNlcjpwYXNz',
+    'x-api-key: AbCdEfGhIjKlMnOpQrStUvWx',
+    "apiKey: config.apiKey.concat('abcdefgh12345678')",
+    'password = "hunter2hunter2${x}"',
+    'Authorization: `Bearer ${x}abcdefgh12345678`',
+    "token = process.env.X || 'abcdefgh12345678'",
+  ];
+  const NOT_FLAGGED = [
+    'api_key = process.env.KEY',
+    'apiKey: config.apiKey',
+    'Authorization: `Bearer ${token}`',
+    'curl -H "Authorization: Bearer $TOKEN"',
+    'password = req.body.password',
+    "x-api-key: headers['x-api-key']",
+  ];
+  it('flags every credential and none of the code, in one pass over the list', () => {
+    expect(FLAGGED.map((t) => [t, detectCredential({ t })])).toEqual(
+      FLAGGED.map((t) => [t, 'credential']),
+    );
+    expect(NOT_FLAGGED.map((t) => [t, detectCredential({ t })])).toEqual(
+      NOT_FLAGGED.map((t) => [t, 'clean']),
+    );
+    for (const t of FLAGGED) expect(redact(t), t).not.toBe(t);
+    for (const t of NOT_FLAGGED) expect(redact(t), t).toBe(t);
+  });
+});
+
 describe('linear-time scanning of hostile input', () => {
   for (const { kind, text } of HOSTILE_INPUTS) {
     it(`detects on 1 MB of ${kind} in under a second`, () => {
