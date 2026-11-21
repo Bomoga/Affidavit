@@ -86,11 +86,12 @@ export function findHostReadingKey(tree: unknown): string | null {
 /**
  * Reads every mapping key of the compose file, before Compose ever sees it, and refuses any key
  * that reads other files (unless its value is empty), wherever it is written: inside `x-`
- * extension blocks, under an anchor, next to a merge key, in flow style (`{env_file: x}`), quoted
- * (`"env_file"`) or in upper case. No YAML library is used (lead decision 2026-11-20, PR #18):
- * `scanYamlKeys` reads the small subset compose files need and refuses everything else, including
- * custom tags (Compose's `!reset`, `!override`), escaped keys, alias keys, duplicate keys and
- * unbalanced input. A refused file makes the target `unsupported` (fail closed).
+ * extension blocks, in flow style (`{env_file: x}`), quoted (`"env_file"`) or in upper case. No
+ * YAML library is used (lead decision 2026-11-20, PR #18): `scanYamlKeys` reads the small subset
+ * compose files need and refuses everything else, including custom tags (Compose's `!reset`,
+ * `!override`), anchors, aliases, merge keys, block scalars it cannot bound exactly, escaped
+ * keys, duplicate keys and unbalanced input. A refused file makes the target `unsupported` (fail
+ * closed).
  */
 export function precheckCompose(text: string): string | null {
   const scan = scanYamlKeys(text);
