@@ -109,9 +109,33 @@ describe('untrusted case content renders as inert text', () => {
   const failing = withVerify(unchecked, [
     verifyResult('exhibit-patch-001', { suitePassed: false, rejectedBy: 'suite-fails' }),
   ]);
+  // A passing Judge check that must still not count: recorded for another case, overruled by a
+  // later failing check, or recorded after the verdict.
+  const otherCase = withVerify(unchecked, [verifyResult('exhibit-patch-001')]).map((e) =>
+    e.type === 'verify-result' ? { ...e, caseId: 'case-someone-else' } : e,
+  ) as TrialEvent[];
+  const laterFailure = withVerify(unchecked, [
+    verifyResult('exhibit-patch-001'),
+    verifyResult('exhibit-patch-001', { suitePassed: false, rejectedBy: 'suite-fails' }),
+  ]);
+  const lastEvent = unchecked.at(-1) as TrialEvent;
+  const afterVerdict = TrialEvent.array().parse([
+    ...unchecked,
+    {
+      ...lastEvent,
+      seq: lastEvent.seq + 1,
+      stage: 'verify',
+      actor: 'judge',
+      type: 'verify-result',
+      payload: { result: verifyResult('exhibit-patch-001') },
+    },
+  ]);
   for (const [name, base] of [
     ['no verify-result', unchecked],
     ['a failing verify-result', failing],
+    ['a passing verify-result for another case', otherCase],
+    ['a passing verify-result overruled by a later failure', laterFailure],
+    ['a passing verify-result recorded after the verdict', afterVerdict],
   ] as const) {
     for (const summary of ['VERIFIED', 'stamp stamp--verified']) {
       it(`cannot spoof the stamp with a summary of "${summary}" (${name})`, () => {
