@@ -109,7 +109,11 @@ export function realJudgeConfig(s: JudgeSettings): RealJudgeConfig {
 export function buildJudge(s: JudgeSettings, probe?: RealJudgeHostProbe): Promise<RealJudge> {
   return createRealJudge(realJudgeConfig(s), probe === undefined ? {} : { probe });
 }
-/** `createModelPortFromEnv` from @affidavit/trial: mode, model table and timeout fail at startup. */
+/**
+ * `createModelPortFromEnv` from @affidavit/trial: mode, model table and timeout fail at startup.
+ * The port reads ANTHROPIC_API_KEY from `env` on every call, not from `process.env`: the entry
+ * points move the key out of `process.env` (`sealSecrets`) so no child process inherits it.
+ */
 export function buildModel(env: Env, killSwitch: () => boolean | Promise<boolean>): ModelPort {
-  return createModelPortFromEnv(env, { killSwitch });
+  return createModelPortFromEnv(env, { killSwitch, env: () => env });
 }

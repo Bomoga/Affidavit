@@ -49,6 +49,26 @@ export interface DiscoverCaseInput {
    * (arraignment's order: score, then id), so a new case can be opened from a fresh scan.
    */
   candidateId?: string | undefined;
+  /**
+   * When given, every F3 hold also gets a case file of its own, under the id this returns for its
+   * candidate, so a caller can record the hold against a case a person can open. Without it the
+   * holds are still listed (`HeldCandidate` without `caseFile`); they are never dropped.
+   */
+  holdCaseId?: ((candidateId: string) => CaseId) | undefined;
+}
+
+/**
+ * An F3 hold of this scan: a dismissal rule matched a candidate at or above the escalation floor,
+ * so it was not dismissed and has no trial yet. Fixed fields from arraignment only.
+ */
+export interface HeldCandidate {
+  candidateId: string;
+  score: number;
+  wouldDismiss: HeldForReview['wouldDismiss'];
+  route: HeldForReview['route'];
+  detail: string;
+  /** Present when the input asked for it (`holdCaseId`). */
+  caseFile?: CaseFile | undefined;
 }
 
 export interface DiscoverCaseDeps {
@@ -72,6 +92,8 @@ export interface DiscoverCaseDeps {
 /**
  * What discovery says about one case. A value, never a thrown error, for every outcome the
  * pipeline is built to reach; infrastructure failures (git, Docker, a tool that crashed) throw.
+ * Every outcome reached after arraignment lists ALL of the scan's F3 holds in `holds`, whichever
+ * candidate was asked for, so a caller can record each one and none is silently dropped.
  */
 export type DiscoverCaseOutcome =
   /** The candidate goes to trial with this contract-valid case file. */
@@ -82,9 +104,10 @@ export type DiscoverCaseOutcome =
       withheld: string[];
       /** True when Semgrep reported a coverage loss. The candidate exists, but others may not. */
       scanPartial: boolean;
+      holds: HeldCandidate[];
     }
   /** Arraignment dismissed the candidate with a recorded reason (always below the floor). */
-  | { kind: 'dismissed'; dismissal: Dismissal }
+  | { kind: 'dismissed'; dismissal: Dismissal; holds: HeldCandidate[] }
   /**
    * An F3 hold: a dismissal rule matched a candidate at or above the escalation floor. Never
    * dismissed. `route` is arraignment's: `person` only, or a person or a second Defense attempt.
@@ -95,13 +118,14 @@ export type DiscoverCaseOutcome =
       wouldDismiss: HeldForReview['wouldDismiss'];
       route: HeldForReview['route'];
       detail: string;
+      holds: HeldCandidate[];
     }
   /** Ingestion found no Node app it supports. Fixed text only, never repo content. */
   | { kind: 'unsupported'; reason: string; detail: string }
   /** Ingestion failed closed: the secret scan did not cover every file. No workspace was kept. */
   | { kind: 'incomplete'; reason: 'partial-secret-scan'; coverageLosses: number }
   /** The scan did not produce the requested candidate (or none went to trial). */
-  | { kind: 'not-found'; candidateId: string | null };
+  | { kind: 'not-found'; candidateId: string | null; holds: HeldCandidate[] };
 
 /** Arraignment refused its input (for example two map answers for one candidate). */
 export class DiscoveryPipelineError extends Error {
@@ -217,10 +241,39 @@ export async function discoverCase(
       );
     }
 
+    const assemble = (a: Arraigned, caseId: CaseId) =>
+      assembleCaseFile({
+        caseId,
+        tenantId: ingested.tenantId,
+        repo: ingested.repo,
+        commit: ingested.commit,
+        workspacePath: ingested.workspacePath,
+        redactions: ingested.redactions,
+        redact: (s) => ingested.redactor.apply(s),
+        arraigned: a,
+        corpus: corpusFor(deps.corpus, ingested.repo, ingested.commit),
+        bootHints: deps.bootHints,
+      });
+
+    // Every hold, whichever candidate was asked for (F3: never silently dropped).
+    const holds: HeldCandidate[] = [];
+    for (const h of arraigned.review) {
+      holds.push({
+        candidateId: h.candidate.id,
+        score: h.candidate.score,
+        wouldDismiss: h.wouldDismiss,
+        route: h.route,
+        detail: h.detail,
+        ...(input.holdCaseId
+          ? { caseFile: (await assemble(h, input.holdCaseId(h.candidate.id))).caseFile }
+          : {}),
+      });
+    }
+
     const want = input.candidateId ?? null;
     const dismissal =
       want === null ? undefined : arraigned.dismissed.find((d) => d.candidateId === want);
-    if (dismissal) return { kind: 'dismissed', dismissal };
+    if (dismissal) return { kind: 'dismissed', dismissal, holds };
     const hold = want === null ? undefined : arraigned.review.find((r) => r.candidate.id === want);
     if (hold) {
       return {
@@ -229,29 +282,20 @@ export async function discoverCase(
         wouldDismiss: hold.wouldDismiss,
         route: hold.route,
         detail: hold.detail,
+        holds,
       };
     }
     const chosen: Arraigned | undefined =
       want === null ? arraigned.toTrial[0] : arraigned.toTrial.find((t) => t.candidate.id === want);
-    if (!chosen) return { kind: 'not-found', candidateId: want };
+    if (!chosen) return { kind: 'not-found', candidateId: want, holds };
 
-    const assembled = await assembleCaseFile({
-      caseId: input.caseId,
-      tenantId: ingested.tenantId,
-      repo: ingested.repo,
-      commit: ingested.commit,
-      workspacePath: ingested.workspacePath,
-      redactions: ingested.redactions,
-      redact: (s) => ingested.redactor.apply(s),
-      arraigned: chosen,
-      corpus: corpusFor(deps.corpus, ingested.repo, ingested.commit),
-      bootHints: deps.bootHints,
-    });
+    const assembled = await assemble(chosen, input.caseId);
     return {
       kind: 'case-file',
       caseFile: assembled.caseFile,
       withheld: assembled.withheld,
       scanPartial,
+      holds,
     };
   } finally {
     rmSync(runDir, { recursive: true, force: true });

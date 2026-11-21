@@ -1,0 +1,2 @@
+ALTER TABLE "review_flags" DROP CONSTRAINT "review_flags_reason_valid";--> statement-breakpoint
+ALTER TABLE "review_flags" ADD CONSTRAINT "review_flags_reason_valid" CHECK ("review_flags"."reason" in ('attempts-exhausted', 'budget-exhausted', 'f3-hold'));

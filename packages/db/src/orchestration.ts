@@ -511,3 +511,48 @@ export async function startCase(
   );
   await ensureStageJob(appPool, caseFile.tenantId, caseFile.id);
 }
+
+/**
+ * Registers a case for an F3 hold (discovery matched a dismissal rule at or above the escalation
+ * floor) and flags it for a person, with no stage job: the case stays at intake, is never
+ * dismissed, and the recovery sweep leaves it alone (a flagged visit is not swept). `detail` is
+ * fixed text from arraignment, never repository content. Idempotent: running it again for the
+ * same case file records nothing new. Returns true when the flag is new.
+ */
+export async function openHeldCase(
+  appPool: AppPool,
+  caseFile: CaseFile,
+  budget: Budget,
+  detail: string,
+  options: { juryEnabled?: boolean } = {},
+): Promise<boolean> {
+  const store = new PgCaseStore(appPool, caseFile.tenantId, { juryEnabled: options.juryEnabled });
+  const exists = await withTenant(appPool, caseFile.tenantId, async (tx) => {
+    const r = await tx.execute(
+      sql`select 1 from public.cases where tenant_id = ${caseFile.tenantId} and id = ${caseFile.id}`,
+    );
+    return r.rows.length > 0;
+  });
+  if (!exists) await store.open(caseFile, budget);
+  const sink = new PgEventSink(appPool, caseFile.tenantId);
+  await recordOnce(
+    { store, sink, events: (id) => visitEvents(appPool, sink, caseFile.tenantId, id) },
+    caseFile.id,
+    'intake',
+    'stenographer',
+    { type: 'stage-entered', payload: {} },
+  );
+  const s = await stageAttemptState(appPool, caseFile.tenantId, caseFile.id);
+  return flagForReview(
+    appPool,
+    {
+      tenantId: caseFile.tenantId,
+      caseId: caseFile.id,
+      stage: s.stage,
+      attempt: s.nextAttempt,
+      visit: s.visit,
+    },
+    'f3-hold',
+    detail,
+  );
+}
