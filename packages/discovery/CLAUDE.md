@@ -78,6 +78,18 @@ Not covered yet: Koa, Fastify, Hapi, Apollo, NestJS and Next route registration 
 - F3: a candidate whose score is at or above `escalationFloor` is never dismissed. If a dismissal rule matches it, it goes to `review` with the reason it would have had (`wouldDismiss`). The worker must hand `review` to a person or to trial, never drop it.
 - Config: `arraignConfigFrom(process.env)` reads `AFFIDAVIT_ESCALATION_FLOOR` (default 0.7) and `AFFIDAVIT_DISMISS_BELOW` (default 0, off). Both must be in 0..1 and the threshold may not be above the floor. The floor goes into every `CaseFile.escalationFloor`.
 
+## Slice hygiene and case file assembly (`src/casefile/`, L1-07)
+
+`assembleCaseFile({ caseId, tenantId, repo, commit, workspacePath, redactions, redact, arraigned, corpus, bootHints })` builds one contract `CaseFile` for one arraigned candidate and validates it (`CaseFileInvalidError` otherwise).
+
+- Slices: the sink's innermost function (or the candidate lines with 10 lines of context), then the functions on the shortest real route path (not a `USE` entry), at most 6 slices of at most 80 lines. A slice inside a larger one is dropped; the slice holding the sink is always first. Files are read from the workspace only (no `..`, no absolute paths, `O_NOFOLLOW`, 1 MiB cap).
+- Hygiene (`slice.ts`), on the whole file before cutting: comments are blanked (line numbers kept), a string, template or JSX text fragment with three or more letter-only words is replaced by `[text removed]`, code-like strings are kept, control, bidirectional and invisible characters become `\u{...}` escapes, and the ingestion redactor is applied again. A file with a syntax error, a parse timeout or no JavaScript or TypeScript grammar is withheld (`WITHHELD_MARKER`) and listed in `withheld`. README and other prose files are never sliced. Every slice has `untrusted: true` and `strippedComments: true`.
+- Route: `routeInfoOf` of the chosen path; absent when the candidate is not `reachable`.
+- Boot hints and safe variant: from the corpus entry only when its repo and pinned commit equal the case's; the safe variant only when a label of the same class overlaps the candidate and a safe variant fixes that label. Otherwise `bootHints` must be given (`MissingBootHintsError`).
+- `redactions` are copied from ingestion as they are (locations, never values).
+
+Real run: `src/casefile/casefile.nodegoat.docker.test.ts` runs ingestion, Semgrep (our rules), the normalizer, the map, arraignment and assembly on the pinned NodeGoat checkout and compares with `fixtures/casefiles/nodegoat-nosqli-where-001.json` (`AFFIDAVIT_CASEFILE_WRITE=1` rewrites it). Needs `AFFIDAVIT_DOCKER_TESTS=1` and `AFFIDAVIT_CORPUS_NETWORK=1` or `AFFIDAVIT_MAP_NODEGOAT_DIR`. On NodeGoat, ingestion currently fails closed (`incomplete`, `partial-secret-scan`: the Font Awesome font files and the `package-lock.json` chunk-split risk), so the test refuses to go on unless `AFFIDAVIT_CASEFILE_UNINGESTED_OK=1`, which uses the hash-verified checkout (no `.git`, no `.env` files, no redaction) and checks that every coverage gap is in those files.
+
 Root CLAUDE.md rules apply here. Do not add dependencies without asking.
 
 ## Libraries still to come (notes, not installed)

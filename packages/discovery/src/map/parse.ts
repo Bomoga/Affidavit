@@ -155,6 +155,83 @@ export async function parseSource(
   }
 }
 
+/** A run of free text in a source file: a comment, a string or template fragment, JSX text. */
+export interface LexicalSpan {
+  kind: 'comment' | 'string' | 'jsx-text';
+  /** Index range in the JavaScript string that was parsed (UTF-16 code units, end exclusive). */
+  start: number;
+  end: number;
+}
+
+/**
+ * Where the comments and the free text are in a file, for slice hygiene (L1-07). Same parser and
+ * budget as `parseSource`; never throws on hostile input. `syntaxError` is true when the tree has
+ * an error or missing node (the spans found are still returned).
+ */
+export async function lexicalSpans(
+  text: string,
+  grammar: Grammar,
+  maxParseMillis: number,
+): Promise<{ spans: LexicalSpan[]; syntaxError: boolean } | 'timeout' | 'failed'> {
+  const parser = await parserFor(grammar);
+  const deadline = Date.now() + maxParseMillis;
+  let timedOut = false;
+  let tree;
+  try {
+    tree = parser.parse(text, null, {
+      progressCallback: () => {
+        if (Date.now() > deadline) {
+          timedOut = true;
+          return true;
+        }
+        return false;
+      },
+    });
+  } catch {
+    return 'failed';
+  }
+  if (timedOut) {
+    tree?.delete();
+    return 'timeout';
+  }
+  if (!tree) return 'failed';
+  const cursor = tree.walk();
+  const spans: LexicalSpan[] = [];
+  let syntaxError = false;
+  try {
+    for (;;) {
+      const t = cursor.nodeType;
+      if (t === 'ERROR' || cursor.nodeIsMissing) syntaxError = true;
+      const kind =
+        t === 'comment' || t === 'html_comment' || t === 'hash_bang_line'
+          ? 'comment'
+          : t === 'string_fragment'
+            ? 'string'
+            : t === 'jsx_text'
+              ? 'jsx-text'
+              : undefined;
+      if (kind) {
+        spans.push({ kind, start: cursor.startIndex, end: cursor.endIndex });
+      } else if (cursor.gotoFirstChild()) {
+        continue;
+      }
+      let up = false;
+      while (!cursor.gotoNextSibling()) {
+        if (!cursor.gotoParent()) {
+          up = true;
+          break;
+        }
+      }
+      if (up) break;
+    }
+  } finally {
+    cursor.delete();
+    tree.delete();
+  }
+  spans.sort((a, b) => a.start - b.start);
+  return { spans, syntaxError };
+}
+
 interface CursorLike {
   nodeType: string;
   nodeIsNamed: boolean;
