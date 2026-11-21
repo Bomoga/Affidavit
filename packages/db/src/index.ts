@@ -8,3 +8,4 @@ export * from './stage-runs.js';
 export * from './stage-attempts.js';
 export * from './orchestration.js';
 export * from './transition-rules.js';
+export * from './stage-scope.js';

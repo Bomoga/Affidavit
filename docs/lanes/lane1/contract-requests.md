@@ -69,7 +69,7 @@ Semgrep SARIF carries only a rule's `metadata.cwe` (as tags) in `properties.tags
 
 **Request.** An entry such as `Orchestrator.runStage(caseId)` that runs exactly the case's current stage, applies the resulting transition, emits `stage-exited` and the next `stage-entered` once, and returns. It must be safe to call again for the same stage after a crash (no second `stage-entered`, no second terminal verdict). This is a Lane 3 API rather than a contract change, but the shape belongs with the Lead.
 
-**Interim.** `apps/worker` wires scripted fake trial stages (`apps/worker/src/fakes/stages.ts`). `AFFIDAVIT_TRIAL_IMPL=real` fails at startup with a not-wired error.
+**Interim.** `apps/worker` wires scripted fake trial stages by default. With `AFFIDAVIT_TRIAL_IMPL=real` (L1-10b) each stage job runs `Orchestrator.run` through `stageScopedPorts` (`@affidavit/db`): the kill switch it sees is also on once the job has moved the case, so one job moves it one stage, and the repeated `stage-entered` of a stage the visit already entered is dropped. One Orchestrator per process, so the workspace and cost ledger do not survive a restart (see `docs/lanes/lane1/real-wiring.md`). `runStage` would remove all of this.
 
 ## CR-8: how a case that needs a person is escalated (raised by L1-10)
 
@@ -99,3 +99,11 @@ Semgrep SARIF carries only a rule's `metadata.cwe` (as tags) in `properties.tags
 **Interim.** `@affidavit/discovery` exports `CandidateReachability` (value, reason, detail, function, paths), `MapCoverage` and `MapRoute` (with `appMiddleware`, `chain`, `mounted`, `pathDynamic`). `routeInfoOf(path)` returns a contract-valid `RouteInfo` and L1-07 should prefer a `reachable` path whose method is not `USE`. L1-06 treats `unknown` as "not dismissed".
 
 `RouteInfo.authRequired` is a heuristic from the middleware chain only: it cannot see an ownership or login check written inside a handler, and `true` means "a guard was proven by name (package) or by body (repo code)", never more. `'unknown'` is used whenever the guard is optional, conditional, scoped to a path the map cannot pin down, or the chain has an item it could not resolve.
+
+## CR-11: the real Judge has no per-case target, and nothing seals a bundle (raised by L1-10b)
+
+**Problem.** `AFFIDAVIT_JUDGE_IMPL=real` builds `Judge(JailExecutor({ targets: new BootedTargets() }), DEFAULT_POLICY)`. `BootedTargets` serves a variant only after it was booted (`bootVariant` from source with the case's boot hints) and only when `CaseFile.target.imageDigest` equals the booted image ID. A discovery case file has no `imageDigest`, and the stored case file cannot change after `CaseStore.open`. So nothing can boot the vulnerable and safe variants for a case and tie the case file to them, and every witness fails closed. `verifyPatch` also needs a `PatchWorkbench` and a `RescanPort`, and no stage seals an evidence bundle with the signer.
+
+**Request.** Decide where the boot happens: (a) before `open` (`open-case` builds and boots both variants, writes `imageDigest`, and the worker keeps the targets running for the case), or (b) a contract change so the Judge (Lane 2) boots per case and the digest is recorded as an event or a Judge-owned field rather than in the immutable case file. Also: which stage seals the bundle (after verify, before the verdict), and the ports for the workbench and rescan in the worker.
+
+**Status.** Answered for the boot by #61 (option b): `createRealJudge` boots each case's variants (`CaseTargets`) and binds the digests on a copy of the case file; the worker uses it for `AFFIDAVIT_JUDGE_IMPL=real` (L1-10b). Still open: a `RescanPort` (Lane 1) so `verifyPatch` can run, the bundle sealing stage, and whether a "targets booted" event carries the digests (contracts). Intake refusals (`unsupported`, `incomplete`) remain failed attempts plus a review flag (CR-4, CR-8).

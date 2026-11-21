@@ -100,3 +100,7 @@ Root CLAUDE.md rules apply here. Do not add dependencies without asking.
 ## Libraries still to come (notes, not installed)
 
 - A SARIF parser (TBD)
+
+## Pipeline (L1-10b)
+
+`discoverCase(deps, input)` in `src/pipeline/` runs ingest, Semgrep through `ToolRunnerPort`, normalize, map, arraign and case file assembly for one repo and commit, in a fresh per-run directory under `workRoot` that is always removed. Outcomes: `case-file`, `dismissed`, `review` (F3 hold), `unsupported`, `incomplete` (partial secret scan), `not-found`. An arraign error (such as duplicate reachability) is a `DiscoveryPipelineError`. `caseFileDiff` names differing top-level fields, never values. `apps/worker` calls it for `AFFIDAVIT_INTAKE_IMPL=real`.

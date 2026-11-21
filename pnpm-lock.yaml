@@ -171,6 +171,9 @@ importers:
       '@affidavit/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@affidavit/corpus':
+        specifier: workspace:*
+        version: link:../../packages/corpus
       '@affidavit/db':
         specifier: workspace:*
         version: link:../../packages/db
@@ -189,6 +192,9 @@ importers:
       '@affidavit/sandbox':
         specifier: workspace:*
         version: link:../../packages/sandbox
+      '@affidavit/signer':
+        specifier: workspace:*
+        version: link:../signer
       '@affidavit/testing':
         specifier: workspace:*
         version: link:../../packages/testing
