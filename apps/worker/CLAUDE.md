@@ -16,15 +16,18 @@ Run from this directory, or add `--filter @affidavit/worker` from the repo root.
 ## Layout
 
 - `config.ts`: environment only, validated, no secret ever in an error or in `describeConfig`. The two database URLs are the `affidavit_app` and `affidavit_worker` role URLs.
-- `handlers.ts`: `selectCores` picks stage work by config (`AFFIDAVIT_INTAKE_IMPL`, `AFFIDAVIT_TRIAL_IMPL`, `AFFIDAVIT_JUDGE_IMPL`, each `fake` or `real`; `real` fails at startup until wired) and wraps it with `@affidavit/db`'s `stageHandler`.
+- `handlers.ts`: `prepareCores(config, components?)` picks stage work by config (`AFFIDAVIT_INTAKE_IMPL`, `AFFIDAVIT_TRIAL_IMPL`, `AFFIDAVIT_JUDGE_IMPL`, each `fake` or `real`), checks host prerequisites first and throws before anything starts; `buildHandlers` wraps the cores with `@affidavit/db`'s `stageHandler`. `components` are the test seams (discover, model, judge, probe, env); production passes none.
+- `real/`: the real wiring (L1-10b). `intake.ts` re-derives the case file with `discoverCase` and refuses unless it reproduces the stored one; `trial.ts` runs `Orchestrator.run` per stage job through `stageScopedPorts`; `components.ts` builds the tool runner, discovery, Judge and model port; `prereqs.ts` is the startup check. Runbook: `docs/lanes/lane1/real-wiring.md`.
+- `open-case.ts` (`pnpm open-case -- --tenant --repo --commit`): opens one case from real discovery output.
 - `worker.ts`: opens the two role pools, runs Graphile Worker, and calls `@affidavit/db`'s `reconcileOnce` on an interval. The handler ordering, lease guard, attempt numbering, recovery policy and review flags live in `packages/db` (see "Orchestration" in its CLAUDE.md), not here.
-- `fakes/stages.ts`: scripted stand-ins. All of intake, map, arraign, defense, prosecution, remedy, verify, jury and the Judge (`FakeJudge`) are fakes today. They emit events idempotently before their transition.
+- `fakes/stages.ts`: scripted stand-ins, the default for every stage and the Judge (`FakeJudge`). They emit events idempotently before their transition.
 - `test-child.ts`: a real worker in its own process for the kill tests; not part of the API.
 
 ## Invariants
 
 - No logic that belongs to a lane: fakes are scripted and labelled `[fake]`.
-- The fake arraign never dismisses (a high-score candidate is never silently dismissed).
+- The fake arraign never dismisses (a high-score candidate is never silently dismissed). The real intake never dismisses either: any outcome other than a reproduced case file fails the attempt, and recovery flags it for review.
+- No secret in any message: config, prerequisite and stage errors name variables, never values (repository sources and database URLs included).
 - Events are emitted once (`recordOnce`) before the transition, which is the last write, so a retry cannot repeat them.
 
 Root CLAUDE.md rules apply here. Do not add dependencies without asking.

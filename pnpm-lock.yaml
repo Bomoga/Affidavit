@@ -161,6 +161,9 @@ importers:
       '@affidavit/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@affidavit/corpus':
+        specifier: workspace:*
+        version: link:../../packages/corpus
       '@affidavit/db':
         specifier: workspace:*
         version: link:../../packages/db

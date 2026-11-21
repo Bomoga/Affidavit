@@ -1,7 +1,7 @@
 import { CaseStage } from '@affidavit/contracts';
 import { describe, expect, it } from 'vitest';
 import { ConfigError, describeConfig, loadConfig } from './config.js';
-import { selectCores, NotWiredError } from './handlers.js';
+import { prepareCores } from './handlers.js';
 
 const SECRET = 'hunter2-not-a-real-password';
 const base = {
@@ -47,18 +47,36 @@ describe('config', () => {
 });
 
 describe('handler selection', () => {
-  it('wires a core for every non-terminal stage with fakes', () => {
-    const cores = selectCores(loadConfig(base));
+  it('wires a core for every non-terminal stage with fakes', async () => {
+    const cores = await prepareCores(loadConfig(base));
     const expected = CaseStage.options.filter(
       (s) => !['verdict', 'dismissed', 'escalated'].includes(s),
     );
     expect(Object.keys(cores).sort()).toEqual([...expected].sort());
   });
 
-  it.each(['AFFIDAVIT_INTAKE_IMPL', 'AFFIDAVIT_TRIAL_IMPL', 'AFFIDAVIT_JUDGE_IMPL'])(
-    'refuses %s=real until it is wired',
-    (name) => {
-      expect(() => selectCores(loadConfig({ ...base, [name]: 'real' }))).toThrow(NotWiredError);
-    },
-  );
+  it.each([
+    ['AFFIDAVIT_INTAKE_IMPL', ['AFFIDAVIT_INTAKE_WORK_ROOT', 'AFFIDAVIT_REPO_SOURCES']],
+    ['AFFIDAVIT_TRIAL_IMPL', ['AFFIDAVIT_JURY_ENABLED=false']],
+    [
+      'AFFIDAVIT_JUDGE_IMPL',
+      [
+        'AFFIDAVIT_JUDGE_WORK_ROOT',
+        'AFFIDAVIT_WITNESS_RUNNER_IMAGE',
+        'AFFIDAVIT_EVIDENCE_DIR',
+        'AFFIDAVIT_SIGNER_SOCKET',
+      ],
+    ],
+  ])('refuses %s=real at load until its settings are given, naming each', (name, needed) => {
+    let err: unknown;
+    try {
+      loadConfig({ ...base, [name]: 'real' });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ConfigError);
+    const message = (err as ConfigError).message;
+    for (const n of needed) expect(message).toContain(n);
+    expect(message).not.toContain(SECRET);
+  });
 });

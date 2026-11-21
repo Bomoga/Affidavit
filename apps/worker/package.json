@@ -13,10 +13,12 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test": "vitest run",
-    "test:pg": "vitest run --config vitest.pg.config.ts"
+    "test:pg": "vitest run --config vitest.pg.config.ts",
+    "open-case": "node --import tsx src/open-case.ts"
   },
   "dependencies": {
     "@affidavit/contracts": "workspace:*",
+    "@affidavit/corpus": "workspace:*",
     "@affidavit/db": "workspace:*",
     "@affidavit/discovery": "workspace:*",
     "@affidavit/evidence": "workspace:*",

@@ -9,7 +9,7 @@ import {
 } from '@affidavit/db';
 import { run } from 'graphile-worker';
 import type { WorkerConfig } from './config.js';
-import { buildHandlers, selectCores } from './handlers.js';
+import { buildHandlers, prepareCores, type Components } from './handlers.js';
 
 export { startCase } from '@affidavit/db';
 
@@ -24,6 +24,8 @@ export interface StartOptions {
   log?: (message: string, err?: unknown) => void;
   workerId?: string;
   hooks?: StageHooks;
+  /** Seams for the real wiring (tests inject fakes here); production passes nothing. */
+  components?: Components;
 }
 
 /**
@@ -42,8 +44,8 @@ export async function startWorker(
     });
   const workerId = options.workerId ?? randomUUID();
   const onPoolError = (err: Error) => log('database pool error', err);
-  // A `real` setting that is not wired fails here, before any connection is opened.
-  selectCores(config);
+  // Every real component is built and its host prerequisites checked before any connection opens.
+  const cores = await prepareCores(config, { log: (m) => log(m), ...options.components });
   // The app pool serves the handlers (up to `concurrency`, plus a heartbeat each) and the
   // reconcile pass, which holds one connection in its per-case lock while it takes another from
   // this same pool. pg's default size of 10 covers the defaults (concurrency 4 plus one
@@ -52,7 +54,7 @@ export async function startWorker(
   let workerPool: WorkerPool | undefined;
   try {
     workerPool = await openPool(config.workerDatabaseUrl, 'affidavit_worker', onPoolError);
-    const handlers = buildHandlers({ appPool, config, hooks: options.hooks });
+    const handlers = buildHandlers({ appPool, config, cores, hooks: options.hooks });
     const runner = await run({
       pgPool: workerPool,
       concurrency: config.concurrency,

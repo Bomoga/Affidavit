@@ -44,3 +44,7 @@ Run from this directory, or add `--filter @affidavit/db` from the repo root.
   - `startCase` is not atomic by design; the sweep repairs a crash after `open`.
 
 Root CLAUDE.md rules apply here. Do not add dependencies without asking.
+
+## Stage-scoped ports (L1-10b)
+
+`stageScopedPorts(env)` adapts a driver that loops a whole case (the trial `Orchestrator.run`) to one stage job: `advanced()` turns true at the first transition (wire it into the driver's kill switch), a `stage-entered` for the job's stage is dropped when the visit already has one, and seq numbers are assigned at emit time so a dropped event leaves no gap. Use the store and sink it returns together. Remove once CR-7 (`runStage`) lands.

@@ -23,6 +23,7 @@ import {
   type JudgePort,
 } from '@affidavit/contracts';
 import { FakeJudge } from '@affidavit/testing';
+import { moveTo, repairIntakeEntry } from '../moves.js';
 
 export function fakeJudge(): JudgePort {
   const witness = Witness.parse(samples.Witness);
@@ -31,32 +32,13 @@ export function fakeJudge(): JudgePort {
   });
 }
 
-/** Exit event, entry event, then the transition last. */
-async function moveTo(env: StageEnv, to: CaseStage): Promise<void> {
-  const { job } = env;
-  await recordOnce(env, job.caseId, job.stage, 'stenographer', {
-    type: 'stage-exited',
-    payload: { to },
-  });
-  await recordOnce(env, job.caseId, to, 'stenographer', {
-    type: 'stage-entered',
-    payload: { from: job.stage },
-  });
-  await env.checkpoint('after-events');
-  await env.store.transition(job.caseId, to);
-}
-
 function passThrough(to: CaseStage): StageCore {
   return (env) => moveTo(env, to);
 }
 
 export const fakeIntakeCores: Partial<Record<CaseStage, StageCore>> = {
   intake: async (env) => {
-    // Repairs a case that was opened but crashed before its first event was written.
-    await recordOnce(env, env.job.caseId, 'intake', 'stenographer', {
-      type: 'stage-entered',
-      payload: {},
-    });
+    await repairIntakeEntry(env);
     await moveTo(env, 'map');
   },
   map: passThrough('arraign'),
