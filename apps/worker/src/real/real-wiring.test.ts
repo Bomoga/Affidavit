@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   CaseFile,
   samples,
@@ -21,7 +24,7 @@ import {
   realIntakeCores,
   type Discover,
 } from './intake.js';
-import { PrerequisiteError, checkPrerequisites, type HostProbe } from './prereqs.js';
+import { PrerequisiteError, checkPrerequisites, realHostProbe, type HostProbe } from './prereqs.js';
 import { TrialHaltedError, realTrialCores } from './trial.js';
 
 const SECRET = 'hunter2-not-a-real-password';
@@ -49,6 +52,7 @@ function probe(overrides: Partial<HostProbe> = {}, missingDirs: string[] = []): 
     platform: 'linux',
     isDirectory: (p) => Promise.resolve(!missingDirs.includes(p)),
     isSocket: () => Promise.resolve(true),
+    isRegularFile: (p) => Promise.resolve(!missingDirs.includes(p)),
     dockerRuntimes: () => Promise.resolve(['runc', 'runsc', 'runsc-affidavit']),
     imagePresent: () => Promise.resolve(true),
     ...overrides,
@@ -169,9 +173,9 @@ describe('startup prerequisites', () => {
     ],
     [
       'a NodeGoat bundle that is not there',
-      probe({}, ['/srv/affidavit/nodegoat-bundle']),
-      { AFFIDAVIT_NODEGOAT_BUNDLE: '/srv/affidavit/nodegoat-bundle' },
-      'AFFIDAVIT_NODEGOAT_BUNDLE is set but is not an existing directory',
+      probe({}, ['/srv/affidavit/nodegoat-bundle.tar']),
+      { AFFIDAVIT_NODEGOAT_BUNDLE: '/srv/affidavit/nodegoat-bundle.tar' },
+      'AFFIDAVIT_NODEGOAT_BUNDLE is set but is not an existing regular file',
     ],
     [
       'no witness runner image',
@@ -196,6 +200,27 @@ describe('startup prerequisites', () => {
   it.each(cases)('refuses %s with a precise message', async (_name, p, extra, expected) => {
     const e = await refusal({ ...realEnv, ...extra }, p);
     expect(e.problems).toEqual([expect.stringContaining(expected)]);
+  });
+
+  it('takes the NodeGoat bundle as a regular file only: not a directory, not a symlink', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'affidavit-bundle-'));
+    try {
+      const tar = join(dir, 'bundle.tar');
+      writeFileSync(tar, 'not a real bundle');
+      expect(await realHostProbe.isRegularFile(tar)).toBe(true);
+      expect(await realHostProbe.isRegularFile(dir)).toBe(false);
+      expect(await realHostProbe.isRegularFile(join(dir, 'missing.tar'))).toBe(false);
+      const link = join(dir, 'link.tar');
+      let linked = true;
+      try {
+        symlinkSync(tar, link);
+      } catch {
+        linked = false; // Windows without symlink rights: the lstat rule is the same.
+      }
+      if (linked) expect(await realHostProbe.isRegularFile(link)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('lists every missing piece at once', async () => {

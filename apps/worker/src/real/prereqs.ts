@@ -4,7 +4,7 @@
  * value. Wiring only: what each Lane 2 piece needs is stated in its own docs, this checks it.
  */
 import { execFile } from 'node:child_process';
-import { stat } from 'node:fs/promises';
+import { lstat, stat } from 'node:fs/promises';
 import { isAbsolute, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { AUDIT_RUNTIME, DEFAULT_TRACE_ROOT, PLAIN_RUNTIME } from '@affidavit/sandbox';
@@ -22,6 +22,8 @@ export interface HostProbe {
   platform: NodeJS.Platform;
   isDirectory(path: string): Promise<boolean>;
   isSocket(path: string): Promise<boolean>;
+  /** A regular file itself, not a symlink to one (lstat). */
+  isRegularFile(path: string): Promise<boolean>;
   /** Registered Docker runtimes, or null when the Docker daemon cannot be reached. */
   dockerRuntimes(): Promise<string[] | null>;
   imagePresent(ref: string): Promise<boolean>;
@@ -37,6 +39,11 @@ export const realHostProbe: HostProbe = {
   isSocket: (p) =>
     stat(p).then(
       (s) => s.isSocket(),
+      () => false,
+    ),
+  isRegularFile: (p) =>
+    lstat(p).then(
+      (s) => s.isFile(),
       () => false,
     ),
   async dockerRuntimes() {
@@ -150,8 +157,10 @@ export async function checkPrerequisites(
         'AFFIDAVIT_SIGNER_SOCKET is not a listening unix socket (start apps/signer, see its CLAUDE.md)',
       );
     }
-    if (judge.nodegoatBundle !== null && !(await probe.isDirectory(judge.nodegoatBundle))) {
-      problems.push('AFFIDAVIT_NODEGOAT_BUNDLE is set but is not an existing directory');
+    if (judge.nodegoatBundle !== null && !(await probe.isRegularFile(judge.nodegoatBundle))) {
+      problems.push(
+        'AFFIDAVIT_NODEGOAT_BUNDLE is set but is not an existing regular file (the bundle tar itself, not a directory or a symlink; the Judge checks its sha256 against pins.json)',
+      );
     }
     if (
       runtimes !== null &&

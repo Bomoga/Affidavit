@@ -83,13 +83,13 @@ The budget defaults are conservative starting caps, not measured numbers ([metri
 
 ### For Judge `real`
 
-| Name                             | Purpose                                                                                      | Required | Example placeholder              |
-| -------------------------------- | -------------------------------------------------------------------------------------------- | -------- | -------------------------------- |
-| `AFFIDAVIT_JUDGE_WORK_ROOT`      | absolute, existing directory for witness attempt directories                                 | yes      | `/srv/affidavit/judge`           |
-| `AFFIDAVIT_WITNESS_RUNNER_IMAGE` | local image ID (`sha256:<64 hex>`) from `pnpm --filter @affidavit/judge runner-image`        | yes      | `sha256:<64 hex>`                |
-| `AFFIDAVIT_EVIDENCE_DIR`         | absolute, existing evidence store directory; must not contain or sit inside either work root | yes      | `/srv/affidavit/evidence`        |
-| `AFFIDAVIT_SIGNER_SOCKET`        | the listening unix socket of `apps/signer`                                                   | yes      | `/run/affidavit/signer.sock`     |
-| `AFFIDAVIT_NODEGOAT_BUNDLE`      | NodeGoat dependency bundle directory (PR #55); checked when set                              | no       | `/srv/affidavit/nodegoat-bundle` |
+| Name                             | Purpose                                                                                                                                                                                                           | Required | Example placeholder                  |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- | ------------------------------------ |
+| `AFFIDAVIT_JUDGE_WORK_ROOT`      | absolute, existing directory for witness attempt directories                                                                                                                                                      | yes      | `/srv/affidavit/judge`               |
+| `AFFIDAVIT_WITNESS_RUNNER_IMAGE` | local image ID (`sha256:<64 hex>`) from `pnpm --filter @affidavit/judge runner-image`                                                                                                                             | yes      | `sha256:<64 hex>`                    |
+| `AFFIDAVIT_EVIDENCE_DIR`         | absolute, existing evidence store directory; must not contain or sit inside either work root                                                                                                                      | yes      | `/srv/affidavit/evidence`            |
+| `AFFIDAVIT_SIGNER_SOCKET`        | the listening unix socket of `apps/signer`                                                                                                                                                                        | yes      | `/run/affidavit/signer.sock`         |
+| `AFFIDAVIT_NODEGOAT_BUNDLE`      | the NodeGoat dependency bundle tar file (PR #55). Startup checks it is a regular file, not a directory or a symlink; the Judge checks its sha256 against `pins.json` and fails closed on a null pin or a mismatch | no       | `/srv/affidavit/nodegoat-bundle.tar` |
 
 ## Host prerequisites
 
@@ -102,7 +102,7 @@ Checked at startup; each line is one possible `PrerequisiteError` entry.
 - The intake work root, the Judge work root and the evidence directory exist; the evidence directory is outside both work roots (the witness jail gets no path to the evidence store).
 - The signer is running and its socket exists.
 - The witness runner image is built locally.
-- The NodeGoat bundle directory exists, when `AFFIDAVIT_NODEGOAT_BUNDLE` is set.
+- The NodeGoat bundle tar is a regular file (not a directory, not a symlink), when `AFFIDAVIT_NODEGOAT_BUNDLE` is set. Its sha256 is checked by the Judge, not at startup.
 
 ## To run a real case
 
@@ -136,3 +136,4 @@ These are outside this lane's packages or need the lead; each is tracked in `con
 - No single-stage entry in the trial package (CR-7). The worker runs `Orchestrator.run` per stage job and stops it after one transition. The trial workspace (admitted witness, patch) and the cost ledger are in process memory, so a worker restart mid-trial fails the next stage and flags it for review.
 - No jury handler (L3-11), so the jury must be disabled.
 - NodeGoat: ingestion returns `incomplete` until PR #54, and the target cannot build without the dependency bundle until PR #55.
+- CR-1: a case file's safe variant does not say which corpus safe variant it means, so a differential run cannot name the exact safe code it compared against.
