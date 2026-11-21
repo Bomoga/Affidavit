@@ -8,9 +8,9 @@
  */
 
 export const NPM_REGISTRY = 'registry.npmjs.org';
-const RESOLVED =
+export const RESOLVED =
   /^https:\/\/registry\.npmjs\.org\/(@[a-z0-9][\w.-]*\/)?[a-z0-9][\w.-]*\/-\/[\w.-]+\.tgz$/i;
-const BAD_VERSION = /^(git|git\+|github:|gitlab:|bitbucket:|file:|link:|http:|https:)/;
+export const BAD_VERSION = /^(git|git\+|github:|gitlab:|bitbucket:|file:|link:|http:|https:)/;
 
 type Obj = Record<string, unknown>;
 const isObj = (v: unknown): v is Obj => typeof v === 'object' && v !== null && !Array.isArray(v);

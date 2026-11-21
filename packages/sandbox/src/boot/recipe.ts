@@ -13,6 +13,10 @@ import { envProblem, hostAliasProblem, workdirProblem } from '../gvisor/args.js'
 import { readDockerfile } from './dockerfile.js';
 import { composePathPairs, execErrorText, scrubPaths } from './scrub.js';
 import { checkLockfile, dependencyFetchProblem } from './lockfile.js';
+import { DEPENDENCY_MOUNT, bundleCoverageProblem, plannedCount } from '../bundle/coverage.js';
+import type { DependencyBundleManifest } from '../bundle/format.js';
+import type { BundleSection } from '../bundle/plan.js';
+import { pruneExcludedDev, type ExcludedDevPackage } from '../bundle/prune.js';
 
 /**
  * Everything needed to build and boot one target, derived from its boot hints, compose file and
@@ -35,7 +39,27 @@ export interface BootRecipe {
   seedScript?: string;
   /** package.json has a `build` script, run offline after the install scripts. */
   buildScript: boolean;
+  /**
+   * Present when dependencies are installed from a pinned dependency bundle: which bundle sections
+   * the install step mounts (`production`, plus `dev` for a build script or a suite image).
+   */
+  install?: {
+    sections: BundleSection[];
+    /**
+     * The reviewed dev exclusions the bundle's dev section records, when the install mounts it.
+     * The build prunes them from the staged package.json and lockfile before `npm ci`.
+     */
+    excludedDev?: ExcludedDevPackage[];
+    /**
+     * The target's own install-time scripts that `--ignore-scripts` skips. Reported, not hidden:
+     * an app that relies on one may build or behave differently from how it ships.
+     */
+    ignoredRootScripts?: string[];
+  };
 }
+
+/** Root package.json scripts `npm ci` would run, in its order. */
+const ROOT_INSTALL_SCRIPTS = ['preinstall', 'install', 'postinstall', 'prepare'] as const;
 
 export type RecipeRead = { ok: true; recipe: BootRecipe } | { ok: false; reason: string };
 
@@ -67,7 +91,15 @@ async function readText(dir: string, rel: string, max = 1024 * 1024): Promise<st
 export async function deriveRecipe(
   treeDir: string,
   hints: BootHints,
-  opts: { devDependencies?: boolean } = {},
+  opts: {
+    devDependencies?: boolean;
+    /**
+     * A verified dependency bundle (`openDependencyBundle`). With it, the lockfile may list
+     * packages, as long as the bundle holds every one of them pinned identically; without it, the
+     * install must download nothing (`dependencyFetchProblem`).
+     */
+    bundle?: DependencyBundleManifest;
+  } = {},
 ): Promise<RecipeRead> {
   const fail = (reason: string): RecipeRead => ({ ok: false, reason });
 
@@ -86,9 +118,34 @@ export async function deriveRecipe(
   const production = {
     production: typeof scripts.build !== 'string' && opts.devDependencies !== true,
   };
+  const sections: BundleSection[] = production.production ? ['production'] : ['production', 'dev'];
+  // With the dev section mounted, its reviewed exclusions are pruned first, exactly as the build
+  // will prune the staged files, and every check below reads the pruned lockfile.
+  const excludedDev =
+    opts.bundle !== undefined && sections.includes('dev')
+      ? (opts.bundle.sections.dev.excluded ?? [])
+      : [];
+  let lock = lockText;
+  if (excludedDev.length > 0) {
+    const pruned = pruneExcludedDev(lockText, pkgText, excludedDev);
+    if (!pruned.ok) return fail(pruned.reason);
+    lock = pruned.lockText;
+  }
   const lockProblem =
-    checkLockfile(lockText, production) ?? dependencyFetchProblem(lockText, pkgText, production);
+    checkLockfile(lock, production) ??
+    (opts.bundle === undefined
+      ? dependencyFetchProblem(lock, pkgText, production)
+      : bundleCoverageProblem(lock, opts.bundle, sections));
   if (lockProblem !== null) return fail(lockProblem);
+  const ignoredRootScripts = ROOT_INSTALL_SCRIPTS.filter((k) => typeof scripts[k] === 'string');
+  const install =
+    opts.bundle !== undefined && plannedCount(lock, sections) > 0
+      ? {
+          sections,
+          ...(excludedDev.length > 0 ? { excludedDev } : {}),
+          ...(ignoredRootScripts.length > 0 ? { ignoredRootScripts } : {}),
+        }
+      : undefined;
 
   let dockerfilePath = hints.path;
   let composeCmd: string[] | undefined;
@@ -174,6 +231,7 @@ export async function deriveRecipe(
     stubs: hints.stubs,
     ...(seedScript === undefined ? {} : { seedScript }),
     buildScript: typeof scripts.build === 'string',
+    ...(install === undefined ? {} : { install }),
   };
   const problem = recipeProblem(recipe);
   return problem === null ? { ok: true, recipe } : fail(problem);
@@ -193,6 +251,12 @@ export function recipeProblem(r: BootRecipe): string | null {
   }
   if (!Number.isSafeInteger(r.port) || r.port < 1 || r.port > 65535) return 'bad port';
   if (!r.healthRoute.startsWith('/') || /[\s\0]/.test(r.healthRoute)) return 'bad health route';
+  if (
+    r.install !== undefined &&
+    (r.workdir === DEPENDENCY_MOUNT || r.workdir.startsWith(`${DEPENDENCY_MOUNT}/`))
+  ) {
+    return `working directory may not be under ${DEPENDENCY_MOUNT}`;
+  }
   return (
     workdirProblem(r.workdir) ??
     envProblem(r.env) ??
