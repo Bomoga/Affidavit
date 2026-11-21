@@ -20,9 +20,13 @@ import type { EvidenceVariant, ExecutionRequest } from '../executor.js';
 import { BootedTargets, type BootedTarget } from './booted.js';
 import {
   pidAlive,
+  procIdentity,
+  procStartTime,
   sweepOrphanedRuns,
   type LeaseHandle,
   type RunLedger,
+  type SweepDeps,
+  type SweepOptions,
   type SweepOutcome,
 } from './lease.js';
 import type { TargetEndpoint, TargetProvider } from './executor.js';
@@ -406,20 +410,31 @@ export class CaseTargets implements TargetProvider {
 
   /**
    * Startup sweep (`sweepOrphanedRuns`): removes the case networks, and every container on them, of
-   * workers whose lease shows they are dead. A run no lease claims, or whose owner may be alive,
-   * is never removed. Off unless the composition root asks for it.
+   * workers whose lease proves they are dead (same host, pid namespace and boot, stale heartbeat,
+   * pid gone or recycled). A run whose owner may be alive is never removed; a run no lease claims
+   * only with `forceUnclaimed`. Off unless the composition root asks for it.
    */
-  sweepOrphans(
+  async sweepOrphans(
     leaseDir: string,
     owner: Pick<LeaseHandle, 'ownerId' | 'hostname'>,
-    opts: { isAlive?: (pid: number) => boolean; warn?: (m: string) => void } = {},
+    opts: Partial<Pick<SweepDeps, 'isAlive' | 'warn' | 'procStart' | 'identity' | 'now'>> &
+      SweepOptions = {},
   ): Promise<SweepOutcome> {
-    return sweepOrphanedRuns(leaseDir, owner, {
-      listRuns: () => this.#deps.listCaseRuns(),
-      removeRun: (runId) => this.#deps.removeCaseNetwork(caseNetworkOfRun(runId)),
-      isAlive: opts.isAlive ?? pidAlive,
-      warn: opts.warn ?? ((m) => process.emitWarning(m)),
-    });
+    const { isAlive, warn, procStart, identity, now, ...limits } = opts;
+    return sweepOrphanedRuns(
+      leaseDir,
+      owner,
+      {
+        listRuns: () => this.#deps.listCaseRuns(),
+        removeRun: (runId) => this.#deps.removeCaseNetwork(caseNetworkOfRun(runId)),
+        isAlive: isAlive ?? pidAlive,
+        procStart: procStart ?? procStartTime,
+        identity: identity ?? (await procIdentity()),
+        warn: warn ?? ((m) => process.emitWarning(m)),
+        ...(now === undefined ? {} : { now }),
+      },
+      limits,
+    );
   }
 
   async #removeAll(nets: readonly CaseNetwork[]): Promise<{ left: CaseNetwork[]; first?: Error }> {

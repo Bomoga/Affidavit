@@ -26,7 +26,7 @@ import { DEFAULT_POLICY, type JudgePolicy } from '../rules.js';
 import { JailExecutor } from './executor.js';
 import { localImagePresent } from './harness.js';
 import { CaseTargets, type SourceResolver, type TargetBootDeps } from './targets.js';
-import { WorkerLease, type LeaseHandle } from './lease.js';
+import { WorkerLease, type LeaseHandle, type SweepDeps } from './lease.js';
 import { JailedPatchWorkbench } from './workbench.js';
 
 /** A pinned dependency bundle the real Judge may build a repository's targets with. */
@@ -73,11 +73,13 @@ export interface RealJudgeConfig {
   dockerDaemonConfig?: string;
   /**
    * At startup, remove the case networks (and their containers) of workers proven dead: a lease
-   * in `leaseDir` on this host name whose pid no longer exists. Default false; the worker turns it
-   * on when `AFFIDAVIT_SWEEP_ORPHANS=1`. A live worker's runs, another host's runs and runs no
-   * lease claims are never removed.
+   * in `leaseDir` on this host name, pid namespace and boot, with a heartbeat stale well past its
+   * interval and a pid that is gone or recycled. Default false; the worker sets `true` when
+   * `AFFIDAVIT_SWEEP_ORPHANS=1`. A possibly live owner's runs are never removed, and an unreadable
+   * lease stops the sweep. Runs no lease claims are removed only with `'force'`
+   * (`AFFIDAVIT_SWEEP_ORPHANS=force`).
    */
-  sweepOrphans?: boolean;
+  sweepOrphans?: boolean | 'force';
   /** Directory of worker lease files shared by every worker on this host (default `<workRoot>/leases`). */
   leaseDir?: string;
 }
@@ -451,7 +453,13 @@ export interface RealJudge {
  */
 export async function createRealJudge(
   config: RealJudgeConfig,
-  opts: { probe?: RealJudgeHostProbe; deps?: TargetBootDeps; lease?: LeaseHandle } = {},
+  opts: {
+    probe?: RealJudgeHostProbe;
+    deps?: TargetBootDeps;
+    lease?: LeaseHandle;
+    /** Test seams for the sweep's process checks (default: procfs and `process.kill`). */
+    sweep?: Partial<Pick<SweepDeps, 'isAlive' | 'procStart' | 'identity' | 'now' | 'warn'>>;
+  } = {},
 ): Promise<RealJudge> {
   const report = await checkRealJudgePrerequisites(config, opts.probe);
   if (report.problems.length > 0) throw new RealJudgePrerequisiteError(report.problems);
@@ -476,9 +484,12 @@ export async function createRealJudge(
     ...(opts.deps === undefined ? {} : { deps: opts.deps }),
   });
   // Off by default: a sweep removes only runs whose lease proves a dead owner on this host.
-  if (config.sweepOrphans === true) {
+  if (config.sweepOrphans === true || config.sweepOrphans === 'force') {
     try {
-      await targets.sweepOrphans(leaseDir, lease);
+      await targets.sweepOrphans(leaseDir, lease, {
+        forceUnclaimed: config.sweepOrphans === 'force',
+        ...opts.sweep,
+      });
     } catch (err) {
       await lease.close().catch(() => undefined);
       throw new RealJudgePrerequisiteError([

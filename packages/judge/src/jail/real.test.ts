@@ -338,35 +338,50 @@ describe('createRealJudge', () => {
     const live = 'a'.repeat(16);
     const dead = 'b'.repeat(16);
     const stray = 'c'.repeat(16);
+    const identity = { pidNs: 'pid:[1]', bootId: 'b' };
     const mk = (pid: number, runIds: string[]) =>
       JSON.stringify({
         schema: LEASE_SCHEMA,
         ownerId: `o${pid}`,
         hostname: 'test-host',
         pid,
+        ...identity,
+        procStart: `${pid}`,
         startedAt: 0,
-        heartbeatAt: Date.now(),
+        heartbeatAt: 0,
+        heartbeatMs: 30_000,
         runIds,
       });
-    writeFileSync(join(leaseDir, 'live.json'), mk(process.pid, [live]));
-    // A pid far above any default pid_max is never a live process.
-    writeFileSync(join(leaseDir, 'dead.json'), mk(2 ** 30, [dead]));
-    const removed: string[] = [];
-    const deps: TargetBootDeps = {
-      ...nothingStarts,
-      listCaseRuns: () => Promise.resolve([live, dead, stray]),
-      removeCaseNetwork: (net) => {
-        removed.push(net.runId);
-        return Promise.resolve();
-      },
+    const start = async (mode: true | 'force') => {
+      writeFileSync(join(leaseDir, 'live.json'), mk(1001, [live]));
+      writeFileSync(join(leaseDir, 'dead.json'), mk(1002, [dead]));
+      const removed: string[] = [];
+      const deps: TargetBootDeps = {
+        ...nothingStarts,
+        listCaseRuns: () => Promise.resolve([live, dead, stray]),
+        removeCaseNetwork: (net) => {
+          removed.push(net.runId);
+          return Promise.resolve();
+        },
+      };
+      const real = await createRealJudge(config({ sweepOrphans: mode, leaseDir }), {
+        probe: goodProbe(),
+        deps,
+        lease: memLease(),
+        sweep: {
+          identity,
+          isAlive: (pid) => pid === 1001,
+          procStart: (pid) => Promise.resolve(`${pid}`),
+          now: () => 60 * 60_000,
+          warn: () => undefined,
+        },
+      });
+      await real.close();
+      return removed;
     };
-    const real = await createRealJudge(config({ sweepOrphans: true, leaseDir }), {
-      probe: goodProbe(),
-      deps,
-      lease: memLease(),
-    });
-    expect(removed).toEqual([dead]);
-    await real.close();
+    expect(await start(true)).toEqual([dead]);
+    // 'force' (AFFIDAVIT_SWEEP_ORPHANS=force) also removes the run no lease claims.
+    expect(await start('force')).toEqual([dead, stray]);
   });
 
   it('acquires a lease file in leaseDir and deletes it on close', async () => {

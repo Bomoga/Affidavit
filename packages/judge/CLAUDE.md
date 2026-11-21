@@ -28,7 +28,7 @@ Run from this directory, or add `--filter @affidavit/judge` from the repo root.
 - The stored case file is never changed; the Judge runs on a copy with the booted `imageDigest`s, and `BootedTargets` serves a variant only for that exact image.
 - Boot failures are typed outcomes (`unsupported`, `boot-failed`) and always tear down every case network the boot made.
 - Startup messages name config fields and variables, never values.
-- The orphan sweep is off by default and removes only case networks a lease proves belong to a dead worker on this host (`src/jail/lease.ts`); unproven ownership is never swept.
+- The orphan sweep is off by default and removes only case networks a lease proves belong to a dead worker (same host, pid namespace and boot, stale heartbeat, pid gone or recycled; `src/jail/lease.ts`); unproven ownership is never swept, and an unreadable lease stops the sweep.
 - `src/` is scanned by the sandbox egress guard; `child_process` only in the files it lists.
 
 ## Intended libraries (notes for later, not installed yet)

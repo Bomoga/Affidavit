@@ -667,18 +667,20 @@ describe('sessions after a failed teardown (review of #61)', () => {
         const f = fakeDeps({ createNetwork: hexNet });
         // Three labelled networks on the host: run 1 (dead owner), 2 (live owner), 3 (no lease).
         for (let i = 0; i < 3; i++) await f.deps.createCaseNetwork();
-        const mine = await WorkerLease.acquire(dir, { hostname: 'h', heartbeatMs: 0 });
-        const dead = await WorkerLease.acquire(dir, {
-          hostname: 'h',
-          pid: 2 ** 30,
-          heartbeatMs: 0,
-        });
+        const identity = { pidNs: 'pid:[1]', bootId: 'b' };
+        const at = (pid: number) =>
+          WorkerLease.acquire(dir, {
+            hostname: 'h',
+            pid,
+            identity,
+            procStart: `${pid}`,
+            heartbeatMs: 0,
+            now: () => 0,
+          });
+        const mine = await at(1000);
+        const dead = await at(1001);
         await dead.addRun('0000000000000001');
-        const live = await WorkerLease.acquire(dir, {
-          hostname: 'h',
-          pid: process.pid,
-          heartbeatMs: 0,
-        });
+        const live = await at(1002);
         await live.addRun('0000000000000002');
         const targets = new CaseTargets({
           workRoot: '/work',
@@ -686,7 +688,13 @@ describe('sessions after a failed teardown (review of #61)', () => {
           deps: f.deps,
           lease: mine,
         });
-        const out = await targets.sweepOrphans(dir, mine, { warn: () => undefined });
+        const out = await targets.sweepOrphans(dir, mine, {
+          warn: () => undefined,
+          identity,
+          isAlive: (pid) => pid !== 1001,
+          procStart: (pid) => Promise.resolve(`${pid}`),
+          now: () => 60 * 60_000,
+        });
         expect(out.removed).toEqual(['0000000000000001']);
         expect(out.kept).toEqual(['0000000000000002']);
         expect(out.unknown).toEqual(['0000000000000003']);
