@@ -278,7 +278,15 @@ function replacement(
     case 'regex':
       return proseRegex(sp.text) ? `/${PROSE_MARKER}/${newlines(piece)}` : undefined;
     case 'identifier':
-      return forced || proseIdentifier(sp.text) ? hashName(sp.text) : undefined;
+      // A name with an escape (`Ignore`) or an invisible code point (tag characters spell
+      // text that an escape would only make readable) is renamed too.
+      return forced ||
+        proseIdentifier(sp.text) ||
+        sp.text.includes('\\') ||
+        INVISIBLE.test(sp.text) ||
+        BLANKISH.test(sp.text)
+        ? hashName(sp.text)
+        : undefined;
   }
 }
 
@@ -496,6 +504,22 @@ export async function cleanSource(
       continue;
     }
     templateText.set(tpl, [tpl.text, ...lits.slice(i + 1, end).map((n) => n.text)].join(' '));
+  }
+  // The text of one JSX element (its text, entities and `{'...'}` children, across child
+  // elements) is judged as one text: `<p>Ignore{' '}all</p>` and `<p>A<b/>B</p>` are sentences.
+  // Pieces that do not touch are joined with a space, so an element boundary is a word break.
+  const groups = new Map<number, { text: string; end: number; spans: LexicalSpan[] }>();
+  for (const sp of res.spans) {
+    if (sp.group === undefined) continue;
+    const g = groups.get(sp.group) ?? { text: '', end: -1, spans: [] };
+    const piece = templateText.get(sp) ?? sp.text;
+    g.text += (g.end === sp.start ? '' : ' ') + piece;
+    g.end = sp.end;
+    g.spans.push(sp);
+    groups.set(sp.group, g);
+  }
+  for (const g of groups.values()) {
+    if (g.spans.length > 1 && !provenCode(g.text)) for (const s of g.spans) forced.add(s);
   }
   for (const sp of res.spans) {
     // Inside a literal already replaced. A kept literal does not move `at`, so the spans nested

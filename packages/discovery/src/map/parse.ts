@@ -173,6 +173,11 @@ export interface LexicalSpan {
    * never treats such a literal as proven code.
    */
   unproven?: boolean;
+  /**
+   * Spans with the same `group` are the text of one JSX element (its text, entities and string
+   * expression children, across child elements) and are judged together, like a template.
+   */
+  group?: number;
 }
 
 const SIMPLE_ESCAPES: Record<string, string> = {
@@ -194,8 +199,10 @@ export function decodeEscape(seq: string): string {
     const cp = parseInt(m[1], 16);
     return cp <= 0x10ffff ? String.fromCodePoint(cp) : '';
   }
-  // Legacy octal (sloppy mode): up to three digits when the first is 0 to 3, else up to two.
-  if (/^(?:[0-3][0-7]{0,2}|[4-7][0-7]?)$/.test(body)) return String.fromCharCode(parseInt(body, 8));
+  // Legacy octal (sloppy mode, ECMA-262 B.1.2): three digits only when the first is 0 to 3, else
+  // at most two, so the value is at most \377. Digits past that are plain text: `\477` is `'7`.
+  const oct = /^(?:[0-3][0-7]{0,2}|[4-7][0-7]?)/.exec(body)?.[0];
+  if (oct !== undefined) return String.fromCharCode(parseInt(oct, 8)) + body.slice(oct.length);
   if (/^(\r\n|\r|\n|\u2028|\u2029)$/.test(body)) return '';
   return SIMPLE_ESCAPES[body] ?? body;
 }
@@ -203,7 +210,31 @@ export function decodeEscape(seq: string): string {
 interface NodeLike {
   type: string;
   text: string;
+  startIndex: number;
   children: (NodeLike | null)[];
+}
+
+/**
+ * Where the text of one outermost JSX element is: its JSX text and entities, and every string or
+ * template that is the whole of a `{...}` expression child, in nested child elements too (the
+ * attributes are judged on their own). Iterative, so deep nesting cannot overflow the stack.
+ */
+function jsxMembers(root: NodeLike, out: Set<number>): void {
+  const stack: NodeLike[] = [root];
+  for (let n = stack.pop(); n; n = stack.pop()) {
+    for (const c of n.children) {
+      if (!c) continue;
+      if (c.type === 'jsx_text' || c.type === 'html_character_reference') out.add(c.startIndex);
+      else if (c.type === 'jsx_element') stack.push(c);
+      else if (c.type === 'jsx_expression') {
+        const inner = c.children.filter((x) => x && x.type !== '{' && x.type !== '}');
+        const only = inner.length === 1 ? inner[0] : undefined;
+        if (only && (only.type === 'string' || only.type === 'template_string')) {
+          out.add(only.startIndex);
+        }
+      }
+    }
+  }
 }
 
 const NAMED_ENTITIES: Record<string, string> = {
@@ -301,6 +332,8 @@ export async function lexicalSpans(
   const cursor = tree.walk();
   const spans: LexicalSpan[] = [];
   let syntaxError = false;
+  let jsxOuterEnd = -1;
+  const jsxGroups: Set<number>[] = [];
   try {
     for (;;) {
       const t = cursor.nodeType;
@@ -342,6 +375,12 @@ export async function lexicalSpans(
       } else if (IDENTIFIER_TYPES.has(t)) {
         spans.push({ kind: 'identifier', ...at, text: cursor.nodeText });
         descend = false;
+      } else if (t === 'jsx_element' && at.start >= jsxOuterEnd) {
+        // An outermost JSX element: its text is one group, judged together in slice hygiene.
+        jsxOuterEnd = at.end;
+        const members = new Set<number>();
+        jsxMembers(cursor.currentNode as unknown as NodeLike, members);
+        jsxGroups.push(members);
       }
       if (descend && cursor.gotoFirstChild()) continue;
       let up = false;
@@ -367,6 +406,15 @@ export async function lexicalSpans(
       prev.text += s.text;
       if (s.unproven) prev.unproven = true;
     } else joined.push({ ...s });
+  }
+  const groupOf = new Map<number, number>();
+  jsxGroups.forEach((members, g) => {
+    for (const start of members) groupOf.set(start, g);
+  });
+  for (const s of joined) {
+    if (s.kind !== 'jsx-text' && s.kind !== 'string' && s.kind !== 'template') continue;
+    const g = groupOf.get(s.start);
+    if (g !== undefined) s.group = g;
   }
   return { spans: joined, syntaxError };
 }
