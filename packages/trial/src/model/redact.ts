@@ -77,9 +77,13 @@ const B64URL_RUN = (group: number) => `(?=([A-Za-z0-9_-]*))\\${group}`;
 const HEADER_RUN = String.raw`(?=((?:[A-Za-z0-9_]|-(?!eyJ))*))\1`;
 /**
  * Credential-bearing names. The search is unanchored, so any prefix matches (FOO_SECRET_KEY,
- * client_secret); a bounded suffix covers SECRET_KEY_BASE, secretKey and private_key_id.
+ * client_secret); a bounded suffix covers SECRET_KEY_BASE, secretKey and private_key_id. The
+ * suffix is atomic (capture group `group`, lookahead plus backreference), so inside a long
+ * identifier run it fails once instead of backtracking through every shorter length.
  */
-const KEYS = String.raw`(?:(?:password|passwd|secret|token|api[_-]?key|authorization|(?:private|signing|encryption|secret|master|session|jwt|auth|access|refresh|client|webhook)[_-]?(?:key|secret|token|password))[\w.-]{0,32})`;
+const KEYS = (group: number) =>
+  String.raw`(?:(?:password|passwd|secret|token|api[_-]?key|authorization|(?:private|signing|encryption|secret|master|session|jwt|auth|access|refresh|client|webhook)[_-]?(?:key|secret|token|password))(?=([\w.-]{0,32}))` +
+  `\\${group}(?![\\w.-]))`;
 /**
  * Count-like names whose all-digit value is a number, not a secret (`max_tokens: 100000`). Only
  * these names exempt an all-digit value; `password=12345678` is still a credential.
@@ -154,9 +158,10 @@ const PATTERNS: readonly Pattern[] = [
   // The user may be empty (redis://:pass@host).
   p(String.raw`(://(?=([^\s/:@]*))\2:)(?=([^\s/@]+))\3(?=@)`, '', `$1${REDACTED}`, true),
   // curl basic auth: `curl -u user:pass` or `--user "user:pass"`, not `"$USER:$PASS"`. The span
-  // from `curl` to the flag is lazy and bounded, so each start costs a constant.
+  // from `curl` to the flag is lazy, bounded, and stops at the next `curl`, so the spans scanned
+  // from successive starts never overlap.
   p(
-    String.raw`(\bcurl\b[^\n]{0,256}?[ \t](?:-u|--user)[ \t]{1,16}["']?)(?![$])[^\s:'"]{1,128}:(?![$])[^\s'"]{1,256}`,
+    String.raw`(\bcurl\b(?:(?!curl\b)[^\n]){0,256}?[ \t](?:-u|--user)[ \t]{1,16}["']?)(?![$])[^\s:'"]{1,128}:(?![$])[^\s'"]{1,256}`,
     'i',
     `$1${REDACTED}`,
   ),
@@ -189,29 +194,30 @@ const PATTERNS: readonly Pattern[] = [
   // Password, secret, token, api key or authorization assigned a quoted literal of 8+
   // characters (see QUOTED_LITERAL for what counts as a placeholder instead).
   p(
-    String.raw`(${KEYS}["']?[ \t]{0,16}[:=][ \t]{0,16})(["'\x60])${QUOTED_LITERAL}[^"'\x60\n]{8,256}\2`,
+    String.raw`(${KEYS(2)}["']?[ \t]{0,16}[:=][ \t]{0,16})(["'\x60])${QUOTED_LITERAL}[^"'\x60\n]{8,256}\3`,
     'i',
-    `$1$2${REDACTED}$2`,
+    `$1$3${REDACTED}$3`,
   ),
   // A quoted literal too long for the bound above is a credential too: redact the whole run.
   p(
-    String.raw`(${KEYS}["']?[ \t]{0,16}[:=][ \t]{0,16})(["'\x60])${QUOTED_LITERAL}[^"'\x60\n]{257}[^"'\x60\n]*`,
+    String.raw`(${KEYS(2)}["']?[ \t]{0,16}[:=][ \t]{0,16})(["'\x60])${QUOTED_LITERAL}[^"'\x60\n]{257}[^"'\x60\n]*`,
     'i',
-    `$1$2${REDACTED}`,
+    `$1$3${REDACTED}`,
   ),
   // A literal behind a placeholder makes the whole expression a credential: a fallback
   // (`process.env.X || '...'`, `?? '...'`), a concatenation, or `.concat('...')`. The code part
-  // is a lazy bounded run that cannot cross a quote, so the first literal on the line is used.
+  // is a lazy bounded run that cannot cross a quote, so the first literal on the line is used, nor
+  // another `:` or `=`, so each start scans only to the next assignment and the total is linear.
   p(
-    String.raw`(${KEYS}["']?[ \t]{0,16}[:=][ \t]{0,16}[^\n"'\x60;]{0,256}?(?:\|\||\?\?|\.concat\(|\+)[ \t]{0,16})(["'\x60])${QUOTED_LITERAL}[^"'\x60\n]{8,256}\2`,
+    String.raw`(${KEYS(2)}["']?[ \t]{0,16}[:=][ \t]{0,16}[^\n"'\x60;:=]{0,256}?(?:\|\||\?\?|\.concat\(|\+)[ \t]{0,16})(["'\x60])${QUOTED_LITERAL}[^"'\x60\n]{8,256}\3`,
     'i',
-    `$1$2${REDACTED}$2`,
+    `$1$3${REDACTED}$3`,
   ),
   // ...or an unquoted literal of 6+ characters that holds a digit or symbol, is not a `$var`,
   // and is not a member expression or call: `password: hunter22` and `PASSWORD = s3cr3t!` are
   // caught, `password = req.body.password`, `token = getToken()` and `max_tokens: 100000` are not.
   p(
-    String.raw`(${KEYS}["']?[ \t]{0,16}[:=][ \t]{0,16})(?![$])(?:(?<!${COUNT_LIKE}["']?[ \t]{0,16}[:=][ \t]{0,16})|(?![0-9]{1,256}(?!${UNQUOTED})))(?![A-Za-z_$][\w$]{0,64}(?:\.[\w$]{1,64}){1,16}(?![\w$]))(?=${UNQUOTED}{0,255}[0-9!@#%^*+/~-])${UNQUOTED}{6,256}`,
+    String.raw`(${KEYS(2)}["']?[ \t]{0,16}[:=][ \t]{0,16})(?![$])(?:(?<!${COUNT_LIKE}["']?[ \t]{0,16}[:=][ \t]{0,16})|(?![0-9]{1,256}(?!${UNQUOTED})))(?![A-Za-z_$][\w$]{0,64}(?:\.[\w$]{1,64}){1,16}(?![\w$]))(?=${UNQUOTED}{0,255}[0-9!@#%^*+/~-])${UNQUOTED}{6,256}`,
     'i',
     `$1${REDACTED}`,
   ),
@@ -228,7 +234,6 @@ const PATTERNS: readonly Pattern[] = [
 const detector = ({ re }: Pattern) => new RegExp(re.source, re.flags.replace('g', ''));
 const WHOLE_DETECTORS: readonly RegExp[] = PATTERNS.filter((x) => x.whole).map(detector);
 const WINDOW_DETECTORS: readonly RegExp[] = PATTERNS.filter((x) => !x.whole).map(detector);
-
 const clock = (b: ScanBudget) => b.now ?? (() => performance.now());
 
 export function redact(
