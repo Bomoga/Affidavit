@@ -86,6 +86,34 @@ export const CREDENTIAL_SAMPLES: readonly { kind: string; text: string; value: s
       'Cookie: s=',
       `${'ey' + 'J'}${'h'.repeat(300)}.${'ey' + 'J'}${'p'.repeat(10_000)}.${'s'.repeat(500)}`,
     ),
+    s('hyphen-prefixed jwt', 'x-', jwt),
+    s('Bearer- prefixed jwt', 'Authorization: Bearer-', jwt),
+    s(
+      'encrypted PEM with headers and a blank line',
+      'const key = `',
+      [
+        `-----BEGIN ${'RSA PRIVATE KEY'}-----`,
+        'Proc-Type: 4,ENCRYPTED',
+        'DEK-Info: AES-128-CBC,2D5F3A1B9C8E7D6F0A1B2C3D4E5F6A7B',
+        '',
+        'k3X9vQ2mL8pR4tY6uW0zA1bC5dE7fG9hJ2kL4mN6pQ8rS0tU2vW4xY6zA8bC0dE2',
+        'fG4hJ6kL8mN0pQ2rS4tU6vW8xY0zA2bC4dE6fG8hJ0kL2mN4pQ6rS8tU0vW2xY4z',
+        '-----END RSA PRIVATE KEY-----',
+      ].join('\n'),
+      '`;\nconst next = 1;',
+    ),
+    s(
+      'PEM with CRLF line endings',
+      '',
+      [
+        `-----BEGIN ${'PRIVATE KEY'}-----`,
+        'MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7crlfcrlfcrlf',
+        '',
+        'Zm9vYmFyYmF6cXV4Zm9vYmFyYmF6cXV4Zm9vYmFyYmF6cXV4Zm9vYmFyYmF6cXV4',
+        '-----END PRIVATE KEY-----',
+      ].join('\r\n'),
+      '\r\nrest',
+    ),
     s('long URL userinfo password', 'postgres://svc:', 'Pw9'.repeat(150), '@db:5432/app'),
     s('long URL userinfo user', `postgres://${'u'.repeat(300)}:`, 'Pw9Pw9Pw9', '@db/app'),
   ];
@@ -134,6 +162,12 @@ export const HOSTILE_INPUTS: readonly { kind: string; text: string }[] = (() => 
       text: fill('QUJD\n', `-----BEGIN ${'PRIVATE KEY'}-----\n`),
     },
     { kind: 'repeated eyJ segments', text: fill('eyJaaaaaaaaa.') },
+    { kind: 'hyphen run of -eyJ', text: fill('-eyJ') },
+    { kind: 'hyphen run of a-eyJ', text: fill('a-eyJ') },
+    { kind: 'eyJ then a hyphen run', text: fill('-', 'eyJ') },
+    { kind: 'repeated -eyJ half JWT', text: fill('-eyJabcdefgh.eyJ') },
+    { kind: 'PEM header then blank lines', text: fill('\n', `-----BEGIN ${'PRIVATE KEY'}-----`) },
+    { kind: 'repeated CRLF PEM headers', text: fill(`-----BEGIN ${'PRIVATE KEY'}-----\r\n\r\n`) },
   ];
 })();
 

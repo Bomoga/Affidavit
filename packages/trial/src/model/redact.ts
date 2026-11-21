@@ -43,6 +43,8 @@ export interface ScanBudget {
 const TOKEN = String.raw`[A-Za-z0-9._~+/=-]{8}[A-Za-z0-9._~+/=-]*`;
 /** A base64url run, matched atomically (lookahead plus backreference) so it never backtracks. */
 const B64URL_RUN = (group: number) => `(?=([A-Za-z0-9_-]*))\\${group}`;
+/** A JWT header run (group 1), atomic, that never runs into the next `-eyJ` start. */
+const HEADER_RUN = String.raw`(?=((?:[A-Za-z0-9_]|-(?!eyJ))*))\1`;
 const KEYS = String.raw`(?:password|passwd|secret|token|api[_-]?key|authorization)`;
 /** Characters an unquoted literal value runs to. Stops at code punctuation. */
 const UNQUOTED = String.raw`[^\s"'\x60,;(){}\[\]<>=:]`;
@@ -83,16 +85,18 @@ const PATTERNS: readonly Pattern[] = [
   // A JWT anywhere (header.payload.signature), of any length. A match starts only where a
   // base64url run starts (lookbehind), and each segment is one atomic run, so every character
   // is visited a bounded number of times however long the token is: no bound to fail open on.
+  // A hyphen may precede the token (`x-eyJ...`). The header run stops before any `-eyJ`, which
+  // is a start of its own, so the runs scanned from successive starts never overlap.
   p(
-    String.raw`(?<![A-Za-z0-9_-])eyJ(?=[A-Za-z0-9_-]{8})${B64URL_RUN(1)}\.eyJ(?=[A-Za-z0-9_-]{8})${B64URL_RUN(2)}(?:\.[A-Za-z0-9_-]*)?`,
+    String.raw`(?<![A-Za-z0-9_])eyJ(?=[A-Za-z0-9_-]{8})${HEADER_RUN}\.eyJ(?=[A-Za-z0-9_-]{8})${B64URL_RUN(2)}(?:\.[A-Za-z0-9_-]*)?`,
     '',
   ),
-  // PEM private key blocks: the header, the rest of its line, then every following non-empty
-  // line up to and including an END line, or up to a blank line or the end of the text. Line by
-  // line, so a missing END never stops at an arbitrary cut. Each line starts with a literal
-  // newline and excludes newlines, so the scan is linear.
+  // PEM private key blocks, blank lines and CRLF included (an encrypted PEM has `Proc-Type` and
+  // `DEK-Info` headers and a blank line before its body): through the END line, or to the end of
+  // the text when there is none. The lazy scan for END and the fallback each visit every
+  // character once, and a match consumes everything it scanned, so the cost stays linear.
   p(
-    String.raw`-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----[^\r\n]*(?:\r?\n(?!-----END )[^\r\n]+)*(?:\r?\n-----END [A-Z ]{0,40}PRIVATE KEY-----)?`,
+    String.raw`-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----(?:[\s\S]*?-----END [A-Z ]{0,40}PRIVATE KEY-----|[\s\S]*)`,
     '',
   ),
   // Credentials in a URL's userinfo: scheme://user:pass@host, of any length. Anchored on the
