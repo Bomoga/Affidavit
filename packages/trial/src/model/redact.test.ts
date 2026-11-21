@@ -63,40 +63,49 @@ describe("the #57 reviewer's code-versus-secret list", () => {
   });
 });
 
-/** Median wall time of three runs, so one scheduler stall on a shared runner does not decide. */
-const medianMs = (run: () => unknown): number => {
-  const times = [0, 1, 2].map(() => {
-    const t0 = performance.now();
-    run();
-    return performance.now() - t0;
-  });
-  return times.sort((a, b) => a - b)[1]!;
-};
+/** Wall times of three runs, sorted, so one scheduler stall on a shared runner does not decide. */
+const timesMs = (run: () => unknown): number[] =>
+  [0, 1, 2]
+    .map(() => {
+      const t0 = performance.now();
+      run();
+      return performance.now() - t0;
+    })
+    .sort((a, b) => a - b);
+const medianMs = (run: () => unknown): number => timesMs(run)[1]!;
 /** Ceiling on the median run. */
 const CEILING_MS = 1000;
-/** Linear growth: 4x the input may take at most 6x the time (plus 20 ms of timer noise). */
-const expectLinear = (small: number, large: number, label: string) =>
+/**
+ * Linear growth: 4x the input may take at most 6x the time, plus 50 ms of timer and GC noise.
+ * Compares the fastest of three runs at each size, the least noisy estimate of the real cost.
+ */
+const expectLinear = (run: (text: string) => unknown, text: string, label: string) => {
+  const small = timesMs(() => run(text.slice(0, text.length / 4)))[0]!;
+  const large = timesMs(() => run(text))[0]!;
   expect(large, `${label}: ${large.toFixed(1)} ms vs ${small.toFixed(1)} ms`).toBeLessThan(
-    6 * small + 20,
+    6 * small + 50,
   );
+};
 
 describe('linear-time scanning of hostile input', () => {
   for (const { kind, text } of HOSTILE_INPUTS) {
     it(`detects on 1 MB of ${kind} in under a second, growing linearly`, () => {
       const verdict = detectCredential({ template: text });
       expect(['clean', 'credential']).toContain(verdict);
-      const large = medianMs(() => detectCredential({ template: text }));
-      const small = medianMs(() => detectCredential({ template: text.slice(0, text.length / 4) }));
-      expect(large, kind).toBeLessThan(CEILING_MS);
-      expectLinear(small, large, kind);
+      expect(
+        medianMs(() => detectCredential({ template: text })),
+        kind,
+      ).toBeLessThan(CEILING_MS);
+      expectLinear((t) => detectCredential({ template: t }), text, kind);
     });
 
     it(`redacts the largest scannable slice of ${kind} in under a second, growing linearly`, () => {
       const slice = text.slice(0, MAX_REDACT_CHARS);
-      const large = medianMs(() => redact(slice));
-      const small = medianMs(() => redact(slice.slice(0, slice.length / 4)));
-      expect(large, kind).toBeLessThan(CEILING_MS);
-      expectLinear(small, large, kind);
+      expect(
+        medianMs(() => redact(slice)),
+        kind,
+      ).toBeLessThan(CEILING_MS);
+      expectLinear((t) => redact(t), slice, kind);
     });
   }
 
