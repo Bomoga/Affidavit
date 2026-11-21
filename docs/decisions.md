@@ -27,3 +27,11 @@ Until the licensing decision lands, the default is the one plan.md already state
 - 2026-11-05: Dependency versions are pinned exactly, and the pnpm release-age gate stays on. Versions published inside the gate window were replaced by the newest older release instead of adding exclusions.
 - 2026-11-05: Dependency install scripts stay disabled except esbuild. Native tree-sitter builds are not used; Lane 1 loads grammars through `web-tree-sitter` (wasm).
 - 2026-11-05: `.claude/settings.json` does not allow `docker run` or `docker build` without a prompt. Substring deny patterns cannot make raw docker safe (a security review flagged `-v /:/host` style bypasses). Lane 2 should add a fixed wrapper script (argv from `buildDockerRunArgs`, images allowlisted by digest, mounts restricted to the workspace) and allow only that. This differs from P0-06 as written in the implementation plan.
+
+## Decisions made 2026-11-20 (Adrian)
+
+- CR-1 approved: contracts v1.1 adds the `verify-result` trial event (PR #52, hardening in #53). The VERIFIED stamp rests only on a Judge `verify-result`.
+- PR #46 (L2-10): patch verification fails closed. When the target's test suite cannot run, the patch is rejected with a rejection rule, never passed with only `suitePassed: false`. Owner: Lane 2.
+- CR-T8: resolved inside Lane 2. `verifyPatch` (PR #17) reads the counterexample parameter header that Lane 3 writes, so ids and runs match what Prosecution submitted. No contract change.
+- PR #18 (L2-04): both requests declined. No egress exception for dependency fetch (a target that needs one is marked unsupported, per plan.md) and no `js-yaml` dependency. Owner: Lane 2 to rework.
+- PR #51 (L1-07): the new fixture `nodegoat-nosqli-where-001.json` is accepted in place of regenerating `nodegoat-sqli-001.json`. Caveat on record: it was built without a full ingestion, so its empty `redactions` prove nothing about secrets. Follow-ups: L1-01 ingestion on NodeGoat (font files, lockfile chunk split) and moving Lane 3 tests to the new fixture.
