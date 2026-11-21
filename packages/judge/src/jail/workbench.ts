@@ -97,19 +97,27 @@ export interface JailedPatchWorkbenchOptions {
   /** Image ID from `buildPatchApplyImage`. */
   applyImage: string;
   /** Host path of the vulnerable commit's source tree for a case (read only, never written). */
-  vulnerableSource: (caseFile: CaseFile) => string;
-  /** The provider the Judge's executor uses; the patched target is registered here while verified. */
-  targets: BootedTargets;
+  vulnerableSource: (caseFile: CaseFile) => string | Promise<string>;
+  /**
+   * The provider the Judge's executor uses; the patched target is registered here while verified.
+   * A function gives each case its own registry (`CaseTargets.registry`), so two cases can verify
+   * patches at the same time.
+   */
+  targets: BootedTargets | ((caseFile: CaseFile) => Promise<BootedTargets>);
   /**
    * The case target's pinned dependency bundle (L2-04c; `pinnedDependencyBundle` checks it against
    * pins.json). Both builds install from it: the patched target with its production section, the
    * suite image with production and dev. Without it, a target with dependencies is unsupported.
+   * A function picks the bundle per case (`CaseTargets.dependencyBundle`).
    */
-  dependencyBundle?: DependencyBundleRef;
+  dependencyBundle?:
+    DependencyBundleRef | ((caseFile: CaseFile) => DependencyBundleRef | undefined);
 }
 
 interface Workspace {
   dir: string;
+  /** Where the patched target is registered until `release`. */
+  registry: BootedTargets;
   target: BootedTarget;
   /** The patched build with devDependencies, used only to run the suite; or why there is none. */
   suite: { image: string } | { unavailable: string };
@@ -196,7 +204,11 @@ export class JailedPatchWorkbench implements PatchWorkbench {
     _patch: PatchExhibit,
     plan: PatchPlan,
   ): Promise<PrepareOutcome> {
-    const srcDir = this.opts.vulnerableSource(caseFile);
+    const srcDir = await this.opts.vulnerableSource(caseFile);
+    const registry =
+      typeof this.opts.targets === 'function'
+        ? await this.opts.targets(caseFile)
+        : this.opts.targets;
     const dir = await mkdtemp(join(this.opts.workRoot, 'patch-'));
     let keep = false;
     try {
@@ -262,7 +274,10 @@ export class JailedPatchWorkbench implements PatchWorkbench {
         if (change !== null) return { ok: false, stage: 'suite', detail: `${rel}: ${change}` };
       }
 
-      const bundleRef = this.opts.dependencyBundle;
+      const bundleRef =
+        typeof this.opts.dependencyBundle === 'function'
+          ? this.opts.dependencyBundle(caseFile)
+          : this.opts.dependencyBundle;
       const bundleOpt = bundleRef === undefined ? {} : { dependencyBundle: bundleRef };
       // The suite precheck reads the bundle's manifest, verified against the pin the same way a
       // build verifies it; a bundle that does not verify is `build`.
@@ -319,12 +334,12 @@ export class JailedPatchWorkbench implements PatchWorkbench {
             });
             suite = { image: suiteImage };
           }
-          this.opts.targets.set('patched', target);
+          registry.set('patched', target);
           const prepared: PreparedPatch = {
             target: { ...caseFile.target, variant: 'patched', imageDigest: target.imageId },
             workspacePath: join(tree, 'full'),
           };
-          this.#open.set(prepared.workspacePath, { dir, target, suite });
+          this.#open.set(prepared.workspacePath, { dir, registry, target, suite });
           keep = true;
           return { ok: true, prepared };
         },
@@ -361,7 +376,7 @@ export class JailedPatchWorkbench implements PatchWorkbench {
   async release(prepared: PreparedPatch): Promise<void> {
     const ws = this.#workspace(prepared);
     this.#open.delete(prepared.workspacePath);
-    this.opts.targets.delete('patched');
+    ws.registry.delete('patched');
     let cleanupError: Error | undefined;
     try {
       await removeCaseNetwork(ws.target.endpoint.net);

@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   chmod,
   copyFile,
@@ -73,27 +74,95 @@ export interface StageReport {
  * world-writable and files world-readable, because build steps run as nobody.
  */
 export async function stageTree(src: string, dest: string): Promise<StageReport> {
+  return walkStageable(src, {
+    async dir(rel) {
+      const to = join(dest, rel);
+      await mkdir(to, { recursive: true });
+      await chmod(to, 0o777);
+    },
+    async file(rel, abs, executable) {
+      await copyFile(abs, join(dest, rel));
+      await chmod(join(dest, rel), executable ? 0o777 : 0o666);
+    },
+  });
+}
+
+/** Staging caps (files, bytes). Configuration only; tests lower them. */
+export interface StageCaps {
+  files: number;
+  bytes: number;
+}
+const STAGE_CAPS: Readonly<StageCaps> = { files: MAX_TREE_FILES, bytes: MAX_TREE_BYTES };
+
+interface StageVisitor {
+  /** A directory to create, relative to the tree (`''` is the root). */
+  dir(rel: string): Promise<void>;
+  /** A regular file to copy; `executable` is the one mode bit staging keeps. */
+  file(rel: string, abs: string, executable: boolean): Promise<void>;
+}
+
+/**
+ * The one definition of what staging copies: directories and regular files, minus `SKIPPED`
+ * names; symlinks, FIFOs, sockets and devices are left out (counted). Files keep only whether any
+ * exec bit was set. Names are visited in sorted order. Throws past the staging caps.
+ */
+async function walkStageable(
+  src: string,
+  visit: StageVisitor,
+  opts: { lstat?: typeof lstat; caps?: Readonly<StageCaps> } = {},
+): Promise<StageReport> {
+  const stat = opts.lstat ?? lstat;
+  const caps = opts.caps ?? STAGE_CAPS;
   const report: StageReport = { files: 0, bytes: 0, skippedLinks: 0 };
-  const walk = async (from: string, to: string): Promise<void> => {
-    await mkdir(to, { recursive: true });
-    await chmod(to, 0o777);
-    for (const name of await readdir(from)) {
+  const walk = async (rel: string): Promise<void> => {
+    await visit.dir(rel);
+    for (const name of (await readdir(join(src, rel))).sort()) {
       if (SKIPPED(name)) continue;
-      const s = await lstat(join(from, name));
-      if (s.isDirectory()) await walk(join(from, name), join(to, name));
+      const r = rel === '' ? name : `${rel}/${name}`;
+      const abs = join(src, r);
+      const s = await stat(abs);
+      if (s.isDirectory()) await walk(r);
       else if (s.isFile()) {
         report.files++;
         report.bytes += s.size;
-        if (report.files > MAX_TREE_FILES || report.bytes > MAX_TREE_BYTES) {
+        if (report.files > caps.files || report.bytes > caps.bytes) {
           throw new Error('source tree is over the size limit');
         }
-        await copyFile(join(from, name), join(to, name));
-        await chmod(join(to, name), (s.mode & 0o111) !== 0 ? 0o777 : 0o666);
+        await visit.file(r, abs, (s.mode & 0o111) !== 0);
       } else report.skippedLinks++;
     }
   };
-  await walk(src, dest);
+  await walk('');
   return report;
+}
+
+/**
+ * SHA-256 of exactly what `stageTree` would copy into a build context (same walker): each
+ * directory's path, and each regular file's path, exec bit and bytes, in sorted order. Two trees
+ * with the same fingerprint stage identically. Read only; never follows a link. `lstat` and `caps`
+ * are for tests.
+ */
+export async function fingerprintStageTree(
+  src: string,
+  opts: { lstat?: typeof lstat; caps?: Readonly<StageCaps> } = {},
+): Promise<string> {
+  const hash = createHash('sha256');
+  await walkStageable(
+    src,
+    {
+      dir(rel) {
+        hash.update(`d\0${rel}\0`);
+        return Promise.resolve();
+      },
+      async file(rel, abs, executable) {
+        const body = await readFile(abs);
+        hash.update(`f\0${rel}\0${executable ? 'x' : '-'}\0${body.length}\0`);
+        hash.update(body);
+      },
+    },
+    opts,
+  );
+  return hash.digest('hex');
 }
 
 /** What a build installed from a dependency bundle, for the evidence bundle and replay. */

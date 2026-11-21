@@ -79,3 +79,19 @@ export async function buildRunnerImage(context: string = RUNNER_CONTEXT): Promis
   if (!IMAGE_ID.test(id)) throw new Error(`docker build did not return an image ID: ${stdout}`);
   return id;
 }
+
+/**
+ * True when Docker has a local image with exactly this ID (`docker image inspect`, no pull, no
+ * network). Used by the real Judge's startup check for the runner and patch-apply images.
+ */
+export async function localImagePresent(imageId: string): Promise<boolean> {
+  if (!IMAGE_ID.test(imageId)) return false;
+  try {
+    const { stdout } = await exec('docker', ['image', 'inspect', '--format', '{{.Id}}', imageId], {
+      timeout: 20_000,
+    });
+    return stdout.trim() === imageId;
+  } catch {
+    return false;
+  }
+}
