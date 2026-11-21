@@ -330,24 +330,15 @@ describe('Judge.verifyPatch', () => {
     );
     const survivor = counterexample({ id: 'exhibit-counter-002' as never, code: 'still works' });
     const unproven = counterexample({ code: 'passes everywhere' });
-    const otherCase = counterexample({ caseId: 'case-other' as never });
-    const malformed = { kind: 'counterexample', code: 1 } as unknown as Exhibit;
-    const r = await verify(patchExhibit(), [
-      counterexample(),
-      survivor,
-      unproven,
-      otherCase,
-      malformed,
-    ]);
+    // Counterexamples for another case or of the wrong shape refuse the whole patch (schema);
+    // see 'counterexample params header (CR-T8)'.
+    const r = await verify(patchExhibit(), [counterexample(), survivor, unproven]);
     expect(r.rejectedBy).toBe('counterexample-survives');
-    expect(r.counterexamples.slice(0, 4)).toEqual([
+    expect(r.counterexamples).toEqual([
       { exhibitId: cid(), survived: false },
       { exhibitId: cid(survivor), survived: true },
       { exhibitId: cid(unproven), survived: false },
-      { exhibitId: cid(otherCase), survived: false },
     ]);
-    expect(r.counterexamples[4]?.exhibitId).toMatch(/^exhibit-counterexample-invalid-/);
-    expect(r.counterexamples[4]?.survived).toBe(false);
     // An inadmissible counterexample is never rerun on the patch.
     expect(
       exec.requests.some(
@@ -440,6 +431,14 @@ describe('Judge.verifyPatch', () => {
           },
         ]),
       ],
+      // Construction errors: the counterexample never runs, so it must not be skipped into a pass.
+      ['another caseId', counterexample({ caseId: 'case-other' as never })],
+      ['kind witness', counterexample({ kind: 'witness' as never })],
+      [
+        'code over maxSourceBytes',
+        counterexample({ code: 'x'.repeat(DEFAULT_POLICY.maxSourceBytes + 1) }),
+      ],
+      ['a value that is not an Exhibit', { kind: 'counterexample', code: 1 } as unknown as Exhibit],
     ])(
       'refuses the patch with schema for a counterexample with %s, before building',
       async (_, bad) => {
@@ -454,6 +453,68 @@ describe('Judge.verifyPatch', () => {
         expect(exec.requests).toHaveLength(0);
       },
     );
+
+    it("rejects a patch that special-cases an admitted counterexample's header value (literal-only-patch)", async () => {
+      // The family never mentions this value; only the counterexample's header does. The
+      // counterexample is admitted (passes on vulnerable, fails on safe) before it counts.
+      const traversal: ParamSpace = [{ name: 'threshold', values: ['..%2fetc%2fpasswd'] }];
+      const { verify } = setup(answer);
+      const r = await verify(
+        patchExhibit(
+          addLines([
+            `            if (threshold === "..%2fetc%2fpasswd") return 403;`,
+            `            const parsed = parseInt(threshold, 10);`,
+          ]),
+        ),
+        [counterexample({}, traversal)],
+      );
+      expect(r.rejectedBy).toBe('literal-only-patch');
+    });
+
+    /** Patch line that legitimately contains the common literal "string". */
+    const typeGuard = () =>
+      patchExhibit(
+        addLines([
+          `            if (typeof threshold !== "string") return 400;`,
+          `            if (path.includes("/etc/passwd/")) return 403;`,
+        ]),
+      );
+    const counterOnly = (code: string, fn: (req: ExecutionRequest) => boolean) =>
+      setup((req) =>
+        body(req.template) === code
+          ? raw(req.params[0]!.values.map(() => fn(req)))
+          : fixedByPatch(req),
+      );
+
+    it('does not let an inadmissible counterexample with a common value veto a sound patch', async () => {
+      // It passes on the safe variant too, so it proves nothing and its values are not used.
+      const { verify } = counterOnly('passes everywhere', () => true);
+      const r = await verify(typeGuard(), [
+        counterexample({ code: 'passes everywhere' }, [{ name: 'threshold', values: ['string'] }]),
+      ]);
+      expect(r.rejectedBy).toBeUndefined();
+      expect(r.counterexamples).toEqual([
+        {
+          exhibitId: cid(
+            counterexample({ code: 'passes everywhere' }, [
+              { name: 'threshold', values: ['string'] },
+            ]),
+            [{ name: 'threshold', values: ['string'] }],
+          ),
+          survived: false,
+        },
+      ]);
+    });
+
+    it("matches an admitted counterexample's value only as a whole literal in a conditional", async () => {
+      // "/etc/passwd" is admitted, but the patch only has it inside a longer literal.
+      const admittedOnly = (req: ExecutionRequest) => req.variant === 'vulnerable';
+      const { verify } = counterOnly('counterexample source', admittedOnly);
+      const r = await verify(typeGuard(), [
+        counterexample({}, [{ name: 'threshold', values: ['/etc/passwd'] }]),
+      ]);
+      expect(r.rejectedBy).toBeUndefined();
+    });
 
     it('returns exactly one result per submitted counterexample, in order', async () => {
       const { verify } = setup(answer);

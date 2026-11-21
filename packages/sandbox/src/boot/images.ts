@@ -29,7 +29,8 @@ export function hubRefProblem(ref: string): string | null {
 
 /**
  * Base images a target may be assembled on. The base is the root filesystem the target runs in,
- * and its `npm rebuild` and build script run on it, so it is held to an allowlist rather than any
+ * and its offline `npm run build` (when the target has a build script) runs on it; nothing is
+ * installed or rebuilt (deny-all egress, lead decision 2026-11-20). So it is held to an allowlist rather than any
  * Hub name: only the official `node` images (`node:<tag>`, `library/node:<tag>`, or either pinned
  * by digest). Sidecars (databases) are separate: they run as their own services and keep the
  * plain Hub rule above. Widen deliberately, one official image at a time.
