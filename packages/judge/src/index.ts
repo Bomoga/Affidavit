@@ -13,3 +13,5 @@ export * from './jail/executor.js';
 export * from './jail/containment.js';
 export * from './jail/booted.js';
 export * from './jail/workbench.js';
+export * from './jail/targets.js';
+export * from './jail/real.js';
