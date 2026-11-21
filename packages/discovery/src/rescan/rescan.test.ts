@@ -19,6 +19,7 @@ import { cleanupTmp, symlinks, tmp } from '../tools/testkit.js';
 import { DiscoveryRescan, rescanPatchedTree, type RescanDeps } from './index.js';
 import {
   NOSQL_WHERE,
+  RESCAN as RESCAN_FIXTURES,
   RULES,
   SQL_CONCAT,
   buildTree,
@@ -209,6 +210,170 @@ describe('rescanPatchedTree', () => {
       rescanPatchedTree(deps(replay('patched', seen, undefined, 2)), whereCase, tree),
     ).rejects.toThrow();
     expect(readdirSync(workRoot)).toEqual([]);
+  });
+});
+
+describe('clean is never the default (review of #66)', () => {
+  /** Drops `ruleId` from the rules the SARIF says it ran (as a rule renamed or missing since intake). */
+  const withoutRule =
+    (ruleId: string) =>
+    (doc: Record<string, unknown>): void => {
+      for (const run of doc['runs'] as { tool: { driver: { rules: { id: string }[] } } }[]) {
+        run.tool.driver.rules = run.tool.driver.rules.filter((r) => r.id !== ruleId);
+      }
+    };
+
+  it('is not clean when the case rule is not among the rules Semgrep loaded', async () => {
+    const { tree, seen, deps } = setup('patched');
+    const r = await rescanPatchedTree(
+      deps(replay('patched', seen, withoutRule(NOSQL_WHERE))),
+      whereCase,
+      tree,
+    );
+    expect(r).toMatchObject({ clean: false, reason: 'rule-not-loaded' });
+  });
+
+  it('is not clean when the SARIF lists no rules at all', async () => {
+    const { tree, seen, deps } = setup('patched');
+    const none = replay('patched', seen, (doc) => {
+      for (const run of doc['runs'] as { tool: { driver: Record<string, unknown> } }[]) {
+        delete run.tool.driver['rules'];
+      }
+    });
+    const r = await rescanPatchedTree(deps(none), whereCase, tree);
+    expect(r).toMatchObject({ clean: false, reason: 'rule-not-loaded' });
+  });
+
+  /** The patched case file rewritten to `bytes`; Semgrep must not even run. */
+  async function withCaseFile(bytes: Buffer | string) {
+    const { tree, seen, deps } = setup('patched');
+    writeFileSync(join(tree, 'src', 'routes.js'), bytes);
+    const r = await rescanPatchedTree(deps(replay('patched', seen)), whereCase, tree);
+    return { r, seen };
+  }
+  const patchedText = (): string =>
+    readFileSync(join(RESCAN_FIXTURES, 'patched', 'src', 'routes.js.fixture'), 'utf8');
+
+  it('is not clean when the case file holds a NUL byte', async () => {
+    const { r, seen } = await withCaseFile(`${patchedText()}\0\n`);
+    expect(r).toMatchObject({ clean: false, reason: 'not-plain-text' });
+    expect(seen.calls).toBe(0);
+  });
+
+  it('is not clean when the case file is UTF-16', async () => {
+    const utf16 = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(patchedText(), 'utf16le')]);
+    const { r, seen } = await withCaseFile(utf16);
+    expect(r).toMatchObject({ clean: false, reason: 'not-plain-text' });
+    expect(seen.calls).toBe(0);
+  });
+
+  it('is not clean when the case file is not valid UTF-8', async () => {
+    const { r } = await withCaseFile(
+      Buffer.concat([Buffer.from(patchedText()), Buffer.from([0xc3, 0x28])]),
+    );
+    expect(r).toMatchObject({ clean: false, reason: 'not-plain-text' });
+  });
+
+  it('is not clean when the case file is over 1 MB', async () => {
+    const pad = `// ${'x'.repeat(100)}\n`.repeat(10_000);
+    const { r, seen } = await withCaseFile(patchedText() + pad);
+    expect(Buffer.byteLength(patchedText() + pad)).toBeGreaterThan(1_000_000);
+    expect(r).toMatchObject({ clean: false, reason: 'not-plain-text' });
+    expect(seen.calls).toBe(0);
+  });
+
+  it('is not clean when the case file looks minified (a line over the cap)', async () => {
+    const { r } = await withCaseFile(`${patchedText()}var a=${'1+'.repeat(3000)}1;\n`);
+    expect(r).toMatchObject({ clean: false, reason: 'not-plain-text' });
+  });
+
+  it('is not clean when the case file holds a control byte', async () => {
+    const { r } = await withCaseFile(`${patchedText()}\u0001\n`);
+    expect(r).toMatchObject({ clean: false, reason: 'not-plain-text' });
+  });
+
+  it('is not clean after a case-only rename, judged by the exact directory listing', async () => {
+    const { tree, seen, deps } = setup('patched');
+    // What a case-insensitive host shows after `routes.js` became `Routes.js`: lstat still finds
+    // `routes.js`, the listing does not.
+    const listDir = (d: string): string[] =>
+      readdirSync(d).map((n) => (n === 'routes.js' ? 'Routes.js' : n));
+    const r = await rescanPatchedTree(
+      { ...deps(replay('patched', seen)), listDir },
+      whereCase,
+      tree,
+    );
+    expect(r).toMatchObject({ clean: false, reason: 'file-missing' });
+    expect(seen.calls).toBe(0);
+    // The same listing without the rename is clean.
+    const ok = await rescanPatchedTree(
+      { ...deps(replay('patched', seen)), listDir: (d) => readdirSync(d) },
+      whereCase,
+      tree,
+    );
+    expect(ok.clean).toBe(true);
+  });
+
+  it('refuses a tree past the copy limits without scanning it', async () => {
+    const { tree, workRoot, seen, deps } = setup('patched');
+    const files = await rescanPatchedTree(
+      { ...deps(replay('patched', seen)), limits: { maxFiles: 2 } },
+      whereCase,
+      tree,
+    );
+    expect(files).toMatchObject({ clean: false, reason: 'tree-too-large' });
+    const bytes = await rescanPatchedTree(
+      { ...deps(replay('patched', seen)), limits: { maxBytes: 100 } },
+      whereCase,
+      tree,
+    );
+    expect(bytes).toMatchObject({ clean: false, reason: 'tree-too-large' });
+    expect(seen.calls).toBe(0);
+    expect(readdirSync(workRoot)).toEqual([]);
+  });
+
+  it('logs a failed cleanup and keeps the scan outcome, clean or not', async () => {
+    const logs: string[] = [];
+    const failingRm = (): void => {
+      throw new Error('EBUSY');
+    };
+    const patched = setup('patched');
+    const clean = await rescanPatchedTree(
+      {
+        ...patched.deps(replay('patched', patched.seen)),
+        removeDir: failingRm,
+        log: (m) => logs.push(m),
+      },
+      whereCase,
+      patched.tree,
+    );
+    expect(clean).toMatchObject({ clean: true, reason: 'clean' });
+    const vulnerable = setup('vulnerable');
+    const dirty = await rescanPatchedTree(
+      {
+        ...vulnerable.deps(replay('vulnerable', vulnerable.seen)),
+        removeDir: failingRm,
+        log: (m) => logs.push(m),
+      },
+      whereCase,
+      vulnerable.tree,
+    );
+    expect(dirty).toMatchObject({ clean: false, reason: 'finding-present' });
+    // A scan that throws still throws.
+    const failed = setup('patched');
+    await expect(
+      rescanPatchedTree(
+        {
+          ...failed.deps(replay('patched', failed.seen, undefined, 2)),
+          removeDir: failingRm,
+          log: (m) => logs.push(m),
+        },
+        whereCase,
+        failed.tree,
+      ),
+    ).rejects.toThrow();
+    expect(logs).toEqual(Array(3).fill('re-scan cleanup failed (Error)'));
+    expect(logs.join('')).not.toContain(patched.workRoot);
   });
 });
 
