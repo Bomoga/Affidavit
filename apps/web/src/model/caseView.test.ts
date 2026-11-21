@@ -187,6 +187,108 @@ describe('stamp rule', () => {
     expect(view.docket.some((d) => d.label.includes(PAYLOAD))).toBe(true);
   });
 
+  it('never stamps on a passing Judge verify-result recorded for another case', () => {
+    const forged = withVerify(withoutVerify(GATE), [verifyResult(PATCH_ID)]).map((e) =>
+      e.type === 'verify-result' ? { ...e, caseId: 'case-someone-else' } : e,
+    );
+    const view = buildCaseView(TrialEvent.array().parse(forged));
+    expect(view.caseId).toBe('case-nodegoat-sqli-001');
+    expect(view.stamp).toBeNull();
+    expect(view.status).toBe('unverified');
+    expect(view.exhibits.find((e) => e.id === PATCH_ID)?.judged).toBe(false);
+    expect(view.docket.some((d) => d.label.includes('confirmed the fix'))).toBe(false);
+  });
+
+  it('ignores every event for another case, wherever it sits in the stream', () => {
+    // A whole passing trial for another case, numbered after this one so no seq collides.
+    const other = withVerify(GATE, [verifyResult(PATCH_ID)]).map((e) => ({
+      ...e,
+      caseId: 'case-someone-else',
+      seq: e.seq + 100,
+    }));
+    const view = buildCaseView(TrialEvent.array().parse([...withoutVerify(GATE), ...other]));
+    expect(view.stamp).toBeNull();
+    expect(view.docket.map((d) => d.seq)).toEqual(withoutVerify(GATE).map((e) => e.seq));
+  });
+
+  it('uses the last Judge check of the patch: a later failure withholds the stamp', () => {
+    const view = buildCaseView(
+      withVerify(GATE, [
+        verifyResult(PATCH_ID),
+        verifyResult(PATCH_ID, { suitePassed: false, rejectedBy: 'suite-fails' }),
+      ]),
+    );
+    expect(view.stamp).toBeNull();
+    expect(view.status).toBe('unverified');
+    expect(view.awaitingVerification).toBe(false);
+    expect(view.exhibits.find((e) => e.id === PATCH_ID)).toMatchObject({
+      admitted: false,
+      judged: true,
+      rejectedBy: 'suite-fails',
+    });
+  });
+
+  it('uses the last Judge check of the patch: a later pass after a failure stamps', () => {
+    const view = buildCaseView(
+      withVerify(GATE, [
+        verifyResult(PATCH_ID, { suitePassed: false, rejectedBy: 'suite-fails' }),
+        verifyResult(PATCH_ID),
+      ]),
+    );
+    expect(view.stamp).toBe('VERIFIED');
+    const patch = view.exhibits.find((e) => e.id === PATCH_ID);
+    expect(patch).toMatchObject({ admitted: true, judged: true });
+    expect(patch?.rejectedBy).toBeUndefined();
+  });
+
+  it('decides by seq, not by the order events arrive in', () => {
+    const events = withVerify(GATE, [
+      verifyResult(PATCH_ID),
+      verifyResult(PATCH_ID, { suitePassed: false, rejectedBy: 'suite-fails' }),
+    ]);
+    expect(buildCaseView([...events].reverse()).stamp).toBeNull();
+  });
+
+  it('never stamps on a passing Judge verify-result recorded after the verdict', () => {
+    const before = withoutVerify(GATE);
+    const last = before.at(-1) as TrialEvent;
+    const late = {
+      ...last,
+      seq: last.seq + 1,
+      stage: 'verify',
+      actor: 'judge',
+      type: 'verify-result',
+      payload: { result: verifyResult(PATCH_ID) },
+    };
+    const view = buildCaseView(TrialEvent.array().parse([...before, late]));
+    expect(view.stamp).toBeNull();
+    expect(view.status).toBe('unverified');
+    expect(view.exhibits.find((e) => e.id === PATCH_ID)?.judged).toBe(false);
+    const entry = view.docket.find((d) => d.seq === last.seq + 1);
+    expect(entry?.label).toBe(
+      `A patch check for ${PATCH_ID} was recorded after the verdict, so it does not count`,
+    );
+    expect(entry?.label).not.toContain(EM_DASH);
+  });
+
+  it('ignores a failing Judge verify-result recorded after the verdict', () => {
+    const before = GATE;
+    const last = before.at(-1) as TrialEvent;
+    const late = {
+      ...last,
+      seq: last.seq + 1,
+      stage: 'verify',
+      actor: 'judge',
+      type: 'verify-result',
+      payload: {
+        result: verifyResult(PATCH_ID, { suitePassed: false, rejectedBy: 'suite-fails' }),
+      },
+    };
+    const view = buildCaseView(TrialEvent.array().parse([...before, late]));
+    expect(view.stamp).toBe('VERIFIED');
+    expect(view.exhibits.find((e) => e.id === PATCH_ID)?.admitted).toBe(true);
+  });
+
   it('ignores a verify result for an exhibit that was never submitted as a patch', () => {
     const view = buildCaseView(withVerify(GATE, [verifyResult(WITNESS_ID)]));
     expect(view.stamp).toBeNull();

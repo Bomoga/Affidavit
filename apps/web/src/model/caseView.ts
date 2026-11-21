@@ -89,14 +89,19 @@ export interface CaseView {
 
 /**
  * A `verify-result` counts as the Judge's patch check only when the Judge recorded it in the
- * verify stage (contracts v1.1, CR-1). The same payload from any other actor or stage is shown on
- * the docket but never backs the stamp.
+ * verify stage (contracts v1.1, CR-1), for this stream's case, before any verdict was written. The
+ * same payload from any other actor or stage, or recorded after a verdict, is shown on the docket
+ * but never backs the stamp. A check for another case is dropped with every other such event.
  */
 function isJudgeVerify(e: TrialEvent): e is Extract<TrialEvent, { type: 'verify-result' }> {
   return e.type === 'verify-result' && e.actor === 'judge' && e.stage === 'verify';
 }
 
-function label(e: TrialEvent, acceptedVerify: ReadonlySet<TrialEvent>): string {
+function label(
+  e: TrialEvent,
+  acceptedVerify: ReadonlySet<TrialEvent>,
+  lateVerify: ReadonlySet<TrialEvent>,
+): string {
   switch (e.type) {
     case 'stage-entered':
       return `Stage started: ${e.stage}`;
@@ -136,6 +141,8 @@ function label(e: TrialEvent, acceptedVerify: ReadonlySet<TrialEvent>): string {
       const r = e.payload.result;
       if (e.actor !== 'judge' || e.stage !== 'verify')
         return `A patch check for ${r.patchExhibitId} was recorded by ${e.actor} in ${e.stage}, not by the Judge in verify`;
+      if (lateVerify.has(e))
+        return `A patch check for ${r.patchExhibitId} was recorded after the verdict, so it does not count`;
       if (acceptedVerify.has(e)) return `The Judge confirmed the fix in patch ${r.patchExhibitId}`;
       return `The Judge did not confirm patch ${r.patchExhibitId} (rule ${r.rejectedBy ?? 'not recorded'})`;
     }
@@ -172,8 +179,14 @@ function docketEntry(
   e: TrialEvent,
   exhibits: ReadonlyMap<string, ExhibitView>,
   acceptedVerify: ReadonlySet<TrialEvent>,
+  lateVerify: ReadonlySet<TrialEvent>,
 ): DocketEntry {
-  const base = { seq: e.seq, at: e.at, stage: e.stage, label: label(e, acceptedVerify) };
+  const base = {
+    seq: e.seq,
+    at: e.at,
+    stage: e.stage,
+    label: label(e, acceptedVerify, lateVerify),
+  };
   switch (e.type) {
     case 'exhibit-submitted':
       return e.payload.kind === 'counterexample'
@@ -229,15 +242,28 @@ function stampBlockers(
  * `verify-result` events, never on what the verdict claims.
  */
 export function buildCaseView(input: readonly TrialEvent[]): CaseView {
+  // The stream's case is the case of its first event by seq (the first one received on a tie).
+  // Any event naming another case is ignored entirely: it is not part of this record.
+  let streamCase: string | undefined;
+  let firstSeq = Infinity;
+  for (const e of input)
+    if (e.seq < firstSeq) {
+      firstSeq = e.seq;
+      streamCase = e.caseId;
+    }
   const bySeq = new Map<number, TrialEvent>();
-  for (const e of input) if (!bySeq.has(e.seq)) bySeq.set(e.seq, e);
+  for (const e of input) if (e.caseId === streamCase && !bySeq.has(e.seq)) bySeq.set(e.seq, e);
   const events = [...bySeq.values()].sort((a, b) => a.seq - b.seq);
 
   const exhibits = new Map<string, ExhibitView>();
   let verdict: Verdict | undefined;
   let escalation: Escalation | undefined;
   let dismissed = false;
+  let firstVerdictSeq: number | undefined;
+  // Judge checks recorded in verify before any verdict, in seq order. Only these count.
   const verifyEvents: Extract<TrialEvent, { type: 'verify-result' }>[] = [];
+  // Judge checks recorded after a verdict. Shown on the docket, never counted.
+  const lateVerify = new Set<TrialEvent>();
 
   const ensure = (id: string): ExhibitView => {
     const prev = exhibits.get(id);
@@ -305,6 +331,7 @@ export function buildCaseView(input: readonly TrialEvent[]): CaseView {
       }
       case 'verdict-written':
         verdict = e.payload.verdict;
+        firstVerdictSeq ??= e.seq;
         break;
       case 'escalated':
       case 'budget-exhausted':
@@ -314,7 +341,10 @@ export function buildCaseView(input: readonly TrialEvent[]): CaseView {
         dismissed = true;
         break;
       case 'verify-result':
-        if (isJudgeVerify(e)) verifyEvents.push(e);
+        // Events arrive here in seq order, so a check after any verdict is already known as late.
+        if (!isJudgeVerify(e)) break;
+        if (firstVerdictSeq !== undefined) lateVerify.add(e);
+        else verifyEvents.push(e);
         break;
       default:
         break;
@@ -328,6 +358,8 @@ export function buildCaseView(input: readonly TrialEvent[]): CaseView {
 
   // A Judge check counts only for an exhibit the record submitted as a patch. It never creates an
   // exhibit, so a check naming a witness or an unknown id changes nothing.
+  // The last counted check of a patch (by seq) is the Judge's decision on it: a later failure
+  // overrules an earlier pass, and a later pass supersedes an earlier failure.
   const acceptedVerify = new Set<TrialEvent>();
   const acceptedPatches = new Set<string>();
   for (const e of verifyEvents) {
@@ -338,12 +370,12 @@ export function buildCaseView(input: readonly TrialEvent[]): CaseView {
     if (ok) {
       acceptedVerify.add(e);
       acceptedPatches.add(target.id);
-    }
-    // The patch's own Judge ruling: admitted once any check accepts it, otherwise judged and not
-    // admitted, with the rule if the Judge named one.
-    const next: ExhibitView = { ...target, admitted: acceptedPatches.has(target.id), judged: true };
-    if (next.admitted) delete next.rejectedBy;
-    else if (r.rejectedBy !== undefined) next.rejectedBy = r.rejectedBy;
+    } else acceptedPatches.delete(target.id);
+    // The patch's own Judge ruling follows its latest check: admitted when it accepts the patch,
+    // otherwise judged and not admitted, with the rule if the Judge named one.
+    const next: ExhibitView = { ...target, admitted: ok, judged: true };
+    delete next.rejectedBy;
+    if (!ok && r.rejectedBy !== undefined) next.rejectedBy = r.rejectedBy;
     exhibits.set(target.id, next);
   }
 
@@ -401,7 +433,7 @@ export function buildCaseView(input: readonly TrialEvent[]): CaseView {
   }
 
   const exhibitList = [...exhibits.values()];
-  const docket = events.map((e) => docketEntry(e, exhibits, acceptedVerify));
+  const docket = events.map((e) => docketEntry(e, exhibits, acceptedVerify, lateVerify));
 
   return {
     caseId: events[0]?.caseId ?? '',
