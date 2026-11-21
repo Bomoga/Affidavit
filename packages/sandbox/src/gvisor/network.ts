@@ -2,9 +2,17 @@ import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { networkInterfaces } from 'node:os';
 import { promisify } from 'node:util';
-import { CASE_NETWORK, PLAIN_RUNTIME, RUN_LABEL, buildGvisorRunArgs, type Limits } from './args.js';
+import {
+  CASE_NETWORK,
+  PLAIN_RUNTIME,
+  RUN_LABEL,
+  buildGvisorRunArgs,
+  type Limits,
+  type TmpfsMount,
+} from './args.js';
 import { inCidr, inCidr6, ipv4ToInt, isIpv4Cidr, isIpv6Cidr, mappedIpv4 } from './cidr.js';
 import type { Mount } from './mounts.js';
+import { parseContainerVolumes, parseImageVolumes, uncoveredVolumes } from './volumes.js';
 
 const exec = promisify(execFile);
 
@@ -131,6 +139,12 @@ export interface ServiceSpec {
   /** Command run inside the service until it exits 0 (for example a health request). */
   readiness?: readonly string[];
   readinessTimeoutMs?: number;
+  /** Names this service resolves (other services on the case network). */
+  hosts?: Readonly<Record<string, string>>;
+  env?: Readonly<Record<string, string>>;
+  workdir?: string;
+  tmpfs?: readonly TmpfsMount[];
+  writableTmpMb?: number;
 }
 
 export interface RunningService {
@@ -149,6 +163,27 @@ export async function startJailedService(
   spec: ServiceSpec,
 ): Promise<RunningService> {
   if (!CASE_NETWORK.test(net.name)) throw new Error(`not a case network: ${net.name}`);
+  // Main's volume rule (runner.ts, refuseImageVolumes): no Docker volume may exist for a jailed
+  // container. A service image may declare VOLUME only if every path is covered by a tmpfs.
+  let declared: string[];
+  try {
+    const { stdout } = await exec('docker', [
+      'image',
+      'inspect',
+      '--format',
+      '{{json .Config.Volumes}}',
+      spec.image,
+    ]);
+    declared = parseImageVolumes(stdout);
+  } catch (e) {
+    throw new Error(`cannot inspect image ${spec.image}`, { cause: e });
+  }
+  const uncovered = uncoveredVolumes(declared, spec.tmpfs ?? []);
+  if (uncovered.length > 0) {
+    throw new Error(
+      `image ${spec.image} declares volumes without a tmpfs over them (${uncovered.join(', ')}); an anonymous volume could keep state after teardown`,
+    );
+  }
   const name = `affidavit-svc-${randomBytes(8).toString('hex')}`;
   const args = buildGvisorRunArgs({
     name,
@@ -158,9 +193,19 @@ export async function startJailedService(
     mounts: spec.mounts ?? [],
     limits: spec.limits,
     runtime: PLAIN_RUNTIME,
-    network: { name: net.name },
+    network: { name: net.name, hosts: spec.hosts },
+    env: spec.env,
+    workdir: spec.workdir,
+    tmpfs: spec.tmpfs,
+    writableTmpMb: spec.writableTmpMb,
   });
   await exec('docker', [args[0] ?? 'run', '--detach', ...args.slice(1)]);
+  const mounts = await exec('docker', ['inspect', '--format', '{{json .Mounts}}', name]);
+  const volumes = parseContainerVolumes(mounts.stdout);
+  if (volumes.length > 0) {
+    await exec('docker', ['rm', '--force', '--volumes', name]).catch(() => undefined);
+    throw new Error(`service ${name} got Docker volumes (${volumes.join(', ')}); refused`);
+  }
   const { stdout } = await exec('docker', [
     'inspect',
     '--format',
