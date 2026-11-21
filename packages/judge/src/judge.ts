@@ -16,6 +16,7 @@ import type { ExecutionVariant, WitnessExecutor } from './executor.js';
 import { addedLines, parseUnifiedDiff, selectFiles } from './patch/diff.js';
 import type { ParsedDiff } from './patch/diff.js';
 import {
+  findCounterexampleSpecialCases,
   findLiteralSpecialCases,
   findSuiteTampering,
   isTestFile,
@@ -192,7 +193,9 @@ export class Judge implements JudgePort {
    * another kind, over the size limit, a bad header) refuses the patch with `schema`. When the
    * patch is refused before any counterexample ran, every runnable counterexample is reported as
    * surviving (nothing was shown) and refused ones as `survived: false`. The literal-only check
-   * covers the counterexamples' header values as well as the family's.
+   * runs on the family's values before building, and on admitted counterexamples' header values
+   * once they are admitted (whole literals in added conditionals only), so an unproven
+   * counterexample cannot veto a patch.
    *
    * `rejectedBy` names the first failed rule in that order. A failed re-scan has no rule of its
    * own in contracts v1.0 and shows only as `rescanClean: false`. When a check never ran, its
@@ -282,12 +285,8 @@ export class Judge implements JudgePort {
       return reject('diff-too-large');
     }
     if (findSuiteTampering(diff).length > 0) return reject('suite-fails');
-    // Every value the patch could be tailored to: the family's and each counterexample's header.
-    const literalParams: ParamSpace = [
-      ...w.data.params,
-      ...counters.flatMap((c) => c.params ?? []),
-    ];
-    if (findLiteralSpecialCases(addedLines(diff), literalParams, testFilesOf(diff)).length > 0) {
+    // The family's values here; admitted counterexamples' values after they are admitted below.
+    if (findLiteralSpecialCases(addedLines(diff), w.data.params, testFilesOf(diff)).length > 0) {
       return reject('literal-only-patch');
     }
 
@@ -326,6 +325,7 @@ export class Judge implements JudgePort {
         plan.tests.files.length === 0 ? null : await deps.workbench.runAddedTests(cf, prepared);
       const suite = { passed: ownSuite.passed === true && addedTests?.passed !== false };
       const results: VerifyResult['counterexamples'] = [];
+      const admittedParams: ParamSpace = [];
       for (const { exhibitId, code, params: space } of counters) {
         if (code === undefined || space === undefined) {
           results.push({ exhibitId, survived: false });
@@ -345,6 +345,7 @@ export class Judge implements JudgePort {
           results.push({ exhibitId, survived: false });
           continue;
         }
+        admittedParams.push(...space);
         const attempts = await this.#attempts(cf, [['patched', prepared.target]], code, space);
         const survived = counterexampleSurvives(
           { exhibitId, familySize: familySize(space), attempts },
@@ -354,7 +355,11 @@ export class Judge implements JudgePort {
       }
       const rescan = await deps.rescan.rescan(cf, prepared.workspacePath);
 
+      // A patch tailored to a value Prosecution proved (an admitted counterexample): only a whole
+      // literal in an added conditional counts, so a common value cannot veto a sound patch.
+      const tailored = findCounterexampleSpecialCases(addedLines(diff), admittedParams).length > 0;
       const rejectedBy: AdmissibilityRule | undefined =
+        (tailored ? 'literal-only-patch' : undefined) ??
         family.rejectedBy ??
         (!suite.passed
           ? 'suite-fails'
