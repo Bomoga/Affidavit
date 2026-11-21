@@ -27,7 +27,7 @@ import {
   type Mount,
 } from '@affidavit/sandbox';
 import { renderDiff, type ParsedDiff } from '../patch/diff.js';
-import { suiteManifestChange } from '../patch/literal.js';
+import { isTestFile, suiteManifestChange, TEST_ROOTS } from '../patch/literal.js';
 import {
   numstatMismatch,
   type PatchPlan,
@@ -171,13 +171,43 @@ export function testRunnerOf(packageJsonText: string): (typeof TEST_RUNNERS)[num
 /** A test file path the added-tests run can mount: plain relative segments, no `..`. */
 const ADDED_TEST_PATH = /^[A-Za-z0-9_@][A-Za-z0-9._@-]*(\/[A-Za-z0-9_@][A-Za-z0-9._@-]*)*$/;
 
+/** A file name a runner treats as a test: `x.test.js`, `x.spec.ts`, `x.test.cjs`, `x.spec.tsx`. */
+const TEST_FILE_NAME = /\.(test|spec)\.[cm]?[jt]sx?$/;
+
 /**
- * Plans the added-tests run: the files the patch adds under a test root (`PatchPlan.tests`, only
- * new files; a patch that edits or deletes a test is refused before any build), copied out of the
- * applied tree and mounted read only at their paths under the recipe's working directory, run by
- * the vulnerable commit's own test runner from the suite image's `node_modules/.bin`. Null when
- * there are no added files, no known runner, or a path or file it will not mount: the added tests
- * are an extra check whose pass is never required, so not running them never helps a patch.
+ * Whether an added file under a test root is one the runner should be handed as a test, rather
+ * than a fixture, helper or snapshot it only loads. Any runner: a `*.test.*` or `*.spec.*` JS or TS
+ * file. Mocha also: a `.js`, `.cjs` or `.mjs` file directly in the test root (`test/a.js`,
+ * `packages/api/test/a.js`), which is where mocha looks by default. Everything else is mounted but
+ * not passed: mocha would `require` a JSON or text fixture and fail with a SyntaxError, and jest or
+ * vitest exit 1 ("No tests found") when no argument matches their test pattern.
+ */
+export function isRunnableTest(path: string, runnerBin: string): boolean {
+  if (!isTestFile(path)) return false;
+  const name = path.split('/').pop() ?? '';
+  if (TEST_FILE_NAME.test(name)) return true;
+  if (runnerBin !== 'mocha' || !/\.[cm]?js$/.test(name)) return false;
+  const parent = path.split('/').slice(0, -1);
+  const isRoot = (s: string | undefined): boolean =>
+    (TEST_ROOTS as readonly string[]).includes(s ?? '');
+  return (parent.length === 1 && isRoot(parent[0])) || (parent.length === 3 && isRoot(parent[2]));
+}
+
+/**
+ * Plans the added-tests run: the files the patch adds under a test root (`PatchPlan.tests` with
+ * status `added`), copied out of the applied tree and mounted read only at their paths under the
+ * recipe's working directory, and run by the vulnerable commit's own test runner from the suite
+ * image's `node_modules/.bin`. Every added file is mounted, so a test can load an added fixture or
+ * helper, but only the ones `isRunnableTest` accepts are passed to the runner.
+ *
+ * Only new files run. A patch that deletes a test file, removes a line from one, or adds a skip,
+ * `.only` or exit to one is refused before any build (step 4); lines a patch appends to an existing
+ * test file are allowed there but are never run here, because the file is not new.
+ *
+ * Null (nothing run, which changes nothing) when: no added file, no added file that looks like a
+ * test, no known runner, a path or file it will not mount, or a mount `validateMounts` refuses (for
+ * example a recipe working directory under a path the jail reserves). The added tests are an extra
+ * check whose pass is never required, so not running them never helps a patch.
  */
 export async function planAddedTests(
   tests: ParsedDiff,
@@ -191,6 +221,8 @@ export async function planAddedTests(
   const pkg = await readIfFile(join(vulnerableRoot, 'package.json'));
   const runner = pkg === null ? null : testRunnerOf(pkg);
   if (runner === null) return null;
+  const runnable = files.filter((f) => isRunnableTest(f, runner.bin));
+  if (runnable.length === 0) return null;
   if (!/^\/[A-Za-z0-9._/-]*$/.test(workdir) || workdir.split('/').includes('..')) return null;
   const copies = join(scratch, 'added-tests');
   const mounts: Mount[] = [];
@@ -205,9 +237,16 @@ export async function planAddedTests(
     await chmod(to, 0o644);
     mounts.push({ hostPath: to, containerPath: posix.join(workdir, path), readOnly: true });
   }
+  let checked: Mount[];
+  try {
+    checked = validateMounts(mounts, [scratch]);
+  } catch {
+    // A refused mount means the tests cannot be run as planned; not running them changes nothing.
+    return null;
+  }
   return {
-    command: [posix.join(workdir, 'node_modules', '.bin', runner.bin), ...runner.args, ...files],
-    mounts: validateMounts(mounts, [scratch]),
+    command: [posix.join(workdir, 'node_modules', '.bin', runner.bin), ...runner.args, ...runnable],
+    mounts: checked,
   };
 }
 
@@ -281,9 +320,10 @@ async function readIfFile(path: string): Promise<string | null> {
  *   (unchanged, checked above).
  * - `runAddedTests` runs the files the patch adds under a test root, in a separate run on the
  *   same suite image: each file is mounted read only at its path, and the vulnerable commit's own
- *   runner (vitest, jest or mocha, from `node_modules/.bin`) runs only those files. A failure
- *   rejects the patch (`suite-fails`); no added files, no known runner, or a path it will not
- *   mount gives null, which changes nothing (`planAddedTests`).
+ *   runner (vitest, jest or mocha, from `node_modules/.bin`) runs only the added files that look
+ *   like tests. A failure rejects the patch (`suite-fails`); no added test file, no known runner,
+ *   or a path or mount it will not use gives null, which changes nothing (`planAddedTests`).
+ *   Lines appended to an existing test file are not run.
  *
  * Throws only on infrastructure failure.
  */
