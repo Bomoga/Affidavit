@@ -436,22 +436,49 @@ describe('Judge.verifyPatch', () => {
       ]);
     });
 
-    it("holds an admitted counterexample's values to the full literal check, declarations included", async () => {
-      const traversal: ParamSpace = [{ name: 'threshold', values: ['..%2fetc%2fpasswd'] }];
+    describe("an admitted counterexample's values: whole literals only", () => {
       const admittedOnly = (req: ExecutionRequest) => req.variant === 'vulnerable';
-      for (const lines of [
-        // Bound to a name first, then compared: the declaration line carries the value.
-        [
-          `            const BAD = '..%2fetc%2fpasswd';`,
-          `            if (threshold === BAD) return 403;`,
-        ],
-        // Inside a longer literal: the original substring rule (4 characters or more) applies.
-        [`            if (path.includes("/x/..%2fetc%2fpasswd/")) return 403;`],
-      ]) {
+      const run = async (values: (string | number)[], lines: string[]) => {
         const { verify } = counterOnly('counterexample source', admittedOnly);
-        const r = await verify(patchExhibit(addLines(lines)), [counterexample({}, traversal)]);
+        return verify(patchExhibit(addLines(lines)), [
+          counterexample({}, [{ name: 'threshold', values }]),
+        ]);
+      };
+
+      it.each([
+        ['a conditional', [`            if (threshold === "..%2fetc%2fpasswd") return 403;`]],
+        [
+          'a declaration, then a comparison by name',
+          [
+            `            const BAD = '..%2fetc%2fpasswd';`,
+            `            if (threshold === BAD) return 403;`,
+          ],
+        ],
+        [
+          'a switch case',
+          [`            switch (threshold) { case '..%2fetc%2fpasswd': return 403; }`],
+        ],
+        ['an array member', [`            const deny = ['x', "..%2fetc%2fpasswd"];`]],
+      ])('rejects the exact value in %s', async (_, lines) => {
+        expect((await run(['..%2fetc%2fpasswd'], lines)).rejectedBy).toBe('literal-only-patch');
+      });
+
+      it('rejects an exact number literal equal to an admitted number', async () => {
+        const r = await run([4242], [`            const LIMIT = 4242;`]);
         expect(r.rejectedBy).toBe('literal-only-patch');
-      }
+      });
+
+      it.each([
+        [
+          'a longer literal',
+          [`            if (path.includes("/x/..%2fetc%2fpasswd/")) return 403;`],
+        ],
+        ['an identifier', [`            const passwdHash = hash(threshold);`]],
+        ['a longer number', [`            const LIMIT = 42420;`]],
+      ])('does not reject a value that only appears inside %s', async (_, lines) => {
+        const values = lines[0]!.includes('LIMIT') ? [4242] : ['passwd', '..%2fetc%2fpasswd'];
+        expect((await run(values, lines)).rejectedBy).toBeUndefined();
+      });
     });
 
     it('returns exactly one result per submitted counterexample, in order', async () => {

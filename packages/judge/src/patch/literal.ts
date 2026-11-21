@@ -312,6 +312,42 @@ export function findLiteralSpecialCases(
 }
 
 /**
+ * The check for values from admitted counterexamples (Prosecution's proven inputs): an added code
+ * line (of any kind: conditional, declaration, assignment, array or object member, `case`) is a
+ * hit when it holds a string literal whose decoded content equals a value exactly, or a number
+ * literal equal to a parameter number. No substring matching, so a short or common value that
+ * merely appears inside other code or a longer literal cannot veto a patch.
+ */
+export function findExactLiteralUses(lines: readonly DiffLine[], params: ParamSpace): LiteralHit[] {
+  const { strings, numbers } = paramLiterals(params);
+  // A quoted number (`'4242'`) counts as the number too: its decoded content is equal.
+  const wanted = new Set<string>([...strings, ...numbers.map(String)]);
+  const number = new RegExp(
+    String.raw`(?<![\w$.])(?<sign>-\s*)?(?<num>${NUM_BODY})(?![\w$.])`,
+    'g',
+  );
+  const hits: LiteralHit[] = [];
+  for (const { path, text } of lines) {
+    if (isTestFile(path)) continue;
+    const code = stripComments(text);
+    let value: string | number | undefined = stringLiterals(code).find((l) => wanted.has(l));
+    if (value === undefined && numbers.length > 0) {
+      // Number tokens outside string literals only: digits inside a longer string never count.
+      const bare = code.replace(/(['"`])(?:\\.|(?!\1)[^\\])*\1/g, '""');
+      for (const m of bare.matchAll(number)) {
+        const n = numericValue(m.groups);
+        if (numbers.includes(n)) {
+          value = n;
+          break;
+        }
+      }
+    }
+    if (value !== undefined) hits.push({ path, line: text, value });
+  }
+  return hits;
+}
+
+/**
  * Lines that skip, narrow or cut short a suite: `.only`, `.skip`, `xit`, `fdescribe`, a runtime
  * `this.skip()` or `ctx.skip()`, and ending the process (`process.exit`, `process.kill`).
  */
