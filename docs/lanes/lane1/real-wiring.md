@@ -138,7 +138,9 @@ A dry run (intake, map and arraign real, trial halting with `model-unconfigured`
 - Linux Node and Linux pnpm in the distro; a Windows `pnpm` on the `PATH` does not work there.
 - The repo cloned under the Linux home (`~/Affidavit`), not under `/mnt/c`: the Windows mount has no POSIX modes or ownership, which the jail's mounts depend on.
 
-Scanners run as nobody (uid 65534) in the jail. Discovery sets every mode the jail needs itself (`docker/tools/README.md`, "Modes"), so the worker's umask does not matter; the repo checkout's `packages/discovery/rules` and `docker/tools/config` must be world-readable (a clone made under umask 022 is).
+Scanners run as nobody (uid 65534) in the jail. Discovery sets every mode the jail needs itself (`docker/tools/README.md`, "Modes"), so the worker's umask does not matter; the repo checkout's `packages/discovery/rules`, `packages/discovery/canary` and `docker/tools/config` must be world-readable (a clone made under umask 022 is). The intake work root must be a directory only the worker's user can enter: `runTool` refuses to run unless each run's parent directory is 0700 and owned by that user (discovery's own `mkdtemp` directories are).
+
+Scanner runs get a 512 MiB `/scratch` tmpfs and 2048 MiB of memory (`TOOL_LIMITS`, `apps/worker/src/real/components.ts`), instead of the witness defaults of 64 and 1024 MiB. Every Semgrep run carries a liveness canary that must match exactly once, so a Semgrep run that cannot write its temp files fails instead of reading as clean (`docker/tools/README.md`, "Running tools").
 
 ## To run a real case
 
@@ -173,3 +175,4 @@ These are outside this lane's packages or need the lead; each is tracked in `con
 - No jury handler (L3-11), so the jury must be disabled.
 - NodeGoat: ingestion returns `incomplete` until PR #54. `pins.json` has `bundleSha256: null` for NodeGoat, so until a human builds, reviews and pins the bundle, a configured bundle is refused at startup, and without one every NodeGoat case is `unsupported` at build.
 - CR-1: a case file's safe variant does not say which corpus safe variant it means, so a differential run cannot name the exact safe code it compared against.
+- No dependency scan (CR-14). Real intake runs Semgrep only: OSV-Scanner needs a writable temp directory under `/tmp`, which the gVisor jail reserves read-only, so it runs only on plain Docker in tests and is not part of `discoverCase`. A real case file therefore holds no dependency findings, and nothing in it says the dependency scanner did not run. Whenever intake is real, the worker and `open-case` log `intake: dependency scan not run` at startup, until the case file can record scanner coverage.

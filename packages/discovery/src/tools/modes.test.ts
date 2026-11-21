@@ -1,14 +1,20 @@
-import { chmodSync, lstatSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { chmodSync, lstatSync, mkdirSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import type { ToolRunnerPort } from '@affidavit/contracts';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   OutputNotFreshError,
   REPORT_FILE_MODE,
+  UnshareableEntryError,
+  loadToolManifest,
   prepareOutput,
   prepareScratch,
+  quarantineSnapshot,
+  runTool,
   shareForJailRead,
 } from './index.js';
-import { cleanupTmp, tmp } from './testkit.js';
+import { cleanupTmp, snapDir, tmp, withSemgrepCanary } from './testkit.js';
 
 afterAll(cleanupTmp);
 
@@ -86,5 +92,53 @@ describe.runIf(posix).each([0o022, 0o077])(
       expect(mode(join(snap, 'link'))).toBe(linkBefore);
       chmodSync(join(snap, 'closed'), 0o700);
     });
+
+    it('shareForJailRead refuses an entry that is neither a file, a directory nor a link', async () => {
+      const snap = join(tmp(), 'snap');
+      mkdirSync(join(snap, 'sub'), { recursive: true });
+      writeFileSync(join(snap, 'a.js'), 'x');
+      execFileSync('mkfifo', [join(snap, 'sub', 'pipe')]);
+      const err = await shareForJailRead(snap).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(UnshareableEntryError);
+      expect((err as UnshareableEntryError).path).toBe('sub/pipe');
+    });
+
+    it('runTool makes the scan copy readable to the jail user before the tool runs', async () => {
+      // Written under this umask, so under 077 every file starts as 0600 and every dir as 0700.
+      const snap = await quarantineSnapshot(snapDir({ 'src/app.js': 'x', 'lib/deep/b.js': 'y' }));
+      const seen: { path: string; mode: number }[] = [];
+      const runner: ToolRunnerPort = {
+        run(_image, _args, mounts) {
+          const src = mounts.find((m) => m.containerPath === '/src')?.hostPath ?? '';
+          const out = mounts.find((m) => m.containerPath === '/out')?.hostPath ?? '';
+          const walk = (dir: string): void => {
+            seen.push({ path: dir, mode: mode(dir) });
+            for (const e of readdirSync(dir, { withFileTypes: true })) {
+              const p = join(dir, e.name);
+              if (e.isDirectory()) walk(p);
+              else seen.push({ path: p, mode: mode(p) });
+            }
+          };
+          walk(src);
+          writeFileSync(join(out, 'semgrep.sarif'), withSemgrepCanary(EMPTY_SEMGREP));
+          return Promise.resolve({ exitCode: 0, outputPath: out });
+        },
+      };
+      await runTool(runner, loadToolManifest(), 'semgrep', {
+        snapshot: snap,
+        outputDir: join(tmp(), 'out'),
+        scratchDir: join(tmp(), 's'),
+        rulesDir: tmp(),
+      });
+      expect(seen.length).toBeGreaterThan(3);
+      for (const s of seen) {
+        const want = lstatSync(s.path).isDirectory() ? 0o055 : 0o044;
+        expect({ path: s.path, others: s.mode & want }).toEqual({ path: s.path, others: want });
+      }
+    });
   },
 );
+
+const EMPTY_SEMGREP = JSON.stringify({
+  runs: [{ tool: { driver: { name: 'semgrep', rules: [] } }, results: [] }],
+});

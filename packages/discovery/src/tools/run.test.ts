@@ -1,4 +1,5 @@
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -15,10 +16,13 @@ import {
   NonUtf8NameError,
   OutputNotFreshError,
   QuarantinedSnapshot,
+  SEMGREP_CANARY,
+  SEMGREP_NO_TMP_EXIT,
   ScratchNotFreshError,
   SnapshotNotCleanError,
   ToolFailedError,
   ToolOutputMissingError,
+  UnsafeRunDirError,
   findOsvLockfiles,
   loadToolManifest,
   quarantineSnapshot,
@@ -26,7 +30,16 @@ import {
   runTool,
   windowHitNotification,
 } from './index.js';
-import { cleanupTmp, put, rawNames, snapDir, symlinks, tmp } from './testkit.js';
+import {
+  canaryResult,
+  cleanupTmp,
+  put,
+  rawNames,
+  snapDir,
+  symlinks,
+  tmp,
+  withSemgrepCanary,
+} from './testkit.js';
 
 afterAll(cleanupTmp);
 
@@ -276,12 +289,17 @@ describe('runTool', () => {
   });
 
   it('treats OSV exit 128 as an empty result only when the snapshot has no lockfile', async () => {
-    const { runner } = fakeRunner(undefined, 128);
-    const res = await runTool(runner, manifest, 'osv-scanner', {
-      ...(await options()),
-      osvDatabaseDir: tmp(),
-    });
+    let placeholderSeen = false;
+    const { runner } = fakeRunner((out) => {
+      // runTool pre-creates the report file so the jail's user can write it.
+      placeholderSeen = existsSync(join(out, 'osv-scanner.json'));
+    }, 128);
+    const o = await options();
+    const res = await runTool(runner, manifest, 'osv-scanner', { ...o, osvDatabaseDir: tmp() });
     expect(res).toMatchObject({ empty: true, exitCode: 128, reports: [], partial: false });
+    expect(placeholderSeen).toBe(true);
+    // The empty placeholder is removed, so no empty report is left to be read as a result.
+    expect(existsSync(join(o.outputDir, 'osv-scanner.json'))).toBe(false);
   });
 
   it('fails OSV exit 128 when a lockfile is present, because it probably failed to parse', async () => {
@@ -347,7 +365,9 @@ describe('runTool', () => {
       '.git/objects/ab/cdef': 'x',
       '.git/payload.js': 'eval(x)',
     });
-    const semgrep = fakeRunner((out) => writeFileSync(join(out, 'semgrep.sarif'), sarif()));
+    const semgrep = fakeRunner((out) =>
+      writeFileSync(join(out, 'semgrep.sarif'), withSemgrepCanary(sarif())),
+    );
     const s = await runTool(semgrep.runner, manifest, 'semgrep', {
       ...(await options(snap)),
       rulesDir: tmp(),
@@ -816,20 +836,22 @@ describe('runTool', () => {
     const { runner } = fakeRunner((out) =>
       writeFileSync(
         join(out, 'semgrep.sarif'),
-        sarif({
-          invocations: [
-            {
-              executionSuccessful: true,
-              toolExecutionNotifications: [
-                {
-                  level: 'warning',
-                  descriptor: { id: 'Syntax error' },
-                  message: { text: 'Syntax error at line /src/broken.js:1' },
-                },
-              ],
-            },
-          ],
-        }),
+        withSemgrepCanary(
+          sarif({
+            invocations: [
+              {
+                executionSuccessful: true,
+                toolExecutionNotifications: [
+                  {
+                    level: 'warning',
+                    descriptor: { id: 'Syntax error' },
+                    message: { text: 'Syntax error at line /src/broken.js:1' },
+                  },
+                ],
+              },
+            ],
+          }),
+        ),
       ),
     );
     const res = await runTool(runner, manifest, 'semgrep', {
@@ -846,7 +868,9 @@ describe('runTool', () => {
     const { runner } = fakeRunner((out) =>
       writeFileSync(
         join(out, 'semgrep.sarif'),
-        sarif({ invocations: [{ executionSuccessful: true, toolExecutionNotifications: [] }] }),
+        withSemgrepCanary(
+          sarif({ invocations: [{ executionSuccessful: true, toolExecutionNotifications: [] }] }),
+        ),
       ),
     );
     const res = await runTool(runner, manifest, 'semgrep', {
@@ -855,4 +879,94 @@ describe('runTool', () => {
     });
     expect(res).toMatchObject({ partial: false, notifications: [] });
   });
+
+  describe('the Semgrep liveness canary', () => {
+    const finding = {
+      ruleId: 'affidavit.injection.sql-concat',
+      locations: [
+        {
+          physicalLocation: {
+            artifactLocation: { uri: '/src/src/app.js' },
+            region: { startLine: 1 },
+          },
+        },
+      ],
+    };
+    const tool = {
+      driver: { name: 'semgrep', rules: [{ id: finding.ruleId }, { id: SEMGREP_CANARY.ruleId }] },
+    };
+    const report = (results: object[]) => JSON.stringify({ runs: [{ tool, results }] });
+    const run = async (body: string) => {
+      const { runner } = fakeRunner((out) => writeFileSync(join(out, 'semgrep.sarif'), body));
+      const o = { ...(await options()), rulesDir: tmp() };
+      return { o, res: runTool(runner, manifest, 'semgrep', o) };
+    };
+
+    it('fails, never reads as clean, when the canary did not match (an empty report)', async () => {
+      const { res } = await run(sarif());
+      const err = await res.catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ToolOutputMissingError);
+      expect((err as Error).message).toMatch(/liveness canary matched 0 times/);
+    });
+
+    it('fails when the canary matched twice, or on another file or line', async () => {
+      for (const results of [
+        [canaryResult(), canaryResult()],
+        [canaryResult('/src/canary/canary.js')],
+        [canaryResult(SEMGREP_CANARY.uri, 2)],
+        [{ ...canaryResult(), locations: [] }],
+      ]) {
+        const { res } = await run(report([finding, ...results]));
+        await expect(res).rejects.toBeInstanceOf(ToolOutputMissingError);
+      }
+    });
+
+    it('accepts the canary match as a file:// URI', async () => {
+      const { res } = await run(report([canaryResult(`file://${SEMGREP_CANARY.uri}`)]));
+      await expect(res).resolves.toMatchObject({ partial: false });
+    });
+
+    it('strips every canary result and rule from the report, so it never becomes a candidate', async () => {
+      const { o, res } = await run(report([finding, canaryResult()]));
+      await res;
+      const doc = JSON.parse(readFileSync(join(o.outputDir, 'semgrep.sarif'), 'utf8')) as {
+        runs: { results: { ruleId: string }[]; tool: { driver: { rules: { id: string }[] } } }[];
+      };
+      expect(doc.runs[0]?.results.map((r) => r.ruleId)).toEqual([finding.ruleId]);
+      expect(doc.runs[0]?.tool.driver.rules.map((r) => r.id)).toEqual([finding.ruleId]);
+      expect(JSON.stringify(doc)).not.toContain('canary');
+    });
+
+    it('reports exit 97 as a failure: the wrapper found no writable temp directory', async () => {
+      const { runner } = fakeRunner(undefined, SEMGREP_NO_TMP_EXIT);
+      const err = await runTool(runner, manifest, 'semgrep', {
+        ...(await options()),
+        rulesDir: tmp(),
+      }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ToolFailedError);
+      expect((err as Error).message).toMatch(/no writable temp directory/);
+    });
+  });
+
+  it.runIf(process.platform !== 'win32')(
+    'refuses output and scratch dirs whose parent is not a private 0700 dir of the worker',
+    async () => {
+      const shared = tmp();
+      chmodSync(shared, 0o755);
+      const { runner, calls } = fakeRunner();
+      const o = await options();
+      for (const bad of [{ outputDir: join(shared, 'out') }, { scratchDir: join(shared, 's') }]) {
+        await expect(
+          runTool(runner, manifest, 'gitleaks', { ...o, ...bad }),
+        ).rejects.toBeInstanceOf(UnsafeRunDirError);
+      }
+      const real = tmp();
+      const link = join(tmp(), 'link');
+      symlinkSync(real, link);
+      await expect(
+        runTool(runner, manifest, 'gitleaks', { ...o, outputDir: join(link, 'out') }),
+      ).rejects.toBeInstanceOf(UnsafeRunDirError);
+      expect(calls).toEqual([]);
+    },
+  );
 });

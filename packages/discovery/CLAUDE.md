@@ -23,6 +23,7 @@ Semgrep, OSV-Scanner and gitleaks run as pinned Docker images (`docker/tools/too
 - `manifest.ts`, `invocations.ts`: load the manifest and build the argv and mounts for each tool.
 - `quarantine.ts`: copies the repo to a scan snapshot, moves tool-control paths (`.git`, ignore files, config) into a sidecar and keeps a neutral-name mapping back to the original paths.
 - `run.ts`: `runTool` runs a tool and fails closed (typed `ToolFailedError`, `ToolOutputMissingError`). For gitleaks it adds a sidecar pass and a windows pass, then maps every report path back to `/src/<original path>`. Report text (`message.text`) is rewritten too, so no internal `qNNNN` or `wNNNN/pNNNN` name reaches a report.
+- Semgrep liveness canary (`canary/semgrep`, mounted at `/canary`, never in `rules/`): every Semgrep run must match it exactly once or `runTool` throws `ToolOutputMissingError`; its results are stripped from the report before anything reads it. The `/bin/sh` TMPDIR wrapper exits 97 (a failure) without a writable temp directory. Run directories must sit in a 0700 parent owned by the worker (`UnsafeRunDirError`).
 - `unscannable.ts`: decides on the host what gitleaks will skip or cut through (it exits 0 either way).
 - `windows.ts`: overlapping windows under 100,000 bytes for large text files and archive-named files. `maxWindowBytes` must be a finite number of at least 0; anything else throws `RangeError` before a tool runs.
 

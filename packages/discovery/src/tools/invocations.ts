@@ -29,6 +29,11 @@ export interface ToolRunOptions {
   gitleaksConfigFile?: string | undefined;
   /** Host path of a vendored OSV database laid out as <dir>/<ecosystem>/all.zip. Mounted read-only. */
   osvDatabaseDir?: string | undefined;
+  /**
+   * Host path of the Semgrep liveness canary (canary.yaml and canary.js). Mounted read-only at
+   * /canary. Defaults to packages/discovery/canary/semgrep in this repo.
+   */
+  semgrepCanaryDir?: string | undefined;
 }
 
 export interface ToolInvocation {
@@ -85,14 +90,35 @@ function baseMounts(o: ToolRunOptions, extra: Mount[]): Mount[] {
  */
 export const SEMGREP_FALLBACK_TMP = '/var/tmp';
 
+/** Exit code of the Semgrep wrapper when it has no writable temp directory. Never an ok code. */
+export const SEMGREP_NO_TMP_EXIT = 97;
+
 /**
- * Keeps `TMPDIR` when the runner set one (the gVisor jail sets `/scratch`, a tmpfs that never
- * touches the host) and uses `/var/tmp` otherwise (plain Docker, where `/tmp` is on the read-only
- * root). Without a writable temp directory semgrep-core finds nothing and Semgrep still exits 0
- * with an empty report (seen on the pinned image), so this wrapper must not be dropped. The script
- * is a constant; Semgrep's arguments reach it only as positional parameters.
+ * Uses `TMPDIR` when the runner set one (the gVisor jail sets `/scratch`, a tmpfs that never
+ * touches the host) and `/var/tmp` otherwise (plain Docker, where `/tmp` is on the read-only root),
+ * and exits 97 unless that directory exists and is writable. Without a writable temp directory
+ * semgrep-core finds nothing and Semgrep still exits 0 with an empty report (seen on the pinned
+ * image), so this wrapper must not be dropped. A temp directory that fills up during the run is
+ * caught by the liveness canary instead (`SEMGREP_CANARY`). The script is a constant; Semgrep's
+ * arguments reach it only as positional parameters.
  */
-export const SEMGREP_TMPDIR_WRAPPER = `exec env TMPDIR="\${TMPDIR:-${SEMGREP_FALLBACK_TMP}}" "$@"`;
+export const SEMGREP_TMPDIR_WRAPPER = `t="\${TMPDIR:-${SEMGREP_FALLBACK_TMP}}"; [ -d "$t" ] && [ -w "$t" ] || exit ${SEMGREP_NO_TMP_EXIT}; exec env TMPDIR="$t" "$@"`;
+
+/**
+ * The liveness canary (`packages/discovery/canary/semgrep`), mounted read-only at /canary next to
+ * every Semgrep scan. runTool requires exactly one match of `ruleId` on `uri` and removes every
+ * result of that rule before the report is read, so a canary never becomes a candidate.
+ */
+export const SEMGREP_CANARY = {
+  ruleId: 'affidavit.canary.semgrep-scanned',
+  uri: '/canary/canary.js',
+  line: 1,
+  mount: '/canary',
+  config: '/canary/canary.yaml',
+} as const;
+
+/** Host path of the canary directory in this repo. */
+export const canaryRoot = (): string => join(repoRoot(), 'packages', 'discovery', 'canary');
 
 function configMount(o: ToolRunOptions): Mount {
   const hostPath = o.configDir ?? join(repoRoot(), 'docker', 'tools', 'config');
@@ -154,13 +180,22 @@ export function buildInvocation(
           '--max-target-bytes=0',
           '--config',
           '/rules',
+          // The liveness canary: its own rule and its own target, never part of /src or /rules.
+          '--config',
+          SEMGREP_CANARY.config,
           '--sarif',
           '--output',
           `/out/${outputFile}`,
           '/src',
+          SEMGREP_CANARY.uri,
         ],
         mounts: baseMounts(o, [
           { hostPath: rules, containerPath: '/rules', readOnly: true },
+          {
+            hostPath: o.semgrepCanaryDir ?? join(canaryRoot(), 'semgrep'),
+            containerPath: SEMGREP_CANARY.mount,
+            readOnly: true,
+          },
           {
             hostPath: joinHost(o.scratchDir, 'tmp'),
             containerPath: SEMGREP_FALLBACK_TMP,

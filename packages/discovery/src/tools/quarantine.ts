@@ -1,4 +1,14 @@
-import { chmod, lstat, mkdir, readdir, rename, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import {
+  chmod,
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  rename,
+  writeFile,
+  type FileHandle,
+} from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { listDir } from './walk.js';
 
@@ -227,27 +237,91 @@ export async function prepareOutput(outputDir: string, reportFile?: string): Pro
  * Lets the jail's user read a snapshot the worker made: every directory the owner can enter and
  * read gets read and enter for group and others too, and every regular file the owner can read
  * gets read for group and others. Nothing gets write or execute it did not have, and what the
- * owner cannot read stays unreadable (so gitleaks' `unreadable` check keeps its meaning). Symlinks
- * are never followed or changed (chmod would follow them). Mutates modes only, so pass only a
- * private scan copy, as for quarantineSnapshot.
+ * owner cannot read stays unreadable (so gitleaks' `unreadable` check keeps its meaning).
+ *
+ * Symlinks are never followed or changed: every entry is opened with O_NOFOLLOW, checked to be
+ * the same inode `lstat` saw and of the same type, and changed with fchmod on that handle, so a
+ * path swapped for a link after the listing changes nothing outside the tree. Any entry that is
+ * not a directory, regular file or symlink (FIFO, socket, device) is refused with
+ * UnshareableEntryError rather than skipped. Mutates modes only, so pass only a private scan copy,
+ * as for quarantineSnapshot. A no-op on Windows, which has no such modes.
  */
 export async function shareForJailRead(dir: string): Promise<void> {
+  if (process.platform === 'win32') return;
   const st = await lstat(dir);
   if (!st.isDirectory()) throw new Error(`not a directory: ${dir}`);
-  await shareEntry(dir, st.mode);
+  await shareDir(dir, '');
 }
 
-async function shareEntry(path: string, mode: number): Promise<void> {
-  const want = (mode & 0o500) === 0o500 ? mode | 0o055 : mode;
-  if ((want & 0o7777) !== (mode & 0o7777)) await chmod(path, want & 0o7777);
-  if ((mode & 0o500) !== 0o500) return; // the owner cannot list it: leave it as it is
+/** A scan copy holds an entry the jail's user cannot be given read access to safely. */
+export class UnshareableEntryError extends Error {
+  readonly path: string;
+  constructor(path: string, why: string) {
+    super(`cannot share ${path || '.'} with the jail: ${why}`);
+    this.name = 'UnshareableEntryError';
+    this.path = path;
+  }
+}
+
+const OPEN_NOFOLLOW = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+
+/**
+ * Opens `path` without following a final symlink and checks it is the inode lstat reported, of
+ * the expected kind. Null when the owner itself cannot open it (EACCES): it is left as it is.
+ */
+async function openSame(
+  path: string,
+  rel: string,
+  seen: { dev: number; ino: number },
+  kind: 'dir' | 'file',
+): Promise<FileHandle | null> {
+  let fh: FileHandle;
+  try {
+    fh = await open(path, OPEN_NOFOLLOW | (kind === 'dir' ? constants.O_DIRECTORY : 0));
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === 'EACCES') return null;
+    throw new UnshareableEntryError(rel, `cannot open it without following links (${code})`);
+  }
+  const st = await fh.stat();
+  const ok = kind === 'dir' ? st.isDirectory() : st.isFile();
+  if (!ok || st.dev !== seen.dev || st.ino !== seen.ino) {
+    await fh.close();
+    throw new UnshareableEntryError(rel, 'it changed while being shared');
+  }
+  return fh;
+}
+
+async function shareDir(path: string, rel: string): Promise<void> {
+  const seen = await lstat(path);
+  const fh = await openSame(path, rel, seen, 'dir');
+  if (fh === null) return; // the owner cannot read it: leave it as it is
+  try {
+    const mode = (await fh.stat()).mode & 0o7777;
+    if ((mode & 0o500) !== 0o500) return; // the owner cannot list it: leave it as it is
+    if ((mode | 0o055) !== mode) await fh.chmod(mode | 0o055);
+  } finally {
+    await fh.close();
+  }
   for (const e of await listDir(path)) {
     const child = join(path, e.name);
-    if (e.isDirectory) {
-      await shareEntry(child, (await lstat(child)).mode);
-    } else if (e.isFile) {
-      const m = (await lstat(child)).mode;
-      if ((m & 0o400) !== 0 && (m & 0o044) !== 0o044) await chmod(child, (m | 0o044) & 0o7777);
+    const childRel = rel === '' ? e.name : `${rel}/${e.name}`;
+    const st = await lstat(child);
+    if (st.isSymbolicLink()) continue; // never followed, never changed
+    if (st.isDirectory()) {
+      await shareDir(child, childRel);
+    } else if (st.isFile()) {
+      const m = st.mode & 0o7777;
+      if ((m & 0o400) === 0 || (m & 0o044) === 0o044) continue;
+      const f = await openSame(child, childRel, st, 'file');
+      if (f === null) continue;
+      try {
+        await f.chmod(m | 0o044);
+      } finally {
+        await f.close();
+      }
+    } else {
+      throw new UnshareableEntryError(childRel, 'it is not a directory, file or symlink');
     }
   }
 }
