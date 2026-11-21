@@ -68,6 +68,16 @@ A string or template key (`o['go']()`, `{ 'go': f }`) counts as a reference to t
 
 Not covered yet: Koa, Fastify, Hapi, Apollo, NestJS and Next route registration as routes (code handed to those packages is `external-entry`, so it is `unknown`, never `unreachable`; a decorated class's methods are entries), dead code that only other dead code refers to, request-time reachability of module-level code, and IDOR-specific path facts beyond the auth flag.
 
+## Arraignment (`src/arraign/`, L1-06)
+
+`arraign({ candidates, reachability, dataAccess, negativeControls, config })` is a pure function (no clock, no I/O, input order does not matter). It fills `reachability`, `score` and `scoreInputs` on each candidate and splits them into `toTrial` (highest score first), `dismissed` (contract `Dismissal`, each with a reason and a detail) and `review`.
+
+- `scoreFacts` is the scoring function. Recorded inputs, each in 0..1: `reachability` (reachable 1, unknown 0.5, unreachable 0), `sinkType` (`SINK_WEIGHTS`: code execution 1, SQL and `$where` 0.9, Mongo operator and IDOR data access 0.7, unclassified 0.5, dependency 0.4), `noAuthOnPath` (no guard 1, unknown 0.5, proven guard 0; always 0.5 for `idor`, which needs a signed-in attacker anyway), `toolAgreement` (`1 - 0.5^tools`). Score is the weighted sum with `SCORE_WEIGHTS` (0.4, 0.3, 0.1, 0.2), rounded to four decimals. The weights are design constants, not measurements.
+- `sinkClassOf`: from our own rule id, raised (never lowered) by a map data-access call inside the candidate's lines; OSV is `dependency`.
+- Dismissal precedence: corpus negative control, then `osv-no-path` (an OSV candidate the map does not show `reachable`; it never goes to trial), then `unreachable`, then `below-threshold` (only when reachability is known and `dismissBelow` is above 0). `unknown` is never dismissed. A candidate with no map answer is `unknown`.
+- F3: a candidate whose score is at or above `escalationFloor` is never dismissed. If a dismissal rule matches it, it goes to `review` with the reason it would have had (`wouldDismiss`). The worker must hand `review` to a person or to trial, never drop it.
+- Config: `arraignConfigFrom(process.env)` reads `AFFIDAVIT_ESCALATION_FLOOR` (default 0.7) and `AFFIDAVIT_DISMISS_BELOW` (default 0, off). Both must be in 0..1 and the threshold may not be above the floor. The floor goes into every `CaseFile.escalationFloor`.
+
 Root CLAUDE.md rules apply here. Do not add dependencies without asking.
 
 ## Libraries still to come (notes, not installed)
