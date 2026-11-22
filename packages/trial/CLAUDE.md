@@ -78,13 +78,13 @@ L3-19 adds opt-in P8 (`--model-matrix`, needs `--fixture-case`): the P7a input o
 
 ## Defense after a refusal (L3-20, CR-T13)
 
-Lead decision 2026-11-21. Tests in `src/defense.test.ts` ("Defense after a provider refusal" and `refusalRouteFromEnv`).
+Lead decision 2026-11-21 (route to the second attempt), superseded by the P8 evidence (opus, sonnet, fable refused, haiku passed): `review` is the default, `second-attempt` opt-in. Tests in `src/defense.test.ts` ("Defense after a provider refusal" and `refusalRouteFromEnv`).
 
 - A `ModelCallError` of class `refusal` (`isModelRefusal` in `src/model/errors.ts`) ends the Defense attempt it hit. The refused model is never asked again in that stage run. A refusal never dismisses.
 - `DefenseConfig.refusalRoute`, from `AFFIDAVIT_REFUSAL_ROUTE` via `refusalRouteFromEnv` (unset or blank is `review`; any other value than `review` or `second-attempt` throws). The worker does not pass it yet, so it gets `review`; the Lane 1 wiring note is in CR-T13.
-- `review` (default): a refused first attempt makes no further model call and goes to review. `second-attempt` (opt-in): it goes once, at any score, to `config.second` with no first-attempt feedback. P8 found the default second-attempt model refused the same input, so `second-attempt` only helps with another table.
-- A refused second attempt never starts a third and goes to review. Review at or above the floor: escalate `no-admissible-witness-above-floor`, refusals named in the detail. Below the floor: throw `DefenseRefusedError` (class `refusal`), so the worker flags the stage for review. Known gap: the queue's stage retries rerun Defense until then; an escalation reason for refusals in contracts would close it.
-- No event type was added; the refusal is told in the escalation or dismissal detail, or in the thrown message (model id and allowlisted category only).
+- `review` (default): a refused first attempt makes no further model call and goes to review. `second-attempt` (opt-in): it goes once, at any score, to `config.second` with no first-attempt feedback (Judge feedback from the refused attempt is dropped). P8 found the default second-attempt model refused the same input, so `second-attempt` only helps with another table.
+- A refused second attempt never starts a third and goes to review. Review at or above the floor: escalate `no-admissible-witness-above-floor`, refusals named in the detail. Below the floor: throw `DefenseRefusedError` (class `refusal`), so the worker flags the stage for review. Known gap: the queue's stage retries rerun Defense until then; the worker should treat a refusal as non-retryable (flag review at once, or emit the v1.2 `halted` event with reason `model-refusal`). Lane 1 note in CR-T13.
+- No event type was added; the refusal is told in the escalation or dismissal detail, or in the thrown message (model id and a contract `RefusalCategory`, else `other`).
 - Only refusals are caught. Kill switch, budget exhausted, unconfigured, config and other call errors pass through. The refused call's cost is settled by the orchestrator as the port reported it.
 
 ## Intended libraries (notes for later, not installed yet)

@@ -1,5 +1,6 @@
 import {
   Dismissal,
+  RefusalCategory,
   type Budget,
   type CaseFile,
   type CaseFileSource,
@@ -93,7 +94,11 @@ type AttemptOutcome =
 
 /** One line naming a refused attempt. Fixed text, a table model id and an allowlisted category. */
 function refusalNote(ordinal: 'one' | 'two', refused: { model: string; error: ModelCallError }) {
-  const category = refused.error.provider?.refusalCategory ?? 'not given';
+  // The port already allowlists it; checked again against the contract so only a known category
+  // ever reaches a detail or message.
+  const raw = refused.error.provider?.refusalCategory;
+  const category =
+    raw === undefined ? 'not given' : RefusalCategory.safeParse(raw).success ? raw : 'other';
   return `Defense attempt ${ordinal} on ${refused.model} was refused by the provider's safeguards (category ${category})`;
 }
 

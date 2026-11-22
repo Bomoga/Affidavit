@@ -412,6 +412,30 @@ describe('Defense after a provider refusal, default route review (L3-20, CR-T13)
     expect(detail.includes(String.fromCharCode(0x2014))).toBe(false);
   });
 
+  it('names only a contract refusal category, else other, in the detail and the error', async () => {
+    const above = await runScripted(
+      caseFile(0.9),
+      [refusal('weather; DROP TABLE')],
+      {},
+      {
+        cfg: config,
+      },
+    );
+    expect((await above.run()).stage).toBe('escalated');
+    const esc = above.events().find((e) => e.type === 'escalated');
+    const detail = esc?.type === 'escalated' ? esc.payload.escalation.detail : '';
+    expect(detail).toContain('(category other)');
+    expect(detail).not.toContain('weather');
+
+    const below = await runScripted(caseFile(0.2), [refusal('weather')], {}, { cfg: config });
+    const err: unknown = await below.run().then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect((err as Error).message).toContain('(category other)');
+    expect((err as Error).message).not.toContain('weather');
+  });
+
   it('fails the stage below the floor without dismissing or calling another model', async () => {
     const cf = caseFile(0.2);
     const t = await runScripted(
