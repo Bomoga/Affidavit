@@ -74,6 +74,8 @@ Invariants, each covered by a test in `src/model/anthropic.test.ts` with a stubb
 
 A model safety refusal (`stop_reason: "refusal"`, which the runtime reports as `invalid_request`) is class `refusal` (`REFUSAL_CLASS`) with an allowlisted category (else `other`), never zero spend, and never returns a submission. A runtime fallback to another model, or any assistant message from a model other than the requested one (`model_mismatch`), fails the turn (`provider-errors.test.ts`). What a refusal should do to a case is open (CR-T13). `--fixture-case` also requires a checked-in, unmodified file (git).
 
+L3-19 adds opt-in P8 (`--model-matrix`, needs `--fixture-case`): the P7a input on every distinct table model, the second-attempt prompt on its model, and `claude-fable-5-2` as a labelled extra, each through the real port with a probe-only model table. Measurement only; Prosecution, Remedy and jurors are reported as SKIP because their input needs earlier-stage artifacts.
+
 ## Intended libraries (notes for later, not installed yet)
 
 - Graphile Worker

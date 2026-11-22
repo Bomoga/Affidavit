@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Options, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
-import { CaseFile, type Budget, type SubmitToolName } from '@affidavit/contracts';
+import { CaseFile, type Budget, type PromptId, type SubmitToolName } from '@affidavit/contracts';
 import { getPrompt, renderPrompt, type UntrustedBlock } from '@affidavit/prompts';
 import { sha256Hex } from '../canonical.js';
 import { defenseBlocks } from '../defense.js';
@@ -25,8 +25,15 @@ import {
   childEnv,
   refusalCategoryOf,
   refusalOf,
+  servedBy,
 } from './anthropic.js';
-import { DEFAULT_MODEL_TABLE, resolveModelTable, type ModelTable } from './models.js';
+import { ModelCallError } from './errors.js';
+import {
+  DEFAULT_MODEL_TABLE,
+  resolveModelTable,
+  type KnownModelId,
+  type ModelTable,
+} from './models.js';
 import { FileRecordingStore } from './recordings.js';
 import { describeThrown, redact } from './redact.js';
 import { SubmissionBox, buildSubmitTools, qualifiedToolName } from './submit-tools.js';
@@ -436,6 +443,143 @@ export interface ProbeSpec {
   readonly turn?: WorkerTurn;
   /** For a port probe: the port mode. Record writes to a fresh temp directory, removed after. */
   readonly mode?: 'live' | 'record';
+  /** For a port probe: the prompt id of the turn. Unset means `defense`. */
+  readonly promptId?: PromptId;
+  /**
+   * For a port probe: the model table this one probe's port is built with, instead of
+   * `ProbeDeps.modelTable`. P8 uses it to send one prompt on a model the table does not name for
+   * it. Probe only: the worker never builds a port from it.
+   */
+  readonly modelTable?: ModelTable;
+  /** P8: a clearly labelled extra probe outside the model table, which may legitimately fail. */
+  readonly extra?: boolean;
+  /**
+   * When set, the probe is never sent: `runLadder` reports SKIP with this reason. P8 uses it for
+   * a stage whose real input cannot be built from a bare case file, rather than faking one.
+   */
+  readonly skipReason?: string;
+}
+
+// ---------------------------------------------------------------------------------------------
+// P8 (L3-19, opt-in only, with `--fixture-case` and `--model-matrix`): the same real Defense
+// input as P7a, sent through the real port on every distinct model id in the model table, plus
+// one labelled extra model. Measurement only: the prompts are the packaged ones, unchanged, and
+// nothing here changes what the port or the orchestrator does with a refusal.
+// ---------------------------------------------------------------------------------------------
+
+/** An extra model id probed after the table's own ids. It may legitimately fail as not found. */
+export const P8_EXTRA_MODEL: KnownModelId = 'claude-fable-5-2';
+
+/** The sentence every P8 interpretation ends with. Text only; no behaviour depends on it. */
+export const REFUSAL_POLICY_SENTENCE =
+  'A refusal is a provider policy decision: the port reports it, never retries it on the same model, and never dismisses a candidate because of it.';
+
+/**
+ * Why a stage's real input cannot be built from a bare case file. Each of these prompts reads
+ * artifacts of an earlier stage that a fixture case file does not have, and faking them would
+ * measure a request the worker never sends.
+ */
+export const P8_STAGE_SKIPS: readonly {
+  id: string;
+  prompts: readonly PromptId[];
+  reason: string;
+}[] = [
+  {
+    id: 'prosecution',
+    prompts: ['prosecution'],
+    reason:
+      'not run: createProsecutionHandler (prosecution.ts) builds its user message inline from the admitted Defense witness (template and params) and the Judge result for it (exhibit id, safe-variant and family results). A bare case file has neither, and no witness has been admitted for this fixture. Not faked.',
+  },
+  {
+    id: 'remedy',
+    prompts: ['remedy'],
+    reason:
+      'not run: createRemedyHandler (remedy.ts) builds its user message inline from the admitted Defense witness (template and params), and its patch is checked against the counterexamples Prosecution admitted. A bare case file has neither. Not faked.',
+  },
+  {
+    id: 'jury',
+    prompts: ['juror-security', 'juror-maintainability', 'juror-blast-radius'],
+    reason:
+      'not run: packages/trial has no jury stage or juror input builder yet (L3-11), and a ballot needs the admitted exhibits, the Judge results and the patch outcome of earlier stages. Not faked.',
+  },
+];
+
+/**
+ * P8: the Defense model matrix. Order: the Defense prompt on each distinct model id in the
+ * table, the table's Defense model first (the P7a replay), then the Defense second-attempt
+ * prompt on its own model with the same input (what a refusal routed there would send, with no
+ * first-attempt feedback), then the labelled extra model, then the stages that cannot be built
+ * from a case file, as SKIP. The USD cap drops the extra first.
+ */
+export function buildModelMatrix(
+  table: ModelTable,
+  fixture: FixtureCase,
+  worker: WorkerTurn,
+): ProbeSpec[] {
+  const cf = fixture.caseFile;
+  const render = (promptId: PromptId) => {
+    const r = renderPrompt(promptId, defenseBlocks(cf, []));
+    return {
+      system: synthetic(`packaged-${promptId}-system`, r.system),
+      user: fixtureText(`fixture-full-${promptId}`, r.user),
+      promptVersion: r.version,
+      outputSchemaRef: r.outputSchemaRef,
+    };
+  };
+  const defense = render('defense');
+  const models = [...new Set(Object.values(table))].sort(
+    (a, b) => Number(b === table.defense) - Number(a === table.defense) || a.localeCompare(b),
+  );
+  const base = {
+    path: 'port' as const,
+    tools: ['submit_witness'] as const,
+    turn: worker,
+    mode: 'live' as const,
+  };
+  const specs: ProbeSpec[] = models.map((model) => ({
+    ...base,
+    id: `P8:defense:${model}`,
+    name: `real Defense input and prompt (as P7a) on ${model}, worker budget, live, ${fixture.relPath}`,
+    model,
+    promptId: 'defense',
+    modelTable: { ...table, defense: model },
+    ...defense,
+  }));
+  const second = table['defense-second-attempt'];
+  specs.push({
+    ...base,
+    id: `P8:defense-second-attempt:${second}`,
+    name: `real Defense input with the packaged Defense second-attempt prompt on its table model ${second} (no first-attempt feedback), ${fixture.relPath}`,
+    model: second,
+    promptId: 'defense-second-attempt',
+    ...render('defense-second-attempt'),
+  });
+  if (!models.includes(P8_EXTRA_MODEL)) {
+    specs.push({
+      ...base,
+      id: `P8x:defense:${P8_EXTRA_MODEL}`,
+      name: `EXTRA, outside the model table, may legitimately fail as model not found: real Defense input and prompt on ${P8_EXTRA_MODEL}, ${fixture.relPath}`,
+      model: P8_EXTRA_MODEL,
+      promptId: 'defense',
+      modelTable: { ...table, defense: P8_EXTRA_MODEL },
+      extra: true,
+      ...defense,
+    });
+  }
+  for (const s of P8_STAGE_SKIPS) {
+    specs.push({
+      id: `P8:${s.id}:${second}`,
+      name: `${s.prompts.join(', ')} on the defense-second-attempt model ${second}`,
+      path: 'port',
+      model: second,
+      promptId: s.prompts[0],
+      system: TRIVIAL_SYSTEM,
+      user: TRIVIAL_USER,
+      tools: [],
+      skipReason: s.reason,
+    });
+  }
+  return specs;
 }
 
 /**
@@ -834,6 +978,18 @@ export interface ProbeResult {
   userShape?: string;
   /** Record mode only: what the recording store did. */
   recording?: string;
+  /** Port probes: the prompt id of the turn. */
+  promptId?: string;
+  /** Port probes: what came of the submission: submitted, no-submission (why), refused, or error. */
+  submission?: string;
+  /** The model the runtime answered with instead of the requested one, when it did. */
+  fallbackModel?: string;
+  /** Port probes: the class the port itself reported, when it threw a `ModelCallError`. */
+  portClass?: string;
+  /** Set when the probe was never sent by design (P8 stages with no real input builder). */
+  skipReason?: string;
+  /** P8: a labelled extra probe outside the model table. */
+  extra?: boolean;
 }
 
 export interface ProbeDeps {
@@ -871,6 +1027,8 @@ interface StreamFacts {
   };
   toolCalls: string[];
   replyText: string;
+  /** Every `model` an assistant message named, in order, deduplicated. */
+  servedModels?: string[];
 }
 
 function textOf(content: unknown): string {
@@ -903,6 +1061,11 @@ function observe(facts: StreamFacts, msg: SDKMessage): void {
     };
   } else if (msg.type === 'assistant') {
     const content = (msg.message as { content?: unknown }).content;
+    const served = (msg.message as { model?: unknown }).model;
+    if (typeof served === 'string') {
+      facts.servedModels ??= [];
+      if (!facts.servedModels.includes(served)) facts.servedModels.push(served);
+    }
     // The runtime reports a refused response under `invalid_request`, and a refusal can follow
     // another error; every assistant message is checked, and a refusal wins the class.
     const refusal = refusalOf(msg.message);
@@ -1139,14 +1302,15 @@ async function runPortProbe(
   const mode = spec.mode ?? 'live';
   const recordDir = mode === 'record' ? mkdtempSync(join(tmpdir(), 'affidavit-probe-rec-')) : '';
   const turn = spec.turn ?? probeTurn(budgetUsd);
+  const promptId = spec.promptId ?? 'defense';
   const req: ModelTurnRequest = {
-    promptId: 'defense',
-    promptVersion: spec.promptVersion ?? getPrompt('defense').version,
+    promptId,
+    promptVersion: spec.promptVersion ?? getPrompt(promptId).version,
     model: spec.model,
     system: spec.system.text,
     user: spec.user.text,
     tools: spec.tools,
-    outputSchemaRef: spec.outputSchemaRef ?? getPrompt('defense').outputSchemaRef,
+    outputSchemaRef: spec.outputSchemaRef ?? getPrompt(promptId).outputSchemaRef,
     maxTurns: turn.maxTurns,
     budget: turn.budget,
   };
@@ -1156,7 +1320,7 @@ async function runPortProbe(
   try {
     const port = new AnthropicModelPort({
       mode,
-      modelTable: deps.modelTable,
+      modelTable: spec.modelTable ?? deps.modelTable,
       timeoutMs: deps.timeoutMs ?? PROBE_TIMEOUT_MS,
       transport: tee,
       env: deps.env,
@@ -1172,7 +1336,7 @@ async function runPortProbe(
     if (mode === 'record') {
       let files: number;
       try {
-        files = readdirSync(join(recordDir, 'defense')).length;
+        files = readdirSync(join(recordDir, promptId)).length;
       } catch {
         files = 0;
       }
@@ -1182,9 +1346,16 @@ async function runPortProbe(
   }
   const base = factsToResult(spec, facts, key, { timedOut: false, stderr: err.lines });
   const portMessage = portError === undefined ? undefined : describeThrown(portError, [key]);
+  const portClass =
+    portError instanceof ModelCallError ? portError.provider?.errorClass : undefined;
+  const fallback = fallbackOf(facts, spec.model, key);
   return {
     ...base,
     status: portError === undefined ? 'PASS' : 'FAIL',
+    promptId,
+    submission: submissionOf(outcome, portError),
+    ...(portClass === undefined ? {} : { portClass }),
+    ...(fallback === undefined ? {} : { fallbackModel: fallback }),
     ...(portMessage === undefined ? {} : { portMessage }),
     detail: [outcome === undefined ? 'port threw' : `port outcome ${outcome}`, base.detail].join(
       '; ',
@@ -1194,6 +1365,40 @@ async function runPortProbe(
     userShape: describeUser(spec.user.text),
     ...(recording === undefined ? {} : { recording }),
   };
+}
+
+/** A model id for display: the id when it has the model id shape, else a fixed phrase. */
+function modelName(raw: string, key: string): string {
+  const shown = showRaw(raw, key);
+  return /^[a-z0-9][a-z0-9.-]{0,63}$/.test(shown) ? shown : 'another model (name withheld)';
+}
+
+/**
+ * The model the runtime answered with instead of `requested`: the runtime's own fallback notice
+ * first, else the first assistant message from another model (as the port's backstop sees it).
+ */
+export function fallbackOf(facts: StreamFacts, requested: string, key: string): string | undefined {
+  if (facts.fallbackModel !== undefined) return modelName(facts.fallbackModel, key);
+  const other = (facts.servedModels ?? []).find((m) => !servedBy(m, requested));
+  return other === undefined ? undefined : modelName(other, key);
+}
+
+/** What came of the submission, from the port's outcome or error. */
+export function submissionOf(outcome: string | undefined, portError: unknown): string {
+  if (portError === undefined) {
+    if (outcome === 'submitted') return 'submitted';
+    return `no-submission (${outcome ?? 'unknown'})`;
+  }
+  if (portError instanceof ModelCallError && portError.provider?.errorClass === REFUSAL_CLASS) {
+    return 'refused';
+  }
+  const cls =
+    portError instanceof ModelCallError
+      ? (portError.provider?.errorClass ?? 'call error')
+      : portError instanceof Error
+        ? portError.name
+        : 'error';
+  return `no-submission (port threw: ${cls})`;
 }
 
 /**
@@ -1376,6 +1581,18 @@ export async function runLadder(
     opts.onResult?.(r);
   };
   for (const spec of ladder) {
+    if (spec.skipReason !== undefined) {
+      push({
+        id: spec.id,
+        name: spec.name,
+        model: spec.model,
+        ...(spec.promptId === undefined ? {} : { promptId: spec.promptId }),
+        status: 'SKIP',
+        detail: spec.skipReason,
+        skipReason: spec.skipReason,
+      });
+      continue;
+    }
     if (!inputAllowed(spec, opts.allowFixtureInput === true)) {
       push({
         id: spec.id,
@@ -1427,7 +1644,7 @@ export async function runLadder(
     const refusedUnreported =
       r.errorClass === REFUSAL_CLASS && (reported === undefined || reported === 0);
     charged += refusedUnreported ? probeReserve : (reported ?? probeReserve);
-    push({ ...r, model: spec.model });
+    push({ ...r, model: spec.model, ...(spec.extra === true ? { extra: true } : {}) });
   }
   return { results, chargedUsd: charged };
 }
@@ -1444,9 +1661,9 @@ export const BANNER = [
 ].join('\n');
 
 export const FIXTURE_BANNER = [
-  '*** --fixture-case: P7 probes send a CHECKED-IN FIXTURE CASE FILE (public corpus content from fixtures/casefiles/) to the model. ***',
-  '*** Raw provider text for P7 is shown below for this local diagnostic only, after key redaction. Do not paste it into a ticket or a recording without reading it first. ***',
-  '*** P7 never reads a user repository, the database, or any case the worker holds. ***',
+  '*** --fixture-case: P7 and P8 probes send a CHECKED-IN FIXTURE CASE FILE (public corpus content from fixtures/casefiles/) to the model. ***',
+  '*** Raw provider text for P7 and P8 is shown below for this local diagnostic only, after key redaction. Do not paste it into a ticket or a recording without reading it first. ***',
+  '*** P7 and P8 never read a user repository, the database, or any case the worker holds. ***',
 ].join('\n');
 
 const statusOf = (results: readonly ProbeResult[], id: string): ProbeStatus | undefined =>
@@ -1540,15 +1757,103 @@ export function interpret(results: readonly ProbeResult[]): string[] {
       "P7a and P7b pass on the fixture: the worker's failure depends on something the probe does not replay (the real case file the worker loads, Judge feedback in a later iteration, the worker's environment), not on the port path.",
     );
   }
-  if (results.some((r) => r.status === 'SKIP'))
+  if (results.some((r) => r.status === 'SKIP' && r.skipReason === undefined))
     out.push('Some probes were skipped by the USD cap; rerun with a higher --max-usd to see them.');
   if (results.some((r) => r.status === 'REFUSED'))
     out.push('Some probes were refused because their input was not synthetic.');
-  if (results.length > 0 && results.every((r) => r.status === 'PASS') && p7.length === 0) {
+  const p8 = results.filter((r) => r.id.startsWith('P8'));
+  if (
+    results.length > 0 &&
+    results.every((r) => r.status === 'PASS') &&
+    p7.length === 0 &&
+    p8.length === 0
+  ) {
     out.push(
       'Every probe passed: the failure depends on the real case content, the real turn count or budget, or a case file larger than P5. Rerun with --fixture-case fixtures/casefiles/<file>.json to replay the worker Defense turn (P7).',
     );
   }
+  out.push(...interpretMatrix(p8));
+  return out;
+}
+
+/** A P8 result as "<prompt> on <model>", with the extra marked. */
+function matrixLabel(r: ProbeResult): string {
+  return `${r.promptId ?? 'defense'} on ${r.model ?? 'unknown model'}${r.extra === true ? ' (extra)' : ''}`;
+}
+
+type MatrixVerdict = 'pass' | 'refused' | 'failed' | 'not run';
+
+/** What one P8 result says, in a word. */
+function matrixVerdict(r: ProbeResult): MatrixVerdict {
+  if (r.status === 'SKIP' || r.status === 'REFUSED') return 'not run';
+  if (r.status === 'PASS') return 'pass';
+  return r.portClass === REFUSAL_CLASS || r.errorClass === REFUSAL_CLASS ? 'refused' : 'failed';
+}
+
+/**
+ * The P8 reading: which model and stage combinations pass, which the safeguards refuse, which
+ * failed for another reason, and which were not run. Facts from this run only; it recommends no
+ * route, since that is the lead's decision (CR-T13).
+ */
+export function interpretMatrix(p8: readonly ProbeResult[]): string[] {
+  if (p8.length === 0) return [];
+  const out: string[] = [];
+  const by = (v: MatrixVerdict) => p8.filter((r) => matrixVerdict(r) === v);
+  const pass = by('pass');
+  const refused = by('refused');
+  const failed = by('failed');
+  const capped = p8.filter((r) => r.status === 'SKIP' && r.skipReason === undefined);
+  out.push(
+    `P8 passed (the port returned without an error): ${pass.length === 0 ? 'none' : pass.map((r) => `${matrixLabel(r)}, ${r.submission ?? 'unknown'}`).join('; ')}.`,
+  );
+  out.push(
+    `P8 refused by the provider's safeguards: ${
+      refused.length === 0
+        ? 'none'
+        : refused
+            .map(
+              (r) =>
+                `${matrixLabel(r)} (category ${r.refusalCategory ?? 'not named'}${r.fallbackModel === undefined ? '' : `; the runtime fell back to ${r.fallbackModel} and the port refused the turn`})`,
+            )
+            .join('; ')
+    }.`,
+  );
+  if (failed.length > 0) {
+    out.push(
+      `P8 failed for another reason (not a refusal): ${failed.map((r) => `${matrixLabel(r)} (class ${r.portClass ?? r.errorClass ?? 'unknown'})`).join('; ')}.${failed.some((r) => r.extra === true) ? ' An extra probe outside the model table can fail only because the organization has no access to that model id; that says nothing about the case.' : ''}`,
+    );
+  }
+  if (capped.length > 0) {
+    out.push(
+      `P8 skipped by the USD cap: ${capped.map(matrixLabel).join('; ')}. Rerun with a higher --max-usd (at most 2) or a lower AFFIDAVIT_TURN_MAX_USD to see them.`,
+    );
+  }
+  for (const r of p8.filter((x) => x.skipReason !== undefined)) {
+    out.push(`P8 ${r.id}: ${r.skipReason}`);
+  }
+  const defenseRun = p8.filter(
+    (r) => r.promptId === 'defense' && r.extra !== true && matrixVerdict(r) !== 'not run',
+  );
+  const second = p8.find(
+    (r) => r.promptId === 'defense-second-attempt' && matrixVerdict(r) !== 'not run',
+  );
+  if (defenseRun.length > 0 && defenseRun.every((r) => matrixVerdict(r) === 'refused')) {
+    out.push(
+      'Every model in the table that ran refused the Defense prompt on this input: moving the turn to another table model does not get past the safeguards for this case.',
+    );
+  }
+  if (second !== undefined) {
+    const v = matrixVerdict(second);
+    const on = second.model ?? 'its model';
+    out.push(
+      v === 'refused'
+        ? `The second-attempt prompt on ${on} was refused too: routing a refusal to the second Defense attempt would end in a second refusal for this input.`
+        : v === 'pass'
+          ? `The second-attempt prompt on ${on} was not refused (${second.submission ?? 'unknown'}): routing a refusal to the second Defense attempt reaches a model that answers, for this input. Whether its witness is admissible is for the Judge, not this probe.`
+          : `The second-attempt prompt on ${on} failed for a reason other than a refusal; read its port message before drawing a routing conclusion.`,
+    );
+  }
+  out.push(REFUSAL_POLICY_SENTENCE);
   return out;
 }
 
@@ -1568,6 +1873,18 @@ export function formatResult(r: ProbeResult): string {
     lines.push(`  refusal explanation (redacted): ${r.refusalExplanation}`);
   }
   if (r.portMessage !== undefined) lines.push(`  port said: ${r.portMessage}`);
+  if (r.promptId !== undefined) {
+    lines.push(
+      `  prompt: ${r.promptId}${r.extra === true ? ' (EXTRA probe, outside the model table)' : ''}`,
+    );
+  }
+  if (r.portClass !== undefined) lines.push(`  port class: ${r.portClass}`);
+  if (r.submission !== undefined) lines.push(`  submission: ${r.submission}`);
+  if (r.id.startsWith('P8') && r.skipReason === undefined && r.status !== 'REFUSED') {
+    lines.push(
+      `  runtime fell back to another model: ${r.fallbackModel === undefined ? 'no' : `yes, ${r.fallbackModel}`}`,
+    );
+  }
   if (r.recording !== undefined) lines.push(`  ${r.recording}`);
   if (r.userShape !== undefined) lines.push(`  user message: ${r.userShape}`);
   if (r.turnUsed !== undefined) lines.push(`  turn values: ${r.turnUsed}`);
@@ -1604,6 +1921,21 @@ export function formatSummary(run: LadderRun, maxUsd: number): string {
   lines.push(
     `Charged against the cap: $${run.chargedUsd.toFixed(4)} of $${maxUsd.toFixed(2)} (unknown spend counts as the full per-probe reserve; the SDK cost is an estimate, not a bill).`,
   );
+  const p8 = run.results.filter((r) => r.id.startsWith('P8'));
+  if (p8.length > 0) {
+    const m = Math.max(5, ...p8.map((r) => matrixLabel(r).length));
+    lines.push(
+      '',
+      'P8 model matrix',
+      `${pad('probe', m)}  ${pad('status', 7)}  ${pad('class', 14)}  ${pad('category', 9)}  ${pad('fallback', 18)}  ${pad('submission', 34)}  cost`,
+    );
+    for (const r of p8) {
+      const notRun = r.skipReason !== undefined;
+      lines.push(
+        `${pad(matrixLabel(r), m)}  ${pad(r.status, 7)}  ${pad(r.portClass ?? r.errorClass ?? '-', 14)}  ${pad(r.refusalCategory ?? '-', 9)}  ${pad(r.fallbackModel ?? (notRun ? '-' : 'no'), 18)}  ${pad(r.submission ?? (notRun ? 'not run' : '-'), 34)}  ${r.costUsd === undefined ? 'unknown' : `$${r.costUsd.toFixed(4)}`}`,
+      );
+    }
+  }
   lines.push('', 'Interpretation');
   for (const l of interpret(run.results)) lines.push(`- ${l}`);
   return lines.join('\n');
