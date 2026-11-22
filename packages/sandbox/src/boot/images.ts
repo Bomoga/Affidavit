@@ -1,3 +1,4 @@
+import { dockerEnv } from '../docker-env.js';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
@@ -64,20 +65,18 @@ export function parseOnBuild(json: string): string[] {
 }
 
 export async function imageOnBuild(image: string): Promise<string[]> {
-  const { stdout } = await exec('docker', [
-    'image',
-    'inspect',
-    '--format',
-    '{{json .Config.OnBuild}}',
-    image,
-  ]);
+  const { stdout } = await exec(
+    'docker',
+    ['image', 'inspect', '--format', '{{json .Config.OnBuild}}', image],
+    { env: dockerEnv() },
+  );
   return parseOnBuild(stdout);
 }
 
 /** Pulls an image Lane 2 pinned itself (`name:tag@sha256:...`), so the jail can inspect it. */
 export async function pullPinned(ref: string): Promise<void> {
   if (!/@sha256:[0-9a-f]{64}$/.test(ref)) throw new Error(`not pinned by digest: ${ref}`);
-  await exec('docker', ['pull', '--quiet', ref], { timeout: 600_000 });
+  await exec('docker', ['pull', '--quiet', ref], { timeout: 600_000, env: dockerEnv() });
 }
 
 /** Repository name as Docker reports it in RepoDigests (`node`, `library/x` is shown as `x`). */
@@ -94,14 +93,12 @@ function repoOf(ref: string): string {
 export async function pinImage(ref: string): Promise<string> {
   const problem = hubRefProblem(ref);
   if (problem !== null) throw new Error(problem);
-  await exec('docker', ['pull', '--quiet', ref], { timeout: 600_000 });
-  const { stdout } = await exec('docker', [
-    'image',
-    'inspect',
-    '--format',
-    '{{json .RepoDigests}}',
-    ref,
-  ]);
+  await exec('docker', ['pull', '--quiet', ref], { timeout: 600_000, env: dockerEnv() });
+  const { stdout } = await exec(
+    'docker',
+    ['image', 'inspect', '--format', '{{json .RepoDigests}}', ref],
+    { env: dockerEnv() },
+  );
   const digests = JSON.parse(stdout) as string[];
   const repo = repoOf(ref);
   const pinned = digests.find((d) => d.split('@')[0] === repo) ?? digests[0];
@@ -113,13 +110,11 @@ export async function pinImage(ref: string): Promise<string> {
 
 /** The VOLUME paths an image declares. The jail covers each with a capped tmpfs. */
 export async function imageVolumes(image: string): Promise<string[]> {
-  const { stdout } = await exec('docker', [
-    'image',
-    'inspect',
-    '--format',
-    '{{json .Config.Volumes}}',
-    image,
-  ]);
+  const { stdout } = await exec(
+    'docker',
+    ['image', 'inspect', '--format', '{{json .Config.Volumes}}', image],
+    { env: dockerEnv() },
+  );
   const v = JSON.parse(stdout) as Record<string, unknown> | null;
   return Object.keys(v ?? {}).sort();
 }

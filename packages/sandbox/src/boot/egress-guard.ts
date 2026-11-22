@@ -124,7 +124,16 @@ const NEEDS_NETWORK_NONE = new Set(['build', 'run', 'create']);
 const TAR_SHORT = /^-[xctfzv]+$/;
 const TAR_LONG = new Set(['-C', '--no-same-owner', '--no-same-permissions']);
 
+/** Where a spawn's `dockerEnv` must be imported from (this package, or it from the judge). */
+const DOCKER_ENV_MODULES = new Set(['./docker-env.js', '../docker-env.js', '@affidavit/sandbox']);
+
 export const EGRESS_ALLOWLIST: readonly EgressAllow[] = [
+  {
+    file: 'boot/compose.ts',
+    what: 'spawn env not dockerEnv() or a literal record: inv.env',
+    reason:
+      'CR-12: composeConfigInvocation builds the whole environment itself (`PATH=/usr/bin:/bin`, `HOME` and `DOCKER_CONFIG` set to the empty config directory, nothing from process.env); asserted in compose.test.ts',
+  },
   {
     file: 'containment/host.ts',
     what: 'import node:http',
@@ -469,6 +478,10 @@ interface ArgWord {
  *   `process`, `Reflect`, `module` or `require` other than `x.member`, `typeof x` or (for
  *   `require`) a direct call, so destructuring or aliasing one is a finding;
  * - `dockerode`, although declared;
+ * - a spawn without an inline options object holding one `env`, after any spread, set to a direct call of the
+ *   imported `dockerEnv` with at most one object literal of string literals, or to an object
+ *   literal of string literals; no spread, later or computed key, alias, `undefined`, `null` or
+ *   mention of `process` (CR-12);
  * - in the sanctioned files, a spawn whose executable is not a literal in `ALLOWED_EXECUTABLES`;
  *   whose argv is not an inline array literal or a `const` array literal in scope in the same file,
  *   so a variable of unknown origin is a finding. Spreads of other such `const` arrays are
@@ -738,6 +751,91 @@ export function findEgress(
     if (cmd === 'tar') checkTar(argv);
   };
 
+  // Every spawn passes an explicit environment, so no child inherits the worker's secrets (CR-12;
+  // `dockerEnv` in docker-env.ts). The `env` value must be one of two shapes the guard can read
+  // in full: a direct call of the imported `dockerEnv` whose only argument (if any) is an object
+  // literal of string literals, or an object literal of string literals. Anything else (a
+  // variable, `undefined` or `null`, which make Node inherit everything, a spread, a computed
+  // name, a second `dockerEnv` argument) is a finding. A later spread or a later or computed key
+  // could replace `env`, so no spread may follow it and no other key may be `env` or unknown.
+  const dockerEnvImported = sf.statements.some(
+    (st) =>
+      ts.isImportDeclaration(st) &&
+      DOCKER_ENV_MODULES.has(plainString(st.moduleSpecifier) ?? '') &&
+      st.importClause !== undefined &&
+      !st.importClause.isTypeOnly &&
+      st.importClause.namedBindings !== undefined &&
+      ts.isNamedImports(st.importClause.namedBindings) &&
+      st.importClause.namedBindings.elements.some(
+        (el) =>
+          !el.isTypeOnly &&
+          el.name.text === 'dockerEnv' &&
+          (el.propertyName === undefined || el.propertyName.text === 'dockerEnv'),
+      ),
+  );
+  const keyName = (p: ts.ObjectLiteralElementLike): string | null => {
+    const n = p.name;
+    if (n === undefined) return null;
+    if (ts.isIdentifier(n) || ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) {
+      return n.text;
+    }
+    if (ts.isComputedPropertyName(n)) return plainString(strip(n.expression));
+    return null;
+  };
+  /** An object literal whose every entry is `name: 'literal'` (no spread, computed or method). */
+  const literalRecord = (e: ts.Expression): boolean =>
+    ts.isObjectLiteralExpression(e) &&
+    e.properties.every(
+      (p) =>
+        ts.isPropertyAssignment(p) &&
+        !ts.isComputedPropertyName(p.name) &&
+        plainString(strip(p.initializer)) !== null,
+    );
+  const checkSpawnEnv = (call: ts.CallExpression): void => {
+    const optsArg = call.arguments[2];
+    const opts = optsArg === undefined ? undefined : strip(optsArg);
+    if (opts === undefined || !ts.isObjectLiteralExpression(opts)) {
+      return add(call, 'spawn without env');
+    }
+    const props = opts.properties;
+    let at = -1;
+    props.forEach((p, i) => {
+      if (keyName(p) === 'env') at = i;
+    });
+    if (at === -1) return add(call, 'spawn without env');
+    const later = props.slice(at + 1);
+    if (later.some((p) => ts.isSpreadAssignment(p))) {
+      return add(call, 'spawn env overridable by a spread');
+    }
+    if (
+      props.some(
+        (p, i) =>
+          i !== at &&
+          (keyName(p) === 'env' ||
+            (p.name !== undefined && ts.isComputedPropertyName(p.name) && keyName(p) === null)),
+      )
+    ) {
+      return add(call, 'spawn env overridable by another key');
+    }
+    const envProp = props[at] as ts.ObjectLiteralElementLike;
+    if (!ts.isPropertyAssignment(envProp)) return add(call, 'spawn env not a plain property');
+    const value = strip(envProp.initializer);
+    if (/\bprocess\b/.test(value.getText(sf))) return add(call, 'spawn env from process.env');
+    if (literalRecord(value)) return;
+    if (
+      ts.isCallExpression(value) &&
+      ts.isIdentifier(value.expression) &&
+      value.expression.text === 'dockerEnv' &&
+      dockerEnvImported &&
+      declarationOf(value.expression) === undefined
+    ) {
+      const [first, ...rest] = value.arguments;
+      if (rest.length === 0 && (first === undefined || literalRecord(strip(first)))) return;
+      return add(call, `spawn env dockerEnv with non-literal arguments`);
+    }
+    add(call, `spawn env not dockerEnv() or a literal record: ${src(value)}`);
+  };
+
   const isNameOnly = (node: ts.Identifier): boolean => {
     const p = node.parent;
     return (
@@ -807,7 +905,10 @@ export function findEgress(
           if (problem !== null) add(node, problem);
         }
       }
-      if (ts.isIdentifier(callee) && childFns.has(callee.text)) checkSpawn(node);
+      if (ts.isIdentifier(callee) && childFns.has(callee.text)) {
+        checkSpawn(node);
+        checkSpawnEnv(node);
+      }
     }
 
     if (ts.isIdentifier(node) && !isNameOnly(node)) {

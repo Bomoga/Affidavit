@@ -1,3 +1,4 @@
+import { dockerEnv } from '@affidavit/sandbox';
 import { execFile } from 'node:child_process';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -74,6 +75,7 @@ export const RUNNER_BUILD_ARGS = [
 export async function buildRunnerImage(context: string = RUNNER_CONTEXT): Promise<string> {
   const { stdout } = await exec('docker', [...RUNNER_BUILD_ARGS, context], {
     maxBuffer: 16 * 1024 * 1024,
+    env: dockerEnv(),
   });
   const id = stdout.trim().split('\n').pop() ?? '';
   if (!IMAGE_ID.test(id)) throw new Error(`docker build did not return an image ID: ${stdout}`);
@@ -89,6 +91,7 @@ export async function localImagePresent(imageId: string): Promise<boolean> {
   try {
     const { stdout } = await exec('docker', ['image', 'inspect', '--format', '{{.Id}}', imageId], {
       timeout: 20_000,
+      env: dockerEnv(),
     });
     return stdout.trim() === imageId;
   } catch {

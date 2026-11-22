@@ -1,3 +1,4 @@
+import { dockerEnv } from '../docker-env.js';
 import { execFileSync } from 'node:child_process';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -15,7 +16,7 @@ export function bridgeGateway(): string {
   return execFileSync(
     'docker',
     ['network', 'inspect', 'bridge', '--format', '{{(index .IPAM.Config 0).Gateway}}'],
-    { encoding: 'utf8' },
+    { encoding: 'utf8', env: dockerEnv() },
   ).trim();
 }
 

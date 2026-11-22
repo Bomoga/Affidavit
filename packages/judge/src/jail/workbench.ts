@@ -15,6 +15,7 @@ import type { CaseFile, PatchExhibit } from '@affidavit/contracts';
 import {
   buildTarget,
   deriveRecipe,
+  dockerEnv,
   openDependencyBundle,
   removeBuildDir,
   removeCaseNetwork,
@@ -67,7 +68,7 @@ export async function buildPatchApplyImage(context: string = PATCH_APPLY_CONTEXT
       PATCH_APPLY_TAG,
       context,
     ],
-    { maxBuffer: 16 * 1024 * 1024 },
+    { maxBuffer: 16 * 1024 * 1024, env: dockerEnv() },
   );
   const id = stdout.trim().split('\n').pop() ?? '';
   if (!/^sha256:[0-9a-f]{64}$/.test(id)) throw new Error(`docker build did not return an image ID`);
@@ -463,7 +464,7 @@ export class JailedPatchWorkbench implements PatchWorkbench {
             const suiteImage = built.imageId;
             // Removed by `release` once handed over; by this if registering the target throws.
             onFailure(async () => {
-              await exec('docker', ['image', 'rm', '--force', suiteImage]);
+              await exec('docker', ['image', 'rm', '--force', suiteImage], { env: dockerEnv() });
             });
             suite = { image: suiteImage };
           }
@@ -545,7 +546,7 @@ export class JailedPatchWorkbench implements PatchWorkbench {
       try {
         // Only this workbench ever uses the suite image; the patched target's image stays,
         // because the evidence bundle names it by ID.
-        await exec('docker', ['image', 'rm', '--force', ws.suite.image]);
+        await exec('docker', ['image', 'rm', '--force', ws.suite.image], { env: dockerEnv() });
       } catch (err) {
         cleanupError ??= err instanceof Error ? err : new Error(String(err));
       }
