@@ -104,9 +104,12 @@ function refusalNote(ordinal: 'one' | 'two', refused: { model: string; error: Mo
 
 /**
  * Thrown when a refusal sends a candidate below the escalation floor to review. No contract
- * escalation reason fits a below-floor candidate yet, and a refusal must never dismiss, so the job
- * fails as a plain call error (class `refusal`) and the worker flags the stage for review. It
- * carries the last refusal's sanitized provider failure; every refusal is named in the message.
+ * escalation reason fits a below-floor candidate yet, and a refusal must never dismiss. It is a
+ * `ModelCallError` of class `refusal`, so the orchestrator halts the case at `defense` with a
+ * `halted` event (reason `model-refusal`, the last refusal's allowlisted category) instead of
+ * failing the stage, and the worker flags the halted case for review (with the Lane 1 change in
+ * `docs/lanes/lane1/contract-requests.md`, a refusal halt is not retried). It carries the last
+ * refusal's sanitized provider failure; every refusal is named in the message.
  */
 export class DefenseRefusedError extends ModelCallError {
   constructor(message: string, last: ModelCallError) {
@@ -145,7 +148,7 @@ export function createDefenseHandler(deps: DefenseDeps): StageHandler {
         const why = `${notes.join('; ')}; `;
         if (!aboveFloor) {
           throw new DefenseRefusedError(
-            `${why}candidate ${candidate.id} scored ${candidate.score}, below the floor ${escalationFloor}; not dismissed, the stage fails so it is flagged for review`,
+            `${why}candidate ${candidate.id} scored ${candidate.score}, below the floor ${escalationFloor}; not dismissed; the case is halted for human review`,
             last,
           );
         }
