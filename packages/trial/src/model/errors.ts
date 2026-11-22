@@ -61,6 +61,24 @@ export class ModelCallError extends Error {
 }
 
 /**
+ * The class the port reports for a model safety refusal. The runtime reports a response that
+ * ended with `stop_reason: "refusal"` (the model's safeguards declined the request) under the
+ * assistant error code `invalid_request`, the same code as a malformed request. They are not the
+ * same: a refusal is a well-formed request the model answered, after it read the whole input and
+ * possibly generated output, so it is billed and is never `REFUSED_BEFORE_WORK`.
+ */
+export const REFUSAL_CLASS = 'refusal';
+
+/**
+ * A `ModelCallError` the port raised for a model safety refusal (class `refusal`). Only the
+ * provider class decides it: a refusal says nothing about whether the finding is real, so the
+ * caller must never treat it as "no witness" (CR-T13).
+ */
+export function isModelRefusal(err: unknown): err is ModelCallError {
+  return err instanceof ModelCallError && err.provider?.errorClass === REFUSAL_CLASS;
+}
+
+/**
  * A provider failure as the port reports it. Every field is sanitized: `errorClass` comes from
  * the runtime's closed snake_case set, `status` is an integer, and `message` was redacted whole
  * (credentials), checked for request content, and only then clipped. Never the request body.

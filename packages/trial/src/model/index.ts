@@ -8,6 +8,8 @@ export {
   ModelConfigError,
   ModelUnconfiguredError,
   NoModelRecordingError,
+  REFUSAL_CLASS,
+  isModelRefusal,
 } from './errors.js';
 export {
   DEFAULT_MODEL_TIMEOUT_MS,
