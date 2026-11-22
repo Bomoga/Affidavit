@@ -152,6 +152,12 @@ export const samples: Readonly<Record<string, unknown>> = {
   Slice: caseFile.slices[0],
   RouteInfo: caseFile.route,
   CaseFile: caseFile,
+  ScannerCoverage: {
+    tool: 'osv',
+    ran: false,
+    reason: 'not-supported-in-jail',
+    detail: 'needs a writable temp directory the jail does not provide yet',
+  },
   Dismissal: {
     schemaVersion: 1,
     candidateId: 'cand-sqli-002',
@@ -208,6 +214,19 @@ export const samples: Readonly<Record<string, unknown>> = {
     type: 'stage-entered',
     payload: {},
   },
+  ModelRecording: {
+    schemaVersion: 1,
+    promptId: 'defense',
+    promptVersion: 'v1',
+    model: 'model-id-placeholder',
+    inputSha256: h('a'),
+    userSha256: h('b'),
+    result: {
+      outcome: 'submitted',
+      submission: { template: '/* witness body recorded from run [id] */' },
+      cost: { stage: 'defense', inputTokens: 0, outputTokens: 0, usd: 0, wallMs: 0, attempt: 1 },
+    },
+  },
   CreateCaseRequest: { repoUrl: 'https://example.test/nodegoat.git', commit },
   CreateCaseResponse: { schemaVersion: 1, caseId: 'case-nodegoat-sqli-001', stage: 'intake' },
   GetCaseResponse: { schemaVersion: 1, caseId: 'case-nodegoat-sqli-001', stage: 'intake' },
@@ -222,7 +241,8 @@ export const samples: Readonly<Record<string, unknown>> = {
 
 /**
  * Valid `TrialEvent` samples per event type, beyond the single `samples.TrialEvent`. The registry
- * has one sample per schema, so event types added after v1.0 keep theirs here (v1.1: CR-1).
+ * has one sample per schema, so event types added after v1.0 keep theirs here (v1.1: CR-1;
+ * v1.2: CR-T1, CR-T12).
  */
 export const trialEventSamples: Readonly<Record<string, unknown>> = {
   'verify-result': {
@@ -234,5 +254,35 @@ export const trialEventSamples: Readonly<Record<string, unknown>> = {
     actor: 'judge',
     type: 'verify-result',
     payload: { result: verifyResult },
+  },
+  'cost-released': {
+    schemaVersion: 1,
+    caseId: 'case-nodegoat-sqli-001',
+    seq: 10,
+    stage: 'defense',
+    at: '2026-11-05T12:00:10.000Z',
+    actor: 'defense',
+    type: 'cost-released',
+    payload: {
+      cost: { stage: 'defense', inputTokens: 0, outputTokens: 0, usd: 0, wallMs: 0, attempt: 1 },
+      remaining: {
+        remainingInputTokens: 900000,
+        remainingOutputTokens: 90000,
+        remainingUsd: 4.5,
+        exhausted: false,
+      },
+      reservationSeq: 9,
+      reason: 'model-call-failed',
+    },
+  },
+  halted: {
+    schemaVersion: 1,
+    caseId: 'case-nodegoat-sqli-001',
+    seq: 7,
+    stage: 'defense',
+    at: '2026-11-05T12:00:07.000Z',
+    actor: 'stenographer',
+    type: 'halted',
+    payload: { reason: 'model-refusal', refusalCategory: 'other' },
   },
 };
