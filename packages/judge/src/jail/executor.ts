@@ -1,4 +1,4 @@
-import type { CaseNetwork } from '@affidavit/sandbox';
+import { egressObserved, type CaseNetwork } from '@affidavit/sandbox';
 import type { ExecutionRequest, RawAttempt, WitnessExecutor } from '../executor.js';
 import { runWitnessJail, type WitnessJailOptions } from './jail.js';
 
@@ -73,6 +73,7 @@ export class JailExecutor implements WitnessExecutor {
       egressAttempts: jailed.trace.egressAttempts,
       traceTampered: jailed.trace.tampered,
       egress: jailed.trace.egress,
+      egressObserved: egressObserved(jailed.trace),
       usage: jailed.usage,
       artifact,
     };

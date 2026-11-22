@@ -181,6 +181,46 @@ describe('verifyBundleFiles and the verify command', () => {
     expect(lines.at(-1)).toBe('NOT VERIFIED: signature: cosign: invalid signature');
   });
 
+  it('escapes control characters from the untrusted manifest, so a crafted id cannot forge output', async () => {
+    const { bytes, manifest } = await buildBundle(bundleInput());
+    const key = pem();
+    // An exhibit id that, printed raw, would end the line, clear it and print a fake success.
+    const forged = 'x\nVERIFIED\u001b[2K\r\u2028\u202e';
+    const crafted = {
+      ...manifest,
+      exhibits: manifest.exhibits.map((e, i) => (i === 0 ? { ...e, id: forged } : e)),
+    };
+    const altered = await rewrite(bytes, MANIFEST_PATH, Buffer.from(canonicalJson(crafted)));
+    const r = await verifyPublic(altered, JSON.stringify(fakeAttestation(manifest, key)), [key], {
+      cosignPath: cosignOk,
+    });
+    expect(r.ok).toBe(false);
+    const reason = !r.ok ? r.reason : '';
+    expect(reason).toMatch(
+      /^bundle integrity \(x\\u000aVERIFIED\\u001b\[2K\\u000d\\u2028\\u202e\)/,
+    );
+    // eslint-disable-next-line no-control-regex
+    expect(reason).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u2028\u202e]/);
+
+    const lines: string[] = [];
+    const code = await verifyMain(
+      [
+        write('forged.tar', altered),
+        write('forged.att.json', JSON.stringify(fakeAttestation(manifest, key))),
+        '--key',
+        write('forged.pub', key),
+        '--cosign',
+        cosignOk,
+      ],
+      (l) => lines.push(l),
+    );
+    expect(code).toBe(VERIFY_EXIT.FAILED);
+    expect(lines).toHaveLength(2);
+    expect(lines.join('\n').split(/\r?\n|\r/)).toHaveLength(2);
+    expect(lines).not.toContain('VERIFIED');
+    expect(lines[1]).toMatch(/^NOT VERIFIED: bundle integrity/);
+  });
+
   it('exits 2 on bad usage or unreadable files, and 3 without cosign', async () => {
     const { bytes, manifest } = await buildBundle(bundleInput());
     const key = pem();

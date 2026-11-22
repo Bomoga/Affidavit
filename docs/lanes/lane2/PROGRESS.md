@@ -27,7 +27,7 @@ Contracts version in use: v1.0
 
 ## Skipped tests
 
-- `apps/signer/src/e2e.integration.test.ts` (4 tests) is skipped in plain `pnpm test`: it needs the sandbox host, the NodeGoat trees and dependency bundle, and cosign. It runs with `pnpm --filter @affidavit/signer test:e2e`. 4 of 4 passed on 2026-11-21 on the owner's workstation (155 s).
+- `apps/signer/src/e2e.integration.test.ts` (4 tests) is skipped in plain `pnpm test`: it needs the sandbox host, the NodeGoat trees and dependency bundle, and cosign. It runs with `pnpm --filter @affidavit/signer test:e2e`; with `AFFIDAVIT_SANDBOX_HOST=1` a missing prerequisite fails it by name instead of skipping (review of PR #71). 4 of 4 passed on 2026-11-21 on the owner's workstation (155 s).
 
 - `packages/sandbox/src/boot/boot.integration.test.ts` (19 tests) is skipped in plain `pnpm test`: it needs the sandbox host, pulls images from Docker Hub, and the NodeGoat cases need `AFFIDAVIT_NODEGOAT_DIR` (the L1-08 corpus checkout, `node packages/corpus/scripts/fetch-pinned.mjs nodegoat`; `pnpm fetch` is pnpm's own command). All 19 passed on 2026-11-16 on the owner's workstation on the hardened PR #18 tip.
 - `packages/judge/src/jail/jail.integration.test.ts` (21 tests) is skipped in plain `pnpm test` for the same reason. It runs with `pnpm --filter @affidavit/judge test:sandbox-host`. All of them, including the IPv6 and embedded-DNS tests and the reviewed L2-07 verifyPatch and admissible-counterexample tests, passed on 2026-11-16 on the owner's workstation on the PR #18 tip (which contains the PR #17 tip).

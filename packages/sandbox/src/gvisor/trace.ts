@@ -33,9 +33,13 @@ export interface EgressEvent {
   address: string;
   /** The destination port, when gVisor printed one. */
   port: number | null;
-  /** `blocked`: the syscall failed; `sent`: it returned success (for example a UDP send). */
-  outcome: 'blocked' | 'sent';
-  /** The errno of a blocked attempt (101 is ENETUNREACH), else null. */
+  /**
+   * `blocked`: refused with an unreachable or permission errno (`BLOCKED_ERRNOS`); `failed`: any
+   * other error, for example EINPROGRESS (115) from a non-blocking connect, which says nothing
+   * about whether the packet left; `sent`: it returned success (for example a UDP send).
+   */
+  outcome: 'blocked' | 'failed' | 'sent';
+  /** The errno of a blocked or failed attempt (101 is ENETUNREACH), else null. */
   errno: number | null;
   /** Sent to Docker's embedded DNS resolver, which forwards names to the host. */
   dns: boolean;
@@ -44,6 +48,12 @@ export interface EgressEvent {
 /** Most egress events kept per run; `egressAttempts` still counts every one. */
 export const MAX_EGRESS_EVENTS = 50;
 
+/**
+ * Errnos that mean the jail refused the attempt: EPERM (1), EACCES (13), ENETUNREACH (101) and
+ * EHOSTUNREACH (113). Any other error is listed as `failed`, never as `blocked`.
+ */
+export const BLOCKED_ERRNOS: ReadonlySet<number> = new Set([1, 13, 101, 113]);
+
 export interface TraceObservations {
   egressAttempts: number;
   /**
@@ -51,6 +61,13 @@ export interface TraceObservations {
    * `egressAttempts` means the rest were counted but not listed.
    */
   egress: EgressEvent[];
+  /**
+   * True only when this run's whole trace was read and parsed. False when tracing was off or the
+   * trace passed its size cap: then `egress` is empty because nothing was observed, not because
+   * nothing tried to leave. A tampered trace is read but may hide lines, so a complete egress log
+   * also needs `tampered` false (see `egressObserved`).
+   */
+  traced: boolean;
   deniedReads: number;
   deniedWrites: number;
   pidsLimitHit: boolean;
@@ -193,10 +210,19 @@ export const DOCKER_EMBEDDED_DNS = '127.0.0.11';
 const under = (path: string, root: string): boolean =>
   path === root || path.startsWith(root.endsWith('/') ? root : `${root}/`);
 
+/**
+ * Whether a run's egress log is a complete record of its attempts: the whole trace was read and
+ * parsed, and no line of it was malformed or split. Only then does an empty `egress` mean nothing
+ * tried to leave.
+ */
+export const egressObserved = (t: Pick<TraceObservations, 'traced' | 'tampered'>): boolean =>
+  t.traced && !t.tampered;
+
 export function parseTrace(text: string, opts: TraceOptions): TraceObservations {
   const out: TraceObservations = {
     egressAttempts: 0,
     egress: [],
+    traced: true,
     deniedReads: 0,
     deniedWrites: 0,
     pidsLimitHit: false,
@@ -239,7 +265,11 @@ export function parseTrace(text: string, opts: TraceOptions): TraceObservations 
           out.egress.push({
             syscall: name as EgressEvent['syscall'],
             ...dest,
-            outcome: failed ? 'blocked' : 'sent',
+            outcome: !failed
+              ? 'sent'
+              : errno !== null && BLOCKED_ERRNOS.has(errno)
+                ? 'blocked'
+                : 'failed',
             errno: failed ? errno : null,
             dns:
               dest.address === DOCKER_EMBEDDED_DNS || /^::ffff:127\.0\.0\.11$/i.test(dest.address),

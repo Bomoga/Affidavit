@@ -152,6 +152,7 @@ async function collectTrace(root: string, id: string, maxBytes: number): Promise
 const OVERFLOWED: TraceObservations = {
   egressAttempts: 0,
   egress: [],
+  traced: false,
   deniedReads: 0,
   deniedWrites: 0,
   pidsLimitHit: false,
@@ -162,6 +163,7 @@ const OVERFLOWED: TraceObservations = {
 const UNTRACED: TraceObservations = {
   egressAttempts: 0,
   egress: [],
+  traced: false,
   deniedReads: 0,
   deniedWrites: 0,
   pidsLimitHit: false,

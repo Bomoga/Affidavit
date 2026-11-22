@@ -43,6 +43,21 @@ export class CosignMissingError extends Error {
   override name = 'CosignMissingError';
 }
 
+/**
+ * Control, line-separator and bidirectional-override characters, escaped before a failure reason
+ * is returned: a reason can quote the manifest's exhibit ids, tar entry names or the attestation's
+ * key id, all read from the untrusted files before any signature check, and printing them raw
+ * would let a crafted bundle add lines (a fake `VERIFIED`) or move the cursor with ANSI escapes.
+ */
+const UNPRINTABLE =
+  // eslint-disable-next-line no-control-regex
+  /[\u0000-\u001f\u007f-\u009f\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
+
+/** `s` with every unprintable character written as a `\uXXXX` escape, so it stays on one line. */
+export function printable(s: string): string {
+  return s.replace(UNPRINTABLE, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
+}
+
 /** Largest attestation file read; a real one is a few KiB plus the manifest. */
 export const MAX_ATTESTATION_BYTES = 16 * 1024 * 1024;
 /** Largest public key file read. */
@@ -71,7 +86,11 @@ export async function verifyPublic(
   opts: { expectedSha256?: string; cosignPath?: string } = {},
 ): Promise<PublicVerification> {
   const bundleSha256 = sha256Hex(bundleBytes);
-  const fail = (reason: string): PublicVerification => ({ ok: false, bundleSha256, reason });
+  const fail = (reason: string): PublicVerification => ({
+    ok: false,
+    bundleSha256,
+    reason: printable(reason),
+  });
 
   if (opts.expectedSha256 !== undefined && !SHA256_HEX.test(opts.expectedSha256)) {
     return fail('the expected bundle digest is not 64 lowercase hex characters');
@@ -148,11 +167,15 @@ export async function verifyPublic(
   };
 }
 
-/** Plain-text lines for a result. Values come from a bundle that passed every check. */
+/**
+ * Plain-text lines for a result. Values of a verified result come from a bundle that passed every
+ * check; a failure's reason is already `printable`, and is escaped again here in case a caller
+ * built the result itself.
+ */
 export function renderVerification(v: PublicVerification): string[] {
   const lines = [`bundle sha256:${v.bundleSha256}`];
   if (!v.ok) {
-    lines.push(`NOT VERIFIED: ${v.reason}`);
+    lines.push(`NOT VERIFIED: ${printable(v.reason)}`);
     return lines;
   }
   lines.push(

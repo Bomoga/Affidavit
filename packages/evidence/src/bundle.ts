@@ -40,7 +40,8 @@ export const EgressEntry = z.object({
   family: z.enum(['ipv4', 'ipv6']),
   address: z.string().min(1).max(45),
   port: z.int().min(0).max(65535).nullable(),
-  outcome: z.enum(['blocked', 'sent']),
+  /** `blocked`: unreachable or permission errno; `failed`: any other errno; `sent`: success. */
+  outcome: z.enum(['blocked', 'failed', 'sent']),
   errno: z.int().min(1).nullable(),
   dns: z.boolean(),
 });
@@ -53,6 +54,9 @@ export const MAX_USAGE_ENTRIES = 1024;
 /**
  * Time and resources of one run of the exhibit (L2-11). `cpuMs` and `memoryPeakBytes` come from
  * the container's cgroup, sampled while it ran (a lower bound), and are null when not measured.
+ * `egressObserved` is true only when the run's whole syscall trace was read and intact; false
+ * means tracing was off, the trace passed its size cap or was tampered with, so the egress log
+ * says nothing about that run.
  */
 export const RunUsageEntry = z.object({
   variant: z.enum(['vulnerable', 'safe', 'patched']),
@@ -60,6 +64,7 @@ export const RunUsageEntry = z.object({
   wallMs: z.int().min(0),
   cpuMs: z.int().min(0).nullable(),
   memoryPeakBytes: z.int().min(0).nullable(),
+  egressObserved: z.boolean(),
 });
 export type RunUsageEntry = z.infer<typeof RunUsageEntry>;
 const UsageLog = z.array(RunUsageEntry).max(MAX_USAGE_ENTRIES).optional();
@@ -74,7 +79,10 @@ export const WitnessRecord = z.object({
   kind: z.literal('witness'),
   witness: z.json(),
   result: ExhibitResult,
-  /** Absent in bundles built before L2-11 or without a recorder; `[]` means nothing tried. */
+  /**
+   * Absent in bundles built before L2-11 or without a recorder. Covers only the runs whose usage
+   * entry has `egressObserved`; see `egressFullyObserved` before reading `[]` as nothing tried.
+   */
   egress: EgressLog,
   /** One entry per run (L2-11); absent when not recorded. */
   usage: UsageLog,
@@ -85,7 +93,10 @@ export const CounterexampleRecord = z.object({
   witnessExhibitId: ExhibitId,
   counterexample: z.json(),
   result: ExhibitResult,
-  /** Absent in bundles built before L2-11 or without a recorder; `[]` means nothing tried. */
+  /**
+   * Absent in bundles built before L2-11 or without a recorder. Covers only the runs whose usage
+   * entry has `egressObserved`; see `egressFullyObserved` before reading `[]` as nothing tried.
+   */
   egress: EgressLog,
   /** One entry per run (L2-11); absent when not recorded. */
   usage: UsageLog,
@@ -97,7 +108,10 @@ export const PatchRecord = z.object({
   counterexampleExhibitIds: z.array(ExhibitId),
   patch: z.json(),
   result: VerifyResult,
-  /** Absent in bundles built before L2-11 or without a recorder; `[]` means nothing tried. */
+  /**
+   * Absent in bundles built before L2-11 or without a recorder. Covers only the runs whose usage
+   * entry has `egressObserved`; see `egressFullyObserved` before reading `[]` as nothing tried.
+   */
   egress: EgressLog,
   /** One entry per run (L2-11); absent when not recorded. */
   usage: UsageLog,
@@ -190,6 +204,22 @@ export interface CaseUsage {
   egressAttempts: number;
   /** Records without a usage log (built before L2-11 or without a recorder). */
   recordsWithoutUsage: number;
+  /** Runs whose egress was not observed (no trace, or one over its cap or tampered with). */
+  egressUnobservedRuns: number;
+}
+
+/**
+ * True only when the record's egress log covers every run: a log is present, every run has a
+ * usage entry, and each says `egressObserved`. Only then does an empty `egress` mean nothing
+ * tried to leave; otherwise some run was not observed and the log proves nothing about it.
+ */
+export function egressFullyObserved(r: ExhibitRecord): boolean {
+  return (
+    r.egress !== undefined &&
+    r.usage !== undefined &&
+    r.usage.length > 0 &&
+    r.usage.every((u) => u.egressObserved)
+  );
 }
 
 /**
@@ -205,6 +235,7 @@ export function caseUsage(records: readonly ExhibitRecord[]): CaseUsage {
     unmeasuredRuns: 0,
     egressAttempts: 0,
     recordsWithoutUsage: 0,
+    egressUnobservedRuns: 0,
   };
   for (const r of records) {
     if (r.kind !== 'patch') out.egressAttempts += r.result.egressAttempts;
@@ -216,6 +247,7 @@ export function caseUsage(records: readonly ExhibitRecord[]): CaseUsage {
       out.runs += 1;
       out.wallMs += u.wallMs;
       if (u.cpuMs === null || u.memoryPeakBytes === null) out.unmeasuredRuns += 1;
+      if (!u.egressObserved) out.egressUnobservedRuns += 1;
       if (u.cpuMs !== null) out.cpuMs += u.cpuMs;
       if (u.memoryPeakBytes !== null) {
         out.memoryPeakBytes = Math.max(out.memoryPeakBytes ?? 0, u.memoryPeakBytes);
@@ -227,7 +259,8 @@ export function caseUsage(records: readonly ExhibitRecord[]): CaseUsage {
 
 /**
  * An egress log must fit its record: no more entries than the result counted (a witness or
- * counterexample), and only variants that kind of exhibit runs on.
+ * counterexample), only variants that kind of exhibit runs on, and a usage log beside it that
+ * says which runs were observed.
  */
 function checkEgressLog(id: string, r: ExhibitRecord): void {
   const allowed = r.kind === 'patch' ? ['vulnerable', 'patched'] : ['vulnerable', 'safe'];
@@ -235,6 +268,14 @@ function checkEgressLog(id: string, r: ExhibitRecord): void {
     throw new BundleIntegrityError(id, 'usage log names a variant this exhibit never runs on');
   }
   if (r.egress === undefined) return;
+  if (r.usage === undefined) {
+    // Without one entry per run, a reader cannot tell which runs the log covers, and `[]` would
+    // read as "nothing tried" for runs nobody observed.
+    throw new BundleIntegrityError(
+      id,
+      'egress log without a usage log cannot say which runs it covers',
+    );
+  }
   if (r.egress.some((e) => !allowed.includes(e.variant))) {
     throw new BundleIntegrityError(id, 'egress log names a variant this exhibit never runs on');
   }

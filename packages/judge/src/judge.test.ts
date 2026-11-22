@@ -473,4 +473,46 @@ describe('Judge run log (L2-11)', () => {
     expect(calls).toEqual([[witnessExhibitId(gateWitness()), 0]]);
     expect(logs[0]?.runs[0]).toMatchObject(usage);
   });
+
+  it('marks each run observed only when its trace was read and intact, so [] never overclaims', async () => {
+    // Attempt 1 of each variant: a full, intact trace. Attempt 2: no trace (off or over its cap),
+    // which lists no egress because nothing was seen. Attempt 3: a tampered trace.
+    const exec = new ScriptedExecutor((req) => ({
+      ...differentialTarget(3)(req),
+      ...(req.attempt === 1 ? { egressObserved: true } : {}),
+      ...(req.attempt === 2 ? { egressObserved: false } : {}),
+      ...(req.attempt === 3 ? { egressObserved: true, traceTampered: true } : {}),
+    }));
+    const logs: ExhibitRunLog[] = [];
+    const judge = new Judge(exec, DEFAULT_POLICY, undefined, {
+      record: (_, log) => logs.push(log),
+    });
+    const result = await judge.runWitness(gateCaseFile(), gateWitness(), ['vulnerable']);
+    // Admission is unchanged: the tampered trace still fails no-egress.
+    expect(result.rejectedBy).toBe('no-egress');
+    const log = logs[0]!;
+    expect(log.egress).toEqual([]);
+    expect(log.runs.map((u) => `${u.variant}:${u.attempt}:${u.egressObserved}`)).toEqual([
+      'vulnerable:1:true',
+      'vulnerable:2:false',
+      'vulnerable:3:false',
+      'safe:1:true',
+      'safe:2:false',
+      'safe:3:false',
+    ]);
+  });
+
+  it('marks runs unobserved when the executor says nothing about its trace', async () => {
+    const logs: ExhibitRunLog[] = [];
+    const judge = new Judge(
+      new ScriptedExecutor(differentialTarget(3)),
+      DEFAULT_POLICY,
+      undefined,
+      {
+        record: (_, log) => logs.push(log),
+      },
+    );
+    await judge.runWitness(gateCaseFile(), gateWitness(), ['vulnerable']);
+    expect(logs[0]!.runs.every((u) => !u.egressObserved)).toBe(true);
+  });
 });

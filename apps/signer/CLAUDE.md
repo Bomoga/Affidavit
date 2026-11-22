@@ -13,8 +13,9 @@ Run from this directory, or add `--filter @affidavit/signer` from the repo root.
 - `pnpm typecheck`
 - `pnpm lint`
 - `pnpm test` (unit; the cosign tests run too when `cosign` is on PATH)
-- `pnpm test:sandbox-host` adds the key isolation test (Docker; sandbox host)
-- `pnpm test:e2e` runs Lane 2 end to end on one real NodeGoat case (Judge in gVisor, bundle, this signer, public verify, replay); same env as `docs/lanes/lane2/real-judge-host.md` step 9, plus cosign
+- `pnpm test:sandbox-host` adds the key isolation test (Docker; sandbox host) and the end to end test, so it needs the `test:e2e` env too
+- `pnpm test:e2e` runs Lane 2 end to end on one real NodeGoat case (Judge in gVisor, bundle, this signer, public verify, replay); same env as `docs/lanes/lane2/real-judge-host.md` step 9, plus cosign. Both scripts set `AFFIDAVIT_SANDBOX_HOST=1`, and with it a missing prerequisite fails the run naming it, never skips (`src/e2e-prerequisites.ts`)
+- The e2e test is why `@affidavit/judge` and `@affidavit/sandbox` are dev dependencies here (test only). It cannot move to `packages/evidence`, which would then need this package as a dev dependency while this package depends on evidence
 - `pnpm start` runs the service (env in `src/main.ts`)
 - cosign: `bash docker/sandbox/install-cosign.sh` (pinned v3.1.4)
 

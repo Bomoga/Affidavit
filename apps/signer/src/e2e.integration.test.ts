@@ -36,6 +36,7 @@ import { RUN_LABEL, readDependencyBundlePins } from '@affidavit/sandbox';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { SignerClient } from './client.js';
 import { CosignSigner } from './cosign.js';
+import { e2ePrerequisites } from './e2e-prerequisites.js';
 import { startSignerServer, type RunningSigner } from './server.js';
 
 // Lane 2 end to end on one real NodeGoat case, with nothing faked inside Lane 2: the real Judge
@@ -46,11 +47,10 @@ import { startSignerServer, type RunningSigner } from './server.js';
 // reruns every exhibit through the real Judge and must reach the same outcomes. Only the trial
 // (Lane 3) is absent: the verdict is written here from the Judge's results, not by a jury.
 // Needs the same host setup as real.integration.test.ts in packages/judge, plus cosign.
-const onSandboxHost = process.env.AFFIDAVIT_SANDBOX_HOST === '1';
-const vulnerableDir = process.env.AFFIDAVIT_NODEGOAT_DIR;
-const safeDir = process.env.AFFIDAVIT_NODEGOAT_SAFE_DIR;
-const bundlePath = process.env.AFFIDAVIT_NODEGOAT_BUNDLE;
-const bundleStore = process.env.AFFIDAVIT_DEPENDENCY_BUNDLE_ROOT;
+// It lives in apps/signer, not packages/evidence: evidence already has judge and sandbox as dev
+// dependencies, but it would also need this package, which depends on evidence (a cycle).
+// Off a sandbox host it is skipped; with AFFIDAVIT_SANDBOX_HOST=1 a missing prerequisite fails
+// the file with its name (e2e-prerequisites.ts), so `test:e2e` can never pass with nothing run.
 const hasCosign = (() => {
   try {
     execFileSync('cosign', ['version'], { stdio: 'ignore' });
@@ -59,15 +59,8 @@ const hasCosign = (() => {
     return false;
   }
 })();
-const SKIP_REASON = !onSandboxHost
-  ? 'not a sandbox host'
-  : vulnerableDir === undefined || safeDir === undefined
-    ? 'AFFIDAVIT_NODEGOAT_DIR and AFFIDAVIT_NODEGOAT_SAFE_DIR are not both set'
-    : bundlePath === undefined || bundleStore === undefined
-      ? 'no NodeGoat dependency bundle (AFFIDAVIT_NODEGOAT_BUNDLE, AFFIDAVIT_DEPENDENCY_BUNDLE_ROOT)'
-      : !hasCosign
-        ? 'cosign is not installed'
-        : null;
+const prerequisites = e2ePrerequisites(process.env, hasCosign);
+const SKIP_REASON = prerequisites.run ? null : prerequisites.skipReason;
 
 const HINTS: BootHints = {
   kind: 'compose',
@@ -116,6 +109,8 @@ describe.skipIf(SKIP_REASON !== null)(
     let attestationJson = '';
 
     beforeAll(async () => {
+      if (!prerequisites.run) throw new Error('unreachable: the suite is skipped');
+      const { vulnerableDir, safeDir, bundlePath, bundleStore } = prerequisites.setup;
       root = mkdtempSync(join(tmpdir(), 'affidavit-e2e-'));
       const keys = join(root, 'keys');
       mkdirSync(keys, { mode: 0o700 });
@@ -177,11 +172,11 @@ describe.skipIf(SKIP_REASON !== null)(
         signerSocket: socketPath,
         signer: new SignerClient(socketPath),
         sources: directorySources([
-          { repo: cf.target.repo, commit: pin.commit, variant: 'vulnerable', dir: vulnerableDir! },
-          { repo: cf.target.repo, commit: pin.commit, variant: 'safe', dir: safeDir! },
+          { repo: cf.target.repo, commit: pin.commit, variant: 'vulnerable', dir: vulnerableDir },
+          { repo: cf.target.repo, commit: pin.commit, variant: 'safe', dir: safeDir },
         ]),
         dependencyBundles: [
-          { app: 'nodegoat', repo: cf.target.repo, path: bundlePath!, storeRoot: bundleStore! },
+          { app: 'nodegoat', repo: cf.target.repo, path: bundlePath, storeRoot: bundleStore },
         ],
         rescan: { rescan: () => Promise.resolve({ clean: true, candidates: [] }) },
         runLogRecorder: { record: (id, log) => logs.set(id, log) },
@@ -236,6 +231,9 @@ describe.skipIf(SKIP_REASON !== null)(
       expect(wLog.egress).toEqual([]);
       expect(wLog.runs).toHaveLength(6);
       expect(wLog.runs.every((r) => r.memoryPeakBytes !== null && r.cpuMs !== null)).toBe(true);
+      // The empty egress log means nothing tried to leave only because every run was observed.
+      expect(wLog.runs.every((r) => r.egressObserved)).toBe(true);
+      expect(pLog.runs.every((r) => r.egressObserved)).toBe(true);
       expect(pLog.runs.length).toBeGreaterThanOrEqual(6);
 
       records.push(
@@ -301,6 +299,7 @@ describe.skipIf(SKIP_REASON !== null)(
         unmeasuredRuns: 0,
         egressAttempts: 0,
         recordsWithoutUsage: 0,
+        egressUnobservedRuns: 0,
       });
     });
 
@@ -318,6 +317,10 @@ describe.skipIf(SKIP_REASON !== null)(
       const tampered = await writeTar([...files].map(([n, b]) => ({ name: n, bytes: b })));
       const bad = await verifyPublic(tampered, attestationJson, [publicKeyPem]);
       expect(bad.ok).toBe(false);
+      const witnessId = name.slice('exhibits/'.length, -'.json'.length);
+      expect(!bad.ok && bad.reason).toBe(
+        `bundle integrity (${witnessId}): bytes do not match the manifest digest`,
+      );
     });
 
     it('replays every exhibit through the real Judge to the same outcomes', async () => {
