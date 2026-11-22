@@ -27,9 +27,13 @@ import {
 } from './anthropic.js';
 import { ModelCallError, ModelUnconfiguredError } from './errors.js';
 import { DEFAULT_MODEL_TABLE } from './models.js';
+import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
+import { qualifiedToolName } from './submit-tools.js';
 import {
   CANARY_KEY,
+  GOOD_WITNESS,
   assistant,
+  refusalAssistant,
   requestFor,
   result,
   stubTransport,
@@ -299,6 +303,335 @@ describe('what a failed call costs', () => {
     );
     const err = await failure(port);
     expect(err.cost).toBeUndefined();
+  });
+});
+
+// L3-18: the runtime reports a usage-policy refusal under the same assistant error code as a
+// malformed request. A refusal is billed and is not a malformed request, so it must not be
+// reported as `invalid_request` and must never be settled as zero spend.
+describe('a model safety refusal', () => {
+  const zeroResult = (text: string) =>
+    result('success', { isError: true, usd: 0, input: 0, output: 0, text });
+
+  it('is reported as class refusal with its category, not invalid_request', async () => {
+    const { port, logs } = makePort(async function* () {
+      await Promise.resolve();
+      yield refusalAssistant();
+      yield zeroResult('API Error: safeguards flagged this message');
+    });
+    const err = await failure(port);
+    expect(err.provider?.errorClass).toBe('refusal');
+    expect(err.provider?.refusalCategory).toBe('cyber');
+    expect(err.message).toContain('provider error refusal');
+    expect(err.message).toContain('category cyber');
+    expect(err.message).toContain('usage policy refusal');
+    expect(err.message).not.toContain('invalid_request');
+    expect(logs.some((l) => l.message.includes('refusal'))).toBe(true);
+  });
+
+  it('with no result and no tokens is unknown spend, never zero: the charge stands', async () => {
+    const { port } = makePort(async function* () {
+      await Promise.resolve();
+      yield refusalAssistant();
+    });
+    expect((await failure(port)).cost).toBeUndefined();
+  });
+
+  it('with a result that reports no spend is unknown spend, not zero', async () => {
+    const { port } = makePort(async function* () {
+      await Promise.resolve();
+      yield refusalAssistant();
+      yield zeroResult('refused');
+    });
+    expect((await failure(port)).cost).toBeUndefined();
+  });
+
+  it('with a result that reports spend carries that spend', async () => {
+    const { port } = makePort(async function* () {
+      await Promise.resolve();
+      yield refusalAssistant();
+      yield result('success', { isError: true, usd: 0.031, input: 1200, output: 40 });
+    });
+    expect((await failure(port)).cost).toMatchObject({
+      inputTokens: 1200,
+      outputTokens: 40,
+      usd: 0.031,
+    });
+  });
+
+  it('never shows the refusal explanation or echoed text', async () => {
+    const { port } = makePort(async function* () {
+      await Promise.resolve();
+      yield refusalAssistant({
+        explanation: 'CANARY-EXPLANATION about $where injection',
+        text: 'API Error: CANARY-ECHO this.userId == ${parsedUserId}',
+      });
+    });
+    const err = await failure(port);
+    expect(err.message).not.toContain('CANARY');
+    expect(err.message).not.toContain('$where');
+    expect(err.message).toContain(PROVIDER_MESSAGE_WITHHELD);
+  });
+
+  for (const [kind, category] of [
+    ['prose', 'Cyber Security!'],
+    ['a number', 7],
+    ['an object', { name: 'cyber' }],
+    ['an unknown snake_case word', 'weapons_of_note'],
+    ['a known word with case changed', 'Cyber'],
+  ] as const) {
+    it(`maps a category that is ${kind} to other, never passing it on`, async () => {
+      const { port } = makePort(async function* () {
+        await Promise.resolve();
+        yield refusalAssistant({ category });
+      });
+      const err = await failure(port);
+      expect(err.provider?.errorClass).toBe('refusal');
+      expect(err.provider?.refusalCategory).toBe('other');
+      expect(err.message).toContain('category other');
+    });
+  }
+
+  for (const category of ['cyber', 'bio', 'chem', 'csam', 'frontier_llm', 'reasoning_extraction']) {
+    it(`passes on the allowlisted category ${category}`, async () => {
+      const { port } = makePort(async function* () {
+        await Promise.resolve();
+        yield refusalAssistant({ category });
+      });
+      expect((await failure(port)).provider?.refusalCategory).toBe(category);
+    });
+  }
+
+  it('a refusal that names no category has none', async () => {
+    const { port } = makePort(async function* () {
+      await Promise.resolve();
+      yield refusalAssistant({ withDetails: false });
+    });
+    const err = await failure(port);
+    expect(err.provider?.errorClass).toBe('refusal');
+    expect(err.provider?.refusalCategory).toBeUndefined();
+  });
+
+  it('never returns a submission captured in a turn that was refused', async () => {
+    const { port, logs } = makePort(async function* (h) {
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      yield refusalAssistant();
+      yield result('success', { isError: true, usd: 0.02, input: 900, output: 30 });
+    });
+    const err = await failure(port);
+    expect(err.provider).toMatchObject({ errorClass: 'refusal', refusalCategory: 'cyber' });
+    expect(err.message).toContain('category cyber');
+    expect(logs.some((l) => l.level === 'warn' && l.message.includes('category cyber'))).toBe(true);
+    expect(err.cost?.usd).toBe(0.02);
+  });
+
+  it('a refusal and a fallback notice together still throw refusal, submission or not', async () => {
+    const { port } = makePort(async function* (h) {
+      yield refusalAssistant();
+      yield {
+        type: 'system',
+        subtype: 'model_refusal_fallback',
+        trigger: 'refusal',
+        direction: 'retry',
+        original_model: 'claude-opus-5-5',
+        fallback_model: 'claude-sonnet-5-5',
+        request_id: null,
+        api_refusal_category: 'cyber',
+        uuid: '00000000-0000-0000-0000-000000000011',
+        session_id: 's',
+      } as unknown as SDKMessage;
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      yield result('success', { usd: 0.03 });
+    });
+    const err = await failure(port);
+    expect(err.provider).toMatchObject({ errorClass: 'refusal', refusalCategory: 'cyber' });
+    expect(err.message).toContain('fallback model');
+  });
+
+  it('fails the turn when an assistant message came from another model, notice or not', async () => {
+    const { port } = makePort(async function* (h) {
+      const m = assistant('m2', 100, 10, undefined, 'calling the tool') as unknown as {
+        message: Record<string, unknown>;
+      };
+      m.message.model = 'claude-sonnet-5-5';
+      yield m as unknown as SDKMessage;
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      yield result('success', { usd: 0.01 });
+    });
+    const err = await failure(port);
+    expect(err.provider?.errorClass).toBe('model_mismatch');
+    expect(err.message).toContain('claude-sonnet-5-5');
+    expect(err.message).toContain('claude-opus-5-5');
+  });
+
+  it('does not echo an unshaped model name, and accepts the same model with a date suffix', async () => {
+    const odd = makePort(async function* () {
+      await Promise.resolve();
+      const m = assistant('m3', 1, 1) as unknown as { message: Record<string, unknown> };
+      m.message.model = 'CANARY model name with spaces';
+      yield m as unknown as SDKMessage;
+      yield result('success', { usd: 0.01 });
+    });
+    const err = await failure(odd.port);
+    expect(err.message).toContain('another model');
+    expect(err.message).not.toContain('CANARY');
+
+    const dated = makePort(async function* (h) {
+      for (const model of ['claude-opus-5-5-20261001', '<synthetic>']) {
+        const m = assistant(`m-${model}`, 1, 1) as unknown as { message: Record<string, unknown> };
+        m.message.model = model;
+        yield m as unknown as SDKMessage;
+      }
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      yield result('success', { usd: 0.01 });
+    });
+    expect((await dated.port.runTurn(requestFor('defense'))).outcome).toBe('submitted');
+  });
+
+  it('a no-fallback refusal notice upgrades invalid_request to refusal', async () => {
+    const { port } = makePort(async function* () {
+      await Promise.resolve();
+      yield assistant('m1', 0, 0, 'invalid_request', 'API Error: Claude cannot help');
+      yield {
+        type: 'system',
+        subtype: 'model_refusal_no_fallback',
+        original_model: 'claude-opus-5-5',
+        request_id: null,
+        api_refusal_category: 'cyber',
+        content: 'refused',
+        uuid: '00000000-0000-0000-0000-000000000009',
+        session_id: 's',
+      } as unknown as SDKMessage;
+    });
+    const err = await failure(port);
+    expect(err.provider).toMatchObject({ errorClass: 'refusal', refusalCategory: 'cyber' });
+    expect(err.cost).toBeUndefined();
+  });
+
+  it('a fallback to another model after a refusal fails the turn even with a submission', async () => {
+    const { port } = makePort(async function* (h) {
+      yield {
+        type: 'system',
+        subtype: 'model_refusal_fallback',
+        trigger: 'refusal',
+        direction: 'retry',
+        original_model: 'claude-opus-5-5',
+        fallback_model: 'claude-sonnet-5-5',
+        request_id: null,
+        api_refusal_category: 'cyber',
+        uuid: '00000000-0000-0000-0000-000000000010',
+        session_id: 's',
+      } as unknown as SDKMessage;
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      yield result('success', { usd: 0.02 });
+    });
+    const err = await failure(port);
+    expect(err.provider).toMatchObject({ errorClass: 'refusal', refusalCategory: 'cyber' });
+    expect(err.message).toContain('fallback model');
+    expect(err.cost?.usd).toBe(0.02);
+  });
+
+  it('a real malformed request is still invalid_request and still zero before work', async () => {
+    const { port } = makePort(async function* () {
+      await Promise.resolve();
+      yield assistant('m1', 0, 0, 'invalid_request', PROVIDER_400);
+    });
+    const err = await failure(port);
+    expect(err.provider?.errorClass).toBe('invalid_request');
+    expect(err.cost?.usd).toBe(0);
+  });
+});
+
+// Second review of L3-18: a refusal anywhere in the stream must win, whatever came before it.
+describe('a refusal anywhere in the stream', () => {
+  const noFallback = (): SDKMessage =>
+    ({
+      type: 'system',
+      subtype: 'model_refusal_no_fallback',
+      original_model: 'claude-opus-5-5',
+      request_id: null,
+      api_refusal_category: 'bio',
+      content: 'refused',
+      uuid: '00000000-0000-0000-0000-000000000020',
+      session_id: 's',
+    }) as unknown as SDKMessage;
+  const withStop = (m: SDKMessage, stop: string): SDKMessage => {
+    (m as unknown as Record<string, unknown>).stop_reason = stop;
+    return m;
+  };
+  const refusedTurn = async (script: Script) => {
+    const { port } = makePort(script);
+    const err = await failure(port);
+    expect(err.provider?.errorClass).toBe('refusal');
+    return err;
+  };
+
+  it('max_output_tokens, then a submission, then a refusal frame: refusal, no submission', async () => {
+    const err = await refusedTurn(async function* (h) {
+      yield assistant('m1', 50, 1500, 'max_output_tokens', 'API Error: output limit');
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      yield refusalAssistant();
+      yield result('success', { isError: true, usd: 0.05, input: 900, output: 1500 });
+    });
+    expect(err.provider?.refusalCategory).toBe('cyber');
+    expect(err.message).toContain('usage policy refusal');
+    expect(err.cost?.usd).toBe(0.05);
+  });
+
+  it('max_output_tokens, then a submission, then a no-fallback notice: refusal', async () => {
+    const err = await refusedTurn(async function* (h) {
+      yield assistant('m1', 50, 1500, 'max_output_tokens');
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      yield noFallback();
+      yield result('success', { isError: true, usd: 0, input: 0, output: 0 });
+    });
+    expect(err.provider?.refusalCategory).toBe('bio');
+    // Zero reported spend for a refusal is unknown spend, even after another error.
+    expect(err.cost).toBeUndefined();
+  });
+
+  it('a submission, then a result whose stop_reason is refusal (no error frame): refusal', async () => {
+    const err = await refusedTurn(async function* (h) {
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      yield withStop(result('success', { usd: 0.02 }), 'refusal');
+    });
+    expect(err.provider?.refusalCategory).toBeUndefined();
+  });
+
+  it('a submission, then a refusal frame: refusal', async () => {
+    await refusedTurn(async function* (h) {
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      yield refusalAssistant();
+    });
+  });
+
+  it('an assistant message with stop_reason refusal and no error field: refusal', async () => {
+    const err = await refusedTurn(async function* (h) {
+      const m = assistant('m1', 10, 1, undefined, 'partial') as unknown as {
+        message: Record<string, unknown>;
+      };
+      m.message.stop_reason = 'refusal';
+      m.message.stop_details = { category: 'cyber', explanation: null };
+      yield m as unknown as SDKMessage;
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      yield result('success', { usd: 0.01 });
+    });
+    expect(err.provider?.refusalCategory).toBe('cyber');
+  });
+
+  it('a normal stream with other stop reasons is not a refusal', async () => {
+    const { port } = makePort(async function* (h) {
+      const m = assistant('m1', 10, 1, undefined, 'calling') as unknown as {
+        message: Record<string, unknown>;
+      };
+      m.message.stop_reason = 'tool_use';
+      yield m as unknown as SDKMessage;
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      yield withStop(result('success', { usd: 0.01 }), 'end_turn');
+    });
+    const out = await port.runTurn(requestFor('defense'));
+    expect(out.outcome).toBe('submitted');
+    expect(out.submission).toEqual(GOOD_WITNESS);
   });
 });
 

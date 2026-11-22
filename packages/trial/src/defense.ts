@@ -100,6 +100,23 @@ function admits(caseFile: CaseFile, r: ExhibitResult): boolean {
   return true;
 }
 
+/**
+ * The untrusted blocks of one Defense turn's user message. All case-file and Judge text goes in
+ * as labeled blocks; the renderer puts them in the user message inside the untrusted wrapper.
+ * Nothing here builds system text. Exported so the model probe replays the exact input (L3-18).
+ */
+export function defenseBlocks(caseFile: CaseFile, notes: readonly string[]): UntrustedBlock[] {
+  const blocks: UntrustedBlock[] = [
+    { label: 'candidate', content: JSON.stringify(caseFile.candidate) },
+    ...caseFile.slices.map((s) => ({
+      label: 'case-file-slice',
+      content: `file: ${s.file}\n${s.code}`,
+    })),
+  ];
+  if (notes.length > 0) blocks.push({ label: 'judge-feedback', content: notes.join('\n') });
+  return blocks;
+}
+
 async function attempt(
   ctx: StageContext,
   deps: DefenseDeps,
@@ -111,19 +128,10 @@ async function attempt(
   const feedback: string[] = [];
 
   for (let i = 0; i < config.maxIterations; i++) {
-    // All case-file and Judge text goes in as labeled blocks. The renderer puts them in the
-    // user message inside the untrusted wrapper. Nothing here builds system text.
-    const blocks: UntrustedBlock[] = [
-      { label: 'candidate', content: JSON.stringify(caseFile.candidate) },
-      ...caseFile.slices.map((s) => ({
-        label: 'case-file-slice',
-        content: `file: ${s.file}\n${s.code}`,
-      })),
-    ];
-    const notes = [...priorFeedback, ...feedback];
-    if (notes.length > 0) blocks.push({ label: 'judge-feedback', content: notes.join('\n') });
-
-    const rendered = render(which.promptId, blocks);
+    const rendered = render(
+      which.promptId,
+      defenseBlocks(caseFile, [...priorFeedback, ...feedback]),
+    );
     const res = await ctx.runAgentValidated(
       {
         promptId: rendered.promptId,

@@ -181,6 +181,63 @@ export const REFUSED_BEFORE_WORK: ReadonlySet<string> = new Set([
   'authentication_failed',
 ]);
 
+/**
+ * The class the port reports for a model safety refusal. The runtime reports a response that
+ * ended with `stop_reason: "refusal"` (the model's safeguards declined the request) under the
+ * assistant error code `invalid_request`, the same code as a malformed request. They are not the
+ * same: a refusal is a well-formed request the model answered, after it read the whole input and
+ * possibly generated output, so it is billed and is never `REFUSED_BEFORE_WORK`.
+ */
+export const REFUSAL_CLASS = 'refusal';
+
+/**
+ * The refusal categories the port passes on. The runtime itself knows `cyber`, `bio`,
+ * `frontier_llm` and `reasoning_extraction` (SDK 0.3.318); the rest are named in advance. Any
+ * other value, string or not, becomes `other`: no free string from the provider is passed on.
+ */
+export const REFUSAL_CATEGORIES = [
+  'cyber',
+  'bio',
+  'chem',
+  'csam',
+  'frontier_llm',
+  'reasoning_extraction',
+  'other',
+] as const;
+export type RefusalCategory = (typeof REFUSAL_CATEGORIES)[number];
+
+/** A present category mapped onto the allowlist; undefined only when none was given. */
+export function refusalCategoryOf(value: unknown): RefusalCategory | undefined {
+  if (value === undefined || value === null) return undefined;
+  return (REFUSAL_CATEGORIES as readonly unknown[]).includes(value)
+    ? (value as RefusalCategory)
+    : 'other';
+}
+
+/**
+ * True when `served` (an assistant message's `model`) is the requested model: the same id, the
+ * same id with a numeric date suffix, or `<synthetic>` (a message the runtime made itself).
+ */
+export function servedBy(served: string, requested: string): boolean {
+  if (served === requested || served === '<synthetic>') return true;
+  return (
+    served.startsWith(`${requested}-`) && /^[0-9]{8}$/.test(served.slice(requested.length + 1))
+  );
+}
+
+/**
+ * Reads a refusal off an assistant error message the runtime built from a refused response (it
+ * sets `message.stop_reason` to `refusal` on that synthetic message). Returns the allowlisted
+ * category, `''` for a refusal that named none, or undefined for no refusal. The explanation is
+ * provider prose and is never read here.
+ */
+export function refusalOf(message: unknown): RefusalCategory | '' | undefined {
+  const m = message as { stop_reason?: unknown; stop_details?: unknown } | null;
+  if (m === null || typeof m !== 'object' || m.stop_reason !== 'refusal') return undefined;
+  const category = (m.stop_details as { category?: unknown } | null | undefined)?.category;
+  return refusalCategoryOf(category) ?? '';
+}
+
 /** Longest provider message an error carries. */
 export const PROVIDER_MESSAGE_MAX = 300;
 /** Shown in place of provider text that matches no known-safe shape. */
@@ -230,6 +287,11 @@ const TEMPLATES: readonly Template[] = [
   { pattern: /credit balance is too low/i, show: () => 'credit balance is too low' },
   { pattern: /\brate[ _-]?limit/i, show: () => 'rate limit' },
   { pattern: /\boverloaded\b/i, show: () => 'overloaded' },
+  {
+    // The runtime's text for a usage-policy refusal (stop_reason "refusal").
+    pattern: /safeguards flagged this message|can't help with this\. Start a new session/,
+    show: () => 'usage policy refusal: the model safeguards declined this request',
+  },
   {
     pattern: /prompt is too long: ([0-9]{1,9}) tokens > ([0-9]{1,9}) maximum/,
     show: (m) => `prompt is too long: ${m[1]} tokens > ${m[2]} maximum`,
@@ -337,8 +399,12 @@ function messageText(content: unknown): string {
 
 function describeProvider(p: ProviderFailure): string {
   const status = p.status === undefined ? '' : ` (HTTP ${p.status})`;
+  const category =
+    p.errorClass === REFUSAL_CLASS
+      ? ` (the model declined the request${p.refusalCategory === undefined ? '' : `, category ${p.refusalCategory}`}; a usage policy refusal, not a malformed request)`
+      : '';
   const said = p.message === undefined ? '' : `: ${p.message}`;
-  return `provider error ${p.errorClass}${status}${said}`;
+  return `provider error ${p.errorClass}${category}${status}${said}`;
 }
 
 /**
@@ -469,6 +535,17 @@ export class AnthropicModelPort implements PreflightModelPort {
     let providerError: string | undefined;
     // The provider's own words for the first error, kept raw here and sanitized before use.
     let providerText: string | undefined;
+    let refusalCategory: RefusalCategory | undefined;
+    // Sticky: once any frame says the turn was refused, nothing later in the stream clears it,
+    // and it outranks every other outcome, a captured submission included.
+    let refused = false;
+    const markRefused = (category: RefusalCategory | ''): void => {
+      refused = true;
+      if (category !== '') refusalCategory ??= category;
+    };
+    let refusalFallback = false;
+    // Set when an assistant message came from a model other than `req.model`.
+    let otherModel: string | undefined;
     let result: SDKResultMessage | undefined;
     const seen = new Map<string, Usage>();
 
@@ -533,17 +610,34 @@ export class AnthropicModelPort implements PreflightModelPort {
         const msg = next.value;
         if (killed) break;
         if (msg.type === 'assistant') {
+          // Every assistant message is checked for a refusal, whatever came before it and
+          // whether or not it carries an error code: the runtime carries on after some errors
+          // (max_output_tokens), so a refusal can follow another error and a submission.
+          const refusal = refusalOf(msg.message);
+          if (refusal !== undefined) markRefused(refusal);
           if (msg.error === 'authentication_failed') authFailed = true;
           else if (msg.error !== undefined && providerError === undefined) {
             // Any other provider error (overloaded, rate_limit, server_error, billing_error, and
             // the rest) is a call error on its own, whatever the result later says. Only a code
-            // from the closed snake_case set goes into the message.
+            // from the closed snake_case set goes into the message. A refused response comes
+            // through as `invalid_request`; the sticky `refused` flag reports it as `refusal`.
             const code = String(msg.error);
             providerError = /^[a-z_]{1,40}$/.test(code) ? code : 'unrecognised';
             // The runtime puts the provider's error text (for an API error, the status and the
             // provider's message) in the content of this synthetic assistant message.
             const text = messageText((msg.message as { content?: unknown }).content);
             if (text !== '') providerText = text;
+          } else if (msg.error !== undefined && refusal !== undefined) {
+            // A refusal after another error: its text is the one that explains the turn.
+            const text = messageText((msg.message as { content?: unknown }).content);
+            if (text !== '') providerText = text;
+          }
+          // Backstop for a runtime that falls back to another model without the
+          // model_refusal_fallback notice: any assistant message from a model other than the
+          // requested one fails the turn. Runtime-made messages (`<synthetic>`) carry no model.
+          const served = (msg.message as { model?: unknown }).model;
+          if (typeof served === 'string' && !servedBy(served, req.model)) {
+            otherModel ??= new RegExp(`^${MODEL_ID}$`).test(served) ? served : 'another model';
           }
           const u = msg.message.usage;
           seen.set(msg.message.id, {
@@ -560,6 +654,22 @@ export class AnthropicModelPort implements PreflightModelPort {
           }
         } else if (msg.type === 'result') {
           result = msg;
+          // The result carries the turn's stop reason; a refusal there counts on its own.
+          if ((msg as { stop_reason?: unknown }).stop_reason === 'refusal') markRefused('');
+        } else if (msg.type === 'system') {
+          const sub = (msg as { subtype?: unknown }).subtype;
+          if (sub === 'model_refusal_fallback') {
+            // The runtime retried the refused request on another model. What that model says is
+            // not from the model the table names, and a verdict records one model per prompt,
+            // so the turn is refused whatever it went on to submit.
+            refusalFallback = true;
+          }
+          if (sub === 'model_refusal_fallback' || sub === 'model_refusal_no_fallback') {
+            markRefused(
+              refusalCategoryOf((msg as { api_refusal_category?: unknown }).api_refusal_category) ??
+                '',
+            );
+          }
         }
       }
     } catch (err) {
@@ -612,6 +722,8 @@ export class AnthropicModelPort implements PreflightModelPort {
     // failed after work started, so its spend is unknown. Unknown (undefined) also for a timeout,
     // an abort or a broken stream: the whole up-front charge stands there.
     const refusedBeforeUsage =
+      !refused &&
+      !refusalFallback &&
       result === undefined &&
       providerError !== undefined &&
       REFUSED_BEFORE_WORK.has(providerError) &&
@@ -620,8 +732,17 @@ export class AnthropicModelPort implements PreflightModelPort {
       streamError === undefined &&
       used.inputTokens === 0 &&
       used.outputTokens === 0;
+    // A refusal is a response: the input was read and output may have been generated, so it is
+    // billed. A result that reports no spend for it under-reports, and is treated as unknown.
+    // Tokens without dollars still under-report the bill, so a refusal needs a reported USD.
     const failureCost: StageCost | undefined =
-      result !== undefined ? cost : refusedBeforeUsage ? { ...cost, usd: 0 } : undefined;
+      result !== undefined
+        ? (refused || refusalFallback) && !(usd > 0)
+          ? undefined
+          : cost
+        : refusedBeforeUsage
+          ? { ...cost, usd: 0 }
+          : undefined;
     const callError = (message: string, provider?: ProviderFailure): ModelCallError =>
       new ModelCallError(message, {
         ...(failureCost === undefined ? {} : { cost: failureCost }),
@@ -632,34 +753,57 @@ export class AnthropicModelPort implements PreflightModelPort {
     // a hung or broken stream, a stream with no result, an execution error) is a call error
     // unless the agent had already submitted, so an outage can never read as "no submission"
     // and dismiss a candidate.
+    const providerFailure = (errorClass: string, fixedMessage?: string): ModelCallError => {
+      const status =
+        result?.subtype === 'success' && Number.isInteger(result.api_error_status)
+          ? (result.api_error_status as number)
+          : undefined;
+      const raw =
+        providerText ??
+        (result?.is_error === true
+          ? result.subtype === 'success'
+            ? result.result
+            : result.errors.join('; ')
+          : undefined);
+      const message =
+        fixedMessage ?? (raw === undefined ? undefined : sanitizeProviderMessage(raw, secrets));
+      const provider: ProviderFailure = {
+        errorClass,
+        ...(errorClass === REFUSAL_CLASS && refusalCategory !== undefined
+          ? { refusalCategory }
+          : {}),
+        ...(status === undefined ? {} : { status }),
+        ...(message === undefined ? {} : { message }),
+      };
+      const text = `agent turn failed: ${describeProvider(provider)}`;
+      this.log('warn', `model turn ${promptId} on ${req.model}: ${text}`, secrets);
+      return callError(text, provider);
+    };
+
     const outcome = ((): ModelTurnResult['outcome'] => {
+      // A refused turn never yields a submission, even one captured before the refusal: the
+      // runtime may retract (tombstone) frames from a refused leg, so what was captured is not
+      // something the model stood by, and the verdict could not say which model produced it.
+      if (refusalFallback) {
+        throw providerFailure(
+          REFUSAL_CLASS,
+          'the runtime switched to a fallback model after a refusal; the turn is refused',
+        );
+      }
+      // The sticky flag outranks a captured submission and any other provider error class.
+      if (refused) throw providerFailure(REFUSAL_CLASS);
+      if (otherModel !== undefined) {
+        throw providerFailure(
+          'model_mismatch',
+          `an assistant message came from ${otherModel}, not the requested ${req.model}; the turn is refused`,
+        );
+      }
       if (overBudget) return 'budget-exhausted';
       if (!box.captured) {
         if (timedOut) {
           throw callError('agent turn hit the wall-clock cap before any submission');
         }
-        if (providerError !== undefined) {
-          const status =
-            result?.subtype === 'success' && Number.isInteger(result.api_error_status)
-              ? (result.api_error_status as number)
-              : undefined;
-          const raw =
-            providerText ??
-            (result?.is_error === true
-              ? result.subtype === 'success'
-                ? result.result
-                : result.errors.join('; ')
-              : undefined);
-          const message = raw === undefined ? undefined : sanitizeProviderMessage(raw, secrets);
-          const provider: ProviderFailure = {
-            errorClass: providerError,
-            ...(status === undefined ? {} : { status }),
-            ...(message === undefined ? {} : { message }),
-          };
-          const text = `agent turn failed: ${describeProvider(provider)}`;
-          this.log('warn', `model turn ${promptId} on ${req.model}: ${text}`, secrets);
-          throw callError(text, provider);
-        }
+        if (providerError !== undefined) throw providerFailure(providerError);
         if (streamError !== undefined) {
           throw callError(`agent turn failed: ${describeThrown(streamError, secrets)}`);
         }

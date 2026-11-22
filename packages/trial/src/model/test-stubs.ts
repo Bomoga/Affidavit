@@ -411,6 +411,33 @@ export function assistant(
   } as unknown as SDKMessage;
 }
 
+/**
+ * What the runtime (claude-agent-sdk 0.3.318) yields for a response that ended with
+ * `stop_reason: "refusal"`: a synthetic assistant message with error `invalid_request`, the
+ * refusal text as content, and the response's stop_reason and stop_details kept on the message.
+ */
+export function refusalAssistant(
+  opts: { category?: unknown; explanation?: string; text?: string; withDetails?: boolean } = {},
+): SDKMessage {
+  const base = assistant(
+    'm-refused',
+    0,
+    0,
+    'invalid_request',
+    opts.text ??
+      "API Error: Claude Opus 5.5's safeguards flagged this message (https://www.anthropic.com/legal/aup). This sometimes happens with safe, normal conversations. Claude Code can't respond to this message with Claude Opus 5.5.",
+  ) as unknown as { message: Record<string, unknown> };
+  base.message.stop_reason = 'refusal';
+  base.message.stop_details =
+    opts.withDetails === false
+      ? null
+      : {
+          ...(opts.category === undefined ? { category: 'cyber' } : { category: opts.category }),
+          explanation: opts.explanation ?? null,
+        };
+  return base as unknown as SDKMessage;
+}
+
 export function result(
   subtype: 'success' | 'error_max_turns' | 'error_max_budget_usd' | 'error_during_execution',
   opts: {

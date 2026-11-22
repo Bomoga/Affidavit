@@ -69,6 +69,11 @@ export interface ProviderFailure {
   errorClass: string;
   status?: number;
   message?: string;
+  /**
+   * For `errorClass` `refusal` only: the refusal category (`cyber`, `bio`, ...) from the refused
+   * response, in the closed snake_case shape. Absent when the response named none.
+   */
+  refusalCategory?: string;
 }
 
 /**
