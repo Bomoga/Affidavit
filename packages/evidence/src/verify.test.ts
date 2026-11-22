@@ -145,6 +145,21 @@ describe('verifyPublic', () => {
     );
   });
 
+  it('refuses a signature by a revoked key, even when that key is passed', async () => {
+    const { bytes, manifest } = await buildBundle(bundleInput());
+    const oldKey = pem();
+    const newKey = pem();
+    const att = JSON.stringify(fakeAttestation(manifest, oldKey));
+    const opts = { cosignPath: cosignOk, revokedKeyIds: [publicKeyId(oldKey)] };
+    const r = await verifyPublic(bytes, att, [newKey, oldKey], opts);
+    expect(!r.ok && r.reason).toBe(`signed by key ${publicKeyId(oldKey)}, which is revoked`);
+    // Revoking another key leaves this one verifying.
+    const fresh = JSON.stringify(fakeAttestation(manifest, newKey));
+    expect((await verifyPublic(bytes, fresh, [newKey, oldKey], opts)).ok).toBe(true);
+    const bad = await verifyPublic(bytes, fresh, [newKey], { ...opts, revokedKeyIds: ['k1'] });
+    expect(!bad.ok && bad.reason).toMatch(/revoked key id "k1" is not sha256:<64 hex>/);
+  });
+
   it('fails when cosign rejects the signature, and says cosign is missing rather than passing', async () => {
     const { bytes, manifest } = await buildBundle(bundleInput());
     const key = pem();
@@ -179,6 +194,14 @@ describe('verifyBundleFiles and the verify command', () => {
     const bad = await verifyMain([bundle, att, '--key', pub, '--cosign', cosignBad], out);
     expect(bad).toBe(VERIFY_EXIT.FAILED);
     expect(lines.at(-1)).toBe('NOT VERIFIED: signature: cosign: invalid signature');
+
+    lines.length = 0;
+    const revoked = await verifyMain(
+      [bundle, att, '--key', pub, '--revoked', publicKeyId(key), '--cosign', cosignOk],
+      out,
+    );
+    expect(revoked).toBe(VERIFY_EXIT.FAILED);
+    expect(lines.at(-1)).toMatch(/which is revoked$/);
   });
 
   it('exits 2 on bad usage or unreadable files, and 3 without cosign', async () => {
@@ -192,6 +215,9 @@ describe('verifyBundleFiles and the verify command', () => {
     expect(await verifyMain([bundle, att], out)).toBe(VERIFY_EXIT.USAGE);
     expect(await verifyMain([bundle, '--key', pub], out)).toBe(VERIFY_EXIT.USAGE);
     expect(await verifyMain([bundle, att, '--key', pub, '--bogus'], out)).toBe(VERIFY_EXIT.USAGE);
+    expect(await verifyMain([bundle, att, '--key', pub, '--revoked', 'old'], out)).toBe(
+      VERIFY_EXIT.USAGE,
+    );
     expect(await verifyMain([bundle, att, '--key', join(dir, 'missing.pub')], out)).toBe(
       VERIFY_EXIT.USAGE,
     );

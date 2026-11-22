@@ -47,6 +47,8 @@ export class CosignMissingError extends Error {
 export const MAX_ATTESTATION_BYTES = 16 * 1024 * 1024;
 /** Largest public key file read. */
 export const MAX_PUBLIC_KEY_BYTES = 64 * 1024;
+/** A key id as `publicKeyId` makes it: the SHA-256 of the key's DER SubjectPublicKeyInfo. */
+export const KEY_ID = /^sha256:[0-9a-f]{64}$/;
 
 /**
  * Verifies `bundleBytes` against `attestationText` and the published public keys, in this order,
@@ -57,8 +59,10 @@ export const MAX_PUBLIC_KEY_BYTES = 64 * 1024;
  *    hashes to `verdictSha256`, and the case file, manifest and verdict agree.
  * 3. `manifest.json` is byte for byte the canonical form of the manifest that parsed, so no field
  *    the schema would drop can ride along unsigned.
- * 4. The attestation parses, and its `keyId` is one of the given keys (key rotation: every
- *    published key may be passed, the attestation names which one signed).
+ * 4. The attestation parses, its `keyId` is not in `revokedKeyIds`, and it is one of the given
+ *    keys (key rotation: every published key may be passed, the attestation names which one
+ *    signed). A revoked key is refused even when its public key is passed: signatures carry no
+ *    trusted timestamp, so one made after the key leaked cannot be told apart from an older one.
  * 5. `verifyAttestation`: the statement is the one built from this manifest, and cosign verifies
  *    the signature offline with that key.
  *
@@ -68,13 +72,18 @@ export async function verifyPublic(
   bundleBytes: Uint8Array,
   attestationText: string,
   publicKeyPems: readonly string[],
-  opts: { expectedSha256?: string; cosignPath?: string } = {},
+  opts: { expectedSha256?: string; cosignPath?: string; revokedKeyIds?: readonly string[] } = {},
 ): Promise<PublicVerification> {
   const bundleSha256 = sha256Hex(bundleBytes);
   const fail = (reason: string): PublicVerification => ({ ok: false, bundleSha256, reason });
 
   if (opts.expectedSha256 !== undefined && !SHA256_HEX.test(opts.expectedSha256)) {
     return fail('the expected bundle digest is not 64 lowercase hex characters');
+  }
+  const revoked = new Set(opts.revokedKeyIds ?? []);
+  for (const id of revoked) {
+    if (!KEY_ID.test(id))
+      return fail(`revoked key id ${JSON.stringify(id)} is not sha256:<64 hex>`);
   }
   let bundle: OpenedBundle;
   let manifestBytes: Uint8Array | undefined;
@@ -105,6 +114,9 @@ export async function verifyPublic(
   const parsed = Attestation.safeParse(attestationJson);
   if (!parsed.success) return fail('the attestation file is not an attestation');
   const attestation = parsed.data;
+  if (revoked.has(attestation.keyId)) {
+    return fail(`signed by key ${attestation.keyId}, which is revoked`);
+  }
 
   const keys = new Map<string, string>();
   for (const [i, pem] of publicKeyPems.entries()) {
@@ -171,6 +183,7 @@ export interface VerifyFilesInput {
   publicKeyPaths: readonly string[];
   expectedSha256?: string;
   cosignPath?: string;
+  revokedKeyIds?: readonly string[];
   out?: (line: string) => void;
 }
 
@@ -193,6 +206,11 @@ export async function verifyBundleFiles(input: VerifyFilesInput): Promise<number
   const out = input.out ?? ((line: string) => process.stdout.write(`${line}\n`));
   if (input.publicKeyPaths.length === 0) {
     out('at least one --key <public key file> is required');
+    return VERIFY_EXIT.USAGE;
+  }
+  const badRevoked = (input.revokedKeyIds ?? []).find((id) => !KEY_ID.test(id));
+  if (badRevoked !== undefined) {
+    out(`--revoked ${JSON.stringify(badRevoked)} is not a key id (sha256:<64 hex>)`);
     return VERIFY_EXIT.USAGE;
   }
   const bundle = await readCapped(input.bundlePath, DEFAULT_TAR_LIMITS.maxTotalBytes, 'bundle');
@@ -222,6 +240,7 @@ export async function verifyBundleFiles(input: VerifyFilesInput): Promise<number
       {
         ...(input.expectedSha256 === undefined ? {} : { expectedSha256: input.expectedSha256 }),
         ...(input.cosignPath === undefined ? {} : { cosignPath: input.cosignPath }),
+        ...(input.revokedKeyIds === undefined ? {} : { revokedKeyIds: input.revokedKeyIds }),
       },
     );
   } catch (err) {

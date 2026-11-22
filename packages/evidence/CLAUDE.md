@@ -14,7 +14,7 @@ Run from this directory, or add `--filter @affidavit/evidence` from the repo roo
 - `pnpm lint`
 - `pnpm test`
 - `pnpm test:sandbox-host` (replay through the real gVisor jail; sandbox host only)
-- `pnpm verify <bundle> <attestation> --key <pub>` (public verification, L2-12; needs cosign)
+- `pnpm verify <bundle> <attestation> --key <pub> [--revoked <keyId>]` (public verification, L2-12; needs cosign)
 - `pnpm test:s3` (S3 store against MinIO; needs `AFFIDAVIT_S3_ENDPOINT`, `AFFIDAVIT_S3_ACCESS_KEY`, `AFFIDAVIT_S3_SECRET_KEY`)
 
 ## Invariants

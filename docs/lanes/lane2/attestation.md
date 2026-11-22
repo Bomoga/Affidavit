@@ -44,7 +44,8 @@ Anyone holding a bundle can check it without access to our systems: no database,
 ```sh
 pnpm --filter @affidavit/evidence verify bundle.tar attestation.json \
   --key affidavit-signer.pub [--key affidavit-signer-2025.pub] \
-  [--expect-sha256 <the verdict's bundleSha256>]
+  [--expect-sha256 <the verdict's bundleSha256>] \
+  [--revoked <keyId of a revoked key>]
 ```
 
 `verifyPublic` (`src/verify.ts`) stops at the first failure:
@@ -52,7 +53,7 @@ pnpm --filter @affidavit/evidence verify bundle.tar attestation.json \
 1. With `--expect-sha256`, the bundle hashes to it, so it is the bundle the verdict names.
 2. `openBundle`: every file is listed in the manifest and hashes to its digest, the verdict hashes to `verdictSha256`, and the case file, manifest and verdict agree. A tampered file is named.
 3. `manifest.json` is byte for byte the canonical form of the manifest that parsed, so a field the schema would drop cannot ride along unsigned.
-4. The attestation parses and its `keyId` is one of the given keys. Pass every published key; the attestation names the one that signed (rotation).
+4. The attestation parses, its `keyId` is not revoked, and it is one of the given keys. Pass every published key; the attestation names the one that signed (rotation). Pass `--revoked <keyId>` for every key listed as revoked in `docs/keys/README.md`: a revoked key is refused even when its public key is also passed, because a signature carries no trusted timestamp, so one made after the leak cannot be told apart from an older one.
 5. `verifyAttestation`: structural checks, then `cosign verify-blob-attestation` offline with that key.
 
 It prints the bundle digest, case, verdict outcome and severity, exhibit count and key id, then `VERIFIED` or `NOT VERIFIED: <reason>`. Exit codes: 0 verified, 1 not verified, 2 usage or unreadable file, 3 cosign not installed (never reported as verified).
