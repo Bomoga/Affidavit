@@ -1,15 +1,17 @@
-// Diagnostic probe for the real model port (L3-17, L3-18). HUMAN-RUN ONLY, by the lead, on their
+// Diagnostic probe for the real model port (L3-17, L3-18, L3-19). HUMAN-RUN ONLY, by the lead, on their
 // own key. Makes a few tiny live calls and prints the provider's raw error text (key redacted)
 // for each failure. See docs/lanes/lane3/model-port.md, "Probing a provider error".
 //
 // Usage, from the repo root, with ANTHROPIC_API_KEY exported in the shell (never on the command
 // line):
 //   node --import tsx packages/trial/scripts/probe-model.ts [--max-usd 0.5] [--filler-kb 16] [--no-fetch]
-//     [--fixture-case fixtures/casefiles/<file>.json] [--only-fixture]
+//     [--fixture-case fixtures/casefiles/<file>.json] [--only-fixture] [--model-matrix]
 // or: pnpm --filter @affidavit/trial probe:model -- [flags]
 //
 // The default ladder (P1 to P6) is synthetic only. `--fixture-case` adds P7, which replays the
 // worker's Defense turn on a checked-in fixture case file; nothing else is ever accepted as input.
+// `--model-matrix` (with `--fixture-case`) runs P8 instead of P7: the same real Defense input on
+// every distinct model id in the model table, plus one labelled extra model.
 import {
   BANNER,
   DEFAULT_FILLER_KB,
@@ -20,6 +22,7 @@ import {
   ProbeKeyError,
   buildFixtureLadder,
   buildLadder,
+  buildModelMatrix,
   formatResult,
   formatSummary,
   loadFixtureCase,
@@ -61,6 +64,7 @@ async function main(): Promise<number> {
     '--no-fetch',
     '--fixture-case',
     '--only-fixture',
+    '--model-matrix',
   ]);
   for (let i = 2; i < process.argv.length; i++) {
     const a = process.argv[i] ?? '';
@@ -75,6 +79,11 @@ async function main(): Promise<number> {
   const onlyFixture = process.argv.includes('--only-fixture');
   if (onlyFixture && fixturePath === undefined) {
     console.error('--only-fixture needs --fixture-case');
+    return 2;
+  }
+  const matrix = process.argv.includes('--model-matrix');
+  if (matrix && fixturePath === undefined) {
+    console.error('--model-matrix needs --fixture-case');
     return 2;
   }
 
@@ -116,7 +125,7 @@ async function main(): Promise<number> {
       .join(', ')}`,
   );
   console.log(
-    `USD cap $${maxUsd.toFixed(2)}, per-probe reserve and SDK maxBudgetUsd $${DEFAULT_RESERVE_USD.toFixed(2)} (P7: the worker turn maxUsd). Caps, not estimates.`,
+    `USD cap $${maxUsd.toFixed(2)}, per-probe reserve and SDK maxBudgetUsd $${DEFAULT_RESERVE_USD.toFixed(2)} (P7 and P8: the worker turn maxUsd). Caps, not estimates.`,
   );
 
   const ladder: ProbeSpec[] = onlyFixture
@@ -126,9 +135,13 @@ async function main(): Promise<number> {
     const { turn, notes } = workerTurnFrom(process.env);
     for (const n of notes) console.log(n);
     console.log(
-      `P7 fixture ${fixture.relPath}; worker turn: maxTurns ${turn.maxTurns}, maxInputTokens ${turn.budget.maxInputTokens}, maxOutputTokens ${turn.budget.maxOutputTokens}, maxUsd ${turn.budget.maxUsd}`,
+      `${matrix ? 'P8' : 'P7'} fixture ${fixture.relPath}; worker turn: maxTurns ${turn.maxTurns}, maxInputTokens ${turn.budget.maxInputTokens}, maxOutputTokens ${turn.budget.maxOutputTokens}, maxUsd ${turn.budget.maxUsd}`,
     );
-    ladder.push(...buildFixtureLadder(table, fixture, turn, DEFAULT_RESERVE_USD));
+    ladder.push(
+      ...(matrix
+        ? buildModelMatrix(table, fixture, turn)
+        : buildFixtureLadder(table, fixture, turn, DEFAULT_RESERVE_USD)),
+    );
   }
   console.log('');
 
@@ -145,7 +158,8 @@ async function main(): Promise<number> {
     },
   );
   console.log(formatSummary(run, maxUsd));
-  return run.results.every((r) => r.status === 'PASS') ? 0 : 1;
+  // A probe skipped by design (a P8 stage with no real input builder) does not fail the run.
+  return run.results.every((r) => r.status === 'PASS' || r.skipReason !== undefined) ? 0 : 1;
 }
 
 main().then(
