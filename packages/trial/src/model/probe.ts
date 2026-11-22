@@ -5,6 +5,7 @@
 //
 // Run by the lead on their own key: `node --import tsx packages/trial/scripts/probe-model.ts`.
 // Nothing in the trial or the worker imports this file.
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -22,6 +23,7 @@ import {
   REFUSAL_CLASS,
   buildAgentOptions,
   childEnv,
+  refusalCategoryOf,
   refusalOf,
 } from './anthropic.js';
 import { DEFAULT_MODEL_TABLE, resolveModelTable, type ModelTable } from './models.js';
@@ -170,7 +172,36 @@ export interface FixtureCase {
  * links) to a regular `.json` file directly inside `fixtures/casefiles/`, any file over
  * `FIXTURE_CASE_MAX_BYTES`, and any content that is not a valid contract `CaseFile`.
  */
-export function loadFixtureCase(path: string, dir: string = FIXTURE_CASE_DIR): FixtureCase {
+/** Whether a file is checked in: `tracked`, `untracked` (or modified), or git is `unavailable`. */
+export type TrackedCheck = (absPath: string) => 'tracked' | 'untracked' | 'unavailable';
+
+/**
+ * The default check: the file is known to git (`git ls-files --error-unmatch`) and matches HEAD
+ * (`git diff --quiet HEAD`), run from the repo root. Any failure other than a missing git binary
+ * is `untracked`; a missing git is `unavailable`, which is refused too.
+ */
+export const gitTracked: TrackedCheck = (absPath) => {
+  const git = (args: string[]): void => {
+    execFileSync('git', args, { cwd: REPO_ROOT, stdio: 'ignore', timeout: 10_000 });
+  };
+  try {
+    git(['ls-files', '--error-unmatch', '--', absPath]);
+    git(['diff', '--quiet', 'HEAD', '--', absPath]);
+    return 'tracked';
+  } catch (err) {
+    return (err as { code?: unknown }).code === 'ENOENT' ? 'unavailable' : 'untracked';
+  }
+};
+
+export interface FixtureCaseOptions {
+  /** The directory the file must sit directly in. Default `FIXTURE_CASE_DIR`. */
+  dir?: string;
+  /** Default `gitTracked`. A test seam only. */
+  isTracked?: TrackedCheck;
+}
+
+export function loadFixtureCase(path: string, opts: FixtureCaseOptions = {}): FixtureCase {
+  const dir = opts.dir ?? FIXTURE_CASE_DIR;
   let real: string;
   let realDir: string;
   try {
@@ -198,6 +229,17 @@ export function loadFixtureCase(path: string, dir: string = FIXTURE_CASE_DIR): F
   if (!rel.endsWith('.json')) throw new FixtureCaseError('--fixture-case needs a .json file');
   const st = statSync(real);
   if (!st.isFile()) throw new FixtureCaseError('--fixture-case is not a regular file');
+  const tracked = (opts.isTracked ?? gitTracked)(real);
+  if (tracked === 'unavailable') {
+    throw new FixtureCaseError(
+      '--fixture-case needs git to confirm the file is checked in, and git is not available; refused',
+    );
+  }
+  if (tracked !== 'tracked') {
+    throw new FixtureCaseError(
+      '--fixture-case only accepts a file checked in to the repo and unmodified from HEAD; this one is untracked or locally changed',
+    );
+  }
   if (st.size > FIXTURE_CASE_MAX_BYTES) {
     throw new FixtureCaseError(
       `--fixture-case is larger than ${FIXTURE_CASE_MAX_BYTES / 1024} KiB`,
@@ -837,8 +879,8 @@ function observe(facts: StreamFacts, msg: SDKMessage): void {
     if (facts.providerError === undefined || facts.providerError === 'invalid_request') {
       facts.providerError = REFUSAL_CLASS;
     }
-    const c = m.api_refusal_category;
-    if (typeof c === 'string' && /^[a-z_]{1,40}$/.test(c)) facts.refusalCategory ??= c;
+    const c = refusalCategoryOf(m.api_refusal_category);
+    if (c !== undefined) facts.refusalCategory ??= c;
     if (typeof m.api_refusal_explanation === 'string') {
       facts.refusalExplanation ??= m.api_refusal_explanation;
     }

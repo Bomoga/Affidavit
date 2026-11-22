@@ -376,18 +376,117 @@ describe('a model safety refusal', () => {
   for (const [kind, category] of [
     ['prose', 'Cyber Security!'],
     ['a number', 7],
-    ['too long', 'x'.repeat(41)],
+    ['an object', { name: 'cyber' }],
+    ['an unknown snake_case word', 'weapons_of_note'],
+    ['a known word with case changed', 'Cyber'],
   ] as const) {
-    it(`drops a category that is ${kind}`, async () => {
+    it(`maps a category that is ${kind} to other, never passing it on`, async () => {
       const { port } = makePort(async function* () {
         await Promise.resolve();
         yield refusalAssistant({ category });
       });
       const err = await failure(port);
       expect(err.provider?.errorClass).toBe('refusal');
-      expect(err.provider?.refusalCategory).toBeUndefined();
+      expect(err.provider?.refusalCategory).toBe('other');
+      expect(err.message).toContain('category other');
     });
   }
+
+  for (const category of ['cyber', 'bio', 'chem', 'csam', 'frontier_llm', 'reasoning_extraction']) {
+    it(`passes on the allowlisted category ${category}`, async () => {
+      const { port } = makePort(async function* () {
+        await Promise.resolve();
+        yield refusalAssistant({ category });
+      });
+      expect((await failure(port)).provider?.refusalCategory).toBe(category);
+    });
+  }
+
+  it('a refusal that names no category has none', async () => {
+    const { port } = makePort(async function* () {
+      await Promise.resolve();
+      yield refusalAssistant({ withDetails: false });
+    });
+    const err = await failure(port);
+    expect(err.provider?.errorClass).toBe('refusal');
+    expect(err.provider?.refusalCategory).toBeUndefined();
+  });
+
+  it('never returns a submission captured in a turn that was refused', async () => {
+    const { port, logs } = makePort(async function* (h) {
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      yield refusalAssistant();
+      yield result('success', { isError: true, usd: 0.02, input: 900, output: 30 });
+    });
+    const err = await failure(port);
+    expect(err.provider).toMatchObject({ errorClass: 'refusal', refusalCategory: 'cyber' });
+    expect(err.message).toContain('category cyber');
+    expect(logs.some((l) => l.level === 'warn' && l.message.includes('category cyber'))).toBe(true);
+    expect(err.cost?.usd).toBe(0.02);
+  });
+
+  it('a refusal and a fallback notice together still throw refusal, submission or not', async () => {
+    const { port } = makePort(async function* (h) {
+      yield refusalAssistant();
+      yield {
+        type: 'system',
+        subtype: 'model_refusal_fallback',
+        trigger: 'refusal',
+        direction: 'retry',
+        original_model: 'claude-opus-5-5',
+        fallback_model: 'claude-sonnet-5-5',
+        request_id: null,
+        api_refusal_category: 'cyber',
+        uuid: '00000000-0000-0000-0000-000000000011',
+        session_id: 's',
+      } as unknown as SDKMessage;
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      yield result('success', { usd: 0.03 });
+    });
+    const err = await failure(port);
+    expect(err.provider).toMatchObject({ errorClass: 'refusal', refusalCategory: 'cyber' });
+    expect(err.message).toContain('fallback model');
+  });
+
+  it('fails the turn when an assistant message came from another model, notice or not', async () => {
+    const { port } = makePort(async function* (h) {
+      const m = assistant('m2', 100, 10, undefined, 'calling the tool') as unknown as {
+        message: Record<string, unknown>;
+      };
+      m.message.model = 'claude-sonnet-5-5';
+      yield m as unknown as SDKMessage;
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      yield result('success', { usd: 0.01 });
+    });
+    const err = await failure(port);
+    expect(err.provider?.errorClass).toBe('model_mismatch');
+    expect(err.message).toContain('claude-sonnet-5-5');
+    expect(err.message).toContain('claude-opus-5-5');
+  });
+
+  it('does not echo an unshaped model name, and accepts the same model with a date suffix', async () => {
+    const odd = makePort(async function* () {
+      await Promise.resolve();
+      const m = assistant('m3', 1, 1) as unknown as { message: Record<string, unknown> };
+      m.message.model = 'CANARY model name with spaces';
+      yield m as unknown as SDKMessage;
+      yield result('success', { usd: 0.01 });
+    });
+    const err = await failure(odd.port);
+    expect(err.message).toContain('another model');
+    expect(err.message).not.toContain('CANARY');
+
+    const dated = makePort(async function* (h) {
+      for (const model of ['claude-opus-5-5-20261001', '<synthetic>']) {
+        const m = assistant(`m-${model}`, 1, 1) as unknown as { message: Record<string, unknown> };
+        m.message.model = model;
+        yield m as unknown as SDKMessage;
+      }
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      yield result('success', { usd: 0.01 });
+    });
+    expect((await dated.port.runTurn(requestFor('defense'))).outcome).toBe('submitted');
+  });
 
   it('a no-fallback refusal notice upgrades invalid_request to refusal', async () => {
     const { port } = makePort(async function* () {

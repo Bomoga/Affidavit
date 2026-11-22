@@ -1,6 +1,14 @@
 // L3-18: the P7 probes, which replay the worker's Defense turn on a checked-in fixture case file.
 // Every test uses a stubbed transport; nothing reaches the network.
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { renderPrompt } from '@affidavit/prompts';
@@ -17,6 +25,7 @@ import {
   buildFixtureLadder,
   describeOptions,
   formatResult,
+  gitTracked,
   interpret,
   isFixtureText,
   isSynthetic,
@@ -60,6 +69,8 @@ function deps(transport: AgentTransport): ProbeDeps {
   };
 }
 
+const tracked = () => 'tracked' as const;
+
 const temps: string[] = [];
 afterEach(() => {
   for (const t of temps.splice(0)) rmSync(t, { recursive: true, force: true });
@@ -96,8 +107,62 @@ describe('loading a fixture case file', () => {
     writeFileSync(join(dir, 'wrong.json'), JSON.stringify({ schemaVersion: 1 }));
     writeFileSync(join(dir, 'big.json'), ' '.repeat(300 * 1024));
     for (const f of ['sub/nested.json', 'case.txt', 'bad.json', 'wrong.json', 'big.json']) {
-      expect(() => loadFixtureCase(join(dir, f), dir)).toThrow(FixtureCaseError);
+      // Treated as checked in, so each file reaches the check it should fail.
+      expect(() => loadFixtureCase(join(dir, f), { dir, isTracked: tracked })).toThrow(
+        FixtureCaseError,
+      );
     }
+  });
+
+  it('accepts a valid file only when it is checked in', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'affidavit-fixture-test-'));
+    temps.push(dir);
+    const copy = join(dir, 'copy.json');
+    copyFileSync(FIXTURE, copy);
+    expect(loadFixtureCase(copy, { dir, isTracked: tracked }).caseFile.id).toBe(
+      'case-nodegoat-nosqli-where-001',
+    );
+    // The real git check: a file outside the repo index is untracked.
+    expect(() => loadFixtureCase(copy, { dir })).toThrow(/untracked or locally changed/);
+    expect(() => loadFixtureCase(copy, { dir, isTracked: () => 'untracked' })).toThrow(
+      /checked in to the repo/,
+    );
+    // No git: refused, never allowed.
+    expect(() => loadFixtureCase(copy, { dir, isTracked: () => 'unavailable' })).toThrow(
+      /git is not available; refused/,
+    );
+  });
+
+  it('the real git check says the checked-in fixture is tracked', () => {
+    expect(gitTracked(FIXTURE)).toBe('tracked');
+  });
+
+  it('refuses an untracked file placed in the real fixtures/casefiles directory', () => {
+    const stray = join(FIXTURE_CASE_DIR, `untracked-probe-test-${process.pid}.json`);
+    copyFileSync(FIXTURE, stray);
+    temps.push(stray);
+    expect(() => loadFixtureCase(stray)).toThrow(/untracked or locally changed/);
+  });
+
+  it('follows a symlink and refuses it when its target is outside the directory', (ctx) => {
+    const dir = mkdtempSync(join(tmpdir(), 'affidavit-fixture-test-'));
+    temps.push(dir);
+    const outside = join(dir, 'to-package.json');
+    const toFixture = join(dir, 'to-fixture.json');
+    try {
+      symlinkSync(join(REPO_ROOT, 'package.json'), outside, 'file');
+      symlinkSync(FIXTURE, toFixture, 'file');
+    } catch {
+      ctx.skip(); // creating symlinks needs a privilege this host does not have
+      return;
+    }
+    // Inside `dir` by name, but the targets are elsewhere: refused, even when tracked.
+    expect(() => loadFixtureCase(outside, { dir, isTracked: tracked })).toThrow(
+      /directly inside the repo fixtures\/casefiles/,
+    );
+    expect(() => loadFixtureCase(toFixture, { dir, isTracked: tracked })).toThrow(
+      /directly inside the repo fixtures\/casefiles/,
+    );
   });
 });
 

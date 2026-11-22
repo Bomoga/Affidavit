@@ -190,20 +190,52 @@ export const REFUSED_BEFORE_WORK: ReadonlySet<string> = new Set([
  */
 export const REFUSAL_CLASS = 'refusal';
 
-/** A refusal category from `stop_details.category`, only in the closed snake_case shape. */
-const REFUSAL_CATEGORY = /^[a-z_]{1,40}$/;
+/**
+ * The refusal categories the port passes on. The runtime itself knows `cyber`, `bio`,
+ * `frontier_llm` and `reasoning_extraction` (SDK 0.3.318); the rest are named in advance. Any
+ * other value, string or not, becomes `other`: no free string from the provider is passed on.
+ */
+export const REFUSAL_CATEGORIES = [
+  'cyber',
+  'bio',
+  'chem',
+  'csam',
+  'frontier_llm',
+  'reasoning_extraction',
+  'other',
+] as const;
+export type RefusalCategory = (typeof REFUSAL_CATEGORIES)[number];
+
+/** A present category mapped onto the allowlist; undefined only when none was given. */
+export function refusalCategoryOf(value: unknown): RefusalCategory | undefined {
+  if (value === undefined || value === null) return undefined;
+  return (REFUSAL_CATEGORIES as readonly unknown[]).includes(value)
+    ? (value as RefusalCategory)
+    : 'other';
+}
+
+/**
+ * True when `served` (an assistant message's `model`) is the requested model: the same id, the
+ * same id with a numeric date suffix, or `<synthetic>` (a message the runtime made itself).
+ */
+export function servedBy(served: string, requested: string): boolean {
+  if (served === requested || served === '<synthetic>') return true;
+  return (
+    served.startsWith(`${requested}-`) && /^[0-9]{8}$/.test(served.slice(requested.length + 1))
+  );
+}
 
 /**
  * Reads a refusal off an assistant error message the runtime built from a refused response (it
- * sets `message.stop_reason` to `refusal` on that synthetic message). Returns the category when it is
- * in the closed shape, `''` for a refusal with no usable category, or undefined for no refusal.
- * The explanation is provider prose and is never read here.
+ * sets `message.stop_reason` to `refusal` on that synthetic message). Returns the allowlisted
+ * category, `''` for a refusal that named none, or undefined for no refusal. The explanation is
+ * provider prose and is never read here.
  */
-export function refusalOf(message: unknown): string | undefined {
+export function refusalOf(message: unknown): RefusalCategory | '' | undefined {
   const m = message as { stop_reason?: unknown; stop_details?: unknown } | null;
   if (m === null || typeof m !== 'object' || m.stop_reason !== 'refusal') return undefined;
   const category = (m.stop_details as { category?: unknown } | null | undefined)?.category;
-  return typeof category === 'string' && REFUSAL_CATEGORY.test(category) ? category : '';
+  return refusalCategoryOf(category) ?? '';
 }
 
 /** Longest provider message an error carries. */
@@ -503,8 +535,10 @@ export class AnthropicModelPort implements PreflightModelPort {
     let providerError: string | undefined;
     // The provider's own words for the first error, kept raw here and sanitized before use.
     let providerText: string | undefined;
-    let refusalCategory: string | undefined;
+    let refusalCategory: RefusalCategory | undefined;
     let refusalFallback = false;
+    // Set when an assistant message came from a model other than `req.model`.
+    let otherModel: string | undefined;
     let result: SDKResultMessage | undefined;
     const seen = new Map<string, Usage>();
 
@@ -590,6 +624,13 @@ export class AnthropicModelPort implements PreflightModelPort {
             const text = messageText((msg.message as { content?: unknown }).content);
             if (text !== '') providerText = text;
           }
+          // Backstop for a runtime that falls back to another model without the
+          // model_refusal_fallback notice: any assistant message from a model other than the
+          // requested one fails the turn. Runtime-made messages (`<synthetic>`) carry no model.
+          const served = (msg.message as { model?: unknown }).model;
+          if (typeof served === 'string' && !servedBy(served, req.model)) {
+            otherModel ??= new RegExp(`^${MODEL_ID}$`).test(served) ? served : 'another model';
+          }
           const u = msg.message.usage;
           seen.set(msg.message.id, {
             inputTokens:
@@ -614,8 +655,10 @@ export class AnthropicModelPort implements PreflightModelPort {
             refusalFallback = true;
           }
           if (sub === 'model_refusal_fallback' || sub === 'model_refusal_no_fallback') {
-            const c = (msg as { api_refusal_category?: unknown }).api_refusal_category;
-            if (typeof c === 'string' && REFUSAL_CATEGORY.test(c)) refusalCategory ??= c;
+            const c = refusalCategoryOf(
+              (msg as { api_refusal_category?: unknown }).api_refusal_category,
+            );
+            if (c !== undefined) refusalCategory ??= c;
             if (
               sub === 'model_refusal_no_fallback' &&
               (providerError === undefined || providerError === 'invalid_request')
@@ -705,47 +748,56 @@ export class AnthropicModelPort implements PreflightModelPort {
     // a hung or broken stream, a stream with no result, an execution error) is a call error
     // unless the agent had already submitted, so an outage can never read as "no submission"
     // and dismiss a candidate.
+    const providerFailure = (errorClass: string, fixedMessage?: string): ModelCallError => {
+      const status =
+        result?.subtype === 'success' && Number.isInteger(result.api_error_status)
+          ? (result.api_error_status as number)
+          : undefined;
+      const raw =
+        providerText ??
+        (result?.is_error === true
+          ? result.subtype === 'success'
+            ? result.result
+            : result.errors.join('; ')
+          : undefined);
+      const message =
+        fixedMessage ?? (raw === undefined ? undefined : sanitizeProviderMessage(raw, secrets));
+      const provider: ProviderFailure = {
+        errorClass,
+        ...(errorClass === REFUSAL_CLASS && refusalCategory !== undefined
+          ? { refusalCategory }
+          : {}),
+        ...(status === undefined ? {} : { status }),
+        ...(message === undefined ? {} : { message }),
+      };
+      const text = `agent turn failed: ${describeProvider(provider)}`;
+      this.log('warn', `model turn ${promptId} on ${req.model}: ${text}`, secrets);
+      return callError(text, provider);
+    };
+
     const outcome = ((): ModelTurnResult['outcome'] => {
+      // A refused turn never yields a submission, even one captured before the refusal: the
+      // runtime may retract (tombstone) frames from a refused leg, so what was captured is not
+      // something the model stood by, and the verdict could not say which model produced it.
       if (refusalFallback) {
-        const provider: ProviderFailure = {
-          errorClass: REFUSAL_CLASS,
-          ...(refusalCategory === undefined ? {} : { refusalCategory }),
-          message: 'the runtime switched to a fallback model after a refusal; the turn is refused',
-        };
-        const text = `agent turn failed: ${describeProvider(provider)}`;
-        this.log('warn', `model turn ${promptId} on ${req.model}: ${text}`, secrets);
-        throw callError(text, provider);
+        throw providerFailure(
+          REFUSAL_CLASS,
+          'the runtime switched to a fallback model after a refusal; the turn is refused',
+        );
+      }
+      if (providerError === REFUSAL_CLASS) throw providerFailure(REFUSAL_CLASS);
+      if (otherModel !== undefined) {
+        throw providerFailure(
+          'model_mismatch',
+          `an assistant message came from ${otherModel}, not the requested ${req.model}; the turn is refused`,
+        );
       }
       if (overBudget) return 'budget-exhausted';
       if (!box.captured) {
         if (timedOut) {
           throw callError('agent turn hit the wall-clock cap before any submission');
         }
-        if (providerError !== undefined) {
-          const status =
-            result?.subtype === 'success' && Number.isInteger(result.api_error_status)
-              ? (result.api_error_status as number)
-              : undefined;
-          const raw =
-            providerText ??
-            (result?.is_error === true
-              ? result.subtype === 'success'
-                ? result.result
-                : result.errors.join('; ')
-              : undefined);
-          const message = raw === undefined ? undefined : sanitizeProviderMessage(raw, secrets);
-          const provider: ProviderFailure = {
-            errorClass: providerError,
-            ...(providerError === REFUSAL_CLASS && refusalCategory !== undefined
-              ? { refusalCategory }
-              : {}),
-            ...(status === undefined ? {} : { status }),
-            ...(message === undefined ? {} : { message }),
-          };
-          const text = `agent turn failed: ${describeProvider(provider)}`;
-          this.log('warn', `model turn ${promptId} on ${req.model}: ${text}`, secrets);
-          throw callError(text, provider);
-        }
+        if (providerError !== undefined) throw providerFailure(providerError);
         if (streamError !== undefined) {
           throw callError(`agent turn failed: ${describeThrown(streamError, secrets)}`);
         }
