@@ -430,8 +430,8 @@ describe('verifyBundleFiles and the verify command', () => {
     );
     expect(r.ok).toBe(false);
     const reason = !r.ok ? r.reason : '';
-    expect(reason).toMatch(
-      /^bundle integrity \(x\\u000aVERIFIED\\u001b\[2K\\u000d\\u2028\\u202e\)/,
+    expect(reason).toBe(
+      'bundle integrity (x\\u{000a}VERIFIED\\u{001b}[2K\\u{000d}\\u{2028}\\u{202e}): is filed under the wrong path',
     );
     // eslint-disable-next-line no-control-regex
     expect(reason).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u2028\u202e]/);
