@@ -3,6 +3,7 @@ import { run } from 'graphile-worker';
 import { beforeAll, expect, it } from 'vitest';
 import { PgCaseStore } from './case-store.js';
 import {
+  NeedsReviewError,
   StageDidNotAdvanceError,
   ensureStageJob,
   openHeldCase,
@@ -245,6 +246,53 @@ describePg('stage attempts, review flags, open-case sweep and recovery', () => {
     expect(await count(`select count(*) n from stage_jobs where case_id='${file.id}'`)).toBe(2);
     expect(await count(`select count(*) n from cost_rows where case_id='${file.id}'`)).toBe(1);
     expect(await count(`select count(*) n from review_flags where case_id='${file.id}'`)).toBe(1);
+    expect(await storeA.stage(file.id)).toBe('intake');
+  });
+
+  it('a core that needs review (a model refusal) is flagged at once and never retried', async () => {
+    const file = sampleCase(A);
+    await storeA.open(file, BUDGET);
+    await ensureStageJob(db().app, A, file.id);
+    const refused = stageHandler(
+      () =>
+        Promise.reject(new NeedsReviewError('model-refusal', 'stage intake halted: model refused')),
+      { appPool: db().app },
+    );
+    const runner = await run({
+      pgPool: db().worker,
+      concurrency: 1,
+      noHandleSignals: true,
+      pollInterval: 100,
+      taskList: stageTaskList(
+        { intake: (j, c) => (j.caseId === file.id ? refused(j, c) : Promise.resolve()) },
+        { appPool: db().app, workerPool: db().worker, leaseSeconds: 3, log: () => undefined },
+      ),
+    });
+    try {
+      await until(
+        async () =>
+          (await count(
+            `select count(*) n from stage_runs where case_id='${file.id}' and failed_at is not null`,
+          )) >= 1,
+      );
+      // Recovery neither retries nor sweeps it, however often it runs.
+      for (let i = 0; i < 3; i++) {
+        const mine = (await reconcileOnce(opts())).filter((a) => a.payload.caseId === file.id);
+        expect(mine).toEqual([]);
+        await wait(150);
+      }
+    } finally {
+      await runner.stop();
+    }
+    const flags = await db().admin.query<{ reason: string; attempt: number; detail: string }>(
+      `select reason, attempt, detail from review_flags where case_id = $1`,
+      [file.id],
+    );
+    expect(flags.rows).toEqual([
+      { reason: 'model-refusal', attempt: 1, detail: 'stage intake halted: model refused' },
+    ]);
+    expect(await count(`select count(*) n from stage_jobs where case_id='${file.id}'`)).toBe(1);
+    expect(await count(`select count(*) n from cost_rows where case_id='${file.id}'`)).toBe(0);
     expect(await storeA.stage(file.id)).toBe('intake');
   });
 

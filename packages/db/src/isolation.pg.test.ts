@@ -26,6 +26,7 @@ const TABLES = [
   'escalations',
   'events',
   'review_flags',
+  'cost_releases',
 ] as const;
 
 async function seed(
@@ -38,23 +39,39 @@ async function seed(
   const sink = new PgEventSink(pool, tenant);
   await store.open(caseFile, BUDGET);
   await store.transition(caseFile.id, 'map');
-  await store.chargeBudget(caseFile.id, {
-    stage: 'map',
+  const charge = {
+    stage: 'map' as const,
     inputTokens: 1,
     outputTokens: 1,
     usd: 0.01,
     wallMs: 1,
     attempt: 1,
-  });
+  };
+  const remaining = await store.chargeBudget(caseFile.id, charge);
+  // Event seqs 0 and 1 (below) and 2 (the charge event) are handed out by the store, as the trial
+  // does. The release is made before the verdict closes the case.
+  await store.nextSeq(caseFile.id);
+  await store.nextSeq(caseFile.id);
+  await store.nextSeq(caseFile.id);
+  await sink.emit(
+    TrialEvent.parse({
+      schemaVersion: 1,
+      caseId: caseFile.id,
+      at: '2026-11-05T12:00:00.000Z',
+      seq: 2,
+      stage: 'map',
+      actor: 'judge',
+      type: 'cost-charged',
+      payload: { cost: charge, remaining },
+    }),
+  );
+  await store.releaseCharge(caseFile.id, { ...charge, usd: 0.005, wallMs: 0 }, 2);
   await store.appendVerdict(Verdict.parse({ ...(samples.Verdict as object), caseId: caseFile.id }));
   await store.putExhibit(Exhibit.parse({ ...(samples.Exhibit as object), caseId: caseFile.id }));
   const run = { tenantId: tenant, caseId: caseFile.id, stage: 'map' as const, attempt: 1 };
   await enqueueStage(pool, run);
   await claimStageRun(workerPool, run, 'seed-worker', 60);
   await flagForReview(pool, { ...run, visit: 2 }, 'attempts-exhausted', 'seed');
-  // Event seqs 0 and 1 are handed out by the store, as the trial does.
-  await store.nextSeq(caseFile.id);
-  await store.nextSeq(caseFile.id);
   const base = {
     schemaVersion: 1,
     caseId: caseFile.id,
@@ -158,6 +175,13 @@ describePg('cross-tenant isolation (tenant A against tenant B data)', () => {
     await expect(
       storeA.putExhibit(Exhibit.parse({ ...(samples.Exhibit as object), caseId: caseB.id })),
     ).rejects.toThrow(/unknown case/);
+    await expect(
+      storeA.releaseCharge(
+        caseB.id,
+        { stage: 'map', inputTokens: 0, outputTokens: 0, usd: 0, wallMs: 0, attempt: 1 },
+        2,
+      ),
+    ).rejects.toThrow(/unknown case/);
     expect(await storeA.getExhibits(caseB.id)).toEqual([]);
     expect(await storeB.stage(caseB.id)).toBe('map');
   });
@@ -176,7 +200,7 @@ describePg('cross-tenant isolation (tenant A against tenant B data)', () => {
     });
     await expect(sinkA.emit(ev)).rejects.toThrow(/unknown case/);
     expect(await sinkA.events(caseB.id)).toEqual([]);
-    expect((await sinkB.events(caseB.id)).length).toBe(2);
+    expect((await sinkB.events(caseB.id)).length).toBe(3);
   });
 
   for (const table of TABLES) {
@@ -208,6 +232,51 @@ describePg('cross-tenant isolation (tenant A against tenant B data)', () => {
     });
   }
 
+  // The v1.2 budget views (CR-T1) read as the invoker, so the same isolation must hold for them.
+  for (const view of ['case_budgets', 'case_cost_ledger']) {
+    it(`both tenants have rows in the ${view} view (seen by the superuser)`, async () => {
+      for (const tenant of [A, B]) {
+        const { rows } = await db().admin.query<{ n: string }>(
+          `select count(*)::text as n from ${view} where tenant_id = $1`,
+          [tenant],
+        );
+        expect(Number(rows[0]!.n), `${view} ${tenant}`).toBeGreaterThan(0);
+      }
+    });
+
+    it(`raw select on the ${view} view as tenant A returns no tenant B row`, async () => {
+      const rows = await withTenant(db().app, A, async (tx) => {
+        const r = await tx.execute(sql.raw(`select tenant_id, case_id from ${view}`));
+        return r.rows as { tenant_id: string; case_id: string }[];
+      });
+      expect(rows.length).toBeGreaterThan(0);
+      expect(rows.every((r) => r.tenant_id === A && r.case_id !== caseB.id)).toBe(true);
+      const named = await withTenant(db().app, A, async (tx) => {
+        const r = await tx.execute(sql`select 1 from ${sql.raw(view)} where case_id = ${caseB.id}`);
+        return r.rows.length;
+      });
+      expect(named).toBe(0);
+    });
+
+    it(`select on the ${view} view with no tenant set returns no rows`, async () => {
+      const { rows } = await db().app.query(`select tenant_id from ${view}`);
+      expect(rows).toHaveLength(0);
+    });
+
+    it(`select on the ${view} view with an empty tenant returns no rows`, async () => {
+      const client = await db().app.connect();
+      try {
+        await client.query('begin');
+        await client.query(`select set_config('app.tenant_id', '', true)`);
+        const { rows } = await client.query(`select tenant_id from ${view}`);
+        await client.query('rollback');
+        expect(rows).toHaveLength(0);
+      } finally {
+        client.release();
+      }
+    });
+  }
+
   it('joins and subqueries as tenant A cannot reach B rows', async () => {
     const client = await db().app.connect();
     try {
@@ -222,6 +291,9 @@ describePg('cross-tenant isolation (tenant A against tenant B data)', () => {
         `select * from cases where tenant_id <> current_setting('app.tenant_id')`,
         `select * from cases where tenant_id = '${B}'`,
         `select case_id from stage_runs where tenant_id = '${B}'`,
+        `select case_id from cost_releases where tenant_id = '${B}'`,
+        `select case_id from case_budgets`,
+        `select case_id from case_cost_ledger`,
       ];
       for (const q of queries) {
         const { rows } = await client.query<Record<string, unknown>>(q);
@@ -290,6 +362,11 @@ describePg('cross-tenant isolation (tenant A against tenant B data)', () => {
     review_flags: {
       text: `insert into review_flags (tenant_id, case_id, stage, attempt, visit, reason, detail)
         values ($1, $2, 'map', 9, 1, 'attempts-exhausted', 'd')`,
+      params: () => [B, caseB.id],
+    },
+    cost_releases: {
+      text: `insert into cost_releases (tenant_id, case_id, reservation_seq, stage, attempt, input_tokens, output_tokens, usd, wall_ms)
+        values ($1, $2, 1, 'map', 1, 0, 0, 0, 0)`,
       params: () => [B, caseB.id],
     },
   };
