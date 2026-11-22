@@ -14,7 +14,7 @@ Run from this directory, or add `--filter @affidavit/evidence` from the repo roo
 - `pnpm lint`
 - `pnpm test`
 - `pnpm test:sandbox-host` (replay through the real gVisor jail; sandbox host only)
-- `pnpm verify <bundle> <attestation> --key <pub>` (public verification, L2-12; needs cosign)
+- `pnpm verify <bundle> <attestation> --keys <keys.json> [--revoked <keyId>]` (public verification, L2-12; needs cosign; keys file format in `docs/keys/README.md`)
 - `pnpm test:s3` (S3 store against MinIO; needs `AFFIDAVIT_S3_ENDPOINT`, `AFFIDAVIT_S3_ACCESS_KEY`, `AFFIDAVIT_S3_SECRET_KEY`)
 
 ## Invariants
@@ -23,6 +23,7 @@ Run from this directory, or add `--filter @affidavit/evidence` from the repo roo
 - A bundle is deterministic: same evidence, same bytes. Do not add timestamps or host details to it outside `createdAt` and `toolVersions`.
 - Replay compares admissibility outcomes, never timings. It never reports success without rerunning.
 - Every store read checks the bytes against their address.
+- `verify` never runs without a keys file, and a key with status `revoked` is never accepted, whatever a date in the bundle says.
 
 Layout and rules: `docs/lanes/lane2/evidence-bundles.md`.
 

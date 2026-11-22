@@ -1,15 +1,21 @@
-import { createPublicKey } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
 import { Attestation, type Verdict } from '@affidavit/contracts';
 import { publicKeyId, verifyAttestation } from './attestation.js';
 import { MANIFEST_PATH, openBundle, type OpenedBundle } from './bundle.js';
 import { canonicalBytes, sha256Hex, SHA256_HEX } from './canonical.js';
 import { BundleIntegrityError } from './errors.js';
+import {
+  KEY_ID,
+  MAX_KEYS_FILE_BYTES,
+  parseKeysFile,
+  publicKeyProblem,
+  type PublishedKey,
+} from './keys.js';
 import { DEFAULT_TAR_LIMITS, readTar } from './tar.js';
 
 /**
  * Public verification (L2-12): checks a verdict's evidence bundle and its signed attestation with
- * nothing but the two files, the published public key(s) and cosign. No database, store, signer,
+ * nothing but the two files, the published keys file and cosign. No database, store, signer,
  * sandbox or network is used, so anyone holding a bundle can check it without access to our
  * systems. See docs/lanes/lane2/attestation.md, "Public verification".
  */
@@ -20,7 +26,7 @@ export const VERIFY_EXIT = {
   VERIFIED: 0,
   /** Tampered or incomplete bundle, bad attestation, unknown key or bad signature. */
   FAILED: 1,
-  /** Bad arguments or unreadable input files. */
+  /** Bad arguments, or a missing, unreadable or malformed input file (the keys file included). */
   USAGE: 2,
   /** cosign is not installed, so the signature could not be checked at all. */
   NO_COSIGN: 3,
@@ -45,11 +51,10 @@ export class CosignMissingError extends Error {
 
 /** Largest attestation file read; a real one is a few KiB plus the manifest. */
 export const MAX_ATTESTATION_BYTES = 16 * 1024 * 1024;
-/** Largest public key file read. */
-export const MAX_PUBLIC_KEY_BYTES = 64 * 1024;
 
 /**
- * Verifies `bundleBytes` against `attestationText` and the published public keys, in this order,
+ * Verifies `bundleBytes` against `attestationText` and the published keys (the entries of the
+ * keys file, `parseKeysFile`), in this order,
  * stopping at the first failure:
  *
  * 1. With `expectedSha256` (the verdict's `bundleSha256`), the bundle hashes to it.
@@ -57,8 +62,10 @@ export const MAX_PUBLIC_KEY_BYTES = 64 * 1024;
  *    hashes to `verdictSha256`, and the case file, manifest and verdict agree.
  * 3. `manifest.json` is byte for byte the canonical form of the manifest that parsed, so no field
  *    the schema would drop can ride along unsigned.
- * 4. The attestation parses, and its `keyId` is one of the given keys (key rotation: every
- *    published key may be passed, the attestation names which one signed).
+ * 4. The attestation parses, its `keyId` is one of the published keys, and that key is not
+ *    revoked: neither `status: 'revoked'` in the keys file nor named in `revokedKeyIds` (an extra
+ *    override). A revoked key is refused whatever its `revokedAt`: signatures carry no trusted
+ *    timestamp, so one made after the key leaked cannot be told apart from an older one.
  * 5. `verifyAttestation`: the statement is the one built from this manifest, and cosign verifies
  *    the signature offline with that key.
  *
@@ -67,14 +74,19 @@ export const MAX_PUBLIC_KEY_BYTES = 64 * 1024;
 export async function verifyPublic(
   bundleBytes: Uint8Array,
   attestationText: string,
-  publicKeyPems: readonly string[],
-  opts: { expectedSha256?: string; cosignPath?: string } = {},
+  publishedKeys: readonly PublishedKey[],
+  opts: { expectedSha256?: string; cosignPath?: string; revokedKeyIds?: readonly string[] } = {},
 ): Promise<PublicVerification> {
   const bundleSha256 = sha256Hex(bundleBytes);
   const fail = (reason: string): PublicVerification => ({ ok: false, bundleSha256, reason });
 
   if (opts.expectedSha256 !== undefined && !SHA256_HEX.test(opts.expectedSha256)) {
     return fail('the expected bundle digest is not 64 lowercase hex characters');
+  }
+  const revoked = new Set(opts.revokedKeyIds ?? []);
+  for (const id of revoked) {
+    if (!KEY_ID.test(id))
+      return fail(`revoked key id ${JSON.stringify(id)} is not sha256:<64 hex>`);
   }
   let bundle: OpenedBundle;
   let manifestBytes: Uint8Array | undefined;
@@ -106,20 +118,33 @@ export async function verifyPublic(
   if (!parsed.success) return fail('the attestation file is not an attestation');
   const attestation = parsed.data;
 
-  const keys = new Map<string, string>();
-  for (const [i, pem] of publicKeyPems.entries()) {
-    try {
-      createPublicKey(pem);
-    } catch {
-      return fail(`public key ${i + 1} is not a PEM public key`);
+  // Checked again here for callers that did not go through parseKeysFile.
+  const keys = new Map<string, PublishedKey>();
+  for (const [i, key] of publishedKeys.entries()) {
+    const problem = publicKeyProblem(key.publicKey);
+    if (problem !== undefined) return fail(`published key ${i + 1} ${problem}`);
+    if (publicKeyId(key.publicKey) !== key.keyId) {
+      return fail(`published key ${i + 1} has a keyId that is not its key's id`);
     }
-    keys.set(publicKeyId(pem), pem);
+    if (keys.has(key.keyId)) return fail(`published key ${i + 1} repeats ${key.keyId}`);
+    keys.set(key.keyId, key);
   }
-  if (keys.size === 0) return fail('no public key given');
-  const pem = keys.get(attestation.keyId);
-  if (pem === undefined) {
-    return fail(`signed by key ${attestation.keyId}, which is none of the given keys`);
+  if (keys.size === 0) return fail('no published key given');
+  const key = keys.get(attestation.keyId);
+  if (revoked.has(attestation.keyId)) {
+    return fail(`signed by key ${attestation.keyId}, which is revoked`);
   }
+  if (key === undefined) {
+    // The attestation's keyId is any non-empty string until it matches a published key.
+    const shown = KEY_ID.test(attestation.keyId)
+      ? attestation.keyId
+      : JSON.stringify(attestation.keyId);
+    return fail(`signed by key ${shown}, which is none of the published keys`);
+  }
+  if (key.status !== 'active') {
+    return fail(`signed by key ${attestation.keyId}, which is revoked`);
+  }
+  const pem = key.publicKey;
 
   let check: Awaited<ReturnType<typeof verifyAttestation>>;
   try {
@@ -148,18 +173,34 @@ export async function verifyPublic(
   };
 }
 
-/** Plain-text lines for a result. Values come from a bundle that passed every check. */
+/**
+ * `text` with every control, format (bidi controls such as U+202E and U+061C, zero-width
+ * characters) and line or paragraph separator character written as a visible `\u{...}` escape,
+ * so text from a bundle or attestation cannot add a line such as `VERIFIED` or reorder what a
+ * terminal shows.
+ */
+export function printable(text: string): string {
+  return text.replace(
+    /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}؜]/gu,
+    (c) => `\\u{${c.codePointAt(0)!.toString(16).padStart(4, '0')}}`,
+  );
+}
+
+/**
+ * Plain-text lines for a result. Every value that can come from the bundle or the attestation
+ * goes through `printable`, even after every check passed.
+ */
 export function renderVerification(v: PublicVerification): string[] {
   const lines = [`bundle sha256:${v.bundleSha256}`];
   if (!v.ok) {
-    lines.push(`NOT VERIFIED: ${v.reason}`);
+    lines.push(`NOT VERIFIED: ${printable(v.reason)}`);
     return lines;
   }
   lines.push(
-    `case ${v.caseId}`,
+    `case ${printable(v.caseId)}`,
     `verdict ${v.outcome}${v.severity === undefined ? '' : ` (severity ${v.severity})`}`,
     `exhibits ${v.exhibits}, every one matching its signed digest`,
-    `signed by ${v.keyId}`,
+    `signed by ${printable(v.keyId)}`,
     'VERIFIED',
   );
   return lines;
@@ -168,9 +209,11 @@ export function renderVerification(v: PublicVerification): string[] {
 export interface VerifyFilesInput {
   bundlePath: string;
   attestationPath: string;
-  publicKeyPaths: readonly string[];
+  /** The published keys file (docs/keys/README.md). Required: verification never runs without it. */
+  keysPath: string | undefined;
   expectedSha256?: string;
   cosignPath?: string;
+  revokedKeyIds?: readonly string[];
   out?: (line: string) => void;
 }
 
@@ -186,44 +229,42 @@ async function readCapped(path: string, max: number, what: string): Promise<Uint
 }
 
 /**
- * Reads the bundle, attestation and key files, verifies them (`verifyPublic`), prints the
+ * Reads the bundle, attestation and keys files, verifies them (`verifyPublic`), prints the
  * result, and returns an exit code from `VERIFY_EXIT`.
  */
 export async function verifyBundleFiles(input: VerifyFilesInput): Promise<number> {
   const out = input.out ?? ((line: string) => process.stdout.write(`${line}\n`));
-  if (input.publicKeyPaths.length === 0) {
-    out('at least one --key <public key file> is required');
+  if (input.keysPath === undefined) {
+    out('--keys <keys file> is required (the published keys file, docs/keys/README.md)');
+    return VERIFY_EXIT.USAGE;
+  }
+  const badRevoked = (input.revokedKeyIds ?? []).find((id) => !KEY_ID.test(id));
+  if (badRevoked !== undefined) {
+    out(`--revoked ${JSON.stringify(badRevoked)} is not a key id (sha256:<64 hex>)`);
     return VERIFY_EXIT.USAGE;
   }
   const bundle = await readCapped(input.bundlePath, DEFAULT_TAR_LIMITS.maxTotalBytes, 'bundle');
   const attestation = await readCapped(input.attestationPath, MAX_ATTESTATION_BYTES, 'attestation');
-  const keys: Uint8Array[] = [];
-  for (const p of input.publicKeyPaths) {
-    const k = await readCapped(p, MAX_PUBLIC_KEY_BYTES, 'public key');
-    if (typeof k === 'string') {
-      out(k);
-      return VERIFY_EXIT.USAGE;
-    }
-    keys.push(k);
-  }
-  for (const r of [bundle, attestation]) {
+  const keysBytes = await readCapped(input.keysPath, MAX_KEYS_FILE_BYTES, 'keys file');
+  for (const r of [keysBytes, bundle, attestation]) {
     if (typeof r === 'string') {
       out(r);
       return VERIFY_EXIT.USAGE;
     }
   }
   const text = (b: Uint8Array) => Buffer.from(b).toString('utf8');
+  const keys = parseKeysFile(text(keysBytes as Uint8Array));
+  if (!keys.ok) {
+    out(`${input.keysPath}: ${keys.reason}`);
+    return VERIFY_EXIT.USAGE;
+  }
   let result: PublicVerification;
   try {
-    result = await verifyPublic(
-      bundle as Uint8Array,
-      text(attestation as Uint8Array),
-      keys.map(text),
-      {
-        ...(input.expectedSha256 === undefined ? {} : { expectedSha256: input.expectedSha256 }),
-        ...(input.cosignPath === undefined ? {} : { cosignPath: input.cosignPath }),
-      },
-    );
+    result = await verifyPublic(bundle as Uint8Array, text(attestation as Uint8Array), keys.keys, {
+      ...(input.expectedSha256 === undefined ? {} : { expectedSha256: input.expectedSha256 }),
+      ...(input.cosignPath === undefined ? {} : { cosignPath: input.cosignPath }),
+      ...(input.revokedKeyIds === undefined ? {} : { revokedKeyIds: input.revokedKeyIds }),
+    });
   } catch (err) {
     if (!(err instanceof CosignMissingError)) throw err;
     out('cosign is not installed; the signature cannot be checked without it');
