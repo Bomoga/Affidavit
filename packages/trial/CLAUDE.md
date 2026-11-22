@@ -72,9 +72,20 @@ Invariants, each covered by a test in `src/model/anthropic.test.ts` with a stubb
 
 `scripts/probe-model.ts` (logic in `src/model/probe.ts`) is a human-run diagnostic: tiny live calls with synthetic input only, raw provider text shown after key redaction. Nothing in the trial imports it. It reuses `buildAgentOptions` from `anthropic.ts`, so keep the port's options built there. See the guide, "Probing a provider error". L3-18 adds opt-in P7 (`--fixture-case`, only a file directly in `fixtures/casefiles/`): the worker's Defense turn replayed through `defenseBlocks` from `defense.ts`, so keep the Defense user message built there.
 
-A model safety refusal (`stop_reason: "refusal"`, which the runtime reports as `invalid_request`) is class `refusal` (`REFUSAL_CLASS`) with an allowlisted category (else `other`), never zero spend, and never returns a submission. A runtime fallback to another model, or any assistant message from a model other than the requested one (`model_mismatch`), fails the turn (`provider-errors.test.ts`). What a refusal should do to a case is open (CR-T13). `--fixture-case` also requires a checked-in, unmodified file (git).
+A model safety refusal (`stop_reason: "refusal"`, which the runtime reports as `invalid_request`) is class `refusal` (`REFUSAL_CLASS`) with an allowlisted category (else `other`), never zero spend, and never returns a submission. A runtime fallback to another model, or any assistant message from a model other than the requested one (`model_mismatch`), fails the turn (`provider-errors.test.ts`). What a refusal does to a case is decided (CR-T13, L3-20): see "Defense after a refusal" below. `--fixture-case` also requires a checked-in, unmodified file (git).
 
 L3-19 adds opt-in P8 (`--model-matrix`, needs `--fixture-case`): the P7a input on every distinct table model, the second-attempt prompt on its model, and `claude-fable-5-2` as a labelled extra, each through the real port with a probe-only model table. Measurement only; Prosecution, Remedy and jurors are reported as SKIP because their input needs earlier-stage artifacts.
+
+## Defense after a refusal (L3-20, CR-T13)
+
+Lead decision 2026-11-21. Tests in `src/defense.test.ts` ("Defense after a provider refusal" and `refusalRouteFromEnv`).
+
+- A `ModelCallError` of class `refusal` (`isModelRefusal` in `src/model/errors.ts`) ends the Defense attempt it hit. The refused model is never asked again in that stage run. A refusal never dismisses.
+- `DefenseConfig.refusalRoute`, from `AFFIDAVIT_REFUSAL_ROUTE` via `refusalRouteFromEnv` (unset or blank is `review`; any other value than `review` or `second-attempt` throws). The worker does not pass it yet, so it gets `review`; the Lane 1 wiring note is in CR-T13.
+- `review` (default): a refused first attempt makes no further model call and goes to review. `second-attempt` (opt-in): it goes once, at any score, to `config.second` with no first-attempt feedback. P8 found the default second-attempt model refused the same input, so `second-attempt` only helps with another table.
+- A refused second attempt never starts a third and goes to review. Review at or above the floor: escalate `no-admissible-witness-above-floor`, refusals named in the detail. Below the floor: throw `DefenseRefusedError` (class `refusal`), so the worker flags the stage for review. Known gap: the queue's stage retries rerun Defense until then; an escalation reason for refusals in contracts would close it.
+- No event type was added; the refusal is told in the escalation or dismissal detail, or in the thrown message (model id and allowlisted category only).
+- Only refusals are caught. Kill switch, budget exhausted, unconfigured, config and other call errors pass through. The refused call's cost is settled by the orchestrator as the port reported it.
 
 ## Intended libraries (notes for later, not installed yet)
 

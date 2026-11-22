@@ -28,12 +28,21 @@ export { ROLE_TOOLS, assertAllowedTools, isModelRole } from './roles.js';
 export type { ModelRole } from './roles.js';
 export { PatchSubmission, SUBMISSIONS, WitnessSubmission } from './envelope.js';
 export type { BallotSubmission, SubmissionCheck, SubmissionSpec } from './envelope.js';
-export { createDefenseHandler, loadCaseFile } from './defense.js';
+export {
+  DEFAULT_REFUSAL_ROUTE,
+  DefenseRefusedError,
+  REFUSAL_ROUTES,
+  REFUSAL_ROUTE_ENV_VAR,
+  createDefenseHandler,
+  loadCaseFile,
+  refusalRouteFromEnv,
+} from './defense.js';
 export type {
   DefenseAttemptConfig,
   DefenseConfig,
   DefenseDeps,
   PromptRenderer,
+  RefusalRoute,
 } from './defense.js';
 export { buildWitness, variantsFor, witnessExhibitId, witnessSha256 } from './witness.js';
 export { InMemoryWorkspace } from './workspace.js';
