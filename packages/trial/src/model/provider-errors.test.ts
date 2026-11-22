@@ -542,6 +542,99 @@ describe('a model safety refusal', () => {
   });
 });
 
+// Second review of L3-18: a refusal anywhere in the stream must win, whatever came before it.
+describe('a refusal anywhere in the stream', () => {
+  const noFallback = (): SDKMessage =>
+    ({
+      type: 'system',
+      subtype: 'model_refusal_no_fallback',
+      original_model: 'claude-opus-5-5',
+      request_id: null,
+      api_refusal_category: 'bio',
+      content: 'refused',
+      uuid: '00000000-0000-0000-0000-000000000020',
+      session_id: 's',
+    }) as unknown as SDKMessage;
+  const withStop = (m: SDKMessage, stop: string): SDKMessage => {
+    (m as unknown as Record<string, unknown>).stop_reason = stop;
+    return m;
+  };
+  const refusedTurn = async (script: Script) => {
+    const { port } = makePort(script);
+    const err = await failure(port);
+    expect(err.provider?.errorClass).toBe('refusal');
+    return err;
+  };
+
+  it('max_output_tokens, then a submission, then a refusal frame: refusal, no submission', async () => {
+    const err = await refusedTurn(async function* (h) {
+      yield assistant('m1', 50, 1500, 'max_output_tokens', 'API Error: output limit');
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      yield refusalAssistant();
+      yield result('success', { isError: true, usd: 0.05, input: 900, output: 1500 });
+    });
+    expect(err.provider?.refusalCategory).toBe('cyber');
+    expect(err.message).toContain('usage policy refusal');
+    expect(err.cost?.usd).toBe(0.05);
+  });
+
+  it('max_output_tokens, then a submission, then a no-fallback notice: refusal', async () => {
+    const err = await refusedTurn(async function* (h) {
+      yield assistant('m1', 50, 1500, 'max_output_tokens');
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      yield noFallback();
+      yield result('success', { isError: true, usd: 0, input: 0, output: 0 });
+    });
+    expect(err.provider?.refusalCategory).toBe('bio');
+    // Zero reported spend for a refusal is unknown spend, even after another error.
+    expect(err.cost).toBeUndefined();
+  });
+
+  it('a submission, then a result whose stop_reason is refusal (no error frame): refusal', async () => {
+    const err = await refusedTurn(async function* (h) {
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      yield withStop(result('success', { usd: 0.02 }), 'refusal');
+    });
+    expect(err.provider?.refusalCategory).toBeUndefined();
+  });
+
+  it('a submission, then a refusal frame: refusal', async () => {
+    await refusedTurn(async function* (h) {
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      yield refusalAssistant();
+    });
+  });
+
+  it('an assistant message with stop_reason refusal and no error field: refusal', async () => {
+    const err = await refusedTurn(async function* (h) {
+      const m = assistant('m1', 10, 1, undefined, 'partial') as unknown as {
+        message: Record<string, unknown>;
+      };
+      m.message.stop_reason = 'refusal';
+      m.message.stop_details = { category: 'cyber', explanation: null };
+      yield m as unknown as SDKMessage;
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      yield result('success', { usd: 0.01 });
+    });
+    expect(err.provider?.refusalCategory).toBe('cyber');
+  });
+
+  it('a normal stream with other stop reasons is not a refusal', async () => {
+    const { port } = makePort(async function* (h) {
+      const m = assistant('m1', 10, 1, undefined, 'calling') as unknown as {
+        message: Record<string, unknown>;
+      };
+      m.message.stop_reason = 'tool_use';
+      yield m as unknown as SDKMessage;
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      yield withStop(result('success', { usd: 0.01 }), 'end_turn');
+    });
+    const out = await port.runTurn(requestFor('defense'));
+    expect(out.outcome).toBe('submitted');
+    expect(out.submission).toEqual(GOOD_WITNESS);
+  });
+});
+
 describe('settling the up-front charge in a trial', () => {
   async function runFailingDefense(
     script: Script | ModelPort,

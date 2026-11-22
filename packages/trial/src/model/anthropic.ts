@@ -536,6 +536,13 @@ export class AnthropicModelPort implements PreflightModelPort {
     // The provider's own words for the first error, kept raw here and sanitized before use.
     let providerText: string | undefined;
     let refusalCategory: RefusalCategory | undefined;
+    // Sticky: once any frame says the turn was refused, nothing later in the stream clears it,
+    // and it outranks every other outcome, a captured submission included.
+    let refused = false;
+    const markRefused = (category: RefusalCategory | ''): void => {
+      refused = true;
+      if (category !== '') refusalCategory ??= category;
+    };
     let refusalFallback = false;
     // Set when an assistant message came from a model other than `req.model`.
     let otherModel: string | undefined;
@@ -603,24 +610,25 @@ export class AnthropicModelPort implements PreflightModelPort {
         const msg = next.value;
         if (killed) break;
         if (msg.type === 'assistant') {
+          // Every assistant message is checked for a refusal, whatever came before it and
+          // whether or not it carries an error code: the runtime carries on after some errors
+          // (max_output_tokens), so a refusal can follow another error and a submission.
+          const refusal = refusalOf(msg.message);
+          if (refusal !== undefined) markRefused(refusal);
           if (msg.error === 'authentication_failed') authFailed = true;
           else if (msg.error !== undefined && providerError === undefined) {
             // Any other provider error (overloaded, rate_limit, server_error, billing_error, and
             // the rest) is a call error on its own, whatever the result later says. Only a code
-            // from the closed snake_case set goes into the message.
+            // from the closed snake_case set goes into the message. A refused response comes
+            // through as `invalid_request`; the sticky `refused` flag reports it as `refusal`.
             const code = String(msg.error);
-            // A refused response comes through as `invalid_request` with stop_reason "refusal"
-            // on the synthetic message. Reported as its own class: it is billed, and it is the
-            // model declining the input, not a request the API could not parse.
-            const refusal = refusalOf(msg.message);
-            if (refusal !== undefined) {
-              providerError = REFUSAL_CLASS;
-              if (refusal !== '') refusalCategory = refusal;
-            } else {
-              providerError = /^[a-z_]{1,40}$/.test(code) ? code : 'unrecognised';
-            }
+            providerError = /^[a-z_]{1,40}$/.test(code) ? code : 'unrecognised';
             // The runtime puts the provider's error text (for an API error, the status and the
             // provider's message) in the content of this synthetic assistant message.
+            const text = messageText((msg.message as { content?: unknown }).content);
+            if (text !== '') providerText = text;
+          } else if (msg.error !== undefined && refusal !== undefined) {
+            // A refusal after another error: its text is the one that explains the turn.
             const text = messageText((msg.message as { content?: unknown }).content);
             if (text !== '') providerText = text;
           }
@@ -646,6 +654,8 @@ export class AnthropicModelPort implements PreflightModelPort {
           }
         } else if (msg.type === 'result') {
           result = msg;
+          // The result carries the turn's stop reason; a refusal there counts on its own.
+          if ((msg as { stop_reason?: unknown }).stop_reason === 'refusal') markRefused('');
         } else if (msg.type === 'system') {
           const sub = (msg as { subtype?: unknown }).subtype;
           if (sub === 'model_refusal_fallback') {
@@ -655,16 +665,10 @@ export class AnthropicModelPort implements PreflightModelPort {
             refusalFallback = true;
           }
           if (sub === 'model_refusal_fallback' || sub === 'model_refusal_no_fallback') {
-            const c = refusalCategoryOf(
-              (msg as { api_refusal_category?: unknown }).api_refusal_category,
+            markRefused(
+              refusalCategoryOf((msg as { api_refusal_category?: unknown }).api_refusal_category) ??
+                '',
             );
-            if (c !== undefined) refusalCategory ??= c;
-            if (
-              sub === 'model_refusal_no_fallback' &&
-              (providerError === undefined || providerError === 'invalid_request')
-            ) {
-              providerError = REFUSAL_CLASS;
-            }
           }
         }
       }
@@ -718,6 +722,8 @@ export class AnthropicModelPort implements PreflightModelPort {
     // failed after work started, so its spend is unknown. Unknown (undefined) also for a timeout,
     // an abort or a broken stream: the whole up-front charge stands there.
     const refusedBeforeUsage =
+      !refused &&
+      !refusalFallback &&
       result === undefined &&
       providerError !== undefined &&
       REFUSED_BEFORE_WORK.has(providerError) &&
@@ -728,11 +734,10 @@ export class AnthropicModelPort implements PreflightModelPort {
       used.outputTokens === 0;
     // A refusal is a response: the input was read and output may have been generated, so it is
     // billed. A result that reports no spend for it under-reports, and is treated as unknown.
-    const refused = providerError === REFUSAL_CLASS || refusalFallback;
-    const reportsSpend = usd > 0 || cost.inputTokens > 0 || cost.outputTokens > 0;
+    // Tokens without dollars still under-report the bill, so a refusal needs a reported USD.
     const failureCost: StageCost | undefined =
       result !== undefined
-        ? refused && !reportsSpend
+        ? (refused || refusalFallback) && !(usd > 0)
           ? undefined
           : cost
         : refusedBeforeUsage
@@ -785,7 +790,8 @@ export class AnthropicModelPort implements PreflightModelPort {
           'the runtime switched to a fallback model after a refusal; the turn is refused',
         );
       }
-      if (providerError === REFUSAL_CLASS) throw providerFailure(REFUSAL_CLASS);
+      // The sticky flag outranks a captured submission and any other provider error class.
+      if (refused) throw providerFailure(REFUSAL_CLASS);
       if (otherModel !== undefined) {
         throw providerFailure(
           'model_mismatch',

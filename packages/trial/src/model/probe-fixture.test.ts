@@ -4,6 +4,7 @@ import {
   copyFileSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   readdirSync,
   rmSync,
   symlinkSync,
@@ -25,6 +26,7 @@ import {
   buildFixtureLadder,
   describeOptions,
   formatResult,
+  gitEnv,
   gitTracked,
   interpret,
   isFixtureText,
@@ -134,7 +136,41 @@ describe('loading a fixture case file', () => {
   });
 
   it('the real git check says the checked-in fixture is tracked', () => {
-    expect(gitTracked(FIXTURE)).toBe('tracked');
+    expect(gitTracked(FIXTURE, readFileSync(FIXTURE))).toBe('tracked');
+  });
+
+  it('compares the bytes read against HEAD, not the index or the file on disk', () => {
+    // Same path, different bytes: what an assume-unchanged or skip-worktree edit looks like.
+    const edited = Buffer.concat([readFileSync(FIXTURE), Buffer.from('\n ')]);
+    expect(gitTracked(FIXTURE, edited)).toBe('untracked');
+    expect(gitTracked(join(REPO_ROOT, '..', 'outside.json'), edited)).toBe('untracked');
+  });
+
+  it('ignores GIT_* variables that could point git elsewhere', () => {
+    const saved = { dir: process.env.GIT_DIR, tree: process.env.GIT_WORK_TREE };
+    process.env.GIT_DIR = join(tmpdir(), 'no-such-git-dir');
+    process.env.GIT_WORK_TREE = tmpdir();
+    try {
+      expect(gitTracked(FIXTURE, readFileSync(FIXTURE))).toBe('tracked');
+    } finally {
+      if (saved.dir === undefined) delete process.env.GIT_DIR;
+      else process.env.GIT_DIR = saved.dir;
+      if (saved.tree === undefined) delete process.env.GIT_WORK_TREE;
+      else process.env.GIT_WORK_TREE = saved.tree;
+    }
+    expect(Object.keys(gitEnv({ GIT_DIR: 'x', git_index_file: 'y', PATH: 'p' }))).toEqual(['PATH']);
+  });
+
+  it('hands the check the same bytes it then parses', () => {
+    let seen: Buffer | undefined;
+    const fx = loadFixtureCase(FIXTURE, {
+      isTracked: (_p, bytes) => {
+        seen = bytes;
+        return 'tracked';
+      },
+    });
+    expect(seen?.equals(readFileSync(FIXTURE))).toBe(true);
+    expect(fx.caseFile.id).toBe('case-nodegoat-nosqli-where-001');
   });
 
   it('refuses an untracked file placed in the real fixtures/casefiles directory', () => {

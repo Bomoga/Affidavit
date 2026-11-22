@@ -173,21 +173,69 @@ export interface FixtureCase {
  * `FIXTURE_CASE_MAX_BYTES`, and any content that is not a valid contract `CaseFile`.
  */
 /** Whether a file is checked in: `tracked`, `untracked` (or modified), or git is `unavailable`. */
-export type TrackedCheck = (absPath: string) => 'tracked' | 'untracked' | 'unavailable';
+/**
+ * Whether `bytes`, read from `absPath`, are exactly what HEAD holds at that path. The caller
+ * passes the bytes it will then parse, so there is no gap between the check and the read.
+ */
+export type TrackedCheck = (
+  absPath: string,
+  bytes: Buffer,
+) => 'tracked' | 'untracked' | 'unavailable';
 
 /**
- * The default check: the file is known to git (`git ls-files --error-unmatch`) and matches HEAD
- * (`git diff --quiet HEAD`), run from the repo root. Any failure other than a missing git binary
- * is `untracked`; a missing git is `unavailable`, which is refused too.
+ * The environment git runs with: the caller's, minus every `GIT_*` variable (GIT_DIR,
+ * GIT_WORK_TREE, GIT_INDEX_FILE, GIT_CONFIG*, ...), so nothing outside the repo can redirect it.
  */
-export const gitTracked: TrackedCheck = (absPath) => {
-  const git = (args: string[]): void => {
-    execFileSync('git', args, { cwd: REPO_ROOT, stdio: 'ignore', timeout: 10_000 });
-  };
+export function gitEnv(parent: Env = process.env): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(parent)) {
+    if (v !== undefined && !k.toUpperCase().startsWith('GIT_')) out[k] = v;
+  }
+  return out;
+}
+
+/** Repo-relative path in git's form, or undefined when `absPath` is outside the repo. */
+function repoPath(absPath: string): string | undefined {
+  let root: string;
   try {
-    git(['ls-files', '--error-unmatch', '--', absPath]);
-    git(['diff', '--quiet', 'HEAD', '--', absPath]);
-    return 'tracked';
+    root = realpathSync(REPO_ROOT);
+  } catch {
+    return undefined;
+  }
+  const rel = relative(root, absPath);
+  if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) return undefined;
+  return rel.split(sep).join('/');
+}
+
+/**
+ * The default check. The blob id of the bytes read (`git hash-object --stdin --path`, so the
+ * path's own clean filters such as line-ending conversion apply, as on commit) must equal the
+ * blob at `HEAD:<path>` (`git rev-parse`). Comparing against HEAD, not the index, also catches
+ * edits hidden with assume-unchanged or skip-worktree. Git runs from the repo root with every
+ * `GIT_*` variable dropped and fsmonitor and hooks off. A missing git binary is `unavailable`,
+ * which is refused too; any other failure is `untracked`.
+ */
+export const gitTracked: TrackedCheck = (absPath, bytes) => {
+  const rel = repoPath(absPath);
+  if (rel === undefined) return 'untracked';
+  const hooksOff = process.platform === 'win32' ? 'NUL' : '/dev/null';
+  const git = (args: string[], input?: Buffer): string =>
+    execFileSync(
+      'git',
+      ['-c', 'core.fsmonitor=false', '-c', `core.hooksPath=${hooksOff}`, ...args],
+      {
+        cwd: REPO_ROOT,
+        env: gitEnv(),
+        input: input ?? '',
+        stdio: ['pipe', 'pipe', 'ignore'],
+        timeout: 10_000,
+        encoding: 'utf8',
+      },
+    ).trim();
+  try {
+    const head = git(['rev-parse', '--verify', '--quiet', `HEAD:${rel}`]);
+    const read = git(['hash-object', '--stdin', `--path=${rel}`], bytes);
+    return /^[0-9a-f]{40,64}$/.test(head) && head === read ? 'tracked' : 'untracked';
   } catch (err) {
     return (err as { code?: unknown }).code === 'ENOENT' ? 'unavailable' : 'untracked';
   }
@@ -229,7 +277,19 @@ export function loadFixtureCase(path: string, opts: FixtureCaseOptions = {}): Fi
   if (!rel.endsWith('.json')) throw new FixtureCaseError('--fixture-case needs a .json file');
   const st = statSync(real);
   if (!st.isFile()) throw new FixtureCaseError('--fixture-case is not a regular file');
-  const tracked = (opts.isTracked ?? gitTracked)(real);
+  if (st.size > FIXTURE_CASE_MAX_BYTES) {
+    throw new FixtureCaseError(
+      `--fixture-case is larger than ${FIXTURE_CASE_MAX_BYTES / 1024} KiB`,
+    );
+  }
+  // Read once: the bytes checked against HEAD are the bytes parsed below.
+  const bytes = readFileSync(real);
+  if (bytes.length > FIXTURE_CASE_MAX_BYTES) {
+    throw new FixtureCaseError(
+      `--fixture-case is larger than ${FIXTURE_CASE_MAX_BYTES / 1024} KiB`,
+    );
+  }
+  const tracked = (opts.isTracked ?? gitTracked)(real, bytes);
   if (tracked === 'unavailable') {
     throw new FixtureCaseError(
       '--fixture-case needs git to confirm the file is checked in, and git is not available; refused',
@@ -240,14 +300,9 @@ export function loadFixtureCase(path: string, opts: FixtureCaseOptions = {}): Fi
       '--fixture-case only accepts a file checked in to the repo and unmodified from HEAD; this one is untracked or locally changed',
     );
   }
-  if (st.size > FIXTURE_CASE_MAX_BYTES) {
-    throw new FixtureCaseError(
-      `--fixture-case is larger than ${FIXTURE_CASE_MAX_BYTES / 1024} KiB`,
-    );
-  }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(real, 'utf8'));
+    parsed = JSON.parse(bytes.toString('utf8'));
   } catch {
     throw new FixtureCaseError('--fixture-case is not valid JSON');
   }
@@ -848,16 +903,21 @@ function observe(facts: StreamFacts, msg: SDKMessage): void {
     };
   } else if (msg.type === 'assistant') {
     const content = (msg.message as { content?: unknown }).content;
-    if (msg.error !== undefined && facts.providerError === undefined) {
-      // The runtime reports a refused response under `invalid_request`; tell them apart here.
-      const refusal = refusalOf(msg.message);
-      facts.providerError = refusal === undefined ? String(msg.error) : REFUSAL_CLASS;
-      if (refusal !== undefined && refusal !== '') facts.refusalCategory = refusal;
+    // The runtime reports a refused response under `invalid_request`, and a refusal can follow
+    // another error; every assistant message is checked, and a refusal wins the class.
+    const refusal = refusalOf(msg.message);
+    if (refusal !== undefined) {
+      facts.providerError = REFUSAL_CLASS;
+      if (refusal !== '') facts.refusalCategory ??= refusal;
       const details = (msg.message as { stop_details?: { explanation?: unknown } | null })
         .stop_details;
-      if (refusal !== undefined && typeof details?.explanation === 'string') {
-        facts.refusalExplanation = details.explanation;
-      }
+      if (typeof details?.explanation === 'string')
+        facts.refusalExplanation ??= details.explanation;
+      const t = textOf(content);
+      if (t !== '') facts.providerText = t;
+      if (typeof m.request_id === 'string') facts.requestId ??= m.request_id;
+    } else if (msg.error !== undefined && facts.providerError === undefined) {
+      facts.providerError = String(msg.error);
       const t = textOf(content);
       if (t !== '') facts.providerText = t;
       if (typeof m.request_id === 'string') facts.requestId = m.request_id;
@@ -876,9 +936,7 @@ function observe(facts: StreamFacts, msg: SDKMessage): void {
     msg.type === 'system' &&
     (m.subtype === 'model_refusal_fallback' || m.subtype === 'model_refusal_no_fallback')
   ) {
-    if (facts.providerError === undefined || facts.providerError === 'invalid_request') {
-      facts.providerError = REFUSAL_CLASS;
-    }
+    facts.providerError = REFUSAL_CLASS;
     const c = refusalCategoryOf(m.api_refusal_category);
     if (c !== undefined) facts.refusalCategory ??= c;
     if (typeof m.api_refusal_explanation === 'string') {
@@ -888,6 +946,7 @@ function observe(facts: StreamFacts, msg: SDKMessage): void {
       facts.fallbackModel = str(m.fallback_model);
     }
   } else if (msg.type === 'result') {
+    if (m.stop_reason === 'refusal') facts.providerError = REFUSAL_CLASS;
     const errors = Array.isArray(m.errors)
       ? (m.errors as unknown[]).filter((e): e is string => typeof e === 'string').join('; ')
       : '';
