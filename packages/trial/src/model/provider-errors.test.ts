@@ -27,9 +27,13 @@ import {
 } from './anthropic.js';
 import { ModelCallError, ModelUnconfiguredError } from './errors.js';
 import { DEFAULT_MODEL_TABLE } from './models.js';
+import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
+import { qualifiedToolName } from './submit-tools.js';
 import {
   CANARY_KEY,
+  GOOD_WITNESS,
   assistant,
+  refusalAssistant,
   requestFor,
   result,
   stubTransport,
@@ -299,6 +303,143 @@ describe('what a failed call costs', () => {
     );
     const err = await failure(port);
     expect(err.cost).toBeUndefined();
+  });
+});
+
+// L3-18: the runtime reports a usage-policy refusal under the same assistant error code as a
+// malformed request. A refusal is billed and is not a malformed request, so it must not be
+// reported as `invalid_request` and must never be settled as zero spend.
+describe('a model safety refusal', () => {
+  const zeroResult = (text: string) =>
+    result('success', { isError: true, usd: 0, input: 0, output: 0, text });
+
+  it('is reported as class refusal with its category, not invalid_request', async () => {
+    const { port, logs } = makePort(async function* () {
+      await Promise.resolve();
+      yield refusalAssistant();
+      yield zeroResult('API Error: safeguards flagged this message');
+    });
+    const err = await failure(port);
+    expect(err.provider?.errorClass).toBe('refusal');
+    expect(err.provider?.refusalCategory).toBe('cyber');
+    expect(err.message).toContain('provider error refusal');
+    expect(err.message).toContain('category cyber');
+    expect(err.message).toContain('usage policy refusal');
+    expect(err.message).not.toContain('invalid_request');
+    expect(logs.some((l) => l.message.includes('refusal'))).toBe(true);
+  });
+
+  it('with no result and no tokens is unknown spend, never zero: the charge stands', async () => {
+    const { port } = makePort(async function* () {
+      await Promise.resolve();
+      yield refusalAssistant();
+    });
+    expect((await failure(port)).cost).toBeUndefined();
+  });
+
+  it('with a result that reports no spend is unknown spend, not zero', async () => {
+    const { port } = makePort(async function* () {
+      await Promise.resolve();
+      yield refusalAssistant();
+      yield zeroResult('refused');
+    });
+    expect((await failure(port)).cost).toBeUndefined();
+  });
+
+  it('with a result that reports spend carries that spend', async () => {
+    const { port } = makePort(async function* () {
+      await Promise.resolve();
+      yield refusalAssistant();
+      yield result('success', { isError: true, usd: 0.031, input: 1200, output: 40 });
+    });
+    expect((await failure(port)).cost).toMatchObject({
+      inputTokens: 1200,
+      outputTokens: 40,
+      usd: 0.031,
+    });
+  });
+
+  it('never shows the refusal explanation or echoed text', async () => {
+    const { port } = makePort(async function* () {
+      await Promise.resolve();
+      yield refusalAssistant({
+        explanation: 'CANARY-EXPLANATION about $where injection',
+        text: 'API Error: CANARY-ECHO this.userId == ${parsedUserId}',
+      });
+    });
+    const err = await failure(port);
+    expect(err.message).not.toContain('CANARY');
+    expect(err.message).not.toContain('$where');
+    expect(err.message).toContain(PROVIDER_MESSAGE_WITHHELD);
+  });
+
+  for (const [kind, category] of [
+    ['prose', 'Cyber Security!'],
+    ['a number', 7],
+    ['too long', 'x'.repeat(41)],
+  ] as const) {
+    it(`drops a category that is ${kind}`, async () => {
+      const { port } = makePort(async function* () {
+        await Promise.resolve();
+        yield refusalAssistant({ category });
+      });
+      const err = await failure(port);
+      expect(err.provider?.errorClass).toBe('refusal');
+      expect(err.provider?.refusalCategory).toBeUndefined();
+    });
+  }
+
+  it('a no-fallback refusal notice upgrades invalid_request to refusal', async () => {
+    const { port } = makePort(async function* () {
+      await Promise.resolve();
+      yield assistant('m1', 0, 0, 'invalid_request', 'API Error: Claude cannot help');
+      yield {
+        type: 'system',
+        subtype: 'model_refusal_no_fallback',
+        original_model: 'claude-opus-5-5',
+        request_id: null,
+        api_refusal_category: 'cyber',
+        content: 'refused',
+        uuid: '00000000-0000-0000-0000-000000000009',
+        session_id: 's',
+      } as unknown as SDKMessage;
+    });
+    const err = await failure(port);
+    expect(err.provider).toMatchObject({ errorClass: 'refusal', refusalCategory: 'cyber' });
+    expect(err.cost).toBeUndefined();
+  });
+
+  it('a fallback to another model after a refusal fails the turn even with a submission', async () => {
+    const { port } = makePort(async function* (h) {
+      yield {
+        type: 'system',
+        subtype: 'model_refusal_fallback',
+        trigger: 'refusal',
+        direction: 'retry',
+        original_model: 'claude-opus-5-5',
+        fallback_model: 'claude-sonnet-5-5',
+        request_id: null,
+        api_refusal_category: 'cyber',
+        uuid: '00000000-0000-0000-0000-000000000010',
+        session_id: 's',
+      } as unknown as SDKMessage;
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      yield result('success', { usd: 0.02 });
+    });
+    const err = await failure(port);
+    expect(err.provider).toMatchObject({ errorClass: 'refusal', refusalCategory: 'cyber' });
+    expect(err.message).toContain('fallback model');
+    expect(err.cost?.usd).toBe(0.02);
+  });
+
+  it('a real malformed request is still invalid_request and still zero before work', async () => {
+    const { port } = makePort(async function* () {
+      await Promise.resolve();
+      yield assistant('m1', 0, 0, 'invalid_request', PROVIDER_400);
+    });
+    const err = await failure(port);
+    expect(err.provider?.errorClass).toBe('invalid_request');
+    expect(err.cost?.usd).toBe(0);
   });
 });
 

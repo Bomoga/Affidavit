@@ -5,21 +5,27 @@
 //
 // Run by the lead on their own key: `node --import tsx packages/trial/scripts/probe-model.ts`.
 // Nothing in the trial or the worker imports this file.
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { Options, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
-import type { SubmitToolName } from '@affidavit/contracts';
-import { getPrompt, renderPrompt } from '@affidavit/prompts';
+import { CaseFile, type Budget, type SubmitToolName } from '@affidavit/contracts';
+import { getPrompt, renderPrompt, type UntrustedBlock } from '@affidavit/prompts';
+import { sha256Hex } from '../canonical.js';
+import { defenseBlocks } from '../defense.js';
 import type { ModelTurnRequest } from '../orchestrator.js';
 import {
   API_KEY_ENV_VAR,
   AnthropicModelPort,
   KEY_SHAPE,
+  REFUSAL_CLASS,
   buildAgentOptions,
   childEnv,
+  refusalOf,
 } from './anthropic.js';
 import { DEFAULT_MODEL_TABLE, resolveModelTable, type ModelTable } from './models.js';
+import { FileRecordingStore } from './recordings.js';
 import { describeThrown, redact } from './redact.js';
 import { SubmissionBox, buildSubmitTools, qualifiedToolName } from './submit-tools.js';
 import type { AgentTransport } from './transport.js';
@@ -119,6 +125,186 @@ function defenseRendered(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Fixture input (L3-18, opt-in only). A P7 probe replays the worker's real Defense input, built by
+// the real `defenseBlocks` from a checked-in case file under `fixtures/casefiles/` (public corpus
+// content, never a user repository). Such text is marked separately from synthetic text, and
+// `runLadder` refuses it unless the caller passed `allowFixtureInput`, which the script does only
+// for `--fixture-case` with a path that `loadFixtureCase` accepted.
+// ---------------------------------------------------------------------------------------------
+
+/** The repo root, from this file's place in `packages/trial/src/model/`. */
+export const REPO_ROOT = resolve(fileURLToPath(new URL('.', import.meta.url)), '../../../../');
+/** The only directory a fixture case file may come from. */
+export const FIXTURE_CASE_DIR = join(REPO_ROOT, 'fixtures', 'casefiles');
+/** Largest fixture case file accepted. */
+export const FIXTURE_CASE_MAX_BYTES = 256 * 1024;
+
+const FIXTURE = new WeakSet<object>();
+
+function fixtureText(origin: string, text: string): SyntheticText {
+  const s = Object.freeze({ origin, text });
+  FIXTURE.add(s);
+  return s;
+}
+
+/** True only for fixture-derived text this module built. */
+export function isFixtureText(x: unknown): x is SyntheticText {
+  return typeof x === 'object' && x !== null && FIXTURE.has(x);
+}
+
+export class FixtureCaseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'FixtureCaseError';
+  }
+}
+
+export interface FixtureCase {
+  /** Path relative to the repo root, for the report. */
+  readonly relPath: string;
+  readonly caseFile: CaseFile;
+}
+
+/**
+ * Loads a checked-in fixture case file. Refuses any path that does not resolve (after following
+ * links) to a regular `.json` file directly inside `fixtures/casefiles/`, any file over
+ * `FIXTURE_CASE_MAX_BYTES`, and any content that is not a valid contract `CaseFile`.
+ */
+export function loadFixtureCase(path: string, dir: string = FIXTURE_CASE_DIR): FixtureCase {
+  let real: string;
+  let realDir: string;
+  try {
+    realDir = realpathSync(dir);
+    // Relative to the current directory, or else to the repo root (pnpm --filter runs the script
+    // from packages/trial). Either way the result must land in `dir`, checked below.
+    let target = resolve(path);
+    try {
+      target = realpathSync(target);
+    } catch {
+      target = realpathSync(resolve(REPO_ROOT, path));
+    }
+    real = target;
+  } catch {
+    throw new FixtureCaseError(
+      `--fixture-case: ${path} does not exist (only files in fixtures/casefiles/ are accepted)`,
+    );
+  }
+  const rel = relative(realDir, real);
+  if (rel === '' || rel.startsWith('..') || isAbsolute(rel) || rel.includes(sep)) {
+    throw new FixtureCaseError(
+      '--fixture-case only accepts a file directly inside the repo fixtures/casefiles/ directory',
+    );
+  }
+  if (!rel.endsWith('.json')) throw new FixtureCaseError('--fixture-case needs a .json file');
+  const st = statSync(real);
+  if (!st.isFile()) throw new FixtureCaseError('--fixture-case is not a regular file');
+  if (st.size > FIXTURE_CASE_MAX_BYTES) {
+    throw new FixtureCaseError(
+      `--fixture-case is larger than ${FIXTURE_CASE_MAX_BYTES / 1024} KiB`,
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(real, 'utf8'));
+  } catch {
+    throw new FixtureCaseError('--fixture-case is not valid JSON');
+  }
+  const cf = CaseFile.safeParse(parsed);
+  if (!cf.success) throw new FixtureCaseError('--fixture-case is not a valid contract CaseFile');
+  return { relPath: relative(REPO_ROOT, real).split(sep).join('/'), caseFile: cf.data };
+}
+
+/** The turn budget the worker passes to every Defense turn (apps/worker `trialSettings`). */
+export interface WorkerTurn {
+  maxTurns: number;
+  budget: Budget;
+}
+
+/** apps/worker defaults, except `maxUsd`, which defaults to the probe's per-turn ceiling. */
+export const WORKER_TURN_DEFAULTS: WorkerTurn = {
+  maxTurns: 6,
+  budget: { maxInputTokens: 100_000, maxOutputTokens: 8_000, maxUsd: 0.5 },
+};
+/** Highest per-turn USD a P7 probe passes as `maxBudgetUsd` and reserves against the cap. */
+export const P7_MAX_TURN_USD = 0.5;
+
+/** The env names apps/worker reads for the turn budget; read here as plain numbers only. */
+export const WORKER_TURN_ENV = {
+  maxTurns: 'AFFIDAVIT_AGENT_MAX_TURNS',
+  maxInputTokens: 'AFFIDAVIT_TURN_MAX_INPUT_TOKENS',
+  maxOutputTokens: 'AFFIDAVIT_TURN_MAX_OUTPUT_TOKENS',
+  maxUsd: 'AFFIDAVIT_TURN_MAX_USD',
+} as const;
+
+/**
+ * The worker's turn budget from the same variables apps/worker reads, falling back to its
+ * defaults. `maxUsd` is capped at `P7_MAX_TURN_USD`; it only bounds spend and never changes the
+ * request the API sees. Returns notes for anything not taken as given.
+ */
+export function workerTurnFrom(env: Env): { turn: WorkerTurn; notes: string[] } {
+  const notes: string[] = [];
+  const int = (name: string, fallback: number, max: number): number => {
+    const raw = env[name];
+    if (raw === undefined || raw === '') return fallback;
+    const n = Number(raw);
+    if (!/^[0-9]{1,9}$/.test(raw) || n < 1 || n > max) {
+      notes.push(`${name} is not a usable integer; using ${fallback}`);
+      return fallback;
+    }
+    return n;
+  };
+  let usd = WORKER_TURN_DEFAULTS.budget.maxUsd;
+  const rawUsd = env[WORKER_TURN_ENV.maxUsd];
+  if (rawUsd !== undefined && rawUsd !== '') {
+    const n = Number(rawUsd);
+    if (!Number.isFinite(n) || n <= 0) notes.push(`${WORKER_TURN_ENV.maxUsd} is not usable`);
+    else if (n > P7_MAX_TURN_USD) {
+      notes.push(
+        `${WORKER_TURN_ENV.maxUsd}=${n} capped at ${P7_MAX_TURN_USD} for the probe (it bounds spend only; the request is the same)`,
+      );
+      usd = P7_MAX_TURN_USD;
+    } else usd = n;
+  }
+  return {
+    turn: {
+      maxTurns: int(WORKER_TURN_ENV.maxTurns, WORKER_TURN_DEFAULTS.maxTurns, 50),
+      budget: {
+        maxInputTokens: int(
+          WORKER_TURN_ENV.maxInputTokens,
+          WORKER_TURN_DEFAULTS.budget.maxInputTokens,
+          2_000_000,
+        ),
+        maxOutputTokens: int(
+          WORKER_TURN_ENV.maxOutputTokens,
+          WORKER_TURN_DEFAULTS.budget.maxOutputTokens,
+          200_000,
+        ),
+        maxUsd: usd,
+      },
+    },
+    notes,
+  };
+}
+
+/** The turn values the synthetic port probes (P4b, P5) use. */
+export function probeTurn(reserveUsd: number): WorkerTurn {
+  return {
+    maxTurns: 2,
+    budget: { maxInputTokens: 200_000, maxOutputTokens: 2_000, maxUsd: reserveUsd },
+  };
+}
+
+/** Shape facts about a user message, for the report. Never its content. */
+export function describeUser(text: string): string {
+  const lines = text.split('\n');
+  const longest = Math.max(...lines.map((l) => l.length));
+  const blocks = [...text.matchAll(/<<<BEGIN UNTRUSTED DATA source=([a-z0-9:_-]{1,64}) /g)].map(
+    (m) => m[1],
+  );
+  return `${Buffer.byteLength(text, 'utf8')} bytes, ${lines.length} lines, longest line ${longest} chars, sha256 ${sha256Hex(text).slice(0, 12)}, blocks [${blocks.join(', ')}]`;
+}
+
+// ---------------------------------------------------------------------------------------------
 // The ladder.
 // ---------------------------------------------------------------------------------------------
 
@@ -146,6 +332,100 @@ export interface ProbeSpec {
   /** For a port probe: the prompt version and schema ref the port checks. */
   readonly promptVersion?: string;
   readonly outputSchemaRef?: string;
+  /**
+   * For a port probe: the turn cap and budget passed to `runTurn`. Unset means the synthetic
+   * probe values (`probeTurn`). Its `maxUsd` is also what the probe reserves against the cap.
+   */
+  readonly turn?: WorkerTurn;
+  /** For a port probe: the port mode. Record writes to a fresh temp directory, removed after. */
+  readonly mode?: 'live' | 'record';
+}
+
+/**
+ * P7: the worker's own Defense turn, on a checked-in fixture case file. Every user message here
+ * is built by the real `defenseBlocks` and `renderPrompt`, as `createDefenseHandler` builds it
+ * for the first attempt (no Judge feedback yet).
+ */
+export function buildFixtureLadder(
+  table: ModelTable,
+  fixture: FixtureCase,
+  worker: WorkerTurn,
+  reserveUsd: number,
+): ProbeSpec[] {
+  const model = table.defense;
+  const cf = fixture.caseFile;
+  const render = (origin: string, blocks: readonly UntrustedBlock[]) => {
+    const r = renderPrompt('defense', blocks);
+    return {
+      system: synthetic('packaged-defense-system', r.system),
+      user: fixtureText(origin, r.user),
+      promptVersion: r.version,
+      outputSchemaRef: r.outputSchemaRef,
+    };
+  };
+  const full = render('fixture-full', defenseBlocks(cf, []));
+  const noSlices = render('fixture-no-slices', defenseBlocks({ ...cf, slices: [] }, []));
+  const slicesOnly = render(
+    'fixture-slices-only',
+    defenseBlocks(cf, []).filter((b) => b.label === 'case-file-slice'),
+  );
+  const trivial = defenseRendered('rendered-defense-tool-user', TOOL_USER.text);
+  const base = { path: 'port' as const, model, tools: ['submit_witness'] as const };
+  const at = `on ${model}, ${fixture.relPath}`;
+  // Ordered by what each tells apart, so the USD cap drops the least informative last.
+  return [
+    {
+      ...base,
+      id: 'P7a',
+      name: `worker Defense turn replayed: real input builder, worker budget, live mode, ${at}`,
+      ...full,
+      turn: worker,
+      mode: 'live',
+    },
+    {
+      ...base,
+      id: 'P7c:no-slices',
+      name: `as P7a with the code slices removed (candidate block only), ${at}`,
+      ...noSlices,
+      turn: worker,
+      mode: 'live',
+    },
+    {
+      ...base,
+      id: 'P7c:trivial',
+      name: `trivial synthetic envelope (as P4b) with the worker budget, on ${model}`,
+      system: trivial.system,
+      user: trivial.user,
+      promptVersion: trivial.version,
+      outputSchemaRef: trivial.outputSchemaRef,
+      turn: worker,
+      mode: 'live',
+    },
+    {
+      ...base,
+      id: 'P7b',
+      name: `as P7a in record mode (temp record dir, removed after), ${at}`,
+      ...full,
+      turn: worker,
+      mode: 'record',
+    },
+    {
+      ...base,
+      id: 'P7c:slices-only',
+      name: `as P7a with only the code slices (no candidate block), ${at}`,
+      ...slicesOnly,
+      turn: worker,
+      mode: 'live',
+    },
+    {
+      ...base,
+      id: 'P7c:probe-budget',
+      name: `as P7a with the synthetic probe turn values instead of the worker budget, ${at}`,
+      ...full,
+      turn: probeTurn(reserveUsd),
+      mode: 'live',
+    },
+  ];
 }
 
 export interface LadderOptions {
@@ -445,6 +725,18 @@ export interface ProbeResult {
   detail: string;
   runtime?: RuntimeInfo;
   stderrTail?: string[];
+  /** For a refusal: the category the response named, in the closed snake_case shape. */
+  refusalCategory?: string;
+  /** For a refusal: the provider's explanation, redacted. Shown only on this local diagnostic. */
+  refusalExplanation?: string;
+  /** The SDK option values the probe ran with. Names and shapes only: never the key or env values. */
+  optionsUsed?: string;
+  /** The turn cap and budget passed to `runTurn`, and how each reaches the SDK. */
+  turnUsed?: string;
+  /** Shape facts about the user message (size, lines, hash, block labels). Never its content. */
+  userShape?: string;
+  /** Record mode only: what the recording store did. */
+  recording?: string;
 }
 
 export interface ProbeDeps {
@@ -468,6 +760,9 @@ interface StreamFacts {
   runtime?: RuntimeInfo;
   providerError?: string;
   providerText?: string;
+  refusalCategory?: string;
+  refusalExplanation?: string;
+  fallbackModel?: string;
   requestId?: string;
   result?: {
     subtype: string;
@@ -512,7 +807,15 @@ function observe(facts: StreamFacts, msg: SDKMessage): void {
   } else if (msg.type === 'assistant') {
     const content = (msg.message as { content?: unknown }).content;
     if (msg.error !== undefined && facts.providerError === undefined) {
-      facts.providerError = String(msg.error);
+      // The runtime reports a refused response under `invalid_request`; tell them apart here.
+      const refusal = refusalOf(msg.message);
+      facts.providerError = refusal === undefined ? String(msg.error) : REFUSAL_CLASS;
+      if (refusal !== undefined && refusal !== '') facts.refusalCategory = refusal;
+      const details = (msg.message as { stop_details?: { explanation?: unknown } | null })
+        .stop_details;
+      if (refusal !== undefined && typeof details?.explanation === 'string') {
+        facts.refusalExplanation = details.explanation;
+      }
       const t = textOf(content);
       if (t !== '') facts.providerText = t;
       if (typeof m.request_id === 'string') facts.requestId = m.request_id;
@@ -526,6 +829,21 @@ function observe(facts: StreamFacts, msg: SDKMessage): void {
       if (facts.requestId === undefined && typeof m.request_id === 'string') {
         facts.requestId = m.request_id;
       }
+    }
+  } else if (
+    msg.type === 'system' &&
+    (m.subtype === 'model_refusal_fallback' || m.subtype === 'model_refusal_no_fallback')
+  ) {
+    if (facts.providerError === undefined || facts.providerError === 'invalid_request') {
+      facts.providerError = REFUSAL_CLASS;
+    }
+    const c = m.api_refusal_category;
+    if (typeof c === 'string' && /^[a-z_]{1,40}$/.test(c)) facts.refusalCategory ??= c;
+    if (typeof m.api_refusal_explanation === 'string') {
+      facts.refusalExplanation ??= m.api_refusal_explanation;
+    }
+    if (m.subtype === 'model_refusal_fallback') {
+      facts.fallbackModel = str(m.fallback_model);
     }
   } else if (msg.type === 'result') {
     const errors = Array.isArray(m.errors)
@@ -593,6 +911,9 @@ function factsToResult(
     detailParts.push(
       `result ${r.subtype}${r.numTurns === undefined ? '' : `, ${r.numTurns} turn(s)`}`,
     );
+  if (facts.fallbackModel !== undefined) {
+    detailParts.push(`runtime fell back to ${showRaw(facts.fallbackModel, key)} after a refusal`);
+  }
   if (facts.toolCalls.length > 0) detailParts.push(`called ${facts.toolCalls.join(', ')}`);
   else if (!failed && facts.replyText.trim() !== '') {
     detailParts.push(`replied "${showRaw(facts.replyText, key).slice(0, 60)}"`);
@@ -602,6 +923,10 @@ function factsToResult(
     name: spec.name,
     status: failed ? 'FAIL' : 'PASS',
     ...(facts.providerError === undefined ? {} : { errorClass: facts.providerError }),
+    ...(facts.refusalCategory === undefined ? {} : { refusalCategory: facts.refusalCategory }),
+    ...(facts.refusalExplanation === undefined
+      ? {}
+      : { refusalExplanation: showRaw(facts.refusalExplanation, key) }),
     ...(r?.status === undefined ? {} : { httpStatus: r.status }),
     ...(raw === undefined ? {} : { rawMessage: showRaw(raw, key) }),
     ...(facts.requestId === undefined ? {} : { requestId: facts.requestId }),
@@ -695,8 +1020,10 @@ async function runPortProbe(
 ): Promise<ProbeResult> {
   const facts: StreamFacts = { toolCalls: [], replyText: '' };
   const err = stderrCollector();
+  let sentOptions: Options | undefined;
   // The real transport, observed: every message is also read here, and stderr is collected.
   const tee: AgentTransport = (params) => {
+    sentOptions = params.options;
     const inner = deps.transport({
       prompt: params.prompt,
       options: { ...params.options, stderr: err.collect },
@@ -708,14 +1035,9 @@ async function runPortProbe(
       }
     })();
   };
-  const port = new AnthropicModelPort({
-    mode: 'live',
-    modelTable: deps.modelTable,
-    timeoutMs: deps.timeoutMs ?? PROBE_TIMEOUT_MS,
-    transport: tee,
-    env: deps.env,
-    ...(deps.makeWorkdir === undefined ? {} : { makeWorkdir: deps.makeWorkdir }),
-  });
+  const mode = spec.mode ?? 'live';
+  const recordDir = mode === 'record' ? mkdtempSync(join(tmpdir(), 'affidavit-probe-rec-')) : '';
+  const turn = spec.turn ?? probeTurn(budgetUsd);
   const req: ModelTurnRequest = {
     promptId: 'defense',
     promptVersion: spec.promptVersion ?? getPrompt('defense').version,
@@ -724,15 +1046,38 @@ async function runPortProbe(
     user: spec.user.text,
     tools: spec.tools,
     outputSchemaRef: spec.outputSchemaRef ?? getPrompt('defense').outputSchemaRef,
-    maxTurns: 2,
-    budget: { maxInputTokens: 200_000, maxOutputTokens: 2_000, maxUsd: budgetUsd },
+    maxTurns: turn.maxTurns,
+    budget: turn.budget,
   };
   let outcome: string | undefined;
   let portError: unknown;
+  let recording: string | undefined;
   try {
-    outcome = (await port.runTurn(req)).outcome;
-  } catch (e) {
-    portError = e;
+    const port = new AnthropicModelPort({
+      mode,
+      modelTable: deps.modelTable,
+      timeoutMs: deps.timeoutMs ?? PROBE_TIMEOUT_MS,
+      transport: tee,
+      env: deps.env,
+      ...(mode === 'record' ? { recordings: new FileRecordingStore(recordDir) } : {}),
+      ...(deps.makeWorkdir === undefined ? {} : { makeWorkdir: deps.makeWorkdir }),
+    });
+    try {
+      outcome = (await port.runTurn(req)).outcome;
+    } catch (e) {
+      portError = e;
+    }
+  } finally {
+    if (mode === 'record') {
+      let files: number;
+      try {
+        files = readdirSync(join(recordDir, 'defense')).length;
+      } catch {
+        files = 0;
+      }
+      recording = `record mode: ${files} recording file(s) written to the temp dir (now removed)`;
+      rmSync(recordDir, { recursive: true, force: true });
+    }
   }
   const base = factsToResult(spec, facts, key, { timedOut: false, stderr: err.lines });
   const portMessage = portError === undefined ? undefined : describeThrown(portError, [key]);
@@ -743,7 +1088,55 @@ async function runPortProbe(
     detail: [outcome === undefined ? 'port threw' : `port outcome ${outcome}`, base.detail].join(
       '; ',
     ),
+    ...(sentOptions === undefined ? {} : { optionsUsed: describeOptions(sentOptions) }),
+    turnUsed: describeTurn(mode, turn),
+    userShape: describeUser(spec.user.text),
+    ...(recording === undefined ? {} : { recording }),
   };
+}
+
+/**
+ * The SDK option values a turn ran with, as names, numbers and shapes. Env values, the system
+ * prompt text and the cwd path are never shown; the key is never shown.
+ */
+export function describeOptions(o: Options): string {
+  const list = (v: unknown): string =>
+    Array.isArray(v) ? `[${(v as unknown[]).map(String).join(', ')}]` : String(v);
+  const rec = o as unknown as Record<string, unknown>;
+  const notSet = (k: string): string => (rec[k] === undefined ? 'unset' : JSON.stringify(rec[k]));
+  return [
+    `model ${String(o.model)}`,
+    `maxTurns ${String(o.maxTurns)}`,
+    `maxBudgetUsd ${String(o.maxBudgetUsd)}`,
+    `permissionMode ${String(o.permissionMode)}`,
+    `tools ${list(o.tools)}`,
+    `allowedTools ${list(o.allowedTools)}`,
+    `disallowedTools ${Array.isArray(o.disallowedTools) ? o.disallowedTools.length : 0} names`,
+    `mcpServers [${Object.keys(o.mcpServers ?? {}).join(', ')}]`,
+    `strictMcpConfig ${String(o.strictMcpConfig)}`,
+    `settingSources ${list(o.settingSources)}`,
+    `hooks [${Object.keys(o.hooks ?? {}).join(', ')}]`,
+    `persistSession ${String(o.persistSession)}`,
+    `includePartialMessages ${String(o.includePartialMessages)}`,
+    `enableFileCheckpointing ${String(o.enableFileCheckpointing)}`,
+    `systemPrompt ${typeof o.systemPrompt === 'string' ? `${o.systemPrompt.length} chars` : 'not a string'}`,
+    `resume ${notSet('resume')}`,
+    `continue ${notSet('continue')}`,
+    `forkSession ${notSet('forkSession')}`,
+    `fallbackModel ${notSet('fallbackModel')}`,
+    `maxThinkingTokens ${notSet('maxThinkingTokens')}`,
+    `thinking ${notSet('thinking')}`,
+    `effort ${notSet('effort')}`,
+    `cwd ${typeof o.cwd === 'string' ? 'fresh temp dir' : 'unset'}`,
+    `env names [${Object.keys(o.env ?? {})
+      .sort()
+      .join(', ')}]`,
+  ].join('; ');
+}
+
+/** The turn values passed to `runTurn`, and which of them reach the SDK at all. */
+export function describeTurn(mode: string, t: WorkerTurn): string {
+  return `mode ${mode}; maxTurns ${t.maxTurns} (sent as SDK maxTurns); maxUsd ${t.budget.maxUsd} (sent as SDK maxBudgetUsd); maxInputTokens ${t.budget.maxInputTokens} and maxOutputTokens ${t.budget.maxOutputTokens} (checked by the port on reported usage; not sent to the SDK or the API)`;
 }
 
 async function runFetchProbe(spec: ProbeSpec, deps: ProbeDeps, key: string): Promise<ProbeResult> {
@@ -841,6 +1234,21 @@ export interface RunOptions {
   maxUsd?: number;
   reserveUsd?: number;
   onResult?: (r: ProbeResult) => void;
+  /**
+   * Accept fixture-derived input (P7). Only `--fixture-case` with a path `loadFixtureCase`
+   * accepted sets it. Without it, a probe whose input is not synthetic is refused.
+   */
+  allowFixtureInput?: boolean;
+}
+
+/** What a probe reserves against the cap before it runs: its own turn USD, or the reserve. */
+function reserveFor(spec: ProbeSpec, reserve: number): number {
+  return spec.turn?.budget.maxUsd ?? reserve;
+}
+
+function inputAllowed(spec: ProbeSpec, allowFixture: boolean): boolean {
+  const ok = (t: SyntheticText): boolean => isSynthetic(t) || (allowFixture && isFixtureText(t));
+  return ok(spec.system) && ok(spec.user);
 }
 
 /**
@@ -867,7 +1275,7 @@ export async function runLadder(
     opts.onResult?.(r);
   };
   for (const spec of ladder) {
-    if (!isSynthetic(spec.system) || !isSynthetic(spec.user)) {
+    if (!inputAllowed(spec, opts.allowFixtureInput === true)) {
       push({
         id: spec.id,
         name: spec.name,
@@ -876,12 +1284,22 @@ export async function runLadder(
       });
       continue;
     }
-    if (charged + reserve > maxUsd + 1e-9) {
+    const probeReserve = reserveFor(spec, reserve);
+    if (spec.turn !== undefined && !(probeReserve > 0 && probeReserve <= P7_MAX_TURN_USD)) {
+      push({
+        id: spec.id,
+        name: spec.name,
+        status: 'REFUSED',
+        detail: `probe ${spec.id} refused: its turn USD must be above 0 and at most ${P7_MAX_TURN_USD}`,
+      });
+      continue;
+    }
+    if (charged + probeReserve > maxUsd + 1e-9) {
       push({
         id: spec.id,
         name: spec.name,
         status: 'SKIP',
-        detail: `USD cap: ${charged.toFixed(4)} charged of ${maxUsd.toFixed(2)}`,
+        detail: `USD cap: ${charged.toFixed(4)} charged of ${maxUsd.toFixed(2)}, this probe reserves ${probeReserve.toFixed(2)}`,
       });
       continue;
     }
@@ -892,8 +1310,8 @@ export async function runLadder(
         spec.path === 'fetch'
           ? await runFetchProbe(spec, deps, key)
           : spec.path === 'port'
-            ? await runPortProbe(spec, deps, key, reserve)
-            : await runSdkProbe(spec, deps, key, reserve);
+            ? await runPortProbe(spec, deps, key, probeReserve)
+            : await runSdkProbe(spec, deps, key, probeReserve);
     } catch (e) {
       r = {
         id: spec.id,
@@ -903,7 +1321,11 @@ export async function runLadder(
         detail: describeThrown(e, [key]),
       };
     }
-    charged += r.costUsd ?? reserve;
+    // A refusal is billed even when the runtime reports no spend for it: reserve the cap then.
+    const reported = r.costUsd;
+    const refusedUnreported =
+      r.errorClass === REFUSAL_CLASS && (reported === undefined || reported === 0);
+    charged += refusedUnreported ? probeReserve : (reported ?? probeReserve);
     push({ ...r, model: spec.model });
   }
   return { results, chargedUsd: charged };
@@ -918,6 +1340,12 @@ export const BANNER = [
   'RAW PROVIDER TEXT IS SHOWN below, after key redaction, because every probe input is fixed synthetic text.',
   'No case file and no repository content is sent. A probe whose input is not synthetic is refused.',
   'P6 probes call https://api.anthropic.com/v1/messages directly and bypass the Agent SDK.',
+].join('\n');
+
+export const FIXTURE_BANNER = [
+  '*** --fixture-case: P7 probes send a CHECKED-IN FIXTURE CASE FILE (public corpus content from fixtures/casefiles/) to the model. ***',
+  '*** Raw provider text for P7 is shown below for this local diagnostic only, after key redaction. Do not paste it into a ticket or a recording without reading it first. ***',
+  '*** P7 never reads a user repository, the database, or any case the worker holds. ***',
 ].join('\n');
 
 const statusOf = (results: readonly ProbeResult[], id: string): ProbeStatus | undefined =>
@@ -977,13 +1405,47 @@ export function interpret(results: readonly ProbeResult[]): string[] {
       'P6a fails while P1 passes: the Defense model id or the direct request is refused; compare with P2.',
     );
   }
+  const p7 = results.filter((r) => r.id.startsWith('P7'));
+  const refused = p7.filter((r) => r.errorClass === REFUSAL_CLASS).map((r) => r.id);
+  if (refused.length > 0) {
+    const cats = [...new Set(p7.map((r) => r.refusalCategory).filter((c) => c !== undefined))];
+    out.push(
+      `${refused.join(', ')}: the model's safeguards REFUSED the request (stop_reason refusal${cats.length > 0 ? `, category ${cats.join(', ')}` : ''}). The runtime reports this as invalid_request, which is what the worker saw. The request is well formed; the case content (or the task the Defense prompt asks for on it) is what is declined. This is a policy question for the lead, not a request bug.`,
+    );
+  }
+  if (s('P7a') === 'FAIL' && s('P7c:trivial') === 'PASS') {
+    out.push(
+      'P7a fails and P7c:trivial passes with the same worker budget: the budget mapping is not the cause; the real input is.',
+    );
+  }
+  if (s('P7a') === 'FAIL' && s('P7c:probe-budget') === 'FAIL') {
+    out.push('P7a and P7c:probe-budget both fail: the turn budget values are not the cause.');
+  }
+  if (s('P7a') === 'PASS' && s('P7c:probe-budget') === 'PASS' && s('P7b') === 'FAIL') {
+    out.push('P7a passes and P7b fails: record mode is the difference; read the P7b port message.');
+  }
+  if (s('P7a') === 'FAIL' && s('P7c:no-slices') === 'PASS') {
+    out.push(
+      'P7a fails and P7c:no-slices passes: the code slices are what the model or API refuses.',
+    );
+  }
+  if (s('P7a') === 'FAIL' && s('P7c:no-slices') === 'FAIL' && s('P7c:slices-only') === 'PASS') {
+    out.push(
+      'P7a and P7c:no-slices fail while P7c:slices-only passes: the candidate block is what is refused.',
+    );
+  }
+  if (s('P7a') === 'PASS' && s('P7b') === 'PASS') {
+    out.push(
+      "P7a and P7b pass on the fixture: the worker's failure depends on something the probe does not replay (the real case file the worker loads, Judge feedback in a later iteration, the worker's environment), not on the port path.",
+    );
+  }
   if (results.some((r) => r.status === 'SKIP'))
     out.push('Some probes were skipped by the USD cap; rerun with a higher --max-usd to see them.');
   if (results.some((r) => r.status === 'REFUSED'))
     out.push('Some probes were refused because their input was not synthetic.');
-  if (results.length > 0 && results.every((r) => r.status === 'PASS')) {
+  if (results.length > 0 && results.every((r) => r.status === 'PASS') && p7.length === 0) {
     out.push(
-      'Every probe passed: the failure depends on the real case content, the real turn count or budget, or a case file larger than P5.',
+      'Every probe passed: the failure depends on the real case content, the real turn count or budget, or a case file larger than P5. Rerun with --fixture-case fixtures/casefiles/<file>.json to replay the worker Defense turn (P7).',
     );
   }
   return out;
@@ -1000,7 +1462,15 @@ export function formatResult(r: ProbeResult): string {
   );
   lines.push(`  detail: ${r.detail}`);
   if (r.rawMessage !== undefined) lines.push(`  provider raw message (redacted): ${r.rawMessage}`);
+  if (r.refusalCategory !== undefined) lines.push(`  refusal category: ${r.refusalCategory}`);
+  if (r.refusalExplanation !== undefined) {
+    lines.push(`  refusal explanation (redacted): ${r.refusalExplanation}`);
+  }
   if (r.portMessage !== undefined) lines.push(`  port said: ${r.portMessage}`);
+  if (r.recording !== undefined) lines.push(`  ${r.recording}`);
+  if (r.userShape !== undefined) lines.push(`  user message: ${r.userShape}`);
+  if (r.turnUsed !== undefined) lines.push(`  turn values: ${r.turnUsed}`);
+  if (r.optionsUsed !== undefined) lines.push(`  SDK options: ${r.optionsUsed}`);
   if (r.requestId !== undefined) lines.push(`  request id: ${r.requestId}`);
   if (r.runtime !== undefined) {
     const rt = r.runtime;

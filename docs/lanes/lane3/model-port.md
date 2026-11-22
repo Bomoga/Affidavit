@@ -113,6 +113,31 @@ The same model overrides as the worker apply (`ANTHROPIC_MODEL_*`, `AFFIDAVIT_MO
 
 Every probe runs (no early stop). Each SDK probe gets `maxBudgetUsd` 0.05, fetch probes `max_tokens` 16, and a probe is skipped once the total charged (reported spend, or the full 0.05 reserve when spend is unknown) would pass the cap. These are caps, not estimates; real cost per probe is [metric] until it has run. The run ends with a summary table and one interpretation line per pattern: P1 fails means a key or organization problem; P2 lists which model ids work; P3 failing with P1 passing means the SDK option set; P4a failing with P3 passing means the tool schema; P4b failing with P4a passing means the Defense system prompt; P5 alone failing means size; P6b failing with P6c passing means the `$schema` keyword. Exit code 0 when every probe passes, 1 when any fails, 2 for a missing or malformed key.
 
+### Replaying the worker's Defense turn (P7, L3-18)
+
+The default ladder is synthetic only. `--fixture-case <path>` adds P7, which replays the worker's own Defense turn on a checked-in fixture case file. The path must resolve (links followed) to a `.json` file directly inside the repo's `fixtures/casefiles/` (public corpus content, never a user repository), at most 256 KiB, that parses as a contract `CaseFile`; anything else is refused before the banner and before any call. The user message is built by the real `defenseBlocks` (exported from `defense.ts`, the same function `createDefenseHandler` uses) and `renderPrompt`, as for a first attempt with no Judge feedback. A banner says that raw provider text is shown for this local diagnostic only; every printed line passes key and credential redaction. Fixture text is marked apart from synthetic text, and `runLadder` refuses it unless the script passed `allowFixtureInput`.
+
+```sh
+# >>> API KEY GOES HERE, from the secrets store, typed into this shell only. <<<
+export ANTHROPIC_API_KEY="<from the secrets store>"
+node --import tsx packages/trial/scripts/probe-model.ts --fixture-case fixtures/casefiles/nodegoat-nosqli-where-001.json --only-fixture --max-usd 2
+```
+
+| Probe            | What it sends                                                                                 |
+| ---------------- | --------------------------------------------------------------------------------------------- |
+| P7a              | The real Defense input from the fixture, the worker turn values, `runTurn` in live mode       |
+| P7c:no-slices    | P7a with the code slices removed (candidate block only)                                       |
+| P7c:trivial      | The synthetic P4b envelope with the worker turn values (isolates the budget mapping)          |
+| P7b              | P7a in record mode, writing to a fresh temp directory that is removed afterwards              |
+| P7c:slices-only  | P7a with only the code slices (no candidate block)                                            |
+| P7c:probe-budget | P7a with the synthetic probe turn values (maxTurns 2, 200000 / 2000 tokens, the 0.05 reserve) |
+
+The worker turn values come from the same variables apps/worker reads (`AFFIDAVIT_AGENT_MAX_TURNS`, `AFFIDAVIT_TURN_MAX_INPUT_TOKENS`, `AFFIDAVIT_TURN_MAX_OUTPUT_TOKENS`, `AFFIDAVIT_TURN_MAX_USD`), defaulting to 6, 100000, 8000 and 0.5, with the USD capped at 0.5 for the probe. Each P7 probe passes that USD as `maxBudgetUsd` and reserves it against the total cap; a refusal that reports no spend is charged the whole reserve. `--only-fixture` skips P1 to P6. For every P7 probe the report prints the status, class, refusal category and explanation (redacted), the raw provider message (redacted), the port's own message, the user message shape (bytes, lines, longest line, hash prefix, block labels; never its content), the turn values and how each reaches the SDK, and the SDK option values (names and numbers only; env variable names, never values).
+
+### A refusal looks like `invalid_request`
+
+The runtime (SDK 0.3.318) reports a response that ended with `stop_reason: "refusal"` (the model's safeguards declined the request) as an assistant error with the code `invalid_request`, the same code as a malformed request, and puts "safeguards flagged this message" text in its content. The port now tells them apart: such a message (or a `model_refusal_no_fallback` notice) is reported as class `refusal` with its category when it is a closed snake_case word (`cyber`, `bio`, ...), and the explanation is never forwarded. A refusal is billed (the input was read), so it is never in `REFUSED_BEFORE_WORK`, and a result that reports zero spend for it counts as unknown spend: the up-front charge stands. A `model_refusal_fallback` notice (the runtime retried on another model) fails the turn whatever was submitted, since the verdict must record the model the table names.
+
 ## Record and replay
 
 - `live`: real calls, nothing written. The only mode allowed unless `AFFIDAVIT_ENV` is `development` or `test`.

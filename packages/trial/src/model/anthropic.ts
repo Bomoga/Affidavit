@@ -181,6 +181,31 @@ export const REFUSED_BEFORE_WORK: ReadonlySet<string> = new Set([
   'authentication_failed',
 ]);
 
+/**
+ * The class the port reports for a model safety refusal. The runtime reports a response that
+ * ended with `stop_reason: "refusal"` (the model's safeguards declined the request) under the
+ * assistant error code `invalid_request`, the same code as a malformed request. They are not the
+ * same: a refusal is a well-formed request the model answered, after it read the whole input and
+ * possibly generated output, so it is billed and is never `REFUSED_BEFORE_WORK`.
+ */
+export const REFUSAL_CLASS = 'refusal';
+
+/** A refusal category from `stop_details.category`, only in the closed snake_case shape. */
+const REFUSAL_CATEGORY = /^[a-z_]{1,40}$/;
+
+/**
+ * Reads a refusal off an assistant error message the runtime built from a refused response (it
+ * sets `message.stop_reason` to `refusal` on that synthetic message). Returns the category when it is
+ * in the closed shape, `''` for a refusal with no usable category, or undefined for no refusal.
+ * The explanation is provider prose and is never read here.
+ */
+export function refusalOf(message: unknown): string | undefined {
+  const m = message as { stop_reason?: unknown; stop_details?: unknown } | null;
+  if (m === null || typeof m !== 'object' || m.stop_reason !== 'refusal') return undefined;
+  const category = (m.stop_details as { category?: unknown } | null | undefined)?.category;
+  return typeof category === 'string' && REFUSAL_CATEGORY.test(category) ? category : '';
+}
+
 /** Longest provider message an error carries. */
 export const PROVIDER_MESSAGE_MAX = 300;
 /** Shown in place of provider text that matches no known-safe shape. */
@@ -230,6 +255,11 @@ const TEMPLATES: readonly Template[] = [
   { pattern: /credit balance is too low/i, show: () => 'credit balance is too low' },
   { pattern: /\brate[ _-]?limit/i, show: () => 'rate limit' },
   { pattern: /\boverloaded\b/i, show: () => 'overloaded' },
+  {
+    // The runtime's text for a usage-policy refusal (stop_reason "refusal").
+    pattern: /safeguards flagged this message|can't help with this\. Start a new session/,
+    show: () => 'usage policy refusal: the model safeguards declined this request',
+  },
   {
     pattern: /prompt is too long: ([0-9]{1,9}) tokens > ([0-9]{1,9}) maximum/,
     show: (m) => `prompt is too long: ${m[1]} tokens > ${m[2]} maximum`,
@@ -337,8 +367,12 @@ function messageText(content: unknown): string {
 
 function describeProvider(p: ProviderFailure): string {
   const status = p.status === undefined ? '' : ` (HTTP ${p.status})`;
+  const category =
+    p.errorClass === REFUSAL_CLASS
+      ? ` (the model declined the request${p.refusalCategory === undefined ? '' : `, category ${p.refusalCategory}`}; a usage policy refusal, not a malformed request)`
+      : '';
   const said = p.message === undefined ? '' : `: ${p.message}`;
-  return `provider error ${p.errorClass}${status}${said}`;
+  return `provider error ${p.errorClass}${category}${status}${said}`;
 }
 
 /**
@@ -469,6 +503,8 @@ export class AnthropicModelPort implements PreflightModelPort {
     let providerError: string | undefined;
     // The provider's own words for the first error, kept raw here and sanitized before use.
     let providerText: string | undefined;
+    let refusalCategory: string | undefined;
+    let refusalFallback = false;
     let result: SDKResultMessage | undefined;
     const seen = new Map<string, Usage>();
 
@@ -539,7 +575,16 @@ export class AnthropicModelPort implements PreflightModelPort {
             // the rest) is a call error on its own, whatever the result later says. Only a code
             // from the closed snake_case set goes into the message.
             const code = String(msg.error);
-            providerError = /^[a-z_]{1,40}$/.test(code) ? code : 'unrecognised';
+            // A refused response comes through as `invalid_request` with stop_reason "refusal"
+            // on the synthetic message. Reported as its own class: it is billed, and it is the
+            // model declining the input, not a request the API could not parse.
+            const refusal = refusalOf(msg.message);
+            if (refusal !== undefined) {
+              providerError = REFUSAL_CLASS;
+              if (refusal !== '') refusalCategory = refusal;
+            } else {
+              providerError = /^[a-z_]{1,40}$/.test(code) ? code : 'unrecognised';
+            }
             // The runtime puts the provider's error text (for an API error, the status and the
             // provider's message) in the content of this synthetic assistant message.
             const text = messageText((msg.message as { content?: unknown }).content);
@@ -560,6 +605,24 @@ export class AnthropicModelPort implements PreflightModelPort {
           }
         } else if (msg.type === 'result') {
           result = msg;
+        } else if (msg.type === 'system') {
+          const sub = (msg as { subtype?: unknown }).subtype;
+          if (sub === 'model_refusal_fallback') {
+            // The runtime retried the refused request on another model. What that model says is
+            // not from the model the table names, and a verdict records one model per prompt,
+            // so the turn is refused whatever it went on to submit.
+            refusalFallback = true;
+          }
+          if (sub === 'model_refusal_fallback' || sub === 'model_refusal_no_fallback') {
+            const c = (msg as { api_refusal_category?: unknown }).api_refusal_category;
+            if (typeof c === 'string' && REFUSAL_CATEGORY.test(c)) refusalCategory ??= c;
+            if (
+              sub === 'model_refusal_no_fallback' &&
+              (providerError === undefined || providerError === 'invalid_request')
+            ) {
+              providerError = REFUSAL_CLASS;
+            }
+          }
         }
       }
     } catch (err) {
@@ -620,8 +683,18 @@ export class AnthropicModelPort implements PreflightModelPort {
       streamError === undefined &&
       used.inputTokens === 0 &&
       used.outputTokens === 0;
+    // A refusal is a response: the input was read and output may have been generated, so it is
+    // billed. A result that reports no spend for it under-reports, and is treated as unknown.
+    const refused = providerError === REFUSAL_CLASS || refusalFallback;
+    const reportsSpend = usd > 0 || cost.inputTokens > 0 || cost.outputTokens > 0;
     const failureCost: StageCost | undefined =
-      result !== undefined ? cost : refusedBeforeUsage ? { ...cost, usd: 0 } : undefined;
+      result !== undefined
+        ? refused && !reportsSpend
+          ? undefined
+          : cost
+        : refusedBeforeUsage
+          ? { ...cost, usd: 0 }
+          : undefined;
     const callError = (message: string, provider?: ProviderFailure): ModelCallError =>
       new ModelCallError(message, {
         ...(failureCost === undefined ? {} : { cost: failureCost }),
@@ -633,6 +706,16 @@ export class AnthropicModelPort implements PreflightModelPort {
     // unless the agent had already submitted, so an outage can never read as "no submission"
     // and dismiss a candidate.
     const outcome = ((): ModelTurnResult['outcome'] => {
+      if (refusalFallback) {
+        const provider: ProviderFailure = {
+          errorClass: REFUSAL_CLASS,
+          ...(refusalCategory === undefined ? {} : { refusalCategory }),
+          message: 'the runtime switched to a fallback model after a refusal; the turn is refused',
+        };
+        const text = `agent turn failed: ${describeProvider(provider)}`;
+        this.log('warn', `model turn ${promptId} on ${req.model}: ${text}`, secrets);
+        throw callError(text, provider);
+      }
       if (overBudget) return 'budget-exhausted';
       if (!box.captured) {
         if (timedOut) {
@@ -653,6 +736,9 @@ export class AnthropicModelPort implements PreflightModelPort {
           const message = raw === undefined ? undefined : sanitizeProviderMessage(raw, secrets);
           const provider: ProviderFailure = {
             errorClass: providerError,
+            ...(providerError === REFUSAL_CLASS && refusalCategory !== undefined
+              ? { refusalCategory }
+              : {}),
             ...(status === undefined ? {} : { status }),
             ...(message === undefined ? {} : { message }),
           };

@@ -70,7 +70,9 @@ Invariants, each covered by a test in `src/model/anthropic.test.ts` with a stubb
 
 ## Model probe (L3-17)
 
-`scripts/probe-model.ts` (logic in `src/model/probe.ts`) is a human-run diagnostic: tiny live calls with synthetic input only, raw provider text shown after key redaction. Nothing in the trial imports it. It reuses `buildAgentOptions` from `anthropic.ts`, so keep the port's options built there. See the guide, "Probing a provider error".
+`scripts/probe-model.ts` (logic in `src/model/probe.ts`) is a human-run diagnostic: tiny live calls with synthetic input only, raw provider text shown after key redaction. Nothing in the trial imports it. It reuses `buildAgentOptions` from `anthropic.ts`, so keep the port's options built there. See the guide, "Probing a provider error". L3-18 adds opt-in P7 (`--fixture-case`, only a file directly in `fixtures/casefiles/`): the worker's Defense turn replayed through `defenseBlocks` from `defense.ts`, so keep the Defense user message built there.
+
+A model safety refusal (`stop_reason: "refusal"`, which the runtime reports as `invalid_request`) is class `refusal` (`REFUSAL_CLASS`), never zero spend, and a runtime fallback to another model after a refusal fails the turn (`provider-errors.test.ts`).
 
 ## Intended libraries (notes for later, not installed yet)
 
