@@ -1092,13 +1092,79 @@ function groupBubbles(bubbles: readonly Bubble[]): Record<PanelId, Bubble[]> {
   return out;
 }
 
+/** What the case file page used to say above the terminal, now the first panel of it. */
+export interface TerminalBriefProps {
+  /** The case headline. It is the page title, shown in the terminal's title bar. */
+  headline: string;
+  summary: string;
+  /** Static wording for why the case is not verified, when it is not. */
+  notVerified?: { awaitingVerification: boolean; reasons: readonly string[] };
+  humanReview?: { reason: string; detail: string; nextSteps: readonly string[] };
+  connection?: ReactNode;
+}
+
+export function TerminalBrief({ brief, uid }: { brief: TerminalBriefProps; uid: string }) {
+  const headingId = `${uid}-brief`;
+  const review = brief.humanReview;
+  return (
+    <section className="term-brief" aria-labelledby={headingId}>
+      <div className="term-box">
+        <div className="term-bar">
+          <PanelHeading id={headingId}>Summary</PanelHeading>
+          <p className="term-bar-meta">{`Cost: ${METRIC}. Time to verdict: ${METRIC}.`}</p>
+        </div>
+        <div className="term-body">
+          <p>{brief.summary}</p>
+          {brief.connection}
+          {brief.notVerified ? (
+            <>
+              <p className="term-dim">Why this is not verified</p>
+              {brief.notVerified.awaitingVerification ? (
+                <p>
+                  The verdict says the fix works, and the Judge has not rejected the patch. But the
+                  Judge&apos;s own patch check is not in this record yet, and the VERIFIED stamp
+                  rests only on that check, never on the verdict&apos;s claim. The stamp appears
+                  once the check is recorded and passes.
+                </p>
+              ) : null}
+              <ul>
+                {brief.notVerified.reasons.map((r, i) => (
+                  <li key={i}>{r}</li>
+                ))}
+              </ul>
+            </>
+          ) : null}
+          {review ? (
+            <section className="term-brief-review" aria-labelledby={`${uid}-review`}>
+              <p id={`${uid}-review`} className="term-brief-review-title">
+                Human review needed
+              </p>
+              <p>{review.reason}</p>
+              <p className="term-dim">Recorded detail</p>
+              <p>{review.detail}</p>
+              <p className="term-dim">Next steps</p>
+              <ul>
+                {review.nextSteps.map((step, i) => (
+                  <li key={i}>{step}</li>
+                ))}
+              </ul>
+            </section>
+          ) : null}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 export function Terminal({
   view,
   toolbar,
+  brief,
   embedded = false,
 }: {
   view: TerminalView;
   toolbar?: ReactNode;
+  brief?: TerminalBriefProps;
   /** Inside a page with its own h1: the title becomes an h2 and panel headings h3. */
   embedded?: boolean;
 }) {
@@ -1120,11 +1186,13 @@ export function Terminal({
         <div className="term-status">
           {embedded ? (
             <h2 id={titleId} className="term-title">
-              <span className="term-brand">Affidavit</span> trial terminal
+              <span className="term-brand">Affidavit</span>{' '}
+              {brief ? brief.headline : 'trial terminal'}
             </h2>
           ) : (
             <h1 id={titleId} className="term-title">
-              <span className="term-brand">Affidavit</span> trial terminal
+              <span className="term-brand">Affidavit</span>{' '}
+              {brief ? brief.headline : 'trial terminal'}
             </h1>
           )}
           <dl className="term-status-fields">
@@ -1147,6 +1215,7 @@ export function Terminal({
           </dl>
         </div>
         {toolbar}
+        {brief ? <TerminalBrief brief={brief} uid={uid} /> : null}
 
         <div className="term-grid">
           <Panel
@@ -1241,10 +1310,12 @@ export function Terminal({
 export function TerminalWithScrubber({
   events,
   content,
+  brief,
   embedded = false,
 }: {
   events: readonly TrialEvent[];
   content?: readonly Exhibit[];
+  brief?: TerminalBriefProps;
   embedded?: boolean;
 }) {
   const uid = useId();
@@ -1297,5 +1368,7 @@ export function TerminalWithScrubber({
       </span>
     </div>
   );
-  return <Terminal view={view} toolbar={toolbar} embedded={embedded} />;
+  return (
+    <Terminal view={view} toolbar={toolbar} embedded={embedded} {...(brief ? { brief } : {})} />
+  );
 }

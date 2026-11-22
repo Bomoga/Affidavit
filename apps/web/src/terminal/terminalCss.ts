@@ -96,6 +96,11 @@ export const TERMINAL_CSS = `
 .term-scrub button:hover { border-color: var(--color-text); }
 .term-scrub button:disabled { color: var(--color-muted); border-style: dotted; cursor: default; }
 
+/* Brief: headline, summary and review notes, above the grid */
+.term-brief { margin-top: 0.5rem; }
+.term-brief-review { margin-top: 0.375rem; padding: 0.25rem 0.5rem; border: 1px solid var(--color-warn); }
+.term-brief-review-title { font-weight: 700; color: var(--color-warn); }
+
 /* Grid of panels */
 .term-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0.5rem; margin-top: 0.5rem; align-items: stretch; }
 .term-panel { display: flex; flex-direction: column; min-width: 0; }
