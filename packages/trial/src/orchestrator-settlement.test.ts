@@ -1,0 +1,487 @@
+// L3-21: settling the up-front charge after every model call (CR-T1) and recording why a case
+// halted (CR-T12, CR-T13), on a FakeCaseStore given the sink, so a release against the wrong
+// seq, stage or attempt is refused the way the Postgres store will refuse it.
+import { describe, expect, it } from 'vitest';
+import {
+  Verdict,
+  type Budget,
+  type CaseStage,
+  type ModelPort,
+  type StageCost,
+  type TrialEvent,
+} from '@affidavit/contracts';
+import { FakeEventSink } from '@affidavit/testing';
+import { REFUSAL_CLASS } from './model/anthropic.js';
+import { ModelCallError, ModelUnconfiguredError } from './model/errors.js';
+import {
+  Orchestrator,
+  RetryStageError,
+  type AgentRequest,
+  type BudgetSettlement,
+  type ModelTurnResult,
+  type StageHandler,
+} from './orchestrator.js';
+import {
+  BIG_BUDGET,
+  LoggingCaseStore,
+  NOW,
+  PATH_TO,
+  assertSchemaValid,
+  makeCaseFile,
+  openAt,
+} from './test-support.js';
+
+const CF = makeCaseFile();
+const CASE = CF.id;
+
+/** The turn cap from the first real run: $0.50, 100000 input and 8000 output tokens. */
+const TURN_BUDGET = { maxInputTokens: 100_000, maxOutputTokens: 8_000, maxUsd: 0.5 };
+
+const req = (overrides: Partial<AgentRequest> = {}): AgentRequest => ({
+  actor: 'defense',
+  promptId: 'defense',
+  promptVersion: '1.0.0',
+  model: 'model-a',
+  system: 'static system text',
+  user: 'u',
+  tools: ['submit_witness'],
+  outputSchemaRef: 'Witness',
+  maxTurns: 4,
+  budget: TURN_BUDGET,
+  ...overrides,
+});
+
+const spent = (usd: number, inputTokens = 900, outputTokens = 120): StageCost => ({
+  stage: 'defense',
+  attempt: 1,
+  inputTokens,
+  outputTokens,
+  usd,
+  wallMs: 7,
+});
+
+type Step = ModelTurnResult | Error;
+
+/** A model that answers (or throws) in call order. */
+function scripted(steps: readonly Step[]): ModelPort & { calls: number } {
+  const queue = [...steps];
+  const port = {
+    calls: 0,
+    runTurn(): Promise<ModelTurnResult> {
+      port.calls++;
+      const next = queue.shift();
+      if (next === undefined) return Promise.reject(new Error('script ran out'));
+      return next instanceof Error ? Promise.reject(next) : Promise.resolve(next);
+    },
+  };
+  return port;
+}
+
+async function setup(
+  opts: {
+    budget?: Budget;
+    stage?: readonly CaseStage[];
+    settlement?: BudgetSettlement;
+    killSwitch?: () => boolean;
+    maxStageAttempts?: number;
+  } = {},
+) {
+  const sink = new FakeEventSink();
+  const store = new LoggingCaseStore([], { events: sink, juryEnabled: false });
+  await openAt(store, CF, opts.budget ?? BIG_BUDGET, opts.stage ?? PATH_TO.defense);
+  const make = (handlers: Partial<Record<CaseStage, StageHandler>>, model: ModelPort) =>
+    new Orchestrator({
+      store,
+      sink,
+      model,
+      handlers,
+      config: {
+        killSwitch: opts.killSwitch ?? (() => false),
+        maxStageAttempts: opts.maxStageAttempts ?? 1,
+        now: () => NOW,
+      },
+      ...(opts.settlement === undefined ? {} : { settlement: opts.settlement }),
+    });
+  return { sink, store, make, events: () => assertSchemaValid(sink.events(CASE)) };
+}
+
+/** A Defense handler that makes `calls` model calls, swallowing call errors, then escalates. */
+function callingDefense(calls: number, seen?: { costs: readonly StageCost[] }): StageHandler {
+  return {
+    async run(ctx) {
+      for (let i = 0; i < calls; i++) {
+        try {
+          await ctx.runAgent(req());
+        } catch (e) {
+          if (!(e instanceof ModelCallError)) throw e;
+        }
+      }
+      if (seen) seen.costs = ctx.costs();
+      return { kind: 'escalate', reason: 'no-admissible-witness-above-floor', detail: 'test' };
+    },
+  };
+}
+
+const ofType = <T extends TrialEvent['type']>(events: readonly TrialEvent[], type: T) =>
+  events.filter((e): e is Extract<TrialEvent, { type: T }> => e.type === type);
+
+describe('settling a successful call (reason reservation-unspent)', () => {
+  it('gives back the unspent part so a $2 case survives many cheap calls (first real run)', async () => {
+    // Before L3-21 each call kept its $0.50 reservation, so the fourth call exhausted a $2 case.
+    const { store, events, make } = await setup({
+      budget: { maxInputTokens: 1_000_000, maxOutputTokens: 100_000, maxUsd: 2 },
+    });
+    const steps = Array.from({ length: 6 }, (): Step => ({
+      outcome: 'no-submission',
+      cost: spent(0.0005),
+    }));
+    const out = await make({ defense: callingDefense(6) }, scripted(steps)).run(CASE);
+    expect(out).toEqual({ status: 'terminal', stage: 'escalated' });
+    const evs = events();
+    expect(evs.some((e) => e.type === 'budget-exhausted')).toBe(false);
+    const escalated = ofType(evs, 'escalated');
+    expect(escalated[0]!.payload.escalation.reason).toBe('no-admissible-witness-above-floor');
+
+    const charged = ofType(evs, 'cost-charged');
+    const released = ofType(evs, 'cost-released');
+    expect(charged).toHaveLength(6);
+    expect(released).toHaveLength(6);
+    released.forEach((r, i) => {
+      expect(r.actor).toBe('defense');
+      expect(r.stage).toBe('defense');
+      expect(r.payload.reason).toBe('reservation-unspent');
+      expect(r.payload.reservationSeq).toBe(charged[i]!.seq);
+      expect(r.payload.cost).toMatchObject({
+        stage: 'defense',
+        attempt: 1,
+        inputTokens: TURN_BUDGET.maxInputTokens - 900,
+        outputTokens: TURN_BUDGET.maxOutputTokens - 120,
+        wallMs: 0,
+      });
+      expect(r.payload.cost.usd).toBeCloseTo(0.4995, 12);
+      expect(r.seq).toBeGreaterThan(charged[i]!.seq);
+    });
+    // The budget view after the last release is the real spend, not six reservations.
+    expect(released.at(-1)!.payload.remaining.remainingUsd).toBeCloseTo(2 - 6 * 0.0005, 6);
+    expect(store.releases(CASE).size).toBe(6);
+
+    const verdict = Verdict.parse(await store.getVerdict(CASE));
+    expect(verdict.cost).toHaveLength(6);
+    for (const c of verdict.cost) expect(c).toEqual(spent(0.0005));
+  });
+
+  it('keeps the reservation up front, so the model is never called past the budget', async () => {
+    const { store, events, make } = await setup({
+      budget: { maxInputTokens: 1_000_000, maxOutputTokens: 100_000, maxUsd: 0.4 },
+    });
+    const model = scripted([]);
+    const out = await make({ defense: callingDefense(1) }, model).run(CASE);
+    expect(out).toEqual({ status: 'terminal', stage: 'escalated' });
+    expect(model.calls).toBe(0);
+    expect(store.charges(CASE).map((c) => c.usd)).toEqual([0.5]);
+    expect(events().some((e) => e.type === 'cost-released')).toBe(false);
+  });
+
+  it('charges an overspent field and releases the unspent ones, netting to the reported cost', async () => {
+    const { store, events, make } = await setup();
+    const over = { ...spent(0.75), inputTokens: 120_000 };
+    const seen = { costs: [] as readonly StageCost[] };
+    await make(
+      { defense: callingDefense(1, seen) },
+      scripted([{ outcome: 'no-submission', cost: over }]),
+    ).run(CASE);
+    const evs = events();
+    expect(store.charges(CASE).map((c) => [c.inputTokens, c.outputTokens, c.usd])).toEqual([
+      [100_000, 8_000, 0.5],
+      [20_000, 0, 0.25],
+    ]);
+    const released = ofType(evs, 'cost-released');
+    expect(released).toHaveLength(1);
+    expect(released[0]!.payload.cost).toMatchObject({
+      inputTokens: 0,
+      outputTokens: 7_880,
+      usd: 0,
+    });
+    expect(seen.costs).toEqual([over]);
+  });
+
+  it('a release that fails does not fail a call that succeeded; the charge stands everywhere', async () => {
+    const { events, make, store } = await setup({
+      settlement: { release: () => Promise.reject(new Error('store down')) },
+    });
+    const seen = { costs: [] as readonly StageCost[] };
+    const out = await make(
+      { defense: callingDefense(1, seen) },
+      scripted([{ outcome: 'no-submission', cost: spent(0.001) }]),
+    ).run(CASE);
+    expect(out.stage).toBe('escalated');
+    expect(events().some((e) => e.type === 'cost-released')).toBe(false);
+    expect(seen.costs[0]).toMatchObject({ usd: 0.5, inputTokens: 100_000, outputTokens: 8_000 });
+    expect(Verdict.parse(await store.getVerdict(CASE)).cost[0]).toMatchObject({ usd: 0.5 });
+  });
+
+  it('a wired settlement is used instead of the store, once per reservation seq', async () => {
+    const calls: number[] = [];
+    const { make, store, events } = await setup({
+      settlement: {
+        release: (id, refund, seq) => {
+          calls.push(seq);
+          return store.releaseCharge(id, refund, seq);
+        },
+      },
+    });
+    await make(
+      { defense: callingDefense(2) },
+      scripted([
+        { outcome: 'no-submission', cost: spent(0.002) },
+        { outcome: 'no-submission', cost: spent(0.003) },
+      ]),
+    ).run(CASE);
+    const charged = ofType(events(), 'cost-charged').map((e) => e.seq);
+    expect(calls).toEqual(charged);
+    expect(
+      new Set(ofType(events(), 'cost-released').map((e) => e.payload.reservationSeq)).size,
+    ).toBe(2);
+  });
+});
+
+describe('the verdict cost agrees with the event stream', () => {
+  /** Net cost per stage and attempt from the stream alone: charges minus releases. */
+  function netFromStream(events: readonly TrialEvent[]) {
+    const net = new Map<string, { inputTokens: number; outputTokens: number; usd: number }>();
+    const add = (c: StageCost, sign: 1 | -1) => {
+      const key = `${c.stage}#${c.attempt}`;
+      const t = net.get(key) ?? { inputTokens: 0, outputTokens: 0, usd: 0 };
+      t.inputTokens += sign * c.inputTokens;
+      t.outputTokens += sign * c.outputTokens;
+      t.usd += sign * c.usd;
+      net.set(key, t);
+    };
+    for (const e of events) {
+      if (e.type === 'cost-charged') add(e.payload.cost, 1);
+      if (e.type === 'cost-released') add(e.payload.cost, -1);
+    }
+    return net;
+  }
+
+  function netFromVerdict(v: Verdict) {
+    const net = new Map<string, { inputTokens: number; outputTokens: number; usd: number }>();
+    for (const c of v.cost) {
+      const key = `${c.stage}#${c.attempt}`;
+      const t = net.get(key) ?? { inputTokens: 0, outputTokens: 0, usd: 0 };
+      t.inputTokens += c.inputTokens;
+      t.outputTokens += c.outputTokens;
+      t.usd += c.usd;
+      net.set(key, t);
+    }
+    return net;
+  }
+
+  it('replaying the events recomputes the verdict cost, across every settlement path', async () => {
+    const { store, events, make } = await setup({ maxStageAttempts: 2 });
+    const model = scripted([
+      // Attempt 1: a cheap success, an overspend, a failure that reported its spend, a failure
+      // with unknown spend, and a refused-before-work failure (zero spend).
+      { outcome: 'no-submission', cost: spent(0.0012) },
+      { outcome: 'no-submission', cost: { ...spent(0.6), outputTokens: 9_000 } },
+      new ModelCallError('agent turn failed', { cost: spent(0.0005, 300, 20) }),
+      new ModelCallError('stream broke'),
+      new ModelCallError('invalid_request', { cost: spent(0, 0, 0) }),
+      // Attempt 2: one sub-micro-dollar success.
+      { outcome: 'no-submission', cost: { ...spent(5e-7), attempt: 2 } },
+    ]);
+    const defense: StageHandler = {
+      async run(ctx) {
+        const n = ctx.attempt === 1 ? 5 : 1;
+        for (let i = 0; i < n; i++) {
+          try {
+            await ctx.runAgent(req());
+          } catch (e) {
+            if (!(e instanceof ModelCallError)) throw e;
+          }
+        }
+        if (ctx.attempt === 1) throw new RetryStageError('again');
+        return { kind: 'escalate', reason: 'no-admissible-witness-above-floor', detail: 'test' };
+      },
+    };
+    expect((await make({ defense }, model).run(CASE)).stage).toBe('escalated');
+
+    const evs = events();
+    const verdict = Verdict.parse(await store.getVerdict(CASE));
+    const fromStream = netFromStream(evs);
+    const fromVerdict = netFromVerdict(verdict);
+    expect([...fromVerdict.keys()].sort()).toEqual([...fromStream.keys()].sort());
+    for (const [key, s] of fromStream) {
+      const v = fromVerdict.get(key)!;
+      expect(v.inputTokens).toBe(s.inputTokens);
+      expect(v.outputTokens).toBe(s.outputTokens);
+      expect(v.usd).toBeCloseTo(s.usd, 12);
+    }
+    // And the figures are the real spend, with only the unknown-spend call kept at its cap.
+    const a1 = fromVerdict.get('defense#1')!;
+    expect(a1.usd).toBeCloseTo(0.0012 + 0.6 + 0.0005 + 0.5 + 0, 9);
+    expect(fromVerdict.get('defense#2')!.usd).toBe(5e-7);
+    // The verdict-written event carries the same verdict the store holds.
+    expect(ofType(evs, 'verdict-written')[0]!.payload.verdict.cost).toEqual(verdict.cost);
+    const reasons = ofType(evs, 'cost-released').map((e) => e.payload.reason);
+    expect(reasons).toEqual([
+      'reservation-unspent',
+      'reservation-unspent',
+      'model-call-failed',
+      'model-call-failed',
+      'reservation-unspent',
+    ]);
+  });
+});
+
+describe('halted events (CR-T12)', () => {
+  const ORDER: CaseStage[] = [
+    'intake',
+    'map',
+    'arraign',
+    'defense',
+    'prosecution',
+    'remedy',
+    'verify',
+  ];
+  const passThrough = (): Partial<Record<CaseStage, StageHandler>> =>
+    Object.fromEntries(
+      ORDER.map((s, i) => [
+        s,
+        { run: () => Promise.resolve({ kind: 'advance', next: ORDER[i + 1] ?? 'verdict' }) },
+      ]),
+    );
+
+  it.each(ORDER)('a kill switch halt is legal at %s and moves no stage', async (stage) => {
+    // The kill switch is read once per stage here; trip it on the read for `stage`.
+    let reads = 0;
+    const at = ORDER.indexOf(stage);
+    const { store, events, make } = await setup({
+      stage: [],
+      killSwitch: () => reads++ === at,
+    });
+    const out = await make(passThrough(), scripted([])).run(CASE);
+    expect(out).toEqual({ status: 'halted', stage, reason: 'kill-switch' });
+    expect(await store.stage(CASE)).toBe(stage);
+    const evs = events();
+    const halted = ofType(evs, 'halted');
+    expect(halted).toHaveLength(1);
+    expect(halted[0]!.stage).toBe(stage);
+    expect(halted[0]!.actor).toBe('stenographer');
+    expect(halted[0]!.payload.reason).toBe('kill-switch');
+    expect(halted[0]!.payload.detail).not.toMatch(/—/);
+    expect(evs.at(-1)!.type).toBe('halted');
+    expect(evs.some((e) => e.type === 'escalated' || e.type === 'dismissed')).toBe(false);
+  });
+
+  it('a resumed run continues inside the halted stage without a second stage-entered', async () => {
+    let tripped = true;
+    const { events, make } = await setup({ killSwitch: () => tripped });
+    const orch = make(
+      { defense: callingDefense(1) },
+      scripted([{ outcome: 'no-submission', cost: spent(0.001) }]),
+    );
+    expect(await orch.run(CASE)).toEqual({
+      status: 'halted',
+      stage: 'defense',
+      reason: 'kill-switch',
+    });
+    tripped = false;
+    expect((await orch.run(CASE)).stage).toBe('escalated');
+    const entered = ofType(events(), 'stage-entered').filter((e) => e.stage === 'defense');
+    expect(entered).toHaveLength(1);
+  });
+
+  it('halts with model-unconfigured before any charge', async () => {
+    const { store, events, make } = await setup();
+    const model: ModelPort & { preflight(): Promise<void> } = {
+      preflight: () => Promise.reject(new ModelUnconfiguredError('ANTHROPIC_API_KEY is not set')),
+      runTurn: () => Promise.reject(new Error('must not be called')),
+    };
+    const out = await make({ defense: callingDefense(1) }, model).run(CASE);
+    expect(out).toEqual({ status: 'halted', stage: 'defense', reason: 'model-unconfigured' });
+    expect(store.charges(CASE)).toEqual([]);
+    const halted = ofType(events(), 'halted');
+    expect(halted.map((h) => [h.stage, h.payload.reason])).toEqual([
+      ['defense', 'model-unconfigured'],
+    ]);
+    expect(halted[0]!.payload.detail).not.toContain('ANTHROPIC_API_KEY');
+  });
+
+  it.each([
+    ['cyber', 'cyber'],
+    ['not-on-the-list', 'other'],
+    [undefined, 'other'],
+  ] as const)(
+    'an unrouted refusal (category %s) halts with model-refusal and category %s, never dismissing',
+    async (given, expected) => {
+      const { store, events, make } = await setup();
+      const refusal = new ModelCallError('provider error: refusal', {
+        cost: spent(0.002),
+        provider: {
+          errorClass: REFUSAL_CLASS,
+          ...(given === undefined ? {} : { refusalCategory: given }),
+        },
+      });
+      const defense: StageHandler = {
+        async run(ctx) {
+          await ctx.runAgent(req());
+          return { kind: 'advance', next: 'prosecution' };
+        },
+      };
+      const out = await make({ defense }, scripted([refusal])).run(CASE);
+      expect(out).toEqual({
+        status: 'halted',
+        stage: 'defense',
+        reason: 'model-refusal',
+        refusalCategory: expected,
+      });
+      expect(await store.stage(CASE)).toBe('defense');
+      expect(await store.getVerdict(CASE)).toBeNull();
+      const evs = events();
+      const halted = ofType(evs, 'halted');
+      expect(halted).toHaveLength(1);
+      expect(halted[0]!.payload).toMatchObject({
+        reason: 'model-refusal',
+        refusalCategory: expected,
+      });
+      expect(halted[0]!.payload.detail).not.toContain('provider error');
+      expect(evs.some((e) => ['dismissed', 'escalated'].includes(e.type))).toBe(false);
+      // The refused call was still settled as the port reported it.
+      expect(ofType(evs, 'cost-released')[0]!.payload.reason).toBe('model-call-failed');
+    },
+  );
+
+  it('a non-refusal call error is not a halt', async () => {
+    const { events, make } = await setup();
+    const defense: StageHandler = {
+      async run(ctx) {
+        await ctx.runAgent(req());
+        return { kind: 'advance', next: 'prosecution' };
+      },
+    };
+    const err = new ModelCallError('rate limited', { provider: { errorClass: 'rate_limit' } });
+    await expect(make({ defense }, scripted([err])).run(CASE)).rejects.toBe(err);
+    expect(events().some((e) => e.type === 'halted')).toBe(false);
+  });
+
+  it('a budget-exhausted halt comes before, and never replaces, the budget-exhausted escalation', async () => {
+    const { store, events, make } = await setup({
+      budget: { maxInputTokens: 1_000_000, maxOutputTokens: 100_000, maxUsd: 0.1 },
+    });
+    const out = await make({ defense: callingDefense(1) }, scripted([])).run(CASE);
+    expect(out).toEqual({ status: 'terminal', stage: 'escalated' });
+    expect(await store.stage(CASE)).toBe('escalated');
+    const tail = events()
+      .filter((e) => ['halted', 'budget-exhausted', 'escalated'].includes(e.type))
+      .map((e) => [e.type, e.stage]);
+    expect(tail).toEqual([
+      ['halted', 'defense'],
+      ['budget-exhausted', 'defense'],
+      ['escalated', 'defense'],
+    ]);
+    const halted = ofType(events(), 'halted')[0]!;
+    expect(halted.payload.reason).toBe('budget-exhausted');
+    expect(halted.payload.refusalCategory).toBeUndefined();
+  });
+});

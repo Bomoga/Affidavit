@@ -1,11 +1,15 @@
 import {
   Escalation,
   type Dismissal,
+  Halt,
   PromptId,
+  RefusalCategory,
   TERMINAL_STAGES,
   TrialEvent,
   isLegalTransition,
   type BudgetState,
+  type CostReleaseReason,
+  type HaltReason as ContractHaltReason,
   type CaseId,
   type CaseStage,
   type CaseStore,
@@ -71,7 +75,12 @@ export interface StageContext {
   ): Promise<ValidatedAgentResult<T>>;
   /** Append a schema-valid trial event for this stage. */
   record<T extends TrialEventType>(type: T, payload: EventPayload<T>, actor?: Role): Promise<void>;
-  /** What model calls actually cost so far in this case, as reported by the model port. */
+  /**
+   * What model calls cost so far in this case, one row per call: the call's `cost-charged`
+   * events minus its `cost-released` events (CR-T1). With a working settlement that is the spend
+   * the port reported; when nothing could be given back (no settlement, unknown spend, a refused
+   * release) the up-front charge stands in the row, as it does in the stream.
+   */
   costs(): readonly StageCost[];
   /** Prompt versions and model ids of every model call so far in this case, keyed by prompt id. */
   runInfo(): RunInfo;
@@ -106,31 +115,42 @@ export interface OrchestratorDeps {
    */
   workspace?: TrialWorkspace;
   /**
-   * Gives back the unspent part of a turn's up-front charge when a model call failed and the
-   * port reported what it actually spent (CR-T1). Optional: without it the up-front charge
-   * stands, which over-counts but never under-counts. The composition root wires it once the
-   * case store can credit a charge.
+   * Gives back the unspent part of a turn's up-front charge once the port has reported what the
+   * call spent, whether the call succeeded (`reservation-unspent`) or failed (`model-call-failed`)
+   * (CR-T1, contracts v1.2). Optional: without it the orchestrator uses `store.releaseCharge`
+   * when the store has it, and otherwise the up-front charge stands, which over-counts but never
+   * under-counts.
    */
   settlement?: BudgetSettlement;
 }
 
 /**
- * Credits a case budget with the unspent part of an up-front charge (CR-T1). `refund` holds
- * non-negative amounts for the stage and attempt of the failed call. `reservationSeq` is the seq
- * of the `cost-charged` event that recorded the charge being settled: an implementation must give
- * back at most once per (caseId, reservationSeq), so a replayed settle cannot mint budget.
+ * Credits a case budget with the unspent part of an up-front charge (CR-T1), with the semantics
+ * of `CaseStore.releaseCharge`. `refund` holds non-negative amounts for the stage and attempt of
+ * the call, never more than the reservation. `reservationSeq` is the seq of the `cost-charged`
+ * event that recorded the charge being settled: an implementation must give back at most once per
+ * (caseId, reservationSeq), so a replayed settle cannot mint budget.
  */
 export interface BudgetSettlement {
   release(caseId: CaseId, refund: StageCost, reservationSeq: number): Promise<BudgetState>;
 }
 
 /**
- * Why a run stopped without finishing. Neither is an escalation or a budget problem.
- * - `kill-switch`: the global kill switch tripped.
+ * Why a case stopped, the contracts v1.2 `HaltReason` (CR-T12). Every halt is recorded as a
+ * `halted` event at the stage the case is in, and none moves the stage.
+ * - `kill-switch`: the global kill switch tripped. `run` returns `halted`.
  * - `model-unconfigured`: the model port has no API key (or the provider refused it). Checked
- *   before the call's budget is charged, so nothing is spent.
+ *   before the call's budget is charged, so nothing is spent. `run` returns `halted`.
+ * - `model-refusal`: a provider safety refusal (`ModelCallError` of class `refusal`) reached the
+ *   orchestrator unhandled. `run` returns `halted` with the allowlisted category. Never a
+ *   dismissal.
+ * - `budget-exhausted`: the budget cannot pay for the call. The `halted` event comes first, then
+ *   the existing `budget-exhausted` event and Escalation; `run` returns `terminal` `escalated`.
  */
-export type HaltReason = 'kill-switch' | 'model-unconfigured';
+export type HaltReason = ContractHaltReason;
+
+/** The halt reasons that end a run as `halted` (a budget halt ends it `escalated`). */
+export type RunHaltReason = Exclude<HaltReason, 'budget-exhausted'>;
 
 /**
  * What `run` returns. A halted case is left at its current stage, untouched, so an operator can
@@ -138,7 +158,13 @@ export type HaltReason = 'kill-switch' | 'model-unconfigured';
  */
 export type RunOutcome =
   | { status: 'terminal'; stage: CaseStage }
-  | { status: 'halted'; stage: CaseStage; reason: HaltReason };
+  | {
+      status: 'halted';
+      stage: CaseStage;
+      reason: RunHaltReason;
+      /** Only with reason `model-refusal`. */
+      refusalCategory?: RefusalCategory;
+    };
 
 /** Throw from a handler to run the stage again. The next agent call is charged first. */
 export class RetryStageError extends Error {
@@ -212,7 +238,49 @@ export const EVENT_ACTOR_FOR_STAGE: Readonly<Record<CaseStage, Role>> = {
   escalated: 'stenographer',
 };
 
-type StageRun = StageResult | { kind: 'halted'; reason: HaltReason };
+type RunHalt = Halt & { reason: RunHaltReason };
+type StageRun = StageResult | { kind: 'halted'; halt: RunHalt };
+
+/**
+ * `REFUSAL_CLASS` in `model/anthropic.ts`, repeated here because that module imports this one.
+ * The orchestrator tests build their refusal from `REFUSAL_CLASS`, so the two cannot drift apart
+ * unnoticed.
+ */
+const PROVIDER_REFUSAL_CLASS = 'refusal';
+
+/** The allowlisted category of a provider refusal, or undefined when `err` is not one. */
+function refusalOf(err: unknown): RefusalCategory | undefined {
+  if (!(err instanceof ModelCallError)) return undefined;
+  if (err.provider?.errorClass !== PROVIDER_REFUSAL_CLASS) return undefined;
+  const parsed = RefusalCategory.safeParse(err.provider.refusalCategory);
+  return parsed.success ? parsed.data : 'other';
+}
+
+/** Operator-facing halt text. Fixed strings only: never model output or a credential. */
+const HALT_DETAIL: Readonly<Record<RunHaltReason, (stage: CaseStage) => string>> = {
+  'kill-switch': (stage) => `the kill switch is on; the case waits at ${stage}`,
+  'model-unconfigured': (stage) =>
+    `the model is not configured; nothing was charged for the refused ${stage} call`,
+  'model-refusal': (stage) => `the provider declined the ${stage} request under its usage policy`,
+};
+
+const round6 = (n: number): number => Math.round(n * 1e6) / 1e6;
+
+/** Per field, how far `a` is above `b` (never below zero), for the stage and attempt given. */
+function excess(stage: CaseStage, attempt: number, a: StageCost, b: StageCost): StageCost {
+  return {
+    stage,
+    attempt,
+    inputTokens: Math.max(0, a.inputTokens - b.inputTokens),
+    outputTokens: Math.max(0, a.outputTokens - b.outputTokens),
+    usd: Math.max(0, round6(a.usd - b.usd)),
+    wallMs: 0,
+  };
+}
+
+function isZero(c: StageCost): boolean {
+  return c.inputTokens === 0 && c.outputTokens === 0 && c.usd === 0;
+}
 
 function isTerminal(stage: CaseStage): boolean {
   return TERMINAL_STAGES.includes(stage);
@@ -242,6 +310,14 @@ export class Orchestrator {
    * TrialWorkspace (separate from the admitted-only getExhibits); not done here.
    */
   private readonly exhibitsSeen = new Map<CaseId, ExhibitId[]>();
+  /** Reservation seqs this instance already released, so a seq is never released twice. */
+  private readonly released = new Set<string>();
+  /**
+   * The stage each case was halted at by this instance. A halt moves no stage, so the next run
+   * resumes inside the stage it already entered and does not emit a second `stage-entered`.
+   * In memory only: a new instance emits `stage-entered` again on resume.
+   */
+  private readonly haltedAt = new Map<CaseId, CaseStage>();
 
   constructor(private readonly deps: OrchestratorDeps) {}
 
@@ -250,9 +326,14 @@ export class Orchestrator {
     const { store, handlers, config } = this.deps;
     let stage = await store.stage(caseId);
     let from: CaseStage | undefined;
+    let resumed = this.haltedAt.get(caseId) === stage;
+    this.haltedAt.delete(caseId);
 
     for (;;) {
-      await this.emit(caseId, stage, 'stage-entered', from === undefined ? {} : { from });
+      if (!resumed) {
+        await this.emit(caseId, stage, 'stage-entered', from === undefined ? {} : { from });
+      }
+      resumed = false;
       if (isTerminal(stage)) {
         // A terminal case must carry a verdict. If an earlier run reached this stage but failed
         // before writing it, write it now rather than leave the case closed with no verdict.
@@ -262,7 +343,12 @@ export class Orchestrator {
         return { status: 'terminal', stage };
       }
 
-      if (await config.killSwitch()) return { status: 'halted', stage, reason: 'kill-switch' };
+      if (await config.killSwitch()) {
+        return this.halt(caseId, stage, {
+          reason: 'kill-switch',
+          detail: HALT_DETAIL['kill-switch'](stage),
+        });
+      }
       const handler = handlers[stage];
       if (!handler) throw new Error(`no handler for stage ${stage}`);
       // A verdict on a case that is still in progress means an earlier run wrote it for a
@@ -275,7 +361,7 @@ export class Orchestrator {
       }
 
       const outcome = await this.runStage(caseId, stage, handler);
-      if (outcome.kind === 'halted') return { status: 'halted', stage, reason: outcome.reason };
+      if (outcome.kind === 'halted') return this.halt(caseId, stage, outcome.halt);
 
       let next: CaseStage;
       if (outcome.kind === 'advance') {
@@ -307,9 +393,34 @@ export class Orchestrator {
         if (err instanceof BudgetExhaustedError) {
           return { kind: 'escalate', reason: 'budget-exhausted', detail: err.detail };
         }
-        if (err instanceof KillSwitchError) return { kind: 'halted', reason: 'kill-switch' };
+        if (err instanceof KillSwitchError) {
+          return {
+            kind: 'halted',
+            halt: { reason: 'kill-switch', detail: HALT_DETAIL['kill-switch'](stage) },
+          };
+        }
         if (err instanceof ModelUnconfiguredError) {
-          return { kind: 'halted', reason: 'model-unconfigured' };
+          return {
+            kind: 'halted',
+            halt: {
+              reason: 'model-unconfigured',
+              detail: HALT_DETAIL['model-unconfigured'](stage),
+            },
+          };
+        }
+        // A refusal that a handler did not route says nothing about the finding, so it never
+        // dismisses, and it is not retried here (the same input is likely refused again). The
+        // case waits at its stage with the allowlisted category on record.
+        const refusalCategory = refusalOf(err);
+        if (refusalCategory !== undefined) {
+          return {
+            kind: 'halted',
+            halt: {
+              reason: 'model-refusal',
+              refusalCategory,
+              detail: HALT_DETAIL['model-refusal'](stage),
+            },
+          };
         }
         if (err instanceof RetryStageError && attempt < max) continue;
         throw err;
@@ -327,7 +438,7 @@ export class Orchestrator {
       record: async (type, payload, actor) => {
         await this.emit(caseId, stage, type, payload, actor);
       },
-      costs: () => [...this.ledger(caseId)],
+      costs: () => this.ledger(caseId).map((c) => ({ ...c })),
       runInfo: () => {
         const i = this.info(caseId);
         return { promptVersions: { ...i.promptVersions }, modelIds: { ...i.modelIds } };
@@ -458,6 +569,10 @@ export class Orchestrator {
       { cost: reservation, remaining },
       role,
     );
+    // This call's row in the ledger: the reservation until a settlement moves it, so the ledger
+    // always nets exactly the charges and releases the event stream records.
+    const row: StageCost = { ...reservation };
+    this.ledger(caseId).push(row);
     if (overdrawn(remaining)) {
       throw new BudgetExhaustedError(
         `the charge for ${stage} attempt ${attempt} exceeds what is left of the case budget`,
@@ -476,8 +591,10 @@ export class Orchestrator {
         caseId,
         stage,
         attempt,
+        role,
         reservation,
         reservationSeq,
+        row,
         err,
         started,
       );
@@ -489,23 +606,24 @@ export class Orchestrator {
       attempt,
       wallMs: result.cost.wallMs || now() - started,
     };
-    this.ledger(caseId).push(actual);
+    row.wallMs = actual.wallMs;
 
-    // A port that overspends its own budget is charged the difference, never refunded.
-    const overage: StageCost = {
+    // A port that overspends its own budget is charged the difference; what it did not spend is
+    // given back (reason `reservation-unspent`). A release that fails leaves the charge standing
+    // and does not fail a call that succeeded: the stream and the ledger both keep the charge.
+    const settled = await this.settleCall(
+      caseId,
       stage,
       attempt,
-      inputTokens: Math.max(0, actual.inputTokens - reservation.inputTokens),
-      outputTokens: Math.max(0, actual.outputTokens - reservation.outputTokens),
-      usd: Math.max(0, Math.round((actual.usd - reservation.usd) * 1e6) / 1e6),
-      wallMs: 0,
-    };
-    if (overage.inputTokens > 0 || overage.outputTokens > 0 || overage.usd > 0) {
-      const after = await store.chargeBudget(caseId, overage);
-      await this.emit(caseId, stage, 'cost-charged', { cost: overage, remaining: after }, role);
-      if (overdrawn(after)) {
-        throw new BudgetExhaustedError(`the model overspent its turn budget in ${stage}`);
-      }
+      role,
+      reservation,
+      reservationSeq,
+      actual,
+      row,
+      'reservation-unspent',
+    );
+    if (settled.overdrawn) {
+      throw new BudgetExhaustedError(`the model overspent its turn budget in ${stage}`);
     }
 
     if (result.outcome === 'budget-exhausted') {
@@ -514,13 +632,94 @@ export class Orchestrator {
     return result;
   }
 
+  /** The settlement to use: the one wired in, else the store's own `releaseCharge`, else none. */
+  private settlement(): BudgetSettlement | undefined {
+    if (this.deps.settlement !== undefined) return this.deps.settlement;
+    const store = this.deps.store;
+    if (typeof store.releaseCharge !== 'function') return undefined;
+    return { release: (caseId, refund, seq) => store.releaseCharge!(caseId, refund, seq) };
+  }
+
+  /**
+   * Settles a reservation against the spend the port reported, per field: an overage is charged
+   * on top (a `cost-charged` event) and the unspent part is released (a `cost-released` event
+   * with `reason`, emitted only after the release succeeded). `row` moves by exactly what the
+   * stream records, so the ledger and the stream net to the same figures. An overage charge that
+   * fails throws. A release that fails (`ReleaseRejectedError`, a store error, a refund that is
+   * not a valid StageCost, an invalid budget returned) is returned as `releaseError`, emits
+   * nothing and leaves `row` alone: the charge stands. With no settlement nothing is released.
+   */
+  private async settleCall(
+    caseId: CaseId,
+    stage: CaseStage,
+    attempt: number,
+    role: Role,
+    reservation: StageCost,
+    reservationSeq: number,
+    actual: StageCost,
+    row: StageCost,
+    reason: CostReleaseReason,
+  ): Promise<{ overdrawn: boolean; releaseError?: unknown }> {
+    const overage = excess(stage, attempt, actual, reservation);
+    let overdrew = false;
+    if (!isZero(overage)) {
+      const after = await this.deps.store.chargeBudget(caseId, overage);
+      await this.emit(caseId, stage, 'cost-charged', { cost: overage, remaining: after }, role);
+      row.inputTokens += overage.inputTokens;
+      row.outputTokens += overage.outputTokens;
+      row.usd = round6(row.usd + overage.usd);
+      overdrew = overdrawn(after);
+    }
+
+    // Not rounded: a release gives back exactly the unspent part, so a sub-micro-dollar spend
+    // (5e-7) still shows in the stream and the verdict instead of rounding away to zero.
+    const unspent: StageCost = {
+      ...excess(stage, attempt, reservation, actual),
+      usd: Math.max(0, reservation.usd - actual.usd),
+    };
+    const settlement = this.settlement();
+    const key = `${caseId}:${reservationSeq}`;
+    if (isZero(unspent) || settlement === undefined || this.released.has(key)) {
+      return { overdrawn: overdrew };
+    }
+    let refund: StageCost;
+    let remaining: BudgetState;
+    try {
+      refund = StageCost.parse(unspent);
+      remaining = await settlement.release(caseId, refund, reservationSeq);
+    } catch (releaseError) {
+      return { overdrawn: overdrew, releaseError };
+    }
+    // Released in the store: never release this seq again, even if the event below fails.
+    this.released.add(key);
+    try {
+      await this.emit(
+        caseId,
+        stage,
+        'cost-released',
+        { cost: refund, remaining, reservationSeq, reason },
+        role,
+      );
+    } catch (emitError) {
+      // The store gave the budget back but the stream has no record of it. Keep the row at the
+      // charge, so the verdict agrees with the stream (over-counting, never under-counting).
+      return { overdrawn: overdrew, releaseError: emitError };
+    }
+    // The released fields now net to exactly what the call spent. Snapped to `actual` rather
+    // than subtracted, so a float difference cannot make the verdict show a cost nobody reported.
+    if (refund.inputTokens > 0) row.inputTokens = actual.inputTokens;
+    if (refund.outputTokens > 0) row.outputTokens = actual.outputTokens;
+    if (refund.usd > 0) row.usd = actual.usd;
+    return { overdrawn: overdrew };
+  }
+
   /**
    * A call that failed after its up-front charge. When the port reported what the call spent
-   * (`ModelCallError.cost`), that figure goes in the ledger, so the verdict reports what calls
-   * cost rather than what was reserved, and the unspent part of the charge is given back through
-   * `settlement` when one is wired. When the spend is unknown (a timeout, an abort, a broken
-   * stream, any other error, or a reported cost that is not a valid `StageCost` with finite,
-   * non-negative numbers), nothing changes: the whole charge stands.
+   * (`ModelCallError.cost`, a valid `StageCost` with finite, non-negative numbers), the
+   * reservation is settled against it as on success, with reason `model-call-failed`: an overage
+   * is charged and the unspent part is given back. When the spend is unknown (a timeout, an
+   * abort, a broken stream, any other error, or a reported cost that is not valid), nothing is
+   * given back: the whole charge stands, in the stream and in the ledger.
    *
    * Returns the error the call should end with instead of the original: only a
    * `BudgetExhaustedError` when the overage charge overdraws the case, as on the success path.
@@ -531,60 +730,58 @@ export class Orchestrator {
     caseId: CaseId,
     stage: CaseStage,
     attempt: number,
+    role: Role,
     reservation: StageCost,
     reservationSeq: number,
+    row: StageCost,
     err: unknown,
     started: number,
   ): Promise<Error | undefined> {
-    if (!(err instanceof ModelCallError)) return undefined;
-    const reported = validCost(err.cost);
-    if (reported === undefined) return undefined;
+    const now = this.deps.config.now ?? Date.now;
+    const reported = err instanceof ModelCallError ? validCost(err.cost) : undefined;
+    if (!(err instanceof ModelCallError) || reported === undefined) {
+      row.wallMs = Math.max(0, now() - started);
+      return undefined;
+    }
+    const actual: StageCost = {
+      ...reported,
+      stage,
+      attempt,
+      wallMs: reported.wallMs || Math.max(0, now() - started),
+    };
+    row.wallMs = actual.wallMs;
     try {
-      const now = this.deps.config.now ?? Date.now;
-      const actual: StageCost = {
-        ...reported,
+      const settled = await this.settleCall(
+        caseId,
         stage,
         attempt,
-        wallMs: reported.wallMs || Math.max(0, now() - started),
-      };
-      this.ledger(caseId).push(actual);
-      // A failed call that spent more than its charge is charged the difference, as on success.
-      const overage: StageCost = {
-        stage,
-        attempt,
-        inputTokens: Math.max(0, actual.inputTokens - reservation.inputTokens),
-        outputTokens: Math.max(0, actual.outputTokens - reservation.outputTokens),
-        usd: Math.max(0, Math.round((actual.usd - reservation.usd) * 1e6) / 1e6),
-        wallMs: 0,
-      };
-      if (overage.inputTokens > 0 || overage.outputTokens > 0 || overage.usd > 0) {
-        const after = await this.deps.store.chargeBudget(caseId, overage);
-        const role = MODEL_ROLE_FOR_STAGE[stage] ?? EVENT_ACTOR_FOR_STAGE[stage];
-        await this.emit(caseId, stage, 'cost-charged', { cost: overage, remaining: after }, role);
-        if (overdrawn(after)) {
-          return new BudgetExhaustedError(`the model overspent its turn budget in ${stage}`);
-        }
-        // Spent more than the charge: nothing to give back.
-        return undefined;
+        role,
+        reservation,
+        reservationSeq,
+        actual,
+        row,
+        'model-call-failed',
+      );
+      if (settled.releaseError !== undefined) err.settlementError = settled.releaseError;
+      if (settled.overdrawn) {
+        return new BudgetExhaustedError(`the model overspent its turn budget in ${stage}`);
       }
-      const settlement = this.deps.settlement;
-      if (settlement === undefined) return undefined;
-      const refund: StageCost = {
-        stage,
-        attempt,
-        inputTokens: Math.max(0, reservation.inputTokens - actual.inputTokens),
-        outputTokens: Math.max(0, reservation.outputTokens - actual.outputTokens),
-        usd: Math.max(0, Math.round((reservation.usd - actual.usd) * 1e6) / 1e6),
-        wallMs: 0,
-      };
-      if (refund.inputTokens === 0 && refund.outputTokens === 0 && refund.usd === 0) {
-        return undefined;
-      }
-      await settlement.release(caseId, refund, reservationSeq);
     } catch (settleErr) {
       err.settlementError = settleErr;
     }
     return undefined;
+  }
+
+  /** Records a halt at `stage` (a `halted` event, no stage change) and returns the outcome. */
+  private async halt(caseId: CaseId, stage: CaseStage, halt: RunHalt): Promise<RunOutcome> {
+    await this.emit(caseId, stage, 'halted', Halt.parse(halt), 'stenographer');
+    this.haltedAt.set(caseId, stage);
+    return {
+      status: 'halted',
+      stage,
+      reason: halt.reason,
+      ...(halt.refusalCategory === undefined ? {} : { refusalCategory: halt.refusalCategory }),
+    };
   }
 
   private async escalate(
@@ -598,6 +795,12 @@ export class Orchestrator {
     // Crash gap: the transition comes first, so a crash before the events below leaves an
     // escalated case with no `escalated` event. The verdict is repaired on rerun (see run());
     // the missing events are not.
+    if (reason === 'budget-exhausted') {
+      // CR-T12: say why the trial stopped calling models. A halt moves no stage and never
+      // replaces the `budget-exhausted` event and its Escalation below.
+      const halt = Halt.parse({ reason: 'budget-exhausted', detail });
+      await this.emit(caseId, stage, 'halted', halt, 'stenographer');
+    }
     await this.deps.store.transition(caseId, 'escalated');
     if (reason === 'budget-exhausted') {
       await this.emit(caseId, stage, 'budget-exhausted', { escalation });

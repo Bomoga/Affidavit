@@ -16,6 +16,7 @@ export type {
   OrchestratorConfig,
   OrchestratorDeps,
   HaltReason,
+  RunHaltReason,
   RunOutcome,
   StageContext,
   StageHandler,

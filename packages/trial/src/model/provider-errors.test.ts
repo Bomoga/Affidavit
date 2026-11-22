@@ -640,13 +640,20 @@ describe('settling the up-front charge in a trial', () => {
     script: Script | ModelPort,
     settlement?: BudgetSettlement,
     timeoutMs = 5_000,
-    store: LoggingCaseStore = new LoggingCaseStore([]),
+    storeIn?: LoggingCaseStore | ((sink: FakeEventSink) => LoggingCaseStore),
     budget: Budget = BIG_BUDGET,
     expected: abstract new (...args: never[]) => Error = ModelCallError,
   ) {
     const cf = makeCaseFile();
-    await openAt(store, cf, budget, PATH_TO.defense);
     const sink = new FakeEventSink();
+    // Given the sink, the fake checks every release against the charge at its seq (#83 review).
+    const store =
+      storeIn === undefined
+        ? new LoggingCaseStore([], { events: sink })
+        : typeof storeIn === 'function'
+          ? storeIn(sink)
+          : storeIn;
+    await openAt(store, cf, budget, PATH_TO.defense);
     const port =
       typeof script === 'function' ? makePort(script, CANARY_KEY, timeoutMs).port : script;
     let thrown: unknown;
@@ -696,11 +703,21 @@ describe('settling the up-front charge in a trial', () => {
     ['negative tokens', { ...COST, outputTokens: -5 }],
     ['not an object', 'free'],
   ] as const) {
-    it(`a reported cost with ${kind} is unknown spend: no refund, nothing in the ledger`, async () => {
+    it(`a reported cost with ${kind} is unknown spend: no refund, the charge stands in the ledger`, async () => {
       const settlement = recorder();
-      const { ledger } = await runFailingDefense(failingWith(bad), settlement);
+      const { ledger, events } = await runFailingDefense(failingWith(bad), settlement);
       expect(settlement.calls).toEqual([]);
-      expect(ledger).toEqual([]);
+      expect(events.some((e) => e.type === 'cost-released')).toBe(false);
+      // Unknown spend never refunds: the verdict row is the whole reservation, as in the stream.
+      const budget = requestFor('defense').budget;
+      expect(ledger).toHaveLength(1);
+      expect(ledger[0]).toMatchObject({
+        stage: 'defense',
+        attempt: 1,
+        inputTokens: budget.maxInputTokens,
+        outputTokens: budget.maxOutputTokens,
+        usd: budget.maxUsd,
+      });
     });
   }
 
@@ -730,12 +747,19 @@ describe('settling the up-front charge in a trial', () => {
       failingWith({ ...COST, usd: 2 }),
       settlement,
       5_000,
-      new LoggingCaseStore([]),
+      undefined,
       { maxInputTokens: 1_000_000, maxOutputTokens: 1_000_000, maxUsd: 1 },
       BudgetExhaustedError,
     );
-    expect(settlement.calls).toEqual([]);
-    expect(events.map((e) => e.type)).toContain('budget-exhausted');
+    // The dollars were overspent, so no dollar comes back; only the unused tokens do.
+    expect(settlement.calls).toHaveLength(1);
+    expect(settlement.calls[0]!.refund.usd).toBe(0);
+    expect(settlement.calls[0]!.refund.inputTokens).toBe(
+      requestFor('defense').budget.maxInputTokens,
+    );
+    const types = events.map((e) => e.type);
+    expect(types).toContain('budget-exhausted');
+    expect(types.filter((t) => t === 'cost-charged')).toHaveLength(2);
   });
 
   function recorder(): BudgetSettlement & {
@@ -807,13 +831,46 @@ describe('settling the up-front charge in a trial', () => {
       20,
     );
     expect(settlement.calls).toEqual([]);
-    expect(ledger).toEqual([]);
+    // The whole charge stands: the ledger row is the reservation, matching the stream.
+    expect(ledger).toHaveLength(1);
+    expect(ledger[0]).toMatchObject({ usd: requestFor('defense').budget.maxUsd });
   });
 
-  it('without a settlement the up-front charge stands and nothing else is charged', async () => {
-    const { cf, store, events } = await runFailingDefense(apiError(PROVIDER_400, { status: 400 }));
+  it("without a settlement dep the store's own releaseCharge settles the refused call", async () => {
+    const { cf, store, events, ledger } = await runFailingDefense(
+      apiError(PROVIDER_400, { status: 400 }),
+    );
+    expect(store.charges(cf.id)).toHaveLength(1);
+    const charged = events.filter((e) => e.type === 'cost-charged');
+    expect(charged).toHaveLength(1);
+    const released = events.filter((e) => e.type === 'cost-released');
+    expect(released).toHaveLength(1);
+    expect(released[0]!.actor).toBe('defense');
+    expect(released[0]!.stage).toBe('defense');
+    expect(released[0]!.payload).toMatchObject({
+      reservationSeq: charged[0]!.seq,
+      reason: 'model-call-failed',
+      cost: { usd: requestFor('defense').budget.maxUsd },
+      remaining: { remainingUsd: BIG_BUDGET.maxUsd },
+    });
+    expect([...store.releases(cf.id).keys()]).toEqual([charged[0]!.seq]);
+    expect(ledger[0]).toMatchObject({ usd: 0, inputTokens: 0, outputTokens: 0 });
+  });
+
+  it('a store without releaseCharge and no settlement keeps the whole charge', async () => {
+    class OlderStore extends LoggingCaseStore {}
+    // An older store: the v1.2 method is simply absent.
+    Object.defineProperty(OlderStore.prototype, 'releaseCharge', { value: undefined });
+    const { cf, store, events, ledger } = await runFailingDefense(
+      apiError(PROVIDER_400, { status: 400 }),
+      undefined,
+      5_000,
+      new OlderStore([]),
+    );
     expect(store.charges(cf.id)).toHaveLength(1);
     expect(events.filter((e) => e.type === 'cost-charged')).toHaveLength(1);
+    expect(events.some((e) => e.type === 'cost-released')).toBe(false);
+    expect(ledger[0]).toMatchObject({ usd: requestFor('defense').budget.maxUsd });
   });
 
   it('a settlement that fails leaves the charge in place and reports the call error', async () => {
@@ -821,6 +878,27 @@ describe('settling the up-front charge in a trial', () => {
       release: () => Promise.reject(new Error('store down')),
     };
     // runFailingDefense asserts the run rejects with the ModelCallError, not the store error.
-    await runFailingDefense(apiError(PROVIDER_400), settlement);
+    const { thrown, events, ledger } = await runFailingDefense(apiError(PROVIDER_400), settlement);
+    expect(((thrown as ModelCallError).settlementError as Error).message).toBe('store down');
+    expect(events.some((e) => e.type === 'cost-released')).toBe(false);
+    expect(ledger[0]).toMatchObject({ usd: requestFor('defense').budget.maxUsd });
+  });
+
+  it('a release the store rejects (wrong seq) emits no cost-released and keeps the charge', async () => {
+    // Points every release at seq 0 (a stage-entered event), which the fake refuses.
+    const { thrown, events, ledger } = await runFailingDefense(
+      apiError(PROVIDER_400, { status: 400 }),
+      undefined,
+      5_000,
+      (sink) => {
+        const s = new LoggingCaseStore([], { events: sink });
+        const real = s.releaseCharge.bind(s);
+        s.releaseCharge = (id, refund) => real(id, refund, 0);
+        return s;
+      },
+    );
+    expect(((thrown as ModelCallError).settlementError as Error).name).toBe('ReleaseRejectedError');
+    expect(events.some((e) => e.type === 'cost-released')).toBe(false);
+    expect(ledger[0]).toMatchObject({ usd: requestFor('defense').budget.maxUsd });
   });
 });

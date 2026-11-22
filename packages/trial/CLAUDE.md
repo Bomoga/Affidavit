@@ -66,7 +66,16 @@ Invariants, each covered by a test in `src/model/anthropic.test.ts` with a stubb
 - Submissions are never rewritten or pattern-redacted. One containing the exact key value throws `ModelCallError` and is not recorded.
 - Provider failures (timeout, abort, hung or broken stream, no result, any assistant `error` code other than `authentication_failed`) throw `ModelCallError` unless the agent already submitted; only an agent that used its turns is `turn-cap`. An outage cannot dismiss a candidate.
 - A provider error always carries its class and HTTP status. Provider text is shown only as fragments rebuilt from the allowlisted `TEMPLATES` in `anthropic.ts` (after JSON decoding and redaction), capped at 300 characters; anything else is `provider message withheld (does not match a known-safe shape)` (`provider-errors.test.ts`). A key that is not printable ASCII without spaces fails `preflight` before any charge.
-- `ModelCallError.cost` is the reported spend of a failed call, or undefined when unknown. Zero without a result only for classes decided before any work (`REFUSED_BEFORE_WORK`). The orchestrator trusts it only when it is a valid finite non-negative `StageCost`, charges any overage (overdrawing is `budget-exhausted`), and gives back the unspent part through the optional `settlement` dep (CR-T1; Lane 1 wires it). A settling failure is attached as `settlementError` and never replaces the call error. Unknown spend keeps the whole charge.
+- `ModelCallError.cost` is the reported spend of a failed call, or undefined when unknown. Zero without a result only for classes decided before any work (`REFUSED_BEFORE_WORK`). The orchestrator trusts it only when it is a valid finite non-negative `StageCost`. Unknown spend keeps the whole charge.
+
+## Cost settlement and halts (L3-21, contracts v1.2)
+
+Tests: `src/orchestrator-settlement.test.ts` and the settlement block of `src/model/provider-errors.test.ts`, on `FakeCaseStore({ events })` so a release against the wrong seq is refused.
+
+- Each model call is charged its whole turn budget up front (unchanged; the budget bounds spend). After the call the reservation is settled per field against the reported spend: overspent fields are charged on top, the unspent rest is released with a `cost-released` event (reason `reservation-unspent` on success, `model-call-failed` on a failed call with known spend). Release goes through `settlement`, else `store.releaseCharge`, else nowhere (charge stands).
+- A release that throws emits nothing; on a failed call it is `settlementError` and never replaces the call error; on a success it does not fail the call. Each reservation seq is released once.
+- `Verdict.cost` and `ctx.costs()`: one row per call, its charges minus its releases, so the verdict equals a replay of the stream.
+- `halted` (actor stenographer, current stage, no stage move) for `kill-switch`, `model-unconfigured`, `model-refusal` (unrouted refusal, allowlisted `refusalCategory`, never dismissed) and `budget-exhausted` (before, never instead of, the `budget-exhausted` escalation). Detail is fixed text only.
 
 ## Model probe (L3-17)
 
