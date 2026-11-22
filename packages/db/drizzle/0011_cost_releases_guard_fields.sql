@@ -1,9 +1,12 @@
--- Review fixes to cost_releases_insert_guard (0009), additive.
--- (1) The charge event's cost must carry every amount as a JSON number (and stage and attempt):
---     a missing or non-numeric field used to compare as NULL and let the refund through.
--- (2) The case row is locked FOR NO KEY UPDATE, not FOR UPDATE. Releases and charges still
---     serialise on it (NO KEY UPDATE conflicts with itself and with UPDATE), but the FOR KEY SHARE
---     lock a child-table foreign key check takes (an event emit, a cost row) is no longer blocked.
+-- Review fix to cost_releases_insert_guard (0009), additive: the charge event's cost must carry
+-- every amount as a JSON number, the stage as a string and the attempt as a number. A missing or
+-- non-numeric field used to compare as NULL and let the refund through.
+--
+-- The case row stays locked FOR UPDATE, deliberately. FOR NO KEY UPDATE would not conflict with
+-- the FOR KEY SHARE that the verdicts foreign key check takes, and appendVerdict takes no other
+-- lock on the case, so a release could see no verdict, wait for nothing, and commit after a
+-- verdict on the same case: a release on a closed case. FOR UPDATE makes the verdict insert wait
+-- for an open release (cost-releases.pg.test.ts, "a verdict and a release racing").
 CREATE OR REPLACE FUNCTION cost_releases_insert_guard() RETURNS trigger
   LANGUAGE plpgsql
   SET search_path = pg_catalog, public
@@ -19,10 +22,11 @@ DECLARE
   rel_out numeric;
   rel_usd numeric;
 BEGIN
-  -- Serialise every release (and charge: chargeBudget takes the same lock) of this case.
+  -- Serialise every release (and charge: chargeBudget takes the same lock) of this case, and make
+  -- a verdict insert (its foreign key check takes FOR KEY SHARE on this row) wait for it.
   SELECT c.stage INTO v_stage FROM public.cases c
     WHERE c.tenant_id = NEW.tenant_id AND c.id = NEW.case_id
-    FOR NO KEY UPDATE;
+    FOR UPDATE;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'cost release rejected: unknown case' USING ERRCODE = 'foreign_key_violation';
   END IF;

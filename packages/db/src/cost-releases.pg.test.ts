@@ -8,7 +8,7 @@ import {
   type StageCost,
 } from '@affidavit/contracts';
 import { sql } from 'drizzle-orm';
-import { expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { PgCaseStore } from './case-store.js';
 import { PgEventSink } from './event-sink.js';
 import { GuardedCaseStore } from './orchestration.js';
@@ -506,6 +506,10 @@ describePg('PgCaseStore.releaseCharge (contracts v1.2, CR-T1)', () => {
       { ...TURN, inputTokens: '100000' }, // a string, not a number
       { ...TURN, wallMs: null },
       { ...TURN, outputTokens: { n: 8000 } },
+      { ...TURN, stage: undefined }, // stage missing
+      { ...TURN, stage: 3 }, // stage not a string
+      { ...TURN, attempt: undefined }, // attempt missing
+      { ...TURN, attempt: '1' }, // attempt a string
     ];
     for (const cost of shapes) {
       const seq = await badCharge(cost);
@@ -524,92 +528,163 @@ describePg('PgCaseStore.releaseCharge (contracts v1.2, CR-T1)', () => {
     expect(await releaseRows(id)).toBe(0);
   });
 
-  it('locks the budget FOR NO KEY UPDATE: charges and releases serialise, child inserts do not wait', async () => {
-    const id = await defenseCase();
-    const seq = await charge(id);
-    // Allocated before the lock is taken: nextSeq updates the case row, so it would wait.
-    const nextEventSeq = await store().nextSeq(id);
-
-    const asApp = async () => {
+  describe('a verdict and a release racing on one case', () => {
+    /** A transaction as the app role under tenant A, left open for the caller to finish. */
+    async function openAppTx() {
       const c = await db().admin.connect();
       await c.query('begin');
       await c.query('set local role affidavit_app');
       await c.query(`select set_config('app.tenant_id', $1, true)`, [A]);
-      await c.query(`set local lock_timeout = '500ms'`);
       return c;
-    };
-    const outcome = (p: Promise<unknown>) =>
-      p.then(
-        () => 'no error',
-        (e: Error) => e.message,
-      );
+    }
+    /** Settles to 'pending' if `p` is still waiting after `ms` (a lock wait), else its outcome. */
+    const stateAfter = (p: Promise<unknown>, ms = 750) =>
+      Promise.race([
+        p.then(
+          () => 'done',
+          (e: Error) => `error: ${e.message}`,
+        ),
+        new Promise<string>((r) => setTimeout(() => r('pending'), ms)),
+      ]);
+    const verdictFor = (caseId: CaseId) =>
+      Verdict.parse({ ...(samples.Verdict as object), caseId });
+    const verdictCount = async (caseId: CaseId) =>
+      (
+        await q<{ n: number }>(`select count(*)::int n from verdicts where case_id = $1`, [caseId])
+      )[0]!.n;
 
-    // The lock chargeBudget and releaseCharge take, held open by another transaction.
-    const holder = await asApp();
-    try {
-      await holder.query(`select stage from public.cases where id = $1 for no key update`, [id]);
-
-      // An event insert (its foreign key check takes FOR KEY SHARE on the case row) goes through.
-      const child = await asApp();
-      try {
-        const event = JSON.stringify({
-          schemaVersion: 1,
-          caseId: id,
-          seq: nextEventSeq,
-          stage: 'defense',
-          at: '2026-11-21T12:00:00.000Z',
-          actor: 'stenographer',
-          type: 'stage-entered',
-          payload: {},
-        });
-        expect(
-          await outcome(
-            child.query(
-              `insert into public.events (tenant_id, case_id, seq, type, event)
-               values ($1, $2, $3, 'stage-entered', $4::jsonb)`,
-              [A, id, nextEventSeq, event],
-            ),
-          ),
-        ).toBe('no error');
-      } finally {
-        await child.query('rollback');
-        child.release();
-      }
-
-      // A second charge or release of the same case still waits for the holder.
-      const rival = await asApp();
-      try {
-        expect(
-          await outcome(
-            rival.query(`select stage from public.cases where id = $1 for no key update`, [id]),
-          ),
-        ).toMatch(/lock timeout/);
-      } finally {
-        await rival.query('rollback');
-        rival.release();
-      }
-      const raced = await asApp();
-      try {
-        expect(
-          await outcome(
-            raced.query(
-              `insert into public.cost_releases
-                (tenant_id, case_id, reservation_seq, stage, attempt, input_tokens, output_tokens, usd, wall_ms)
-               values ($1, $2, $3, 'defense', 1, 0, 0, 0.1, 0)`,
-              [A, id, seq],
-            ),
-          ),
-        ).toMatch(/lock timeout/);
-      } finally {
-        await raced.query('rollback');
-        raced.release();
-      }
-    } finally {
-      await holder.query('rollback');
-      holder.release();
+    /**
+     * Parks a transaction just after the release guard ran: the superuser holds the charge
+     * event's row FOR UPDATE, so the release's foreign key check on it (FOR KEY SHARE, which runs
+     * after the BEFORE INSERT guard) waits, while the release keeps the case lock the guard and
+     * PgCaseStore.lockCase really took.
+     */
+    async function holdChargeEvent(caseId: CaseId, seq: number) {
+      const c = await db().admin.connect();
+      await c.query('begin');
+      await c.query(`select 1 from public.events where case_id = $1 and seq = $2 for update`, [
+        caseId,
+        seq,
+      ]);
+      return {
+        release: async () => {
+          await c.query('commit');
+          c.release();
+        },
+      };
     }
 
-    // Once the holder is gone, the store's own release goes through.
-    expect((await store().releaseCharge(id, UNSPENT, seq)).remainingUsd).toBe(1.997);
+    it('a verdict waits for an open release through the store (lockCase and the guard)', async () => {
+      const id = await defenseCase();
+      const seq = await charge(id);
+      const blocker = await holdChargeEvent(id, seq);
+      let blockerOpen = true;
+      try {
+        const release = store().releaseCharge(id, UNSPENT, seq);
+        expect(await stateAfter(release)).toBe('pending');
+        // The release is parked holding the case lock; the verdict's foreign key check waits.
+        const verdict = store().appendVerdict(verdictFor(id));
+        expect(await stateAfter(verdict)).toBe('pending');
+        await blocker.release();
+        blockerOpen = false;
+        // The release commits first (the case was open when it ran), then the verdict lands.
+        expect((await release).remainingUsd).toBe(1.997);
+        await verdict;
+      } finally {
+        if (blockerOpen) await blocker.release();
+      }
+      expect(await releaseRows(id)).toBe(1);
+      expect(await verdictCount(id)).toBe(1);
+      // From now on the case is closed: no further release.
+      const seq2 = await emitCharge(id, TURN, {
+        remainingInputTokens: 0,
+        remainingOutputTokens: 0,
+        remainingUsd: 0,
+        exhausted: true,
+      });
+      expect((await rejection(store().releaseCharge(id, UNSPENT, seq2))).message).toMatch(/closed/);
+    });
+
+    it('a verdict waits for an open raw release insert (the guard alone holds the lock)', async () => {
+      const id = await defenseCase();
+      const seq = await charge(id);
+      const blocker = await holdChargeEvent(id, seq);
+      let blockerOpen = true;
+      const raw = await openAppTx();
+      try {
+        const insert = raw.query(
+          `insert into public.cost_releases
+            (tenant_id, case_id, reservation_seq, stage, attempt, input_tokens, output_tokens, usd, wall_ms)
+           values ($1, $2, $3, 'defense', 1, 0, 0, 0.1, 0)`,
+          [A, id, seq],
+        );
+        expect(await stateAfter(insert)).toBe('pending');
+        const verdict = store().appendVerdict(verdictFor(id));
+        expect(await stateAfter(verdict)).toBe('pending');
+        await blocker.release();
+        blockerOpen = false;
+        await insert;
+        // The verdict still waits: the release's transaction holds the case lock until it ends.
+        expect(await stateAfter(verdict)).toBe('pending');
+        await raw.query('commit');
+        await verdict;
+      } finally {
+        if (blockerOpen) await blocker.release();
+        await raw.query('rollback').catch(() => undefined);
+        raw.release();
+      }
+      expect(await releaseRows(id)).toBe(1);
+      expect(await verdictCount(id)).toBe(1);
+    });
+
+    it('a release that waits behind an open verdict is refused once the verdict commits', async () => {
+      const id = await defenseCase();
+      const seq = await charge(id);
+      const v = verdictFor(id);
+      const holder = await openAppTx();
+      try {
+        // An uncommitted verdict insert: its foreign key check holds FOR KEY SHARE on the case.
+        await holder.query(
+          `insert into public.verdicts (tenant_id, case_id, outcome, verdict) values ($1, $2, $3, $4::jsonb)`,
+          [A, id, v.outcome, JSON.stringify(v)],
+        );
+        const viaStore = store().releaseCharge(id, UNSPENT, seq);
+        expect(await stateAfter(viaStore)).toBe('pending');
+        await holder.query('commit');
+        expect((await rejection(viaStore)).message).toMatch(/closed/);
+      } finally {
+        await holder.query('rollback').catch(() => undefined);
+        holder.release();
+      }
+      expect(await releaseRows(id)).toBe(0);
+
+      // The same through a raw insert, so the guard alone decides.
+      const id2 = await defenseCase();
+      const seq2 = await charge(id2);
+      const v2 = verdictFor(id2);
+      const holder2 = await openAppTx();
+      const raw = await openAppTx();
+      try {
+        await holder2.query(
+          `insert into public.verdicts (tenant_id, case_id, outcome, verdict) values ($1, $2, $3, $4::jsonb)`,
+          [A, id2, v2.outcome, JSON.stringify(v2)],
+        );
+        const insert = raw.query(
+          `insert into public.cost_releases
+            (tenant_id, case_id, reservation_seq, stage, attempt, input_tokens, output_tokens, usd, wall_ms)
+           values ($1, $2, $3, 'defense', 1, 0, 0, 0.1, 0)`,
+          [A, id2, seq2],
+        );
+        expect(await stateAfter(insert)).toBe('pending');
+        await holder2.query('commit');
+        expect(await stateAfter(insert)).toMatch(/cost release rejected: the case is closed/);
+      } finally {
+        await holder2.query('rollback').catch(() => undefined);
+        holder2.release();
+        await raw.query('rollback').catch(() => undefined);
+        raw.release();
+      }
+      expect(await releaseRows(id2)).toBe(0);
+    });
   });
 });

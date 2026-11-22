@@ -74,10 +74,17 @@ describe('cost_releases guard review fixes (migration 0011)', () => {
     expect(fix).toContain('SET search_path = pg_catalog, public');
   });
 
-  it('locks the case row FOR NO KEY UPDATE, so child foreign key checks are not blocked', () => {
-    expect(fix).toMatch(/FROM public\.cases c[\s\S]*?FOR NO KEY UPDATE;/);
+  it('keeps the case row lock FOR UPDATE, so a verdict insert waits for an open release', () => {
     const code = fix.replace(/--[^\n]*/g, '');
-    expect(code).not.toMatch(/\bFOR UPDATE\b/);
+    expect(code).toMatch(/FROM public\.cases c[\s\S]*?FOR UPDATE;/);
+    expect(code).not.toMatch(/NO KEY UPDATE|KEY SHARE/);
+  });
+
+  it('PgCaseStore.lockCase takes the same FOR UPDATE lock as the guard', () => {
+    const src = readFileSync(fileURLToPath(new URL('./case-store.ts', import.meta.url)), 'utf8');
+    const body = /private async lockCase\([\s\S]*?\n {2}\}/.exec(src)?.[0] ?? '';
+    expect(body).toContain(".for('update')");
+    expect(body).not.toMatch(/no key update|key share/i);
   });
 
   it('refuses a charge cost with a missing or non-numeric amount instead of comparing NULL', () => {

@@ -1082,7 +1082,12 @@ describe('real trial cores', () => {
       return { cores, requests };
     }
 
-    /** Whether the installed @affidavit/trial reads `stopAfterTransition` (PR #84). */
+    /**
+     * Whether the installed @affidavit/trial reads `stopAfterTransition` (PR #84). TEMPORARY and
+     * deliberately crude (a text search of the class source; a rename or minifier would fool it).
+     * Remove it, and make the gated test below unconditional, in the Lane 1 follow-up that drops
+     * the `quietStop` fallback in trial.ts once #84 is merged to main.
+     */
     const orchestratorReadsStopHook = /stopAfterTransition/.test(Orchestrator.toString());
 
     async function runDefense(killSwitch: () => boolean | Promise<boolean>) {

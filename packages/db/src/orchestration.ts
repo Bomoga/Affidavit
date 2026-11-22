@@ -320,9 +320,13 @@ export function stageHandler(core: StageCore, options: StageHandlerOptions): Sta
           }
         } catch (flagErr) {
           const why = flagErr instanceof Error ? flagErr.name : 'unknown error';
-          log(
-            `could not flag ${job.stage} attempt ${job.attempt} of a case for review (${reason}): ${why}`,
-          );
+          try {
+            log(
+              `could not flag ${job.stage} attempt ${job.attempt} of a case for review (${reason}): ${why}`,
+            );
+          } catch {
+            // A broken logger must not replace the stage work's error either.
+          }
         }
       }
       throw err;

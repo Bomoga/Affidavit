@@ -167,16 +167,16 @@ export class PgCaseStore implements CaseStore {
 
   /**
    * Locks the case row (the budget) for the rest of the transaction; returns its stage.
-   * FOR NO KEY UPDATE: charges and releases still run one at a time (the lock conflicts with
-   * itself and with UPDATE), but an event emit or cost row insert, whose foreign key check takes
-   * FOR KEY SHARE on this row, is not blocked by it (migration 0011 does the same in the guard).
+   * FOR UPDATE, not FOR NO KEY UPDATE: a verdict insert's foreign key check takes FOR KEY SHARE
+   * on this row, and only FOR UPDATE makes it wait, so a release can never commit after a verdict
+   * it did not see (migration 0011 keeps the guard on the same lock).
    */
   private async lockCase(tx: Tx, caseId: CaseId): Promise<CaseStage> {
     const [row] = await tx
       .select({ stage: t.cases.stage })
       .from(t.cases)
       .where(this.caseWhere(caseId))
-      .for('no key update');
+      .for('update');
     if (!row) throw unknownCase(caseId);
     return CaseStageSchema.parse(row.stage);
   }

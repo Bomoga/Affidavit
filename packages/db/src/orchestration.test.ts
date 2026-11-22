@@ -64,6 +64,18 @@ describe('stageHandler, non-retryable failures', () => {
     });
     await expect(quiet(job, ctx)).rejects.toBe(plain);
     expect(logs).toHaveLength(1);
+
+    // A logger that throws does not replace the original error either.
+    let logged = 0;
+    const loud = stageHandler(() => Promise.reject(refusal), {
+      appPool: pool,
+      log: () => {
+        logged++;
+        throw new Error('logger broke');
+      },
+    });
+    await expect(loud(job, ctx)).rejects.toBe(refusal);
+    expect(logged).toBe(1);
   });
 });
 
