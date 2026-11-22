@@ -27,7 +27,9 @@ Moving to KMS is a code change, not only a configuration change. `AFFIDAVIT_SIGN
 | Public key                  | Published by the lead in `docs/keys/keys.json` (format in `docs/keys/README.md`): `keyId`, the PEM public key, `status` (`active` or `revoked`) and the dates `validFrom`, `retiredAt` and `revokedAt`. `verify` (L2-12) requires this file (`--keys`), picks the key by the attestation's `keyId`, and refuses any key whose status is `revoked` |
 | Who can request signatures  | The API and the worker, through the socket group. They never get the key path, password or cosign output                                                                                                                                                                                                                                          |
 
-The keys file, its format (`docs/keys/README.md`) and `verify --keys` come with PR #77. Until that merges, `verify` on main still takes `--key <pem>`.
+The keys file, its format (`docs/keys/README.md`) and `verify --keys` come with PR #77.
+
+Two gaps in the signer's own file checks, held by process until the code adds them: `apps/signer` checks only that the key and password files are not readable by group or others. It does not check that they are owned by the signer's user, and it follows symlinks (`stat`, not `lstat`). So whoever sets up the host must make sure both are regular files owned by `affidavit-signer`, not links.
 
 ## Which host
 
@@ -48,6 +50,7 @@ The dates (`validFrom`, `retiredAt`, `revokedAt`, the destruction date) let anyo
 A signature by a revoked key could be a forgery made after the leak, so `verify` refuses revoked keys outright (`attestation.md`, "Public verification"). Verdicts the team still stands behind are re-signed with the new key. Rules:
 
 - Re-signing is only for a bundle whose `bundleSha256` was recorded before the compromise (the verdict row in the database and the evidence store address, both written when the verdict was made). The bundle in the store must hash to that recorded value, and the recording must predate the earliest time the key could have leaked. A bundle with no such record is not re-signed: a forger with the old key could have planted it, and re-signing would turn a forged bundle into a valid one.
+- That rule holds only if the database and the evidence store were outside the compromise. Whoever could change them could record a forged bundle's `bundleSha256` with an earlier date. On the demo workstation the signer, the database and the store may share one host, so a host compromise there covers all three: then no stored verdict is re-signed, and each case is rerun from scratch instead.
 - Re-signing a manifest changes nothing in the bundle, so `bundleSha256` stays the same.
 - **There is no tooling for this yet.** It needs a re-sign job in Lane 2 (read each recorded `bundleSha256`, load and check the bundle, sign its manifest with the new key, store the new attestation) and a way to list the verdicts signed by a given `keyId`. It is not built; until it is, a compromise leaves the old verdicts unverifiable.
 
