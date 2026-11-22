@@ -128,6 +128,13 @@ function detail(event: TrialEvent): string {
       const rejected = r.rejectedBy ? ` rejected by ${sanitize(r.rejectedBy)}` : '';
       return `${sanitize(r.patchExhibitId)} familyFlipped=${String(r.familyFlipped)} suitePassed=${String(r.suitePassed)} rescanClean=${String(r.rescanClean)}${rejected}`;
     }
+    // v1.2 (contracts): rendered so the switch stays total.
+    case 'cost-released': {
+      const c = event.payload.cost;
+      return `${sanitize(c.stage)} attempt ${c.attempt}, usd ${c.usd} released from #${event.payload.reservationSeq} (${sanitize(event.payload.reason)})`;
+    }
+    case 'halted':
+      return sanitize(event.payload.reason);
   }
 }
 
