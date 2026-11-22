@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   IllegalTransitionError,
+  ReleaseRejectedError,
   VerdictAlreadyWrittenError,
   samples,
   type Budget,
@@ -143,6 +144,77 @@ describe('FakeCaseStore', () => {
     const last = await store.chargeBudget(caseFile.id, cost({ usd: 0.9 }));
     expect(last.exhausted).toBe(true);
     expect(store.charges(caseFile.id)).toHaveLength(2);
+  });
+
+  describe('releaseCharge (v1.2, CR-T1)', () => {
+    const remaining = {
+      remainingInputTokens: 900,
+      remainingOutputTokens: 990,
+      remainingUsd: 0.9,
+      exhausted: false,
+    };
+    async function charged(withSink = true) {
+      const events = new FakeEventSink();
+      const store = new FakeCaseStore(withSink ? { events } : {});
+      await store.open(caseFile, budget);
+      const after = await store.chargeBudget(caseFile.id, cost());
+      const seq = await store.nextSeq(caseFile.id);
+      await events.emit({
+        schemaVersion: 1,
+        caseId: caseFile.id,
+        seq,
+        stage: 'intake',
+        at: '2026-11-05T12:00:00.000Z',
+        actor: 'defense',
+        type: 'cost-charged',
+        payload: { cost: cost(), remaining: after },
+      });
+      return { store, seq };
+    }
+
+    it('gives back the unspent part and recomputes exhaustion', async () => {
+      const { store, seq } = await charged();
+      const after = await store.releaseCharge(
+        caseFile.id,
+        cost({ inputTokens: 60, outputTokens: 4, usd: 0.06 }),
+        seq,
+      );
+      expect(after).toEqual({
+        ...remaining,
+        remainingInputTokens: 960,
+        remainingOutputTokens: 994,
+        remainingUsd: 0.96,
+      });
+      expect(store.releases(caseFile.id).get(seq)?.inputTokens).toBe(60);
+    });
+
+    it('is idempotent on the reservation seq', async () => {
+      const { store, seq } = await charged();
+      const first = await store.releaseCharge(caseFile.id, cost({ usd: 0.05 }), seq);
+      const again = await store.releaseCharge(caseFile.id, cost(), seq);
+      expect(again).toEqual(first);
+      expect(store.releases(caseFile.id).size).toBe(1);
+    });
+
+    it('refuses to release more than the charge, another stage, or a seq that is no charge', async () => {
+      const { store, seq } = await charged();
+      const release = (refund: StageCost, at = seq) => store.releaseCharge(caseFile.id, refund, at);
+      await expect(release(cost({ usd: 0.2 }))).rejects.toBeInstanceOf(ReleaseRejectedError);
+      await expect(release(cost({ stage: 'remedy' }))).rejects.toThrow(/different stage/);
+      await expect(release(cost(), seq + 1)).rejects.toThrow(/no cost-charged event/);
+      await expect(release({ ...cost(), usd: -1 })).rejects.toThrow(/not a valid StageCost/);
+      // A rejected release changes nothing and does not burn the seq.
+      expect(store.releases(caseFile.id).size).toBe(0);
+      await store.releaseCharge(caseFile.id, cost(), seq);
+    });
+
+    it('never lets the ledger go negative, even without a sink to check seqs', async () => {
+      const { store, seq } = await charged(false);
+      await store.releaseCharge(caseFile.id, cost(), seq);
+      await expect(store.releaseCharge(caseFile.id, cost(), seq + 1)).rejects.toThrow(
+        /more than the case was charged/,
+      );
+    });
   });
 
   it('hands out increasing sequence numbers per case', async () => {

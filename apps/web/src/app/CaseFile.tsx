@@ -1,7 +1,7 @@
 import type { Exhibit, TrialEvent } from '@affidavit/contracts';
 import { useId, useState, type ReactNode } from 'react';
 import type { CaseView, DocketEntry, ExhibitView } from '../model/caseView.js';
-import { TerminalWithScrubber } from '../terminal/Terminal.js';
+import { TerminalWithScrubber, type TerminalBriefProps } from '../terminal/Terminal.js';
 import { Courtroom } from './Courtroom.js';
 import { REVIEW_REASON, RULE_TEXT, STATUS_STAMP } from './status.js';
 
@@ -276,6 +276,71 @@ export function CaseFile({
   /** Exhibit content (patch diff, witness code) when a source has it. */
   content?: readonly Exhibit[];
 }) {
+  const lower = (
+    <>
+      <section aria-labelledby="exhibits-heading">
+        <h2 id="exhibits-heading">{`Exhibits (${view.exhibits.length})`}</h2>
+        {view.exhibits.length === 0 ? (
+          <p className="muted">No exhibits have been filed.</p>
+        ) : (
+          view.exhibits.map((x) => (
+            <Collapsible key={x.id} level={3} title={x.id} meta={`${x.kind}, ${exhibitState(x)}`}>
+              <ExhibitDetail exhibit={x} />
+            </Collapsible>
+          ))
+        )}
+      </section>
+
+      <section aria-label="Docket" className="docket-section">
+        <Collapsible level={2} title="Docket" meta={`${view.docket.length} entries`}>
+          <ol className="docket">
+            {view.docket.map((d) => (
+              <li key={d.seq}>
+                <span className="mono muted">{`#${d.seq} ${d.stage} `}</span>
+                {d.label}
+                <span className="mono muted">{`  ${d.at}`}</span>
+                <DocketDetail entry={d} exhibits={view.exhibits} />
+              </li>
+            ))}
+          </ol>
+        </Collapsible>
+      </section>
+    </>
+  );
+
+  // With the recorded events the dense terminal is the whole top of the page. Its own title is the
+  // h1, and what used to sit above it (headline, summary, review notes) is its Brief panel.
+  if (events) {
+    const brief: TerminalBriefProps = {
+      headline: view.headline,
+      summary: view.summary,
+      ...(view.status === 'unverified' && view.stampWithheld.length > 0
+        ? {
+            notVerified: {
+              awaitingVerification: view.awaitingVerification,
+              reasons: view.stampWithheld,
+            },
+          }
+        : {}),
+      ...(view.humanReview
+        ? {
+            humanReview: {
+              reason: REVIEW_REASON[view.humanReview.reason],
+              detail: view.humanReview.detail,
+              nextSteps: view.humanReview.nextSteps,
+            },
+          }
+        : {}),
+      ...(connection ? { connection } : {}),
+    };
+    return (
+      <>
+        <TerminalWithScrubber events={events} brief={brief} {...(content ? { content } : {})} />
+        {lower}
+      </>
+    );
+  }
+
   return (
     <article aria-labelledby="page-heading">
       <p className="label">{`Case file ${slug ?? view.caseId}`}</p>
@@ -329,39 +394,9 @@ export function CaseFile({
         </section>
       ) : null}
 
-      {events ? (
-        <TerminalWithScrubber events={events} embedded {...(content ? { content } : {})} />
-      ) : (
-        <Courtroom view={view} />
-      )}
+      <Courtroom view={view} />
 
-      <section aria-labelledby="exhibits-heading">
-        <h2 id="exhibits-heading">{`Exhibits (${view.exhibits.length})`}</h2>
-        {view.exhibits.length === 0 ? (
-          <p className="muted">No exhibits have been filed.</p>
-        ) : (
-          view.exhibits.map((x) => (
-            <Collapsible key={x.id} level={3} title={x.id} meta={`${x.kind}, ${exhibitState(x)}`}>
-              <ExhibitDetail exhibit={x} />
-            </Collapsible>
-          ))
-        )}
-      </section>
-
-      <section aria-label="Docket" className="docket-section">
-        <Collapsible level={2} title="Docket" meta={`${view.docket.length} entries`}>
-          <ol className="docket">
-            {view.docket.map((d) => (
-              <li key={d.seq}>
-                <span className="mono muted">{`#${d.seq} ${d.stage} `}</span>
-                {d.label}
-                <span className="mono muted">{`  ${d.at}`}</span>
-                <DocketDetail entry={d} exhibits={view.exhibits} />
-              </li>
-            ))}
-          </ol>
-        </Collapsible>
-      </section>
+      {lower}
     </article>
   );
 }

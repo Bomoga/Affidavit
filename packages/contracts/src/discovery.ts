@@ -85,6 +85,47 @@ export const Redaction = z.object({
 });
 export type Redaction = z.infer<typeof Redaction>;
 
+/**
+ * v1.2 (CR-14): a scanner intake may run. Wider than `Candidate.tool`, because a scanner that finds
+ * no candidates of its own (gitleaks, the secret scan) still has coverage worth recording.
+ */
+export const ScannerTool = z.enum(['semgrep', 'codeql', 'osv', 'treesitter', 'gitleaks']);
+export type ScannerTool = z.infer<typeof ScannerTool>;
+
+/** v1.2 (CR-14): why a scanner did not run for a case. */
+export const ScannerSkipReason = z.enum([
+  /** The tool cannot run inside the jail yet (OSV-Scanner needs a writable temp directory). */
+  'not-supported-in-jail',
+  /** Intake was configured without this tool. */
+  'not-configured',
+  /** The tool started but produced no usable report. */
+  'tool-failed',
+]);
+export type ScannerSkipReason = z.infer<typeof ScannerSkipReason>;
+
+/**
+ * v1.2 (CR-14): one scanner's coverage for a case. A scanner that did not run must say why, so a
+ * case with no dependency findings can tell "nothing vulnerable" from "not checked".
+ */
+export const ScannerCoverage = z
+  .object({
+    tool: ScannerTool,
+    ran: z.boolean(),
+    /** Pinned reference of what ran, for example an image digest. */
+    ref: z.string().min(1).optional(),
+    reason: ScannerSkipReason.optional(),
+    detail: z.string().optional(),
+  })
+  .refine((s) => s.ran || s.reason !== undefined, {
+    message: 'a scanner that did not run must name the reason',
+    path: ['reason'],
+  })
+  .refine((s) => !s.ran || s.reason === undefined, {
+    message: 'a scanner that ran cannot carry a skip reason',
+    path: ['reason'],
+  });
+export type ScannerCoverage = z.infer<typeof ScannerCoverage>;
+
 export const CaseFile = z.object({
   schemaVersion: SchemaVersion,
   id: CaseId,
@@ -98,6 +139,17 @@ export const CaseFile = z.object({
   /** Arraignment score at or above this means no silent dismissal (F3). */
   escalationFloor: z.number().min(0).max(1),
   safeVariant: TargetRef.optional(),
+  /**
+   * v1.2 (CR-14), optional so v1.0 and v1.1 case files still parse with `schemaVersion: 1`.
+   * Absent means coverage was not recorded (a case file written before v1.2), never "all ran".
+   * At most one entry per tool.
+   */
+  scanners: z
+    .array(ScannerCoverage)
+    .refine((list) => new Set(list.map((s) => s.tool)).size === list.length, {
+      message: 'each scanner appears at most once',
+    })
+    .optional(),
 });
 export type CaseFile = z.infer<typeof CaseFile>;
 
