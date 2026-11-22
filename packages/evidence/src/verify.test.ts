@@ -12,6 +12,7 @@ import {
   publicKeyId,
 } from './attestation.js';
 import { buildBundle, MANIFEST_PATH } from './bundle.js';
+import { parseKeysFile, type PublishedKey } from './keys.js';
 import { canonicalJson } from './canonical.js';
 import { readTar, writeTar } from './tar.js';
 import { bundleInput } from './test-helpers.js';
@@ -31,6 +32,14 @@ const pem = (): string =>
     type: 'spki',
     format: 'pem',
   }) as string;
+
+/** A keys file entry for `publicKey`. */
+const entry = (
+  publicKey: string,
+  status: PublishedKey['status'] = 'active',
+  extra: Partial<PublishedKey> = {},
+): PublishedKey => ({ keyId: publicKeyId(publicKey), publicKey, status, ...extra });
+const keysFile = (...keys: PublishedKey[]): string => JSON.stringify({ schemaVersion: 1, keys });
 
 /** Stand-ins for cosign: one accepts every signature, one rejects every signature. */
 const cosignOk = write('cosign-ok', '#!/bin/sh\nexit 0\n');
@@ -67,7 +76,7 @@ describe('verifyPublic', () => {
     const { bytes, sha256, manifest } = await buildBundle(bundleInput());
     const key = pem();
     const att = JSON.stringify(fakeAttestation(manifest, key));
-    const r = await verifyPublic(bytes, att, [pem(), key], {
+    const r = await verifyPublic(bytes, att, [entry(pem()), entry(key)], {
       expectedSha256: sha256,
       cosignPath: cosignOk,
     });
@@ -87,9 +96,14 @@ describe('verifyPublic', () => {
     const w = new Uint8Array(files.get('exhibits/exhibit-witness-001.json')!);
     w[5] = (w[5] ?? 0) ^ 1;
     const tampered = await rewrite(bytes, 'exhibits/exhibit-witness-001.json', w);
-    const r = await verifyPublic(tampered, JSON.stringify(fakeAttestation(manifest, key)), [key], {
-      cosignPath: cosignOk,
-    });
+    const r = await verifyPublic(
+      tampered,
+      JSON.stringify(fakeAttestation(manifest, key)),
+      [entry(key)],
+      {
+        cosignPath: cosignOk,
+      },
+    );
     expect(r.ok).toBe(false);
     expect(!r.ok && r.reason).toMatch(/^bundle integrity \(exhibit-witness-001\)/);
   });
@@ -98,12 +112,12 @@ describe('verifyPublic', () => {
     const { bytes, manifest } = await buildBundle(bundleInput());
     const key = pem();
     const att = JSON.stringify(fakeAttestation(manifest, key));
-    const other = await verifyPublic(bytes, att, [key], {
+    const other = await verifyPublic(bytes, att, [entry(key)], {
       expectedSha256: 'f'.repeat(64),
       cosignPath: cosignOk,
     });
     expect(!other.ok && other.reason).toMatch(/expected digest/);
-    const bad = await verifyPublic(bytes, att, [key], {
+    const bad = await verifyPublic(bytes, att, [entry(key)], {
       expectedSha256: 'xyz',
       cosignPath: cosignOk,
     });
@@ -116,9 +130,14 @@ describe('verifyPublic', () => {
     // An extra field the schema drops: it would ride along unsigned.
     const padded = { ...JSON.parse(canonicalJson(manifest)), note: 'unsigned' } as object;
     const altered = await rewrite(bytes, MANIFEST_PATH, Buffer.from(JSON.stringify(padded)));
-    const r = await verifyPublic(altered, JSON.stringify(fakeAttestation(manifest, key)), [key], {
-      cosignPath: cosignOk,
-    });
+    const r = await verifyPublic(
+      altered,
+      JSON.stringify(fakeAttestation(manifest, key)),
+      [entry(key)],
+      {
+        cosignPath: cosignOk,
+      },
+    );
     expect(!r.ok && r.reason).toBe('manifest.json is not the canonical form of its manifest');
   });
 
@@ -128,7 +147,7 @@ describe('verifyPublic', () => {
       .manifest;
     const key = pem();
     const opts = { cosignPath: cosignOk };
-    const reason = async (att: string, keys = [key]) => {
+    const reason = async (att: string, keys = [entry(key)]) => {
       const r = await verifyPublic(bytes, att, keys, opts);
       return r.ok ? 'ok' : r.reason;
     };
@@ -138,25 +157,43 @@ describe('verifyPublic', () => {
     expect(await reason('not json')).toBe('the attestation file is not JSON');
     expect(await reason('{"schemaVersion":1}')).toBe('the attestation file is not an attestation');
     const att = JSON.stringify(fakeAttestation(manifest, key));
-    expect(await reason(att, [pem()])).toMatch(/which is none of the given keys/);
-    expect(await reason(att, [])).toBe('no public key given');
-    expect(await reason(att, ['-----BEGIN PUBLIC KEY-----\nnope\n'])).toBe(
-      'public key 1 is not a PEM public key',
+    expect(await reason(att, [entry(pem())])).toMatch(/which is none of the published keys/);
+    expect(await reason(att, [])).toBe('no published key given');
+    const notPem = { ...entry(key), publicKey: '-----BEGIN PUBLIC KEY-----\nnope\n' };
+    expect(await reason(att, [notPem])).toBe('published key 1 is not a PEM public key');
+    const wrongId = { ...entry(key), keyId: publicKeyId(pem()) };
+    expect(await reason(att, [wrongId])).toBe(
+      "published key 1 has a keyId that is not its key's id",
     );
   });
 
-  it('refuses a signature by a revoked key, even when that key is passed', async () => {
+  it('refuses a signature by a key the keys file marks revoked, whatever its revokedAt', async () => {
+    const { bytes, manifest } = await buildBundle(bundleInput());
+    const oldKey = pem();
+    const newKey = pem();
+    const att = JSON.stringify(fakeAttestation(manifest, oldKey));
+    const opts = { cosignPath: cosignOk };
+    const revokedEntry = entry(oldKey, 'revoked', { revokedAt: '2099-01-01T00:00:00Z' });
+    const r = await verifyPublic(bytes, att, [entry(newKey), revokedEntry], opts);
+    expect(!r.ok && r.reason).toBe(`signed by key ${publicKeyId(oldKey)}, which is revoked`);
+    // The same key, still active, verifies; revoking another key leaves this one verifying.
+    expect((await verifyPublic(bytes, att, [entry(newKey), entry(oldKey)], opts)).ok).toBe(true);
+    const fresh = JSON.stringify(fakeAttestation(manifest, newKey));
+    expect((await verifyPublic(bytes, fresh, [entry(newKey), revokedEntry], opts)).ok).toBe(true);
+  });
+
+  it('refuses a key named by the revokedKeyIds override, even when the file says active', async () => {
     const { bytes, manifest } = await buildBundle(bundleInput());
     const oldKey = pem();
     const newKey = pem();
     const att = JSON.stringify(fakeAttestation(manifest, oldKey));
     const opts = { cosignPath: cosignOk, revokedKeyIds: [publicKeyId(oldKey)] };
-    const r = await verifyPublic(bytes, att, [newKey, oldKey], opts);
+    const keys = [entry(newKey), entry(oldKey)];
+    const r = await verifyPublic(bytes, att, keys, opts);
     expect(!r.ok && r.reason).toBe(`signed by key ${publicKeyId(oldKey)}, which is revoked`);
-    // Revoking another key leaves this one verifying.
     const fresh = JSON.stringify(fakeAttestation(manifest, newKey));
-    expect((await verifyPublic(bytes, fresh, [newKey, oldKey], opts)).ok).toBe(true);
-    const bad = await verifyPublic(bytes, fresh, [newKey], { ...opts, revokedKeyIds: ['k1'] });
+    expect((await verifyPublic(bytes, fresh, keys, opts)).ok).toBe(true);
+    const bad = await verifyPublic(bytes, fresh, keys, { ...opts, revokedKeyIds: ['k1'] });
     expect(!bad.ok && bad.reason).toMatch(/revoked key id "k1" is not sha256:<64 hex>/);
   });
 
@@ -164,25 +201,63 @@ describe('verifyPublic', () => {
     const { bytes, manifest } = await buildBundle(bundleInput());
     const key = pem();
     const att = JSON.stringify(fakeAttestation(manifest, key));
-    const r = await verifyPublic(bytes, att, [key], { cosignPath: cosignBad });
+    const r = await verifyPublic(bytes, att, [entry(key)], { cosignPath: cosignBad });
     expect(!r.ok && r.reason).toBe('signature: cosign: invalid signature');
     await expect(
-      verifyPublic(bytes, att, [key], { cosignPath: join(dir, 'no-such-cosign') }),
+      verifyPublic(bytes, att, [entry(key)], { cosignPath: join(dir, 'no-such-cosign') }),
     ).rejects.toThrow(/cosign is not installed/);
   });
 });
 
+describe('parseKeysFile', () => {
+  it('accepts a well formed file and refuses every malformed one', () => {
+    const a = pem();
+    const b = pem();
+    const good = parseKeysFile(
+      keysFile(
+        entry(a, 'active', { validFrom: '2026-11-21T00:00:00Z' }),
+        entry(b, 'revoked', { revokedAt: '2026-12-01T00:00:00Z' }),
+      ),
+    );
+    expect(good.ok && good.keys.map((k) => k.status)).toEqual(['active', 'revoked']);
+    const reason = (text: string) => {
+      const r = parseKeysFile(text);
+      return r.ok ? 'ok' : r.reason;
+    };
+    expect(reason('nope')).toBe('the keys file is not JSON');
+    expect(reason('{"schemaVersion":1,"keys":[]}')).toMatch(/is not a keys file at keys/);
+    expect(reason(JSON.stringify({ keys: [entry(a)] }))).toMatch(/is not a keys file/);
+    expect(reason(keysFile({ ...entry(a), status: 'retired' as 'active' }))).toMatch(
+      /is not a keys file at keys\.0\.status/,
+    );
+    expect(reason(keysFile({ ...entry(a), note: 'x' } as PublishedKey))).toMatch(
+      /is not a keys file/,
+    );
+    expect(reason(keysFile(entry(a, 'active', { revokedAt: 'yesterday' })))).toMatch(
+      /is not a keys file at keys\.0\.revokedAt/,
+    );
+    expect(reason(keysFile({ ...entry(a), keyId: publicKeyId(b) }))).toMatch(
+      /keyId that is not its key's id at keys\.0/,
+    );
+    expect(reason(keysFile({ ...entry(a), publicKey: 'nope' }))).toMatch(/not PEM at keys\.0/);
+    expect(reason(keysFile(entry(a), entry(a)))).toMatch(/twice/);
+    expect(reason(keysFile(entry(a, 'active', { revokedAt: '2026-12-01T00:00:00Z' })))).toMatch(
+      /revokedAt on a key that is not revoked/,
+    );
+  });
+});
+
 describe('verifyBundleFiles and the verify command', () => {
-  it('prints the verdict and exits 0 when verified, 1 when not', async () => {
+  it('prints the verdict and exits 0 when verified, 1 when not or when the key is revoked', async () => {
     const { bytes, manifest, sha256 } = await buildBundle(bundleInput());
     const key = pem();
     const bundle = write('ok.tar', bytes);
     const att = write('ok.att.json', JSON.stringify(fakeAttestation(manifest, key)));
-    const pub = write('ok.pub', key);
+    const keys = write('ok.keys.json', keysFile(entry(pem()), entry(key)));
     const lines: string[] = [];
     const out = (l: string) => lines.push(l);
     const ok = await verifyMain(
-      [bundle, att, '--key', pub, '--expect-sha256', sha256, '--cosign', cosignOk],
+      [bundle, att, '--keys', keys, '--expect-sha256', sha256, '--cosign', cosignOk],
       out,
     );
     expect(ok).toBe(VERIFY_EXIT.VERIFIED);
@@ -191,42 +266,78 @@ describe('verifyBundleFiles and the verify command', () => {
     expect(lines).toContain(`signed by ${publicKeyId(key)}`);
 
     lines.length = 0;
-    const bad = await verifyMain([bundle, att, '--key', pub, '--cosign', cosignBad], out);
+    const bad = await verifyMain([bundle, att, '--keys', keys, '--cosign', cosignBad], out);
     expect(bad).toBe(VERIFY_EXIT.FAILED);
     expect(lines.at(-1)).toBe('NOT VERIFIED: signature: cosign: invalid signature');
 
+    // Revoked in the keys file: refused with no --revoked flag at all.
     lines.length = 0;
+    const revokedKeys = write(
+      'revoked.keys.json',
+      keysFile(entry(pem()), entry(key, 'revoked', { revokedAt: '2026-12-01T00:00:00Z' })),
+    );
     const revoked = await verifyMain(
-      [bundle, att, '--key', pub, '--revoked', publicKeyId(key), '--cosign', cosignOk],
+      [bundle, att, '--keys', revokedKeys, '--cosign', cosignOk],
       out,
     );
     expect(revoked).toBe(VERIFY_EXIT.FAILED);
+    expect(lines.at(-1)).toBe(`NOT VERIFIED: signed by key ${publicKeyId(key)}, which is revoked`);
+
+    // --revoked on top of a file that still says active.
+    lines.length = 0;
+    const override = await verifyMain(
+      [bundle, att, '--keys', keys, '--revoked', publicKeyId(key), '--cosign', cosignOk],
+      out,
+    );
+    expect(override).toBe(VERIFY_EXIT.FAILED);
     expect(lines.at(-1)).toMatch(/which is revoked$/);
   });
 
-  it('exits 2 on bad usage or unreadable files, and 3 without cosign', async () => {
+  it('exits 2 without a readable, well formed keys file, on bad usage, and 3 without cosign', async () => {
     const { bytes, manifest } = await buildBundle(bundleInput());
     const key = pem();
     const bundle = write('u.tar', bytes);
     const att = write('u.att.json', JSON.stringify(fakeAttestation(manifest, key)));
+    const keys = write('u.keys.json', keysFile(entry(key)));
     const pub = write('u.pub', key);
     const lines: string[] = [];
     const out = (l: string) => lines.push(l);
+    // No keys file: never verified, whatever else is passed.
+    expect(await verifyMain([bundle, att, '--cosign', cosignOk], out)).toBe(VERIFY_EXIT.USAGE);
+    expect(lines[0]).toMatch(/--keys <keys file> is required/);
+    // The old --key flag is gone, so a bare public key cannot skip the status list.
+    expect(await verifyMain([bundle, att, '--key', pub, '--cosign', cosignOk], out)).toBe(
+      VERIFY_EXIT.USAGE,
+    );
+    // Missing, unreadable (a directory), or malformed keys files.
+    lines.length = 0;
+    expect(await verifyMain([bundle, att, '--keys', join(dir, 'missing.json')], out)).toBe(
+      VERIFY_EXIT.USAGE,
+    );
+    expect(lines.at(-1)).toMatch(/keys file .* cannot be read/);
+    expect(await verifyMain([bundle, att, '--keys', dir], out)).toBe(VERIFY_EXIT.USAGE);
+    // A bare PEM is not a keys file.
+    lines.length = 0;
+    expect(await verifyMain([bundle, att, '--keys', pub, '--cosign', cosignOk], out)).toBe(
+      VERIFY_EXIT.USAGE,
+    );
+    expect(lines.at(-1)).toMatch(/the keys file is not JSON/);
+    const empty = write('empty.keys.json', '{"schemaVersion":1,"keys":[]}');
+    expect(await verifyMain([bundle, att, '--keys', empty, '--cosign', cosignOk], out)).toBe(
+      VERIFY_EXIT.USAGE,
+    );
     expect(await verifyMain([bundle, att], out)).toBe(VERIFY_EXIT.USAGE);
-    expect(await verifyMain([bundle, '--key', pub], out)).toBe(VERIFY_EXIT.USAGE);
-    expect(await verifyMain([bundle, att, '--key', pub, '--bogus'], out)).toBe(VERIFY_EXIT.USAGE);
-    expect(await verifyMain([bundle, att, '--key', pub, '--revoked', 'old'], out)).toBe(
+    expect(await verifyMain([bundle, '--keys', keys], out)).toBe(VERIFY_EXIT.USAGE);
+    expect(await verifyMain([bundle, att, '--keys', keys, '--bogus'], out)).toBe(VERIFY_EXIT.USAGE);
+    expect(await verifyMain([bundle, att, '--keys', keys, '--revoked', 'old'], out)).toBe(
       VERIFY_EXIT.USAGE,
     );
-    expect(await verifyMain([bundle, att, '--key', join(dir, 'missing.pub')], out)).toBe(
-      VERIFY_EXIT.USAGE,
-    );
-    expect(await verifyMain([dir, att, '--key', pub], out)).toBe(VERIFY_EXIT.USAGE);
+    expect(await verifyMain([dir, att, '--keys', keys], out)).toBe(VERIFY_EXIT.USAGE);
     expect(
       await verifyBundleFiles({
         bundlePath: bundle,
         attestationPath: att,
-        publicKeyPaths: [pub],
+        keysPath: keys,
         cosignPath: join(dir, 'no-such-cosign'),
         out,
       }),
@@ -295,10 +406,8 @@ describe.runIf(hasCosign)('with real cosign signatures', { timeout: 120_000 }, (
       [
         write('real.tar', bytes),
         write('real.att.json', JSON.stringify(att)),
-        '--key',
-        write('older.pub', older),
-        '--key',
-        write('real.pub', pub),
+        '--keys',
+        write('real.keys.json', keysFile(entry(older), entry(pub))),
         '--expect-sha256',
         sha256,
       ],
@@ -314,7 +423,7 @@ describe.runIf(hasCosign)('with real cosign signatures', { timeout: 120_000 }, (
     sig[sig.length - 1] = (sig[sig.length - 1] ?? 0) ^ 1;
     sigBundle.dsseEnvelope.signatures[0]!.sig = sig.toString('base64');
     const flipped = { ...att, signature: JSON.stringify(sigBundle) };
-    const r = await verifyPublic(bytes, JSON.stringify(flipped), [pub]);
+    const r = await verifyPublic(bytes, JSON.stringify(flipped), [entry(pub)]);
     expect(r.ok).toBe(false);
     expect(!r.ok && r.reason).toMatch(/^signature: cosign:/);
   });

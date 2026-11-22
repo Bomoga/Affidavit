@@ -39,24 +39,26 @@ cosign verify-blob-attestation \
 
 ## Public verification (L2-12)
 
-Anyone holding a bundle can check it without access to our systems: no database, store, signer, sandbox or network. They need the bundle tar, the attestation (the `Attestation` JSON), the published public key(s), cosign, and this repository's `@affidavit/evidence` package.
+Anyone holding a bundle can check it without access to our systems: no database, store, signer, sandbox or network. They need the bundle tar, the attestation (the `Attestation` JSON), the published keys file (`docs/keys/keys.json`, format in `docs/keys/README.md`), cosign, and this repository's `@affidavit/evidence` package. The keys file holds public keys only; the verifier never talks to the signer.
 
 ```sh
 pnpm --filter @affidavit/evidence verify bundle.tar attestation.json \
-  --key affidavit-signer.pub [--key affidavit-signer-2025.pub] \
+  --keys docs/keys/keys.json \
   [--expect-sha256 <the verdict's bundleSha256>] \
-  [--revoked <keyId of a revoked key>]
+  [--revoked <keyId>]...
 ```
+
+`--keys` is required. A missing, unreadable or malformed keys file is exit 2, never a verification, so "no list", "unreadable list" and "nothing revoked" cannot look the same. There is no `--key <pem>` flag: a bare public key would skip the status list.
 
 `verifyPublic` (`src/verify.ts`) stops at the first failure:
 
 1. With `--expect-sha256`, the bundle hashes to it, so it is the bundle the verdict names.
 2. `openBundle`: every file is listed in the manifest and hashes to its digest, the verdict hashes to `verdictSha256`, and the case file, manifest and verdict agree. A tampered file is named.
 3. `manifest.json` is byte for byte the canonical form of the manifest that parsed, so a field the schema would drop cannot ride along unsigned.
-4. The attestation parses, its `keyId` is not revoked, and it is one of the given keys. Pass every published key; the attestation names the one that signed (rotation). Pass `--revoked <keyId>` for every key listed as revoked in `docs/keys/README.md`: a revoked key is refused even when its public key is also passed, because a signature carries no trusted timestamp, so one made after the leak cannot be told apart from an older one.
+4. The attestation parses, its `keyId` is one of the keys in the keys file (the attestation names the one that signed, so rotation needs no flag), and that key is not revoked: its `status` is not `revoked` and it is not named by `--revoked`. A revoked key is refused whatever its `revokedAt` and whatever the bundle's `createdAt`, because a signature carries no trusted timestamp, so one made after the leak cannot be told apart from an older one. `--revoked <keyId>` (repeatable) is an extra override on top of the file, for a revocation the verifier has heard of before the published file is updated; a malformed id is exit 2.
 5. `verifyAttestation`: structural checks, then `cosign verify-blob-attestation` offline with that key.
 
-It prints the bundle digest, case, verdict outcome and severity, exhibit count and key id, then `VERIFIED` or `NOT VERIFIED: <reason>`. Exit codes: 0 verified, 1 not verified, 2 usage or unreadable file, 3 cosign not installed (never reported as verified).
+It prints the bundle digest, case, verdict outcome and severity, exhibit count and key id, then `VERIFIED` or `NOT VERIFIED: <reason>`. Exit codes: 0 verified, 1 not verified (a revoked key included), 2 usage, or a missing, unreadable or malformed bundle, attestation or keys file, 3 cosign not installed (never reported as verified).
 
 Verification checks that the evidence is the evidence we signed. It does not rerun the exhibits; `affidavit replay` with a sandbox host does that.
 
@@ -72,12 +74,12 @@ Verification checks that the evidence is the evidence we signed. It does not rer
 
 ## Key custody (open decision)
 
-Where the production key lives and how it rotates is still open in `docs/decisions.md` (owner: Lane 2 owner with the lead). Nothing in the code depends on the answer: `AFFIDAVIT_SIGNER_KEY` is any cosign key reference. The options:
+Where the production key lives and how it rotates is still open in `docs/decisions.md` (owner: unassigned there). The options:
 
 1. An encrypted cosign key file readable only by the signer's user, with its password in the team's secret manager. Works today on one host.
-2. A cloud KMS or Vault key (`awskms://`, `gcpkms://`, `hashivault://`). The key never leaves the KMS; needs a cloud account and credentials scoped to the signer.
+2. A cloud KMS or Vault key (`awskms://`, `gcpkms://`, `hashivault://`). The key never leaves the KMS; needs a cloud account and credentials scoped to the signer. Not usable yet: cosign gets only `PATH`, a throwaway `HOME` and the key password (above), so KMS credentials never reach it. Using a KMS key needs a code change in `apps/signer` (see `key-custody.md`).
 
-Either way, rotation means a new key pair, the new public key published next to the old ones, and verifiers trying each published key by `keyId`.
+Either way, rotation means a new key pair and a new entry in `docs/keys/keys.json` next to the old ones; `verify` picks the key by `keyId`. Revocation means setting that key's `status` to `revoked` in the same file. The proposal is `key-custody.md` (PR #72).
 
 ## Tests
 

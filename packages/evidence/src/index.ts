@@ -5,4 +5,5 @@ export * from './replay.js';
 export * from './store.js';
 export * from './tar.js';
 export * from './attestation.js';
+export * from './keys.js';
 export * from './verify.js';
