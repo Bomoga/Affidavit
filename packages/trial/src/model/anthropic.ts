@@ -6,11 +6,16 @@ import { PromptId, type CaseStage, type StageCost } from '@affidavit/contracts';
 import { getPrompt } from '@affidavit/prompts';
 import { KillSwitchError, type ModelTurnRequest, type ModelTurnResult } from '../orchestrator.js';
 import { ROLE_TOOLS, assertAllowedTools } from '../roles.js';
-import { ModelCallError, ModelConfigError, ModelUnconfiguredError } from './errors.js';
+import {
+  ModelCallError,
+  ModelConfigError,
+  ModelUnconfiguredError,
+  type ProviderFailure,
+} from './errors.js';
 import { isKnownModelId, type ModelTable } from './models.js';
 import type { PreflightModelPort } from './preflight.js';
 import { FileRecordingStore, type RecordingStore } from './recordings.js';
-import { clipRedacted, containsSecret, describeThrown, redact } from './redact.js';
+import { containsSecret, describeThrown, redact } from './redact.js';
 import {
   DENIED_BUILTIN_TOOLS,
   SUBMIT_SERVER_NAME,
@@ -114,6 +119,180 @@ function resultUsage(result: SDKResultMessage): Usage {
 
 const toInt = (n: number): number => (Number.isFinite(n) && n > 0 ? Math.ceil(n) : 0);
 
+/** A key the HTTP runtime will accept as a header value: printable ASCII, no spaces. */
+const KEY_SHAPE = /^[\x21-\x7e]+$/;
+
+/**
+ * Provider error classes decided before the model does any work, so a call that failed with one
+ * of them and reported no usage spent nothing. Any other class keeps the up-front charge.
+ */
+export const REFUSED_BEFORE_WORK: ReadonlySet<string> = new Set([
+  'invalid_request',
+  'rate_limit',
+  'billing_error',
+  'authentication_failed',
+]);
+
+/** Longest provider message an error carries. */
+export const PROVIDER_MESSAGE_MAX = 300;
+/** Shown in place of provider text that matches no known-safe shape. */
+export const PROVIDER_MESSAGE_WITHHELD =
+  'provider message withheld (does not match a known-safe shape)';
+/** Longest provider text the templates are matched against. Longer text is withheld. */
+const PROVIDER_SCAN_MAX = 16_384;
+
+/** Request fields an API validation path may start with. */
+const PATH_ROOTS =
+  'tools|messages|system|thinking|output_config|max_tokens|temperature|top_p|top_k|metadata|stop_sequences';
+/** Validation reasons shown after a path. Anything else after a path is not shown. */
+const PATH_REASONS = [
+  'JSON schema is invalid',
+  'Field required',
+  'Extra inputs are not permitted',
+  'Input should be a valid string',
+  'Input should be a valid dictionary',
+  'Input should be a valid list',
+  'String should have at least 1 character',
+  'text content blocks must be non-empty',
+  'text content blocks must contain non-whitespace text',
+  'unexpected tool_use_id found in tool_result blocks',
+  'does not support oneOf, allOf, or anyOf at the top level',
+] as const;
+/** Names a validation path may contain after its root: request structure, never case content. */
+const PATH_NAMES =
+  '(?:content|text|type|input_schema|custom|name|description|source|tool_use_id|tool_result|tool_use|image|document|media_type|data|properties|items|role|cache_control|budget_tokens|effort|format|input|id|display)(?![A-Za-z0-9_])';
+const MODEL_ID = String.raw`claude-[a-z]{2,10}(?:-[0-9]{1,2}){1,3}`;
+const PARAMS = 'temperature|top_p|top_k|budget_tokens|thinking\\.type|effort';
+
+interface Template {
+  pattern: RegExp;
+  /** Builds the shown fragment from fixed text and the strictly shaped captures only. */
+  show: (m: RegExpExecArray) => string;
+}
+
+/**
+ * Every shape of provider text that may be shown. Each template rebuilds its fragment from fixed
+ * text plus captures that are digits, a strictly shaped model id, or a validation path made of
+ * known roots, indices and short snake_case names. No free text from the provider is forwarded.
+ */
+const TEMPLATES: readonly Template[] = [
+  { pattern: /Invalid API key/i, show: () => 'Invalid API key' },
+  { pattern: /Invalid X-Api-Key header value/i, show: () => 'Invalid X-Api-Key header value' },
+  { pattern: /organization has been disabled/i, show: () => 'organization has been disabled' },
+  { pattern: /credit balance is too low/i, show: () => 'credit balance is too low' },
+  { pattern: /\brate[ _-]?limit/i, show: () => 'rate limit' },
+  { pattern: /\boverloaded\b/i, show: () => 'overloaded' },
+  {
+    pattern: /prompt is too long: ([0-9]{1,9}) tokens > ([0-9]{1,9}) maximum/,
+    show: (m) => `prompt is too long: ${m[1]} tokens > ${m[2]} maximum`,
+  },
+  {
+    pattern: /max_tokens: ([0-9]{1,9}) > ([0-9]{1,9}), which is the maximum allowed/,
+    show: (m) => `max_tokens: ${m[1]} > ${m[2]}, which is the maximum allowed`,
+  },
+  {
+    pattern: /tool_choice: type "tool" and "any" are not supported/,
+    show: () => 'tool_choice: type "tool" and "any" are not supported',
+  },
+  {
+    pattern: new RegExp(String.raw`\b(${PARAMS})\b[^.;]{0,80}?\b(?:not supported|not allowed)`),
+    show: (m) => `${m[1]}: not supported`,
+  },
+  {
+    pattern: new RegExp(String.raw`\bmodel: (${MODEL_ID})(?![A-Za-z0-9_-])`),
+    show: (m) => `model: ${m[1]}`,
+  },
+  {
+    pattern: new RegExp(
+      String.raw`\b((?:${PATH_ROOTS})(?:\.(?:[0-9]{1,4}|${PATH_NAMES})){0,8})(?![A-Za-z0-9_.]): ?([^\n]{0,200})`,
+    ),
+    show: (m) => {
+      const reason = PATH_REASONS.find((r) => (m[2] ?? '').includes(r));
+      return `${m[1]}: ${reason ?? '(reason withheld)'}`;
+    },
+  },
+];
+
+/** The provider's error type from a JSON body, only in the closed snake_case shape. */
+const ERROR_TYPE = /^[a-z_]{1,40}$/;
+
+/** Decodes the first JSON error body in `text`, if there is one; otherwise undefined. */
+function decodeErrorBody(text: string): { type?: string; message?: string } | undefined {
+  const start = text.indexOf('{');
+  if (start === -1) return undefined;
+  try {
+    const parsed = JSON.parse(text.slice(start)) as unknown;
+    const err = (parsed as { error?: unknown } | null)?.error as
+      { type?: unknown; message?: unknown } | undefined;
+    if (err === null || typeof err !== 'object') return undefined;
+    return {
+      ...(typeof err.type === 'string' ? { type: err.type } : {}),
+      ...(typeof err.message === 'string' ? { message: err.message } : {}),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The provider's own error text, reduced to what is known to be safe for an error message and a
+ * log line. It fails closed: a JSON error body is decoded, the text is redacted (the key by value
+ * and every credential pattern), and then only fragments rebuilt from the allowlisted
+ * templates above are shown. Anything else, including any echo of the request or case content
+ * in whatever encoding, becomes `PROVIDER_MESSAGE_WITHHELD`. Never the request body.
+ */
+export function sanitizeProviderMessage(
+  text: string,
+  secrets: readonly string[],
+): string | undefined {
+  if (text.trim() === '') return undefined;
+  if (text.length > PROVIDER_SCAN_MAX) return PROVIDER_MESSAGE_WITHHELD;
+  // Decoded before redaction, so a redaction cannot break the JSON. Each decoded field is then
+  // redacted on its own, and no free text from it is forwarded anyway.
+  const decoded = decodeErrorBody(text);
+  const body =
+    decoded === undefined
+      ? undefined
+      : {
+          ...(decoded.type === undefined ? {} : { type: redact(decoded.type, secrets) }),
+          ...(decoded.message === undefined ? {} : { message: redact(decoded.message, secrets) }),
+        };
+  const subject = body?.message ?? redact(text, secrets);
+  const shown: string[] = [];
+  if (body?.type !== undefined && ERROR_TYPE.test(body.type)) shown.push(body.type);
+  for (const t of TEMPLATES) {
+    const m = t.pattern.exec(subject);
+    if (m === null) continue;
+    const fragment = t.show(m);
+    if (!shown.includes(fragment)) shown.push(fragment);
+  }
+  // An error type alone says nothing beyond the class; withhold rather than imply more.
+  if (shown.length === 0 || (shown.length === 1 && body?.type === shown[0])) {
+    return shown.length === 0
+      ? PROVIDER_MESSAGE_WITHHELD
+      : `${shown[0]}; ${PROVIDER_MESSAGE_WITHHELD}`;
+  }
+  const out = shown.join('; ');
+  return out.length > PROVIDER_MESSAGE_MAX ? `${out.slice(0, PROVIDER_MESSAGE_MAX)}...` : out;
+}
+
+/** The text blocks of a runtime message, which for a provider error hold the provider's text. */
+function messageText(content: unknown): string {
+  if (!Array.isArray(content)) return '';
+  const parts: string[] = [];
+  for (const block of content as unknown[]) {
+    const b = block as { type?: unknown; text?: unknown } | null;
+    if (b !== null && b.type === 'text' && typeof b.text === 'string') parts.push(b.text);
+  }
+  return parts.join(' ');
+}
+
+function describeProvider(p: ProviderFailure): string {
+  const status = p.status === undefined ? '' : ` (HTTP ${p.status})`;
+  const said = p.message === undefined ? '' : `: ${p.message}`;
+  return `provider error ${p.errorClass}${status}${said}`;
+}
+
 /**
  * ModelPort on the Claude Agent SDK. One `runTurn` is one agent session that can do exactly one
  * thing: call the role's submit tool. The agent has no shell, no file tools, no network tools, no
@@ -205,6 +384,16 @@ export class AnthropicModelPort implements PreflightModelPort {
     if (key === undefined || key.trim() === '') {
       throw new ModelUnconfiguredError(`${API_KEY_ENV_VAR} is not set`);
     }
+    // The runtime refuses a key that is not a valid HTTP header value before it sends anything,
+    // and reports that as `invalid_request`, after the orchestrator has charged the turn. A key
+    // with a trailing newline or CR (a CRLF env file, `$(cat key)`), a space, pasted quotes, or
+    // any non-ASCII character is refused here instead, before any charge. The message names the
+    // problem, never the value.
+    if (!KEY_SHAPE.test(key)) {
+      throw new ModelUnconfiguredError(
+        `${API_KEY_ENV_VAR} contains whitespace, a line break, or a character that is not printable ASCII; set it to the bare key`,
+      );
+    }
     return key;
   }
 
@@ -230,6 +419,8 @@ export class AnthropicModelPort implements PreflightModelPort {
     let overBudget = false;
     let authFailed = false;
     let providerError: string | undefined;
+    // The provider's own words for the first error, kept raw here and sanitized before use.
+    let providerText: string | undefined;
     let result: SDKResultMessage | undefined;
     const seen = new Map<string, Usage>();
 
@@ -317,6 +508,10 @@ export class AnthropicModelPort implements PreflightModelPort {
             // from the closed snake_case set goes into the message.
             const code = String(msg.error);
             providerError = /^[a-z_]{1,40}$/.test(code) ? code : 'unrecognised';
+            // The runtime puts the provider's error text (for an API error, the status and the
+            // provider's message) in the content of this synthetic assistant message.
+            const text = messageText((msg.message as { content?: unknown }).content);
+            if (text !== '') providerText = text;
           }
           const u = msg.message.usage;
           seen.set(msg.message.id, {
@@ -377,6 +572,30 @@ export class AnthropicModelPort implements PreflightModelPort {
       wallMs,
     };
 
+    // What a failed call spent, for the orchestrator to settle its up-front charge against.
+    // Known when the runtime reported a result. Also known, as zero, when the provider refused
+    // the request with a class that is decided before any work (a refused request is not billed)
+    // and the stream then ended cleanly with no tokens. Every other class with no result
+    // (server_error, overloaded, max_output_tokens, unknown, unrecognised and the rest) may have
+    // failed after work started, so its spend is unknown. Unknown (undefined) also for a timeout,
+    // an abort or a broken stream: the whole up-front charge stands there.
+    const refusedBeforeUsage =
+      result === undefined &&
+      providerError !== undefined &&
+      REFUSED_BEFORE_WORK.has(providerError) &&
+      !timedOut &&
+      !overBudget &&
+      streamError === undefined &&
+      used.inputTokens === 0 &&
+      used.outputTokens === 0;
+    const failureCost: StageCost | undefined =
+      result !== undefined ? cost : refusedBeforeUsage ? { ...cost, usd: 0 } : undefined;
+    const callError = (message: string, provider?: ProviderFailure): ModelCallError =>
+      new ModelCallError(message, {
+        ...(failureCost === undefined ? {} : { cost: failureCost }),
+        ...(provider === undefined ? {} : { provider }),
+      });
+
     // Only the agent's own behaviour maps to an outcome. A provider failure (wall-clock timeout,
     // a hung or broken stream, a stream with no result, an execution error) is a call error
     // unless the agent had already submitted, so an outage can never read as "no submission"
@@ -385,24 +604,44 @@ export class AnthropicModelPort implements PreflightModelPort {
       if (overBudget) return 'budget-exhausted';
       if (!box.captured) {
         if (timedOut) {
-          throw new ModelCallError('agent turn hit the wall-clock cap before any submission');
+          throw callError('agent turn hit the wall-clock cap before any submission');
         }
         if (providerError !== undefined) {
-          throw new ModelCallError(`agent turn failed: provider error ${providerError}`);
+          const status =
+            result?.subtype === 'success' && Number.isInteger(result.api_error_status)
+              ? (result.api_error_status as number)
+              : undefined;
+          const raw =
+            providerText ??
+            (result?.is_error === true
+              ? result.subtype === 'success'
+                ? result.result
+                : result.errors.join('; ')
+              : undefined);
+          const message = raw === undefined ? undefined : sanitizeProviderMessage(raw, secrets);
+          const provider: ProviderFailure = {
+            errorClass: providerError,
+            ...(status === undefined ? {} : { status }),
+            ...(message === undefined ? {} : { message }),
+          };
+          const text = `agent turn failed: ${describeProvider(provider)}`;
+          this.log('warn', `model turn ${promptId} on ${req.model}: ${text}`, secrets);
+          throw callError(text, provider);
         }
         if (streamError !== undefined) {
-          throw new ModelCallError(`agent turn failed: ${describeThrown(streamError, secrets)}`);
+          throw callError(`agent turn failed: ${describeThrown(streamError, secrets)}`);
         }
       }
       if (exceeds(used) || result?.subtype === 'error_max_budget_usd') return 'budget-exhausted';
       if (box.captured) return 'submitted';
-      if (result === undefined) throw new ModelCallError('agent stream ended without a result');
+      if (result === undefined) throw callError('agent stream ended without a result');
       // The agent used every turn it had and never called its submit tool.
       if (result.subtype === 'error_max_turns') return 'turn-cap';
       if (result.subtype === 'error_during_execution' || result.is_error) {
         const detail = result.subtype === 'success' ? result.result : result.errors.join('; ');
-        // Redacted whole, then clipped: never the other way round.
-        throw new ModelCallError(`agent turn failed: ${clipRedacted(detail, secrets)}`);
+        // Runtime and provider text: only known-safe shapes are shown, as for a provider error.
+        const shown = sanitizeProviderMessage(detail, secrets) ?? 'no detail';
+        throw callError(`agent turn failed: ${result.subtype}: ${shown}`);
       }
       return 'no-submission';
     })();

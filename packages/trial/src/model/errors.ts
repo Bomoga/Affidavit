@@ -1,3 +1,5 @@
+import type { StageCost } from '@affidavit/contracts';
+
 /**
  * Typed errors of the Anthropic model port. None of them ever carries the API key: every message
  * is built from fixed text plus values that went through `redact` first.
@@ -36,10 +38,37 @@ export class ModelConfigError extends Error {
  * stage is retried by the queue, which charges the budget again first.
  */
 export class ModelCallError extends Error {
-  constructor(message: string) {
+  /**
+   * What the failed call spent, when the runtime reported it (a result arrived, or the provider
+   * refused the request before producing any tokens). Undefined when the spend is unknown (a
+   * timeout, an abort, a broken stream): then the orchestrator's up-front charge stands.
+   */
+  readonly cost: StageCost | undefined;
+  /** The sanitized provider failure, when there was one. Already in `message`. */
+  readonly provider: ProviderFailure | undefined;
+  /**
+   * Set by the orchestrator when settling the call's up-front charge failed. Secondary: the call
+   * error is still the one reported, and the charge stays in place.
+   */
+  settlementError: unknown;
+
+  constructor(message: string, extra: { cost?: StageCost; provider?: ProviderFailure } = {}) {
     super(message);
     this.name = 'ModelCallError';
+    this.cost = extra.cost;
+    this.provider = extra.provider;
   }
+}
+
+/**
+ * A provider failure as the port reports it. Every field is sanitized: `errorClass` comes from
+ * the runtime's closed snake_case set, `status` is an integer, and `message` was redacted whole
+ * (credentials), checked for request content, and only then clipped. Never the request body.
+ */
+export interface ProviderFailure {
+  errorClass: string;
+  status?: number;
+  message?: string;
 }
 
 /**
