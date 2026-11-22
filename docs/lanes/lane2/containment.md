@@ -43,6 +43,8 @@ containment:
     - run: bash docker/sandbox/ci-containment.sh
 ```
 
+Two conditions for that runner (also in the script's header): the job must never run on pull requests from forks, since the suites build and run the checkout's code on the sandbox host's Docker daemon (trigger it on pushes to this repo's branches, or on PRs only after a maintainer approves the run), and the runner must hold no repository secrets or credentials (no signing key, evidence store or cloud credentials, deploy tokens). The suites need none.
+
 ## Latest run
 
 Nothing in Lane 2 is called hardened until every row passes on gVisor (L2-02). On 2026-11-14 the gVisor table below passed 8 of 8, contained and recorded, on three consecutive runs on the Lane 2 owner's workstation (Fedora 44, Docker 29.9.3, runsc release-20261109.0, SELinux enforcing). That host is not yet the shared sandbox host or CI (open decision 1 in `docs/decisions.md`). How the gVisor runner records each attempt is in `sandbox-runner.md`.

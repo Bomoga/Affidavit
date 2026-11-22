@@ -9,6 +9,14 @@
 # the runsc-affidavit runtime or its trace directory is missing. Both suites always run, so one
 # failure does not hide the other. The suites rewrite docs/lanes/lane2/containment.md; this
 # script never commits it and prints what changed.
+#
+# Wiring it to a self-hosted runner (the job in docs/lanes/lane2/containment.md, "In CI"):
+# - Never run it on pull requests from forks. The suites build and run code from the checkout on
+#   the runner's Docker daemon, so a fork PR would be arbitrary code on the sandbox host. Trigger
+#   it on pushes to branches of this repo, or on PRs only after a maintainer approves the run.
+# - The runner must hold no repository secrets and no credentials: no signing key, no evidence
+#   store or cloud credentials, no deploy tokens. The suites need none, and a contained probe
+#   that escaped would find nothing to take.
 set -euo pipefail
 
 RUNTIME="runsc-affidavit"

@@ -163,6 +163,27 @@ The only secret input is `ANTHROPIC_API_KEY`. The database passwords are generat
 - Real discovery no longer sends the case's candidate to trial (it would be dismissed, it is held for review under F3, or the scan does not find it): `DiscoveryOutcomeError`, naming the outcome and discovery's reason codes, at the first of intake, map or arraign. Real discovery produces a case file that differs from the stored one: `CaseFileMismatchError`, naming the fields. A duplicate-reachability error from arraign: `DiscoveryPipelineError`. All take the same path as above. A case opened for trial is never dismissed by Lane 1.
 - No API key, or a key the provider refused: the stage halts with `TrialHaltedError` (`model-unconfigured`) before any charge; recovery retries (zero-amount cost rows) and then flags the stage for review. Set the key and clear the flag to resume.
 - Kill switch: same path, reason `kill-switch`.
+- The model refuses the request on safety grounds (a `model-refusal` halt, once the trial package reports it): not retried, since a retry asks the same model again. The stage is flagged for review at once (`review_flags` reason `model-refusal`, with the halt message as detail). Never dismissed. Find them with `select case_id, stage, detail from review_flags where reason = 'model-refusal'`.
+
+## Budget: up-front charges and releases (L1-19, CR-T1)
+
+The orchestrator charges each model turn up front at the turn cap (`AFFIDAVIT_TURN_MAX_*`), before the call. When a call fails and the model port reports what it spent, the orchestrator gives the unspent part back through its `settlement`, which the worker wires to the job store's `releaseCharge` (`apps/worker/src/real/trial.ts`). Without that, a cheap case runs out of budget after a few failed turns, because every failed turn keeps its whole cap.
+
+- A release is an insert-only `cost_releases` row keyed by the seq of the `cost-charged` event it releases, so a replay changes nothing. `cost_rows` is never updated or deleted.
+- The live budget is the `case_budgets` view (the gross columns on `cases` plus releases); `chargeBudget` and `releaseCharge` both return it. `cases.remaining_*` and `cases.exhausted` stay gross (charges only), so they over-count once a release exists.
+- For cost reports use the `case_cost_ledger` view (charged, released and net per stage attempt). A bare sum of `cost_rows` counts every up-front charge in full.
+- A release is refused, with nothing changed, when the case is closed (terminal stage or verdict), when the seq is not a `cost-charged` event of the case, when the refund names another stage or attempt or exceeds the charge in any field, or when the case's releases would exceed its charges. A refused release never fails the call: the orchestrator attaches it to the call error as `settlementError` and the charge stands.
+- The trial does not emit `cost-released` yet (Lane 3, CR-T1 step 2), so the event stream still shows only the up-front `cost-charged`; `case_budgets` and `case_cost_ledger` already show the release.
+- Even once it does, the stream can lack a `cost-released` for good: the release commits in its own transaction and the event is emitted after it, so a crash between the two leaves the release recorded and no event, and nothing re-emits it. The ledger (`cost_releases`, `case_budgets`, `case_cost_ledger`) is authoritative. A total computed from the event stream can only over-count spend, never under-count it, which is the safe direction for a budget.
+- The guard reads the charge event's cost (migration 0011): a cost with a missing or non-numeric amount, stage or attempt refuses the release instead of comparing as NULL.
+- Charges and releases lock the case row `FOR UPDATE`, so they run one at a time per case, and a verdict insert on the case waits for an open release (a release that loses the race to a verdict is refused as closed). The lock also makes event inserts on that case wait for the charge or release transaction, which is short.
+
+```sql
+-- as affidavit_app, with the tenant set
+select * from case_budgets where case_id = '<case id>';
+select stage, attempt, charged_usd, released_usd, net_usd from case_cost_ledger
+  where case_id = '<case id>' order by stage, attempt;
+```
 
 ## What still blocks a real verdict
 

@@ -238,6 +238,7 @@ export function buildHandlers(options: {
   config: WorkerConfig;
   cores: Cores;
   hooks?: StageHooks;
+  log?: (message: string) => void;
 }): Partial<Record<CaseStage, StageHandler>> {
   const out: Partial<Record<CaseStage, StageHandler>> = {};
   for (const [stage, core] of Object.entries(options.cores)) {
@@ -245,6 +246,7 @@ export function buildHandlers(options: {
       appPool: options.appPool,
       juryEnabled: options.config.juryEnabled,
       hooks: options.hooks,
+      log: options.log,
     });
   }
   return out;

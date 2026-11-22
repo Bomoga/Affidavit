@@ -5,6 +5,7 @@ import {
   CASEFILE_ENTRY_ID,
   buildBundle,
   caseUsage,
+  egressFullyObserved,
   loadBundle,
   openBundle,
   storeBundle,
@@ -283,11 +284,28 @@ describe('egress log in exhibit records (L2-11)', () => {
     errno: 101,
     dns: false,
   } as const;
-  const withLog = (egress: unknown[], count = 1) => {
+  const observedRun = (variant: string, attempt: number, egressObserved = true) => ({
+    variant,
+    attempt,
+    wallMs: 1000,
+    cpuMs: null,
+    memoryPeakBytes: null,
+    egressObserved,
+  });
+  const allRuns = (observed = true) =>
+    (['vulnerable', 'safe'] as const).flatMap((v) =>
+      [1, 2, 3].map((a) => observedRun(v, a, observed)),
+    );
+  const withLog = (egress: unknown[], count = 1, usage: unknown[] | null = allRuns()) => {
     const [w, ...rest] = records();
     return bundleInput({
       exhibits: [
-        { ...w!, egress, result: { ...w!.result, egressAttempts: count } } as (typeof rest)[0],
+        {
+          ...w!,
+          egress,
+          ...(usage === null ? {} : { usage }),
+          result: { ...w!.result, egressAttempts: count },
+        } as (typeof rest)[0],
         ...rest,
       ],
     });
@@ -309,9 +327,47 @@ describe('egress log in exhibit records (L2-11)', () => {
 
   it('keeps bundles without a log valid, and an empty log means nothing tried', async () => {
     const { bytes } = await buildBundle(bundleInput());
-    expect((await openBundle(bytes)).exhibits.get('exhibit-witness-001')?.egress).toBeUndefined();
+    const bare = (await openBundle(bytes)).exhibits.get('exhibit-witness-001')!;
+    expect(bare.egress).toBeUndefined();
+    expect(egressFullyObserved(bare)).toBe(false);
     const empty = await buildBundle(withLog([], 0));
-    expect((await openBundle(empty.bytes)).exhibits.get('exhibit-witness-001')?.egress).toEqual([]);
+    const r = (await openBundle(empty.bytes)).exhibits.get('exhibit-witness-001')!;
+    expect(r.egress).toEqual([]);
+    expect(egressFullyObserved(r)).toBe(true);
+  });
+
+  it('never lets [] claim nothing tried for a run whose egress was not observed', async () => {
+    // One run with no complete trace (tracing off, over its cap, or tampered with).
+    const runs = allRuns();
+    runs[4] = observedRun('safe', 2, false);
+    const partial = await buildBundle(withLog([], 0, runs));
+    const r = (await openBundle(partial.bytes)).exhibits.get('exhibit-witness-001')!;
+    expect(r.egress).toEqual([]);
+    expect(egressFullyObserved(r)).toBe(false);
+    expect(caseUsage([r]).egressUnobservedRuns).toBe(1);
+    // The flag is signed with the record: flipping it changes the exhibit digest.
+    const flipped = await tamper(partial.bytes, (files) => {
+      const name = 'exhibits/exhibit-witness-001.json';
+      const text = Buffer.from(files.get(name)!).toString();
+      files.set(name, Buffer.from(text.replace('"egressObserved":false', '"egressObserved":true')));
+    });
+    await expect(openBundle(flipped)).rejects.toThrow(/exhibit-witness-001/);
+    // A usage entry must say whether its egress was observed.
+    const unflagged: Partial<ReturnType<typeof observedRun>> = observedRun('safe', 1);
+    delete unflagged.egressObserved;
+    await expect(buildBundle(withLog([], 0, [unflagged]))).rejects.toThrow();
+  });
+
+  it('refuses an egress log with no usage log, which could not say which runs it covers', async () => {
+    await expect(buildBundle(withLog([], 0, null))).rejects.toThrow(
+      /egress log without a usage log/,
+    );
+  });
+
+  it('accepts a failed attempt with its errno', async () => {
+    const failed = { ...entry, outcome: 'failed', errno: 115 } as const;
+    const { bytes } = await buildBundle(withLog([failed]));
+    expect((await openBundle(bytes)).exhibits.get('exhibit-witness-001')?.egress).toEqual([failed]);
   });
 
   it('refuses a log that does not fit its record', async () => {
@@ -332,6 +388,7 @@ describe('run usage in exhibit records (L2-11)', () => {
     wallMs: 1000 * attempt,
     cpuMs: measured ? 300 : null,
     memoryPeakBytes: measured ? 50_000_000 * attempt : null,
+    egressObserved: measured,
   });
 
   it('carries usage under the exhibit digest and totals it per case, never guessing', async () => {
@@ -352,6 +409,7 @@ describe('run usage in exhibit records (L2-11)', () => {
       unmeasuredRuns: 1,
       egressAttempts: 0,
       recordsWithoutUsage: 1,
+      egressUnobservedRuns: 1,
     });
   });
 

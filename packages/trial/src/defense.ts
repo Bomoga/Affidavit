@@ -1,5 +1,6 @@
 import {
   Dismissal,
+  RefusalCategory,
   type Budget,
   type CaseFile,
   type CaseFileSource,
@@ -9,8 +10,14 @@ import {
   type PromptId,
 } from '@affidavit/contracts';
 import type { RenderedPrompt, UntrustedBlock } from '@affidavit/prompts';
-import { SUBMISSIONS } from './envelope.js';
-import type { StageContext, StageHandler, StageResult } from './orchestrator.js';
+import { SUBMISSIONS, type WitnessSubmission } from './envelope.js';
+import { ModelCallError, isModelRefusal } from './model/errors.js';
+import type {
+  StageContext,
+  StageHandler,
+  StageResult,
+  ValidatedAgentResult,
+} from './orchestrator.js';
 import { buildWitness, variantsFor, witnessExhibitId } from './witness.js';
 import type { TrialWorkspace } from './workspace.js';
 
@@ -22,14 +29,48 @@ export interface DefenseAttemptConfig {
   model: string;
 }
 
+/**
+ * What a provider safety refusal of the first Defense attempt does (L3-20, CR-T13).
+ * - `review` (default): no further model calls; the case goes to a person and is never dismissed.
+ * - `second-attempt` (opt-in): the case goes once to the second attempt (`DefenseConfig.second`),
+ *   with no first-attempt feedback. P8 found the default second-attempt model refused the same
+ *   input, so this is off unless a deployment chooses it.
+ */
+export type RefusalRoute = 'review' | 'second-attempt';
+export const REFUSAL_ROUTES: readonly RefusalRoute[] = ['review', 'second-attempt'];
+export const DEFAULT_REFUSAL_ROUTE: RefusalRoute = 'review';
+export const REFUSAL_ROUTE_ENV_VAR = 'AFFIDAVIT_REFUSAL_ROUTE';
+
+/**
+ * Reads `AFFIDAVIT_REFUSAL_ROUTE` for the composition root. Unset or blank is `review`. The value
+ * is trimmed and matched without case; anything else throws, so a typo cannot silently pick a
+ * route. Nothing in this package calls it: apps/worker adopts it when it wires the route.
+ */
+export function refusalRouteFromEnv(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): RefusalRoute {
+  const raw = env[REFUSAL_ROUTE_ENV_VAR]?.trim().toLowerCase() ?? '';
+  if (raw === '') return DEFAULT_REFUSAL_ROUTE;
+  const route = REFUSAL_ROUTES.find((r) => r === raw);
+  if (route === undefined) {
+    throw new Error(`${REFUSAL_ROUTE_ENV_VAR} must be one of ${REFUSAL_ROUTES.join(', ')}`);
+  }
+  return route;
+}
+
 export interface DefenseConfig {
   first: DefenseAttemptConfig;
-  /** Used only above the escalation floor. Must differ from `first` in model and prompt. */
+  /**
+   * Used above the escalation floor, and, with `refusalRoute` `second-attempt`, at any score when
+   * the provider refused the first attempt. Must differ from `first` in model and prompt.
+   */
   second: DefenseAttemptConfig;
   /** Agent turns per attempt. Schema failures and Judge rejections each use one. */
   maxIterations: number;
   maxTurns: number;
   turnBudget: Budget;
+  /** What a refusal of the first attempt does. Defaults to `review` (`DEFAULT_REFUSAL_ROUTE`). */
+  refusalRoute?: RefusalRoute;
 }
 
 export interface DefenseDeps {
@@ -41,9 +82,41 @@ export interface DefenseDeps {
   workspace: TrialWorkspace;
 }
 
-interface AttemptOutcome {
-  admitted: boolean;
-  feedback: string[];
+/**
+ * How one Defense attempt ended. `refused` means the provider's safeguards declined a turn of
+ * this attempt (a `ModelCallError` of class `refusal`): the attempt stops there, its model is not
+ * asked again, and the refusal never reads as "no witness".
+ */
+type AttemptOutcome =
+  | { kind: 'admitted' }
+  | { kind: 'failed'; feedback: string[] }
+  | { kind: 'refused'; model: string; error: ModelCallError };
+
+/** One line naming a refused attempt. Fixed text, a table model id and an allowlisted category. */
+function refusalNote(ordinal: 'one' | 'two', refused: { model: string; error: ModelCallError }) {
+  // The port already allowlists it; checked again against the contract so only a known category
+  // ever reaches a detail or message.
+  const raw = refused.error.provider?.refusalCategory;
+  const category =
+    raw === undefined ? 'not given' : RefusalCategory.safeParse(raw).success ? raw : 'other';
+  return `Defense attempt ${ordinal} on ${refused.model} was refused by the provider's safeguards (category ${category})`;
+}
+
+/**
+ * Thrown when a refusal sends a candidate below the escalation floor to review. No contract
+ * escalation reason fits a below-floor candidate yet, and a refusal must never dismiss. It is a
+ * `ModelCallError` of class `refusal`, so the orchestrator halts the case at `defense` with a
+ * `halted` event (reason `model-refusal`, the last refusal's allowlisted category) instead of
+ * failing the stage, and the worker flags the halted case for review (with the Lane 1 change in
+ * `docs/lanes/lane1/contract-requests.md`, a refusal halt is not retried). It carries the last
+ * refusal's sanitized provider failure; every refusal is named in the message.
+ */
+export class DefenseRefusedError extends ModelCallError {
+  constructor(message: string, last: ModelCallError) {
+    super(message, last.provider === undefined ? {} : { provider: last.provider });
+    this.name = 'DefenseRefusedError';
+    this.settlementError = last.settlementError;
+  }
 }
 
 export async function loadCaseFile(source: CaseFileSource, caseId: CaseId): Promise<CaseFile> {
@@ -65,29 +138,79 @@ export function createDefenseHandler(deps: DefenseDeps): StageHandler {
     async run(ctx): Promise<StageResult> {
       const caseFile = await loadCaseFile(deps.caseFiles, ctx.caseId);
 
-      const first = await attempt(ctx, deps, caseFile, config.first, []);
-      if (first.admitted) return { kind: 'advance', next: 'prosecution' };
+      const { candidate, escalationFloor } = caseFile;
+      const aboveFloor = candidate.score >= escalationFloor;
+      const route = config.refusalRoute ?? DEFAULT_REFUSAL_ROUTE;
 
-      if (caseFile.candidate.score < caseFile.escalationFloor) {
+      // A refusal goes to a person. No contract event carries a note, so what happened is told in
+      // the escalation detail or the thrown message (model id and allowlisted category only).
+      const toReview = (notes: string[], last: ModelCallError): StageResult => {
+        const why = `${notes.join('; ')}; `;
+        if (!aboveFloor) {
+          throw new DefenseRefusedError(
+            `${why}candidate ${candidate.id} scored ${candidate.score}, below the floor ${escalationFloor}; not dismissed; the case is halted for human review`,
+            last,
+          );
+        }
+        return {
+          kind: 'escalate',
+          reason: 'no-admissible-witness-above-floor',
+          detail: `${why}candidate ${candidate.id} scored ${candidate.score}, at or above the floor ${escalationFloor}; no admissible witness, held for human review`,
+        };
+      };
+
+      const first = await attempt(ctx, deps, caseFile, config.first, []);
+      if (first.kind === 'admitted') return { kind: 'advance', next: 'prosecution' };
+
+      if (first.kind === 'refused' && route === 'review') {
+        return toReview([refusalNote('one', first)], first.error);
+      }
+
+      if (first.kind === 'failed' && !aboveFloor) {
         const dismissal = Dismissal.parse({
           schemaVersion: 1,
-          candidateId: caseFile.candidate.id,
+          candidateId: candidate.id,
           reason: 'no-admissible-witness-below-floor',
-          detail: `candidate scored ${caseFile.candidate.score}, below the escalation floor ${caseFile.escalationFloor}; no admissible witness`,
+          detail: `candidate scored ${candidate.score}, below the escalation floor ${escalationFloor}; no admissible witness`,
         });
         await ctx.record('dismissed', { dismissal }, 'defense');
         return { kind: 'advance', next: 'dismissed' };
       }
 
-      // Above the floor (F3): never dismiss on one attempt. Try again with a different
-      // model and prompt, then hand it to a human.
-      const second = await attempt(ctx, deps, caseFile, config.second, first.feedback);
-      if (second.admitted) return { kind: 'advance', next: 'prosecution' };
+      // Above the floor (F3): never dismiss on one attempt. Try again with a different model and
+      // prompt, then hand it to a human. With route `second-attempt`, a refusal of the first
+      // attempt goes to the same second attempt at any score, since a refusal says nothing about
+      // the finding. The refused model is not asked again, and there is no feedback to pass on.
+      const prior = first.kind === 'failed' ? first.feedback : [];
+      const second = await attempt(ctx, deps, caseFile, config.second, prior);
+      if (second.kind === 'admitted') return { kind: 'advance', next: 'prosecution' };
+
+      const notes: string[] = [];
+      if (first.kind === 'refused') notes.push(refusalNote('one', first));
+      // A refused second attempt never starts a third.
+      if (second.kind === 'refused') {
+        notes.push(refusalNote('two', second));
+        return toReview(notes, second.error);
+      }
+      const why = notes.length > 0 ? `${notes.join('; ')}; ` : '';
+
+      if (!aboveFloor) {
+        // Below the floor the second attempt ran only because the first was refused, and it
+        // failed on its own merits: dismissed, as one failed honest attempt is today.
+        const dismissal = Dismissal.parse({
+          schemaVersion: 1,
+          candidateId: candidate.id,
+          reason: 'no-admissible-witness-below-floor',
+          detail: `${why}candidate scored ${candidate.score}, below the escalation floor ${escalationFloor}; the second Defense attempt produced no admissible witness`,
+        });
+        await ctx.record('dismissed', { dismissal }, 'defense');
+        return { kind: 'advance', next: 'dismissed' };
+      }
 
       return {
         kind: 'escalate',
         reason: 'no-admissible-witness-above-floor',
-        detail: `candidate ${caseFile.candidate.id} scored ${caseFile.candidate.score}, at or above the floor ${caseFile.escalationFloor}; two Defense attempts produced no admissible witness`,
+        detail: `${why}candidate ${candidate.id} scored ${candidate.score}, at or above the floor ${escalationFloor}; two Defense attempts produced no admissible witness`,
       };
     },
   };
@@ -132,24 +255,33 @@ async function attempt(
       which.promptId,
       defenseBlocks(caseFile, [...priorFeedback, ...feedback]),
     );
-    const res = await ctx.runAgentValidated(
-      {
-        promptId: rendered.promptId,
-        promptVersion: rendered.version,
-        model: which.model,
-        system: rendered.system,
-        user: rendered.user,
-        tools: ['submit_witness'],
-        outputSchemaRef: rendered.outputSchemaRef,
-        maxTurns: config.maxTurns,
-        budget: config.turnBudget,
-      },
-      SUBMISSIONS.defense,
-    );
+    let res: ValidatedAgentResult<WitnessSubmission>;
+    try {
+      res = await ctx.runAgentValidated(
+        {
+          promptId: rendered.promptId,
+          promptVersion: rendered.version,
+          model: which.model,
+          system: rendered.system,
+          user: rendered.user,
+          tools: ['submit_witness'],
+          outputSchemaRef: rendered.outputSchemaRef,
+          maxTurns: config.maxTurns,
+          budget: config.turnBudget,
+        },
+        SUBMISSIONS.defense,
+      );
+    } catch (err) {
+      // Only a provider refusal ends the attempt here. The orchestrator already settled its
+      // charge as the port reported it. Kill switch, budget, unconfigured, config and every
+      // other call error go up unchanged.
+      if (isModelRefusal(err)) return { kind: 'refused', model: which.model, error: err };
+      throw err;
+    }
 
     if (res.outcome === 'no-submission') {
       feedback.push('no witness was submitted');
-      return { admitted: false, feedback };
+      return { kind: 'failed', feedback };
     }
     if (res.outcome === 'inadmissible') {
       feedback.push(`schema: ${res.errors.join('; ')}`);
@@ -186,12 +318,12 @@ async function attempt(
     if (admits(caseFile, result)) {
       await deps.workspace.saveWitness(ctx.caseId, { witness, result });
       await deps.workspace.addExhibit(ctx.caseId, result.exhibitId);
-      return { admitted: true, feedback };
+      return { kind: 'admitted' };
     }
 
     feedback.push(
       `judge: ${result.rejectedBy ?? (caseFile.safeVariant && result.safeVariantFail !== true ? 'differential' : 'witness did not pass')}`,
     );
   }
-  return { admitted: false, feedback };
+  return { kind: 'failed', feedback };
 }

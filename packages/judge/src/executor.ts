@@ -51,6 +51,13 @@ export interface RawAttempt {
    * is still counted in `egressAttempts`. Optional: an executor without a trace lists none.
    */
   egress?: readonly EgressEvent[];
+  /**
+   * True only when the executor read this run's whole syscall trace and found it intact, so
+   * `egress` is a complete record (up to its cap) and an empty one means nothing tried to leave.
+   * Absent or false when tracing was off, the trace passed its size cap, or it was tampered with:
+   * the run's egress was then not observed, and the run log says so.
+   */
+  egressObserved?: boolean;
   /** Peak memory and CPU time the executor measured (L2-11). Optional, like `egress`. */
   usage?: RunUsage;
   /** Raw bytes of the result artifact (see artifact.ts), or null when the runner wrote none. */

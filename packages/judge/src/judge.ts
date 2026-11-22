@@ -47,11 +47,22 @@ export interface RunUsageEntry {
   wallMs: number;
   cpuMs: number | null;
   memoryPeakBytes: number | null;
+  /**
+   * The run's whole syscall trace was read and intact, so its egress attempts are all in the log
+   * (up to the per-run cap). False when tracing was off, the trace overflowed its cap or was
+   * tampered with: that run's egress was not observed, and its absence from `egress` proves
+   * nothing.
+   */
+  egressObserved: boolean;
 }
 
 /** What the Judge observed across every run of one exhibit, in run order. */
 export interface ExhibitRunLog {
-  /** Egress attempts gVisor listed (up to 50 per run; the result's count covers every one). */
+  /**
+   * Egress attempts gVisor listed (up to 50 per run; the result's count covers every one). Only
+   * the runs whose entry in `runs` has `egressObserved` are covered: an empty list means nothing
+   * tried to leave only when every run was observed.
+   */
   egress: EgressEntry[];
   /** One entry per run. */
   runs: RunUsageEntry[];
@@ -541,6 +552,7 @@ export class Judge implements JudgePort {
             wallMs: Math.round(raw.durationMs),
             cpuMs: raw.usage?.cpuMs ?? null,
             memoryPeakBytes: raw.usage?.memoryPeakBytes ?? null,
+            egressObserved: raw.egressObserved === true && !raw.traceTampered,
           });
         }
       }

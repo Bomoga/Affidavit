@@ -10,6 +10,7 @@ import {
   ModelCallError,
   ModelConfigError,
   ModelUnconfiguredError,
+  REFUSAL_CLASS,
   type ProviderFailure,
 } from './errors.js';
 import { isKnownModelId, type ModelTable } from './models.js';
@@ -148,21 +149,57 @@ interface Usage {
   outputTokens: number;
 }
 
+/** A sum of reported counts, or NaN when any of them is missing or not a finite non-negative. */
+function reportedSum(...values: unknown[]): number {
+  let total = 0;
+  for (const v of values) {
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) return Number.NaN;
+    total += v;
+  }
+  return total;
+}
+
+/**
+ * Token totals as the result reports them. A field is NaN (unknown) when any count it sums is
+ * missing or not a finite non-negative number, so a missing cache field can never read as zero.
+ */
 function resultUsage(result: SDKResultMessage): Usage {
   let inputTokens = 0;
   let outputTokens = 0;
   const models = Object.values(result.modelUsage ?? {});
   if (models.length > 0) {
     for (const m of models) {
-      inputTokens += m.inputTokens + m.cacheReadInputTokens + m.cacheCreationInputTokens;
-      outputTokens += m.outputTokens;
+      inputTokens += reportedSum(m.inputTokens, m.cacheReadInputTokens, m.cacheCreationInputTokens);
+      outputTokens += reportedSum(m.outputTokens);
     }
   } else {
-    const u = result.usage;
-    inputTokens = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens;
-    outputTokens = u.output_tokens;
+    const u = (result.usage ?? {}) as Partial<SDKResultMessage['usage']>;
+    inputTokens = reportedSum(
+      u.input_tokens,
+      u.cache_read_input_tokens,
+      u.cache_creation_input_tokens,
+    );
+    outputTokens = reportedSum(u.output_tokens);
   }
   return { inputTokens, outputTokens };
+}
+
+/**
+ * One token field of a turn that produced a result. The larger of the result's figure and the
+ * streamed count when both are known. When the result's figure is unknown (NaN), the streamed
+ * count when the stream saw any and it is complete, else the turn's cap: unknown spend is never
+ * under-reported, because the orchestrator gives back whatever a call reports it did not spend.
+ * `streamPartial` says the streamed count is only a lower bound (a streamed input count whose
+ * cache fields were missing and counted as zero), so it cannot stand in for an unknown total.
+ */
+export function tokenField(
+  fromResult: number,
+  fromStream: number,
+  cap: number,
+  streamPartial = false,
+): number {
+  if (Number.isFinite(fromResult)) return Math.max(fromResult, fromStream);
+  return fromStream > 0 && !streamPartial ? fromStream : Math.max(cap, fromStream);
 }
 
 const toInt = (n: number): number => (Number.isFinite(n) && n > 0 ? Math.ceil(n) : 0);
@@ -181,14 +218,8 @@ export const REFUSED_BEFORE_WORK: ReadonlySet<string> = new Set([
   'authentication_failed',
 ]);
 
-/**
- * The class the port reports for a model safety refusal. The runtime reports a response that
- * ended with `stop_reason: "refusal"` (the model's safeguards declined the request) under the
- * assistant error code `invalid_request`, the same code as a malformed request. They are not the
- * same: a refusal is a well-formed request the model answered, after it read the whole input and
- * possibly generated output, so it is billed and is never `REFUSED_BEFORE_WORK`.
- */
-export const REFUSAL_CLASS = 'refusal';
+/** Defined with the error types so `defense.ts` can recognise a refusal (L3-20). */
+export { REFUSAL_CLASS };
 
 /**
  * The refusal categories the port passes on. The runtime itself knows `cyber`, `bio`,
@@ -582,6 +613,8 @@ export class AnthropicModelPort implements PreflightModelPort {
       parentEnv: this.env(),
     });
 
+    // Set when any streamed usage lacked a cache field, so the streamed input is a lower bound.
+    let streamInputPartial = false;
     const tokens = (): Usage => {
       let inputTokens = 0;
       let outputTokens = 0;
@@ -640,6 +673,14 @@ export class AnthropicModelPort implements PreflightModelPort {
             otherModel ??= new RegExp(`^${MODEL_ID}$`).test(served) ? served : 'another model';
           }
           const u = msg.message.usage;
+          // A streamed input count without its cache fields under-counts the input, so it can
+          // never stand in for an unknown result total (see `tokenField`).
+          if (
+            typeof u.cache_read_input_tokens !== 'number' ||
+            typeof u.cache_creation_input_tokens !== 'number'
+          ) {
+            streamInputPartial = true;
+          }
           seen.set(msg.message.id, {
             inputTokens:
               (u.input_tokens ?? 0) +
@@ -691,14 +732,29 @@ export class AnthropicModelPort implements PreflightModelPort {
     const wallMs = Math.max(0, Math.round(result?.duration_ms ?? now() - started));
     let used: Usage;
     let usd: number;
+    // False when the result's dollar figure is missing or not a finite non-negative number.
+    let usdKnown = true;
     if (result !== undefined) {
       const fromResult = resultUsage(result);
       const fromStream = tokens();
       used = {
-        inputTokens: Math.max(fromResult.inputTokens, fromStream.inputTokens),
-        outputTokens: Math.max(fromResult.outputTokens, fromStream.outputTokens),
+        inputTokens: tokenField(
+          fromResult.inputTokens,
+          fromStream.inputTokens,
+          req.budget.maxInputTokens,
+          streamInputPartial,
+        ),
+        outputTokens: tokenField(
+          fromResult.outputTokens,
+          fromStream.outputTokens,
+          req.budget.maxOutputTokens,
+        ),
       };
-      usd = Number.isFinite(result.total_cost_usd) ? Math.max(0, result.total_cost_usd) : 0;
+      const reportedUsd: unknown = result.total_cost_usd;
+      usdKnown =
+        typeof reportedUsd === 'number' && Number.isFinite(reportedUsd) && reportedUsd >= 0;
+      // Unknown dollars are reported as the turn's whole USD budget, so none of it is given back.
+      usd = usdKnown ? (reportedUsd as number) : req.budget.maxUsd;
     } else {
       // Cut off before the runtime reported a cost. The true figure is unknown, so report the
       // whole turn budget rather than a number nobody measured.
@@ -737,7 +793,7 @@ export class AnthropicModelPort implements PreflightModelPort {
     // Tokens without dollars still under-report the bill, so a refusal needs a reported USD.
     const failureCost: StageCost | undefined =
       result !== undefined
-        ? (refused || refusalFallback) && !(usd > 0)
+        ? (refused || refusalFallback) && !(usdKnown && usd > 0)
           ? undefined
           : cost
         : refusedBeforeUsage

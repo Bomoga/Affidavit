@@ -40,16 +40,24 @@ vulnerable commit plus the patch.
 
 Each record may also carry `egress`, its egress log (L2-11): one entry per attempt to reach
 outside the jail during its runs, with the run's variant and attempt, the syscall, destination
-address and port, `blocked` or `sent`, the errno, and whether it went to Docker's DNS resolver. It
-is inside the exhibit file, so the exhibit digest and the signed manifest cover it. Absent means
-no log was recorded (bundles from before L2-11, or a Judge without a recorder); `[]` means nothing
-tried to leave. Replay ignores it: it compares outcomes, and the count in the result already
-decides `no-egress`.
+address and port, `blocked`, `failed` or `sent`, the errno, and whether it went to Docker's DNS
+resolver. It is inside the exhibit file, so the exhibit digest and the signed manifest cover it.
+Absent means no log was recorded (bundles from before L2-11, or a Judge without a recorder).
+
+The log covers only the runs that were observed. Each `usage` entry carries `egressObserved`, true
+only when that run's whole syscall trace was read and intact; it is false when tracing was off, the
+trace passed its size cap, or it was tampered with, and that run's attempts are then not in the log
+at all. So `[]` means nothing tried to leave only when every run says `egressObserved`
+(`egressFullyObserved(record)`); with any unobserved run it proves nothing about that run. A
+record with an egress log must also carry its usage log, or `openBundle` refuses it. Replay ignores
+both: it compares outcomes, and the count and trace check in the result already decide
+`no-egress` (a tampered trace fails it, observed or not).
 
 Each record may also carry `usage` (L2-11): one entry per run with its variant, attempt, wall
-time, CPU time and peak memory (`cpuMs` and `memoryPeakBytes` null when not measured; see
-`sandbox-runner.md`, "Run usage"). `caseUsage(records)` totals a case: runs, wall time, measured
-CPU, the highest peak, how many runs were not measured, and egress attempts. It never fills in a
+time, CPU time, peak memory (`cpuMs` and `memoryPeakBytes` null when not measured; see
+`sandbox-runner.md`, "Run usage") and `egressObserved`. `caseUsage(records)` totals a case: runs,
+wall time, measured CPU, the highest peak, how many runs were not measured, egress attempts, and
+how many runs' egress was not observed (`egressUnobservedRuns`). It never fills in a
 missing measurement, so a total with unmeasured runs is a lower bound. The worker can use its
 `wallMs` for `StageCost`; CPU and memory have no `StageCost` field in contracts v1.0.
 
@@ -81,8 +89,9 @@ Before anything runs, and failing with `BundleIntegrityError` naming the exhibit
    present, equal the manifest's. Replay uses the manifest's digests.
 7. Each record holds the result for its own id, every reference resolves to a record of the right
    kind, `results` lists every record exactly once, and every exhibit the verdict cites is present.
-   An egress or usage log names only variants its kind of exhibit runs on, and a witness or counterexample
-   log lists no more attempts than its result counted.
+   An egress or usage log names only variants its kind of exhibit runs on, an egress log comes
+   with a usage log, and a witness or counterexample log lists no more attempts than its result
+   counted.
 
 Changing any byte of an exhibit fails step 4 with that exhibit's id. Rewriting a record and its
 manifest digest together fails at step 1 when the bundle digest is checked, and from L2-09 the
@@ -159,7 +168,11 @@ digest; `loadBundle` gets the tar by digest and opens it.
 - **Run logs.** `RunRecord` carries stdout and stderr digests, but `JudgePort` does not return the
   logs, so they are not in the bundle.
 - **Signature.** L2-09 signs the manifest digest; `replay` will then check the attestation before
-  trusting the manifest.
+  trusting the manifest. Public verification of a bundle and its attestation (`verify`, L2-12)
+  already exists and needs the published keys file (`--keys docs/keys/keys.json`, format in
+  `docs/keys/README.md`): it refuses a bundle signed by a key whose status is `revoked`, and exits
+  2 when the keys file is missing, unreadable or malformed. See `attestation.md`, "Public
+  verification".
 
 ## Open questions for the lead
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { MAX_EGRESS_EVENTS, isIpAddress, parseTrace } from './trace.js';
+import { MAX_EGRESS_EVENTS, egressObserved, isIpAddress, parseTrace } from './trace.js';
 
 // Lines in the exact shape gVisor's strace writes (captured from runsc release-20261109.0).
 const P = 'I1114 02:07:19.833280       1 strace.go:606] [   3:   3] node';
@@ -218,6 +218,35 @@ describe('parseTrace: egress log', () => {
     expect(t.egress[0]?.address).toBe('10.0.0.0');
   });
 
+  it('labels only unreachable and permission errnos blocked; any other error is failed', () => {
+    const EINPROGRESS = '-1 errno=115 (operation now in progress)';
+    const EHOSTUNREACH = '-1 errno=113 (no route to host)';
+    const ECONNREFUSED = '-1 errno=111 (connection refused)';
+    const t = parse(
+      exit(connect('AF_INET', '1.1.1.1'), EINPROGRESS),
+      exit(connect('AF_INET', '1.1.1.2'), EHOSTUNREACH),
+      exit(connect('AF_INET', '1.1.1.3'), EACCES),
+      exit(connect('AF_INET', '1.1.1.4'), ECONNREFUSED),
+    );
+    expect(t.egressAttempts).toBe(4);
+    expect(t.egress.map((e) => [e.address, e.outcome, e.errno])).toEqual([
+      ['1.1.1.1', 'failed', 115],
+      ['1.1.1.2', 'blocked', 113],
+      ['1.1.1.3', 'blocked', 13],
+      ['1.1.1.4', 'failed', 111],
+    ]);
+  });
+
+  it('marks a parsed trace traced, and its egress observed only when not tampered', () => {
+    const clean = parse(exit(connect('AF_INET', '1.1.1.1'), ENETUNREACH));
+    expect(clean.traced).toBe(true);
+    expect(egressObserved(clean)).toBe(true);
+    const split = parse(exit(openat('/etc/a', 'O_RDONLY'), OK), 'b"');
+    expect(split.tampered).toBe(true);
+    expect(egressObserved(split)).toBe(false);
+    expect(egressObserved({ traced: false, tampered: false })).toBe(false);
+  });
+
   it('counts but does not list an address that is not an IP address', () => {
     const t = parse(exit(connect('AF_INET6', 'zz::not-an-ip'), ENETUNREACH));
     expect(t.egressAttempts).toBe(1);
@@ -258,6 +287,7 @@ describe('parseTrace: robustness', () => {
     expect(t).toEqual({
       egressAttempts: 0,
       egress: [],
+      traced: true,
       deniedReads: 0,
       deniedWrites: 0,
       pidsLimitHit: false,

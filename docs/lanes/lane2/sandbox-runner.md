@@ -98,7 +98,9 @@ gVisor cannot start under an SELinux process label (`SELinux is not supported: s
 
 ### Egress log (L2-11)
 
-Besides the count, `parseTrace` lists the first 50 egress attempts of a run (`trace.egress`, `MAX_EGRESS_EVENTS`) in trace order: syscall, address family, destination address and port, `blocked` (the syscall failed, with its errno) or `sent` (it returned success, for example a UDP send to the embedded resolver), and `dns` for Docker's embedded resolver on 127.0.0.11. Only what gVisor renders itself is kept, never the command name or a path, which the jailed process controls; an entry is listed only when its address is a well-formed IP address, though every attempt is still counted. `egressAttempts` and the trace check decide `no-egress`; the log is a record for the evidence bundle and never changes a verdict.
+Besides the count, `parseTrace` lists the first 50 egress attempts of a run (`trace.egress`, `MAX_EGRESS_EVENTS`) in trace order: syscall, address family, destination address and port, an outcome with its errno. The outcome is `blocked` only for an errno that means the jail refused it (EPERM, EACCES, ENETUNREACH, EHOSTUNREACH: `BLOCKED_ERRNOS`), `failed` for any other error (EINPROGRESS (115) from a non-blocking connect says nothing about whether a packet left), and `sent` when it returned success (for example a UDP send to the embedded resolver), and `dns` for Docker's embedded resolver on 127.0.0.11. Only what gVisor renders itself is kept, never the command name or a path, which the jailed process controls; an entry is listed only when its address is a well-formed IP address, though every attempt is still counted. `egressAttempts` and the trace check decide `no-egress`; the log is a record for the evidence bundle and never changes a verdict.
+
+`trace.traced` is true only when the run's whole trace was read and parsed; it is false when tracing was off or the trace passed its size cap, and then `egress` is empty because nothing was observed. `egressObserved(trace)` (traced and not tampered) says whether the list is a complete record of the run; the `JailExecutor` passes it to the Judge as `RawAttempt.egressObserved`.
 
 ### Run usage (L2-11)
 
@@ -106,7 +108,7 @@ Each run also reports `usage`: the highest `memory.peak` and the CPU time (`cpu.
 
 ### Run log per exhibit
 
-The Judge hands each judged exhibit's run log to an optional `RunLogRecorder` (`new Judge(executor, policy, verify, recorder)`, or `runLogRecorder` in `createRealJudge`): every egress entry and one usage entry per run (wall time, CPU, peak memory), each tagged with variant and attempt. The caller files it in the exhibit's bundle record (`docs/lanes/lane2/evidence-bundles.md`).
+The Judge hands each judged exhibit's run log to an optional `RunLogRecorder` (`new Judge(executor, policy, verify, recorder)`, or `runLogRecorder` in `createRealJudge`): every egress entry and one usage entry per run (wall time, CPU, peak memory, and `egressObserved`, true only when that run's trace was read whole and intact), each tagged with variant and attempt. The caller files it in the exhibit's bundle record (`docs/lanes/lane2/evidence-bundles.md`).
 
 The runner throws, rather than reporting a clean run, when Docker or the runtime is missing, the trace is missing or empty, or a container or volume is left behind. The trace file is deleted after reading.
 

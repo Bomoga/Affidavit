@@ -64,6 +64,7 @@ export async function startWorker(
       config,
       cores: prepared.cores,
       hooks: options.hooks,
+      log: (m) => log(m),
     });
     const runner = await run({
       pgPool: workerPool,

@@ -125,7 +125,7 @@ describe('escalated case view (escalated-001)', () => {
   it('renders a clear human-review state', async () => {
     renderApp('/cases/escalated-001');
     expect(
-      await screen.findByRole('heading', { level: 1, name: 'Needs human review' }),
+      await screen.findByRole('heading', { level: 1, name: /Needs human review$/ }),
     ).toBeTruthy();
     expect(screen.getAllByText('HUMAN REVIEW')[0]).toBeTruthy();
     const panel = screen.getByRole('region', { name: 'Human review needed' });

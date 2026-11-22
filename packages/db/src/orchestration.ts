@@ -59,10 +59,24 @@ function check(signal: AbortSignal): void {
 
 /** A CaseStore whose writes are refused once the job's signal aborted. Reads pass through. */
 export class GuardedCaseStore implements CaseStore {
+  /**
+   * v1.2 (CR-T1). Present only when the inner store has it, so a store that cannot release still
+   * reads as one that cannot (the charge stands). Lease-guarded like `chargeBudget`.
+   */
+  readonly releaseCharge?: CaseStore['releaseCharge'];
+
   constructor(
     private readonly inner: CaseStore,
     private readonly signal: AbortSignal,
-  ) {}
+  ) {
+    const release = inner.releaseCharge?.bind(inner);
+    if (release) {
+      this.releaseCharge = (caseId, refund, reservationSeq) => {
+        check(this.signal);
+        return release(caseId, refund, reservationSeq);
+      };
+    }
+  }
   open(caseFile: CaseFile, budget: Budget) {
     check(this.signal);
     return this.inner.open(caseFile, budget);
@@ -193,6 +207,40 @@ export class StageDidNotAdvanceError extends Error {
 }
 
 /**
+ * Stage work that a retry cannot help (for example a model safety refusal: a retry asks the same
+ * model again). `stageHandler` flags this attempt's visit for review at once, so recovery neither
+ * retries it nor sweeps it; the case stays where it is and is never dismissed. Any error whose
+ * `reviewReason` property is one stage work may raise is treated the same way (`reviewReasonOf`).
+ */
+export class NeedsReviewError extends Error {
+  constructor(
+    readonly reviewReason: StageWorkReviewReason,
+    message: string,
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+    this.name = 'NeedsReviewError';
+  }
+}
+
+/**
+ * The review reasons stage work (the worker's cores, the trial) may raise from an error. The other
+ * reasons are written by recovery (`attempts-exhausted`, `budget-exhausted`) or by `openHeldCase`
+ * (`f3-hold`), never by an error, so an error naming one of them is an ordinary failure.
+ */
+export const STAGE_WORK_REVIEW_REASONS = [
+  'model-refusal',
+] as const satisfies readonly ReviewReason[];
+export type StageWorkReviewReason = (typeof STAGE_WORK_REVIEW_REASONS)[number];
+
+/** The review reason an error from stage work carries, or undefined for an ordinary failure. */
+export function reviewReasonOf(err: unknown): StageWorkReviewReason | undefined {
+  if (typeof err !== 'object' || err === null) return undefined;
+  const r = (err as { reviewReason?: unknown }).reviewReason;
+  return STAGE_WORK_REVIEW_REASONS.find((x) => x === r);
+}
+
+/**
  * Makes sure the case's current stage has a job for the current visit, enqueuing the next unused
  * attempt number if there is none. Safe to call from several processes: enqueueing is idempotent
  * on the attempt key. Returns the payload it enqueued, or null if a job already exists, the case
@@ -225,6 +273,8 @@ export interface StageHandlerOptions {
   appPool: AppPool;
   juryEnabled?: boolean;
   hooks?: StageHooks;
+  /** Where a failure to flag a non-retryable attempt is reported. Default: stderr. */
+  log?: (message: string) => void;
 }
 
 /**
@@ -236,23 +286,51 @@ export interface StageHandlerOptions {
  */
 export function stageHandler(core: StageCore, options: StageHandlerOptions): StageHandler {
   const { appPool, hooks } = options;
+  const log = options.log ?? ((message: string) => console.error(`[stage] ${message}`));
   return async (job, ctx) => {
     const pgStore = new PgCaseStore(appPool, job.tenantId, { juryEnabled: options.juryEnabled });
     const pgSink = new PgEventSink(appPool, job.tenantId);
     const store = new GuardedCaseStore(pgStore, ctx.signal);
     await hooks?.beforeStageWork?.(job);
-    await core({
-      job,
-      store,
-      sink: new GuardedEventSink(pgSink, ctx.signal),
-      caseFiles: new PgCaseFileSource(appPool, job.tenantId),
-      signal: ctx.signal,
-      events: (caseId) => visitEvents(appPool, pgSink, job.tenantId, caseId),
-      checkpoint: async (name) => {
-        check(ctx.signal);
-        await hooks?.checkpoint?.(job, name);
-      },
-    });
+    try {
+      await core({
+        job,
+        store,
+        sink: new GuardedEventSink(pgSink, ctx.signal),
+        caseFiles: new PgCaseFileSource(appPool, job.tenantId),
+        signal: ctx.signal,
+        events: (caseId) => visitEvents(appPool, pgSink, job.tenantId, caseId),
+        checkpoint: async (name) => {
+          check(ctx.signal);
+          await hooks?.checkpoint?.(job, name);
+        },
+      });
+    } catch (err) {
+      const reason = reviewReasonOf(err);
+      if (reason !== undefined) {
+        // Not retryable: flag this attempt's visit now (only while it is still the case's current
+        // stage and latest attempt), then fail the attempt as usual. The stage work's error is
+        // the one that fails the attempt: a failure to flag is only logged (the attempt then fails
+        // as an ordinary error, and recovery's attempt cap still stops it).
+        try {
+          const s = await stageAttemptState(appPool, job.tenantId, job.caseId);
+          if (s.stage === job.stage && s.latestAttempt === job.attempt) {
+            const detail = err instanceof Error ? err.message : reason;
+            await flagForReview(appPool, { ...job, visit: s.visit }, reason, detail);
+          }
+        } catch (flagErr) {
+          const why = flagErr instanceof Error ? flagErr.name : 'unknown error';
+          try {
+            log(
+              `could not flag ${job.stage} attempt ${job.attempt} of a case for review (${reason}): ${why}`,
+            );
+          } catch {
+            // A broken logger must not replace the stage work's error either.
+          }
+        }
+      }
+      throw err;
+    }
     await hooks?.afterStageWork?.(job);
     const now = await store.stage(job.caseId);
     if (now === job.stage) throw new StageDidNotAdvanceError(job.stage);

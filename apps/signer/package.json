@@ -14,10 +14,15 @@
     "format:check": "prettier --check .",
     "test": "vitest run",
     "start": "tsx src/main.ts",
-    "test:sandbox-host": "AFFIDAVIT_SANDBOX_HOST=1 vitest run"
+    "test:sandbox-host": "AFFIDAVIT_SANDBOX_HOST=1 vitest run",
+    "test:e2e": "AFFIDAVIT_SANDBOX_HOST=1 vitest run src/e2e.integration.test.ts"
   },
   "dependencies": {
     "@affidavit/contracts": "workspace:*",
     "@affidavit/evidence": "workspace:*"
+  },
+  "devDependencies": {
+    "@affidavit/judge": "workspace:*",
+    "@affidavit/sandbox": "workspace:*"
   }
 }

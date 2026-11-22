@@ -146,6 +146,11 @@ function label(
       if (acceptedVerify.has(e)) return `The Judge confirmed the fix in patch ${r.patchExhibitId}`;
       return `The Judge did not confirm patch ${r.patchExhibitId} (rule ${r.rejectedBy ?? 'not recorded'})`;
     }
+    // v1.2 (contracts): labelled so the switch stays total; no other effect on the view.
+    case 'cost-released':
+      return `Unspent cost released for ${e.payload.cost.stage}`;
+    case 'halted':
+      return `Case halted: ${e.payload.reason}`;
   }
 }
 
