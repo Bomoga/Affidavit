@@ -123,3 +123,11 @@ Semgrep SARIF carries only a rule's `metadata.cwe` (as tags) in `properties.tags
 **Interim (L1-10c).** Each hold is opened as a case of its own at intake with its assembled case file and flagged for a person: `review_flags` reason `f3-hold` (migration 0007), detail with arraignment's `wouldDismiss`, `route` and detail, no stage job (`openHeldCase` in `@affidavit/db`). The recovery sweep leaves a flagged visit alone, so it is never queued or dismissed.
 
 **Request.** Decide how a `person-or-trial` hold reaches a second Defense attempt (an operator action that clears the flag and enqueues intake, or a contract path), and whether a hold is an event (for example `held-for-review` with the route) so the courtroom can show it. Related: CR-8.
+
+## CR-14: a case file cannot say which scanners did not run (raised by L1-18)
+
+**Problem.** Real intake runs Semgrep only. OSV-Scanner (dependency findings) is left out because it needs a writable temp directory under `/tmp`, which the gVisor tool runner reserves read-only (it runs only on plain Docker, in tests). A real case file therefore holds no dependency findings, and no contract field records that the dependency scan was not run, so a reader of the case file or the courtroom cannot tell "no vulnerable dependency" from "not checked".
+
+**Interim (L1-18).** Whenever intake is real, the worker and `open-case` log `intake: dependency scan not run` at startup (`DEPENDENCY_SCAN_WARNING` in `apps/worker/src/config.ts`), and `docs/lanes/lane1/real-wiring.md` lists it under what still blocks a real verdict.
+
+**Request.** Lead: a scanner-coverage note in the case file (for example the scanners run, with their pinned references, and the ones not run with a reason enum such as `not-supported-in-jail`), so the gap travels with the case. Lane 2: a way for the tool runner to give a tool a private writable temp directory that OSV-Scanner can use (it reads its offline database from `$TMPDIR/osv-scalibr`); Lane 1 then adds OSV to real intake.

@@ -93,7 +93,7 @@ export interface CaseView {
  * same payload from any other actor or stage, or recorded after a verdict, is shown on the docket
  * but never backs the stamp. A check for another case is dropped with every other such event.
  */
-function isJudgeVerify(e: TrialEvent): e is Extract<TrialEvent, { type: 'verify-result' }> {
+export function isJudgeVerify(e: TrialEvent): e is Extract<TrialEvent, { type: 'verify-result' }> {
   return e.type === 'verify-result' && e.actor === 'judge' && e.stage === 'verify';
 }
 
@@ -155,18 +155,26 @@ function label(
  * misses, repeats or invents a counterexample is not evidence the patch was tested against them.
  * This is the same rule `packages/trial` applies before Remedy accepts a patch.
  */
-function isAccepted(v: VerifyResult, expectedCounterexamples: readonly string[]): boolean {
-  const got = v.counterexamples.map((c) => c.exhibitId as string);
-  const want = new Set(expectedCounterexamples);
-  const complete =
-    got.length === want.size && new Set(got).size === got.length && got.every((id) => want.has(id));
+export function isAccepted(v: VerifyResult, expectedCounterexamples: readonly string[]): boolean {
   return (
     v.rejectedBy === undefined &&
     v.familyFlipped &&
     v.suitePassed &&
     v.rescanClean &&
-    complete &&
+    counterexamplesComplete(v, expectedCounterexamples) &&
     v.counterexamples.every((c) => !c.survived)
+  );
+}
+
+/** True when the check reports exactly one result for each expected counterexample, no more. */
+export function counterexamplesComplete(
+  v: VerifyResult,
+  expectedCounterexamples: readonly string[],
+): boolean {
+  const got = v.counterexamples.map((c) => c.exhibitId as string);
+  const want = new Set(expectedCounterexamples);
+  return (
+    got.length === want.size && new Set(got).size === got.length && got.every((id) => want.has(id))
   );
 }
 
@@ -238,12 +246,11 @@ function stampBlockers(
 }
 
 /**
- * Builds the case view from the event stream alone. The VERIFIED stamp rests on the Judge's own
- * `verify-result` events, never on what the verdict claims.
+ * The events that make up this record, in seq order. The stream's case is the case of its first
+ * event by seq (the first one received on a tie). Any event naming another case is ignored
+ * entirely: it is not part of this record. A repeated seq keeps the first event received.
  */
-export function buildCaseView(input: readonly TrialEvent[]): CaseView {
-  // The stream's case is the case of its first event by seq (the first one received on a tie).
-  // Any event naming another case is ignored entirely: it is not part of this record.
+export function recordedEvents(input: readonly TrialEvent[]): TrialEvent[] {
   let streamCase: string | undefined;
   let firstSeq = Infinity;
   for (const e of input)
@@ -253,7 +260,15 @@ export function buildCaseView(input: readonly TrialEvent[]): CaseView {
     }
   const bySeq = new Map<number, TrialEvent>();
   for (const e of input) if (e.caseId === streamCase && !bySeq.has(e.seq)) bySeq.set(e.seq, e);
-  const events = [...bySeq.values()].sort((a, b) => a.seq - b.seq);
+  return [...bySeq.values()].sort((a, b) => a.seq - b.seq);
+}
+
+/**
+ * Builds the case view from the event stream alone. The VERIFIED stamp rests on the Judge's own
+ * `verify-result` events, never on what the verdict claims.
+ */
+export function buildCaseView(input: readonly TrialEvent[]): CaseView {
+  const events = recordedEvents(input);
 
   const exhibits = new Map<string, ExhibitView>();
   let verdict: Verdict | undefined;

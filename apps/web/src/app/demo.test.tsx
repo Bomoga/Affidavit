@@ -96,7 +96,7 @@ describe('awaiting Judge verification (no verify-result recorded)', () => {
     renderApp('/cases/nodegoat-sqli-001');
     const h1 = await settled();
     expect(h1.textContent).toContain('Verified');
-    expect(screen.getByText('VERIFIED')).toBeTruthy();
+    expect(screen.getAllByText('VERIFIED')[0]).toBeTruthy();
     expect(screen.queryByText('UNVERIFIED')).toBeNull();
     expect(screen.queryByText(PENDING_NOTE)).toBeNull();
     const patch = screen.getByRole('button', { name: /exhibit-patch-001/ });

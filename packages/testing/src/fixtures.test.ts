@@ -3,6 +3,7 @@ import type { z } from 'zod';
 import {
   AdmissibilityRule,
   CaseFile,
+  Exhibit,
   ExhibitResult,
   TrialEvent,
   VerifyResult,
@@ -15,6 +16,7 @@ function schemaForFixture(path: string): z.ZodType | null {
   if (path.startsWith('exhibit-results/verify-')) return VerifyResult;
   if (path.startsWith('exhibit-results/')) return ExhibitResult;
   if (path.startsWith('trials/') && path.endsWith('.events.json')) return TrialEvent.array();
+  if (path.startsWith('exhibits/') && path.endsWith('.exhibits.json')) return Exhibit.array();
   return null;
 }
 

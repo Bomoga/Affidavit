@@ -1,5 +1,7 @@
+import type { Exhibit, TrialEvent } from '@affidavit/contracts';
 import { useId, useState, type ReactNode } from 'react';
 import type { CaseView, DocketEntry, ExhibitView } from '../model/caseView.js';
+import { TerminalWithScrubber } from '../terminal/Terminal.js';
 import { Courtroom } from './Courtroom.js';
 import { REVIEW_REASON, RULE_TEXT, STATUS_STAMP } from './status.js';
 
@@ -263,10 +265,16 @@ export function CaseFile({
   view,
   slug,
   connection,
+  events,
+  content,
 }: {
   view: CaseView;
   slug?: string;
   connection?: ReactNode;
+  /** The recorded events. With them the page shows the trial terminal, not the seat list. */
+  events?: readonly TrialEvent[];
+  /** Exhibit content (patch diff, witness code) when a source has it. */
+  content?: readonly Exhibit[];
 }) {
   return (
     <article aria-labelledby="page-heading">
@@ -321,7 +329,11 @@ export function CaseFile({
         </section>
       ) : null}
 
-      <Courtroom view={view} />
+      {events ? (
+        <TerminalWithScrubber events={events} embedded {...(content ? { content } : {})} />
+      ) : (
+        <Courtroom view={view} />
+      )}
 
       <section aria-labelledby="exhibits-heading">
         <h2 id="exhibits-heading">{`Exhibits (${view.exhibits.length})`}</h2>

@@ -2,7 +2,14 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { buildInvocation } from './invocations.js';
+import {
+  SEMGREP_CANARY,
+  SEMGREP_FALLBACK_TMP,
+  SEMGREP_NO_TMP_EXIT,
+  SEMGREP_TMPDIR_WRAPPER,
+  buildInvocation,
+  canaryRoot,
+} from './invocations.js';
 import {
   ToolDisabledError,
   ToolOptionError,
@@ -64,7 +71,14 @@ describe('tool invocations', () => {
           expect(m.containerPath).not.toBe('/');
         }
         const writable = inv.mounts.filter((m) => !m.readOnly).map((m) => m.containerPath);
-        for (const p of writable) expect(['/out', '/tmp', '/root/.semgrep']).toContain(p);
+        const scratch = name === 'osv-scanner' ? ['/tmp'] : ['/var/tmp', '/root/.semgrep'];
+        for (const p of writable) expect(['/out', ...scratch]).toContain(p);
+      });
+
+      it('each writable scratch mount is a scratchSubdir of this run', () => {
+        for (const m of inv.mounts.filter((x) => !x.readOnly && x.containerPath !== '/out')) {
+          expect(inv.scratchSubdirs.map((s) => join(opts.scratchDir, s))).toContain(m.hostPath);
+        }
       });
 
       it('takes nothing from repo contents: option-like file names change no argv', () => {
@@ -92,19 +106,61 @@ describe('tool invocations', () => {
 
   it('semgrep uses only our own rules and never registry configs', () => {
     const { args } = buildInvocation(manifest, 'semgrep', opts);
-    expect(args[0]).toBe('semgrep');
+    expect(args.slice(0, 6)).toEqual(['sh', '-c', SEMGREP_TMPDIR_WRAPPER, 'sh', 'semgrep', 'scan']);
     expect(args).toContain('--metrics=off');
     expect(args).toContain('--disable-version-check');
     expect(args).not.toContain('auto');
     expect(args).not.toContain('--config=auto');
     const configValues = args.flatMap((a, i) => (args[i - 1] === '--config' ? [a] : []));
-    expect(configValues).toEqual(['/rules']);
+    // Our rules, and the liveness canary's own rule (never part of the production pack).
+    expect(configValues).toEqual(['/rules', SEMGREP_CANARY.config]);
+    // Targets: the snapshot, then the canary's own file.
+    expect(args.slice(-2)).toEqual(['/src', SEMGREP_CANARY.uri]);
     for (const a of args) {
       expect(a).not.toMatch(/^p\//);
       expect(a).not.toMatch(/^r\//);
       expect(a).not.toMatch(/^https?:/);
       expect(a).not.toMatch(/semgrep\.dev/);
     }
+  });
+
+  it('semgrep and gitleaks mount nothing at or under /tmp, which the gVisor jail reserves', () => {
+    for (const name of ['semgrep', 'gitleaks'] as const) {
+      const { mounts } = buildInvocation(manifest, name, opts);
+      for (const m of mounts) expect(m.containerPath).not.toMatch(/^\/tmp(\/|$)/);
+    }
+  });
+
+  it('semgrep keeps a TMPDIR the runner set and falls back to its writable scratch mount', () => {
+    // The script is a constant: no argument is spliced into it, they arrive as "$@".
+    // It refuses (exit 97) unless the directory exists and a probe byte can really be written
+    // there (`[ -w ]` is true for root even on a read-only mount).
+    expect(SEMGREP_TMPDIR_WRAPPER).toBe(
+      `t="\${TMPDIR:-${SEMGREP_FALLBACK_TMP}}"; p="$t/.affidavit-tmp-probe"; [ -d "$t" ] && [ -w "$t" ] && (printf x > "$p") 2>/dev/null && rm -f "$p" || { rm -f "$p" 2>/dev/null; exit 97; }; exec env TMPDIR="$t" "$@"`,
+    );
+    expect(SEMGREP_NO_TMP_EXIT).toBe(97);
+    expect(isOkExit(manifest, 'semgrep', SEMGREP_NO_TMP_EXIT)).toBe(false);
+    const { mounts, scratchSubdirs } = buildInvocation(manifest, 'semgrep', opts);
+    expect(mounts).toContainEqual({
+      hostPath: join(opts.scratchDir, 'tmp'),
+      containerPath: SEMGREP_FALLBACK_TMP,
+      readOnly: false,
+    });
+    expect(scratchSubdirs).toEqual(['tmp', 'semgrep-home']);
+    expect(buildInvocation(manifest, 'gitleaks', opts).scratchSubdirs).toEqual([]);
+  });
+
+  it('semgrep mounts the liveness canary read-only, outside /src and /rules', () => {
+    const { mounts } = buildInvocation(manifest, 'semgrep', opts);
+    expect(mounts).toContainEqual({
+      hostPath: join(canaryRoot(), 'semgrep'),
+      containerPath: SEMGREP_CANARY.mount,
+      readOnly: true,
+    });
+    const own = buildInvocation(manifest, 'semgrep', { ...opts, semgrepCanaryDir: '/c' });
+    expect(own.mounts).toContainEqual({ hostPath: '/c', containerPath: '/canary', readOnly: true });
+    expect(SEMGREP_CANARY.uri.startsWith(`${SEMGREP_CANARY.mount}/`)).toBe(true);
+    expect(SEMGREP_CANARY.config.startsWith(`${SEMGREP_CANARY.mount}/`)).toBe(true);
   });
 
   it('semgrep ignores every repo-controlled switch: git, nosemgrep, semgrepignore', () => {

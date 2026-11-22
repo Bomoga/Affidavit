@@ -4,7 +4,13 @@ import { useEffect, useMemo } from 'react';
 import { buildCaseView } from '../model/caseView.js';
 import { SAFE_CASE_ID, type BackoffPolicy, type StreamTransport } from '../model/liveStream.js';
 import { CaseFile, ConnectionStatus, Stamp, StampNote } from './CaseFile.js';
-import { CaseNotFoundError, loadCase, loadCaseList } from './data.js';
+import {
+  CaseNotFoundError,
+  getCaseEvents,
+  getCaseExhibits,
+  loadCase,
+  loadCaseList,
+} from './data.js';
 import { useSourceConfig, useTrialStream } from './source.js';
 
 const caseApi = getRouteApi('/cases/$caseId');
@@ -111,6 +117,7 @@ function LiveCasePage({
     <CaseFile
       view={view}
       slug={caseId}
+      events={snapshot.events}
       connection={
         <ConnectionStatus
           status={snapshot.status}
@@ -148,7 +155,14 @@ function FixtureCasePage({ caseId }: { caseId: string }) {
         <p role="alert">This case file could not be loaded.</p>
       </>
     );
-  return <CaseFile view={q.data} slug={caseId} />;
+  return (
+    <CaseFile
+      view={q.data}
+      slug={caseId}
+      events={getCaseEvents(caseId) ?? []}
+      content={getCaseExhibits(caseId)}
+    />
+  );
 }
 
 export function NotFoundPage() {
