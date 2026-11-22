@@ -24,7 +24,7 @@ import {
 } from '@affidavit/db';
 import type { DiscoverCaseInput, DiscoverCaseOutcome } from '@affidavit/discovery';
 import { FakeJudge, readFixtureJson, sha256Hex } from '@affidavit/testing';
-import { witnessExhibitId, witnessSha256 } from '@affidavit/trial';
+import { ModelCallError, REFUSAL_CLASS, witnessExhibitId, witnessSha256 } from '@affidavit/trial';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { loadConfig } from './config.js';
 import { startCase, startWorker, type RunningWorker } from './worker.js';
@@ -316,5 +316,114 @@ describePg('worker real wiring, injected fakes, real Postgres and Graphile Worke
     expect(discoverCalls).toHaveLength(1);
     expect(discoverCalls[0]?.candidateId).toBe(file.candidate.id);
     expect(model.requests).toEqual(['defense', 'prosecution', 'remedy']);
+  });
+
+  /**
+   * A case below the escalation floor (sample floor 0.7) whose Defense model fails every call
+   * with `fail`, run on the real wiring until `done` holds.
+   */
+  async function failingDefense(fail: () => Error, done: (id: string) => Promise<boolean>) {
+    const id = `case-refusal-${randomBytes(4).toString('hex')}`;
+    const sample = CaseFile.parse(samples.CaseFile);
+    const file = CaseFile.parse({
+      ...sample,
+      id,
+      tenantId: TENANT,
+      candidate: { ...sample.candidate, score: 0.5 },
+    });
+    const discover = (): Promise<DiscoverCaseOutcome> =>
+      Promise.resolve({
+        kind: 'case-file',
+        caseFile: file,
+        withheld: [],
+        scanPartial: false,
+        holds: [],
+      });
+    const requests: string[] = [];
+    const model: ModelPort = {
+      runTurn: (req) => {
+        requests.push(req.promptId);
+        return Promise.reject(fail());
+      },
+    };
+    const w = await startWorker(loadConfig(realEnv()), {
+      log: () => undefined,
+      components: {
+        env: realEnv(),
+        discover,
+        judge: new FakeJudge({ witnessResults: {} }),
+        model,
+        log: () => undefined,
+      },
+    });
+    running.push(w);
+    await startCase(appPool, file, {
+      maxInputTokens: 1_000_000,
+      maxOutputTokens: 200_000,
+      maxUsd: 5,
+    });
+    await until(() => done(id));
+    return { id, requests };
+  }
+
+  const flagsOf = (id: string) =>
+    psql(`select stage, attempt, reason from review_flags where case_id='${id}' order by attempt`);
+  const defenseAttempts = async (id: string) =>
+    (
+      await psql(
+        `select attempt from stage_runs where case_id='${id}' and stage='defense' order by attempt`,
+      )
+    ).map((r) => Number(r[0]));
+  const eventTypes = async (id: string) =>
+    (await psql(`select type from events where case_id='${id}' order by seq`)).map((r) => r[0]);
+
+  it('a Defense refusal below the floor is flagged for review at once and never retried', async () => {
+    const { id, requests } = await failingDefense(
+      () =>
+        // A refusal whose spend the port did not report.
+        new ModelCallError('the provider declined the request', {
+          provider: { errorClass: REFUSAL_CLASS, refusalCategory: 'cyber' },
+        }),
+      async (id) => (await flagsOf(id)).length > 0,
+    );
+    // Several lease and reconcile periods: long enough for recovery to retry if it were going to.
+    await wait(8_000);
+
+    expect(await flagsOf(id)).toEqual([['defense', '1', 'model-refusal']]);
+    expect(await defenseAttempts(id)).toEqual([1]);
+    expect(await stageOf(id)).toBe('defense');
+    // The refused model was asked once, by the one attempt.
+    expect(requests).toEqual(['defense']);
+    const types = await eventTypes(id);
+    expect(types.filter((t) => t === 'halted')).toHaveLength(1);
+    expect(
+      (
+        await psql(
+          `select event->'payload'->>'reason' from events where case_id='${id}' and type='halted'`,
+        )
+      )[0]?.[0],
+    ).toBe('model-refusal');
+    // No dismissal, no escalation, and nothing given back for a spend nobody reported.
+    for (const t of ['dismissed', 'escalated', 'cost-released']) expect(types, t).not.toContain(t);
+    expect((await psql(`select count(*) from cost_releases where case_id='${id}'`))[0]?.[0]).toBe(
+      '0',
+    );
+  });
+
+  it('an ordinary Defense failure is still retried, then flagged when the attempts run out', async () => {
+    const { id, requests } = await failingDefense(
+      () => new ModelCallError('the provider timed out'),
+      async (id) => (await flagsOf(id)).length > 0,
+    );
+
+    expect(await defenseAttempts(id)).toEqual([1, 2, 3]);
+    const flags = await flagsOf(id);
+    expect(flags).toHaveLength(1);
+    expect(flags[0]?.[0]).toBe('defense');
+    expect(flags[0]?.[2]).toBe('attempts-exhausted');
+    expect(await stageOf(id)).toBe('defense');
+    expect(requests.length).toBeGreaterThanOrEqual(3);
+    const types = await eventTypes(id);
+    for (const t of ['dismissed', 'halted']) expect(types, t).not.toContain(t);
   });
 });

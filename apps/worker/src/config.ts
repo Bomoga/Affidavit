@@ -4,6 +4,12 @@
  * (they can carry passwords). Errors name variables, never values.
  */
 import type { Budget } from '@affidavit/contracts';
+import {
+  REFUSAL_ROUTES,
+  REFUSAL_ROUTE_ENV_VAR,
+  refusalRouteFromEnv,
+  type RefusalRoute,
+} from '@affidavit/trial';
 
 export type Impl = 'fake' | 'real';
 export type ToolRunnerKind = 'docker' | 'gvisor';
@@ -39,6 +45,12 @@ export interface TrialSettings {
   defenseIterations: number;
   prosecutionCounterexamples: number;
   remedyIterations: number;
+  /**
+   * `AFFIDAVIT_REFUSAL_ROUTE`: what a provider refusal of the first Defense attempt does.
+   * `review` (default) halts the case for a person; `second-attempt` tries the second Defense
+   * model and prompt at any score. Read through @affidavit/trial's `refusalRouteFromEnv`.
+   */
+  refusalRoute: RefusalRoute;
 }
 
 /** `AFFIDAVIT_JUDGE_IMPL=real`: Lane 2's Judge on the gVisor witness jail. */
@@ -277,7 +289,18 @@ function trialSettings(env: Env, problems: string[]): TrialSettings {
       problems,
     ),
     remedyIterations: intVar(env, 'AFFIDAVIT_REMEDY_ITERATIONS', 2, 1, 10, problems),
+    refusalRoute: refusalRouteVar(env, problems),
   };
+}
+
+/** Never echoes the value: the problem names the variable and the accepted values only. */
+function refusalRouteVar(env: Env, problems: string[]): RefusalRoute {
+  try {
+    return refusalRouteFromEnv({ [REFUSAL_ROUTE_ENV_VAR]: env[REFUSAL_ROUTE_ENV_VAR] });
+  } catch {
+    problems.push(`${REFUSAL_ROUTE_ENV_VAR} must be one of ${REFUSAL_ROUTES.join(', ')}`);
+    return 'review';
+  }
 }
 
 function judgeSettings(env: Env, problems: string[]): JudgeSettings {
@@ -455,6 +478,7 @@ export function describeConfig(config: WorkerConfig): Record<string, unknown> {
           killSwitchFile: config.trialSettings.killSwitchFile !== null,
           turnBudget: config.trialSettings.turnBudget,
           maxAgentTurns: config.trialSettings.maxAgentTurns,
+          refusalRoute: config.trialSettings.refusalRoute,
         }
       : {}),
     ...(config.judgeSettings

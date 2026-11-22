@@ -6,16 +6,19 @@
  * Orchestrator is built per process (it keeps the per-case cost ledger and prompt versions in
  * memory), and each stage job runs `Orchestrator.run` with the job's own lease-guarded ports,
  * routed through AsyncLocalStorage, and `stageScopedPorts` from @affidavit/db: the orchestrator
- * stops once the case has moved (`stopAfterTransition`, or the kill switch until the trial package
- * reads that), so one job moves the case one stage, and the repeated `stage-entered` at the start
- * of each run is not stored twice.
+ * stops once the case has moved (`stopAfterTransition`, with no event), so one job moves the case
+ * one stage, and the repeated `stage-entered` at the start of each run is not stored twice.
  *
  * A halt that did not move the case fails the job with TrialHaltedError, whose message names the
  * reason. Nothing is charged for a missing key: the port refuses before the orchestrator charges.
  * For `kill-switch` and `model-unconfigured`, recovery retries up to AFFIDAVIT_MAX_STAGE_ATTEMPTS
  * (each retry is a zero-amount cost row) and then flags the stage for review. A `model-refusal`
- * is not retried: the stage is flagged for review at once (`reviewReason`). The case is never
- * dismissed or escalated by a halt.
+ * halt (for example a Defense refusal below the escalation floor on the `review` route, whose
+ * `DefenseRefusedError` the orchestrator turns into the halt) is not retried: the stage is flagged
+ * for review at once (`reviewReason`). A refusal thrown past the orchestrator is mapped the same
+ * way. The case is never dismissed or escalated by a halt. `AFFIDAVIT_REFUSAL_ROUTE`
+ * (`settings.refusalRoute`) picks what a first Defense refusal does: `review` (the default) or
+ * `second-attempt` (the second Defense model and prompt, at any score).
  *
  * Settlement (contracts v1.2, CR-T1): the orchestrator charges each model turn up front at the
  * turn cap. When a call fails and the port reported what it spent, the orchestrator gives the
@@ -35,7 +38,6 @@ import type {
   CaseId,
   CaseStage,
   CaseStore,
-  EventSink,
   HaltReason as ContractHaltReason,
   JudgePort,
   ModelPort,
@@ -50,8 +52,10 @@ import {
   createProsecutionHandler,
   createRemedyHandler,
   createVerifyHandler,
+  isModelRefusal,
   modelFor,
   type ModelTable,
+  type ReportingEventSink,
 } from '@affidavit/trial';
 import type { TrialSettings } from '../config.js';
 
@@ -94,7 +98,8 @@ export class TrialHaltedError extends Error {
 
 interface Scope {
   store: CaseStore;
-  sink: EventSink;
+  /** The stage-scoped sink resolves to the stored seq (undefined for a dropped event). */
+  sink: ReportingEventSink;
   caseFiles: CaseFileSource;
   advanced(): boolean;
 }
@@ -139,7 +144,7 @@ export function realTrialCores(w: TrialWiring): Partial<Record<CaseStage, StageC
     appendVerdict: (v) => scope().store.appendVerdict(v),
     getVerdict: (id) => scope().store.getVerdict(id),
   };
-  const sink: EventSink = { emit: (e) => scope().sink.emit(e) };
+  const sink: ReportingEventSink = { emit: (e) => scope().sink.emit(e) };
   const caseFiles: CaseFileSource = {
     next: (t) => scope().caseFiles.next(t),
     get: (id) => scope().caseFiles.get(id),
@@ -148,35 +153,20 @@ export function realTrialCores(w: TrialWiring): Partial<Record<CaseStage, StageC
   const s = w.settings;
   const workspace = new InMemoryWorkspace();
   const model = (id: Parameters<typeof modelFor>[1]) => modelFor(w.modelTable, id);
-  // One job moves the case one stage. The quiet way is `stopAfterTransition` (Lane 3, being added
-  // after PR #84: stop with no `halted` event). Until the installed @affidavit/trial calls it, the
-  // kill switch also reads "the case has moved", as before; from the first call on (this process
-  // then knows the orchestrator supports it), the kill switch is the real switch only, so moving
-  // the case is never reported as a kill-switch halt.
-  let quietStop = false;
-  const stopAfterTransition = (): boolean => {
-    quietStop = true;
-    return scope().advanced();
-  };
-  const killSwitch = async (): Promise<boolean> =>
-    (await w.killSwitch()) || (!quietStop && scope().advanced());
-  // Typed wider than OrchestratorDeps so the extra field compiles before and after Lane 3 adds
-  // it. It is passed at the top level (the dependency) and in `config`, so either placement works.
-  type Deps = ConstructorParameters<typeof Orchestrator>[0];
-  type QuietStop = { stopAfterTransition?: () => boolean };
-  const config: Deps['config'] & QuietStop = {
-    killSwitch,
-    stopAfterTransition,
-    maxStageAttempts: w.maxStageAttempts,
-  };
-  const deps: Deps & QuietStop = {
+  // One job moves the case one stage: `stopAfterTransition` ends the run once this job's
+  // transition has landed, with no event (the run returns `stopped`). The kill switch is the real
+  // switch only, so moving the case is never reported as a halt.
+  const deps: ConstructorParameters<typeof Orchestrator>[0] = {
     store,
     sink,
     model: w.model,
     workspace,
     settlement: { release },
-    stopAfterTransition,
-    config,
+    config: {
+      killSwitch: w.killSwitch,
+      stopAfterTransition: () => scope().advanced(),
+      maxStageAttempts: w.maxStageAttempts,
+    },
     handlers: {
       defense: createDefenseHandler({
         caseFiles,
@@ -189,6 +179,7 @@ export function realTrialCores(w: TrialWiring): Partial<Record<CaseStage, StageC
           maxIterations: s.defenseIterations,
           maxTurns: s.maxAgentTurns,
           turnBudget: s.turnBudget,
+          refusalRoute: s.refusalRoute,
         },
       }),
       prosecution: createProsecutionHandler({
@@ -224,15 +215,24 @@ export function realTrialCores(w: TrialWiring): Partial<Record<CaseStage, StageC
 
   const core: StageCore = async (env) => {
     const ports = stageScopedPorts(env);
-    const outcome = await als.run(
-      {
-        store: ports.store,
-        sink: ports.sink,
-        caseFiles: env.caseFiles,
-        advanced: () => ports.advanced(),
-      },
-      () => orchestrator.run(env.job.caseId),
-    );
+    const outcome = await als
+      .run(
+        {
+          store: ports.store,
+          sink: ports.sink,
+          caseFiles: env.caseFiles,
+          advanced: () => ports.advanced(),
+        },
+        () => orchestrator.run(env.job.caseId),
+      )
+      .catch((err: unknown) => {
+        // The orchestrator turns a provider refusal into a `model-refusal` halt. Should one ever
+        // escape it as a thrown error, it is still review, never a retry of the refused model.
+        if (isModelRefusal(err) && !ports.advanced()) {
+          throw new TrialHaltedError(env.job.stage, 'model-refusal');
+        }
+        throw err;
+      });
     if (outcome.status === 'halted' && !ports.advanced()) {
       throw new TrialHaltedError(env.job.stage, outcome.reason);
     }
