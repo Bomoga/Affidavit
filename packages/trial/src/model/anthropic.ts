@@ -21,6 +21,7 @@ import {
   SUBMIT_SERVER_NAME,
   SubmissionBox,
   buildSubmitTools,
+  type SubmitToolSet,
 } from './submit-tools.js';
 import { sdkTransport, type AgentTransport } from './transport.js';
 
@@ -74,7 +75,7 @@ function defaultWorkdir(): { path: string; dispose(): void } {
  * the runtime can start, and home, config and temp directories pointed at the empty per-turn
  * directory so no user or project settings, memory, or CLAUDE.md can be picked up.
  */
-function childEnv(key: string, workdir: string, parent: Env): Record<string, string> {
+export function childEnv(key: string, workdir: string, parent: Env): Record<string, string> {
   const env: Record<string, string> = {
     [API_KEY_ENV_VAR]: key,
     HOME: workdir,
@@ -93,6 +94,53 @@ function childEnv(key: string, workdir: string, parent: Env): Record<string, str
     if (v !== undefined) env[name] = v;
   }
   return env;
+}
+
+export interface AgentOptionsInput {
+  abortController: AbortController;
+  /** The fresh empty per-turn directory: cwd, home, config and temp. */
+  workdir: string;
+  tools: SubmitToolSet;
+  system: string;
+  model: string;
+  maxTurns: number;
+  maxBudgetUsd: number;
+  key: string;
+  parentEnv: Env;
+}
+
+/**
+ * The SDK options of one agent turn. The port uses exactly this, and the diagnostic probe
+ * (`scripts/probe-model.ts`) calls it too, so a probe exercises the same option set.
+ */
+export function buildAgentOptions(i: AgentOptionsInput): Options {
+  return {
+    abortController: i.abortController,
+    cwd: i.workdir,
+    additionalDirectories: [],
+    // No built-in tools at all; the submit tools are the only tools the agent has.
+    tools: [],
+    allowedTools: i.tools.allowedTools,
+    disallowedTools: [...DENIED_BUILTIN_TOOLS],
+    // Anything not pre-approved is denied; nothing can prompt, and nothing runs code.
+    permissionMode: 'dontAsk',
+    mcpServers: { [SUBMIT_SERVER_NAME]: i.tools.server },
+    strictMcpConfig: true,
+    settingSources: [],
+    skills: [],
+    plugins: [],
+    agents: {},
+    hooks: i.tools.hooks,
+    systemPrompt: i.system,
+    model: i.model,
+    maxTurns: i.maxTurns,
+    maxBudgetUsd: i.maxBudgetUsd,
+    persistSession: false,
+    enableFileCheckpointing: false,
+    includePartialMessages: false,
+    env: childEnv(i.key, i.workdir, i.parentEnv),
+    stderr: () => undefined,
+  };
 }
 
 interface Usage {
@@ -120,7 +168,7 @@ function resultUsage(result: SDKResultMessage): Usage {
 const toInt = (n: number): number => (Number.isFinite(n) && n > 0 ? Math.ceil(n) : 0);
 
 /** A key the HTTP runtime will accept as a header value: printable ASCII, no spaces. */
-const KEY_SHAPE = /^[\x21-\x7e]+$/;
+export const KEY_SHAPE = /^[\x21-\x7e]+$/;
 
 /**
  * Provider error classes decided before the model does any work, so a call that failed with one
@@ -445,33 +493,17 @@ export class AnthropicModelPort implements PreflightModelPort {
             );
           }, this.config.killSwitchPollMs ?? 250);
 
-    const options: Options = {
+    const options: Options = buildAgentOptions({
       abortController: ac,
-      cwd: workdir.path,
-      additionalDirectories: [],
-      // No built-in tools at all; the submit tools are the only tools the agent has.
-      tools: [],
-      allowedTools: tools.allowedTools,
-      disallowedTools: [...DENIED_BUILTIN_TOOLS],
-      // Anything not pre-approved is denied; nothing can prompt, and nothing runs code.
-      permissionMode: 'dontAsk',
-      mcpServers: { [SUBMIT_SERVER_NAME]: tools.server },
-      strictMcpConfig: true,
-      settingSources: [],
-      skills: [],
-      plugins: [],
-      agents: {},
-      hooks: tools.hooks,
-      systemPrompt: req.system,
+      workdir: workdir.path,
+      tools,
+      system: req.system,
       model: req.model,
       maxTurns: req.maxTurns,
       maxBudgetUsd: req.budget.maxUsd,
-      persistSession: false,
-      enableFileCheckpointing: false,
-      includePartialMessages: false,
-      env: childEnv(key, workdir.path, this.env()),
-      stderr: () => undefined,
-    };
+      key,
+      parentEnv: this.env(),
+    });
 
     const tokens = (): Usage => {
       let inputTokens = 0;
