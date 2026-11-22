@@ -10,6 +10,7 @@ import {
   ModelCallError,
   ModelConfigError,
   ModelUnconfiguredError,
+  REFUSAL_CLASS,
   type ProviderFailure,
 } from './errors.js';
 import { isKnownModelId, type ModelTable } from './models.js';
@@ -181,14 +182,8 @@ export const REFUSED_BEFORE_WORK: ReadonlySet<string> = new Set([
   'authentication_failed',
 ]);
 
-/**
- * The class the port reports for a model safety refusal. The runtime reports a response that
- * ended with `stop_reason: "refusal"` (the model's safeguards declined the request) under the
- * assistant error code `invalid_request`, the same code as a malformed request. They are not the
- * same: a refusal is a well-formed request the model answered, after it read the whole input and
- * possibly generated output, so it is billed and is never `REFUSED_BEFORE_WORK`.
- */
-export const REFUSAL_CLASS = 'refusal';
+/** Defined with the error types so `defense.ts` can recognise a refusal (L3-20). */
+export { REFUSAL_CLASS };
 
 /**
  * The refusal categories the port passes on. The runtime itself knows `cyber`, `bio`,

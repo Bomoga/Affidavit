@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -15,10 +15,14 @@ import {
   caseUsage,
   FsEvidenceStore,
   loadBundle,
+  parseKeysFile,
+  publicKeyId,
   readTar,
   replay,
   storeBundle,
+  verifyBundleFiles,
   verifyPublic,
+  VERIFY_EXIT,
   writeTar,
   type ExhibitRecord,
 } from '@affidavit/evidence';
@@ -303,19 +307,61 @@ describe.skipIf(SKIP_REASON !== null)(
       });
     });
 
-    it('verifies from files alone, and refuses one changed byte', async () => {
-      const ok = await verifyPublic(stored!.bytes, attestationJson, [publicKeyPem], {
+    it('verifies from files alone, and refuses one changed byte or a revoked key', async () => {
+      // The published keys file (docs/keys/README.md) with the signer's key, as verify requires.
+      const keysJson = (status: 'active' | 'revoked') =>
+        JSON.stringify({
+          schemaVersion: 1,
+          keys: [
+            {
+              keyId: publicKeyId(publicKeyPem),
+              publicKey: publicKeyPem,
+              status,
+              ...(status === 'revoked' ? { revokedAt: new Date().toISOString() } : {}),
+            },
+          ],
+        });
+      const files = join(root, 'verify');
+      mkdirSync(files);
+      const bundleFile = join(files, 'bundle.tar');
+      const attestationFile = join(files, 'attestation.json');
+      writeFileSync(bundleFile, stored!.bytes);
+      writeFileSync(attestationFile, attestationJson);
+      writeFileSync(join(files, 'keys.json'), keysJson('active'));
+      writeFileSync(join(files, 'revoked.keys.json'), keysJson('revoked'));
+      const verify = async (keysFile: string) => {
+        const lines: string[] = [];
+        const code = await verifyBundleFiles({
+          bundlePath: bundleFile,
+          attestationPath: attestationFile,
+          keysPath: join(files, keysFile),
+          expectedSha256: stored!.sha256,
+          out: (l) => lines.push(l),
+        });
+        return { code, lines };
+      };
+      const ok = await verify('keys.json');
+      expect(ok.code).toBe(VERIFY_EXIT.VERIFIED);
+      expect(ok.lines).toContain(`case ${cf.id}`);
+      expect(ok.lines.at(-1)).toBe('VERIFIED');
+      const revoked = await verify('revoked.keys.json');
+      expect(revoked.code).toBe(VERIFY_EXIT.FAILED);
+      expect(revoked.lines.at(-1)).toMatch(/which is revoked$/);
+
+      const parsed = parseKeysFile(keysJson('active'));
+      if (!parsed.ok) throw new Error(`keys file: ${parsed.reason}`);
+      const direct = await verifyPublic(stored!.bytes, attestationJson, parsed.keys, {
         expectedSha256: stored!.sha256,
       });
-      expect(ok).toMatchObject({ ok: true, caseId: cf.id, outcome: 'proven-fixed' });
+      expect(direct).toMatchObject({ ok: true, caseId: cf.id, outcome: 'proven-fixed' });
 
-      const files = await readTar(stored!.bytes);
-      const name = [...files.keys()].find((n) => n.startsWith('exhibits/exhibit-witness'))!;
-      const changed = new Uint8Array(files.get(name)!);
+      const entries = await readTar(stored!.bytes);
+      const name = [...entries.keys()].find((n) => n.startsWith('exhibits/exhibit-witness'))!;
+      const changed = new Uint8Array(entries.get(name)!);
       changed[10] = (changed[10] ?? 0) ^ 1;
-      files.set(name, changed);
-      const tampered = await writeTar([...files].map(([n, b]) => ({ name: n, bytes: b })));
-      const bad = await verifyPublic(tampered, attestationJson, [publicKeyPem]);
+      entries.set(name, changed);
+      const tampered = await writeTar([...entries].map(([n, b]) => ({ name: n, bytes: b })));
+      const bad = await verifyPublic(tampered, attestationJson, parsed.keys);
       expect(bad.ok).toBe(false);
       const witnessId = name.slice('exhibits/'.length, -'.json'.length);
       expect(!bad.ok && bad.reason).toBe(

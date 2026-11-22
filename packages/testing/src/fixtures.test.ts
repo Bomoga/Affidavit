@@ -5,6 +5,7 @@ import {
   CaseFile,
   Exhibit,
   ExhibitResult,
+  ModelRecording,
   TrialEvent,
   VerifyResult,
 } from '@affidavit/contracts';
@@ -17,6 +18,8 @@ function schemaForFixture(path: string): z.ZodType | null {
   if (path.startsWith('exhibit-results/')) return ExhibitResult;
   if (path.startsWith('trials/') && path.endsWith('.events.json')) return TrialEvent.array();
   if (path.startsWith('exhibits/') && path.endsWith('.exhibits.json')) return Exhibit.array();
+  // v1.2 (CR-T11): record mode writes models/<promptId>/<inputSha256>.json.
+  if (/^models\/[^/]+\/[0-9a-f]{64}\.json$/.test(path)) return ModelRecording;
   return null;
 }
 
@@ -84,6 +87,18 @@ describe('fixtures', () => {
       counterexamples: [],
     });
     expect(r.payload.result.rejectedBy).toBeUndefined();
+  });
+
+  it('model recordings sit at models/<promptId>/<inputSha256>.json (CR-T11)', () => {
+    for (const f of files.filter((p) => p.startsWith('models/'))) {
+      const r = ModelRecording.parse(readFixtureJson(f));
+      expect(f).toBe(`models/${r.promptId}/${r.inputSha256}.json`);
+    }
+  });
+
+  it('maps a model recording path to ModelRecording and nothing else under models/ (CR-T11)', () => {
+    expect(schemaForFixture(`models/defense/${'a'.repeat(64)}.json`)).toBe(ModelRecording);
+    expect(schemaForFixture('models/defense/notes.json')).toBeNull();
   });
 
   it('fixtures contain no em dashes', () => {

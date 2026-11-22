@@ -1,5 +1,11 @@
 import { readFileSync } from 'node:fs';
-import { CaseFile, TrialEvent, samples, type CaseStage } from '@affidavit/contracts';
+import {
+  CaseFile,
+  TrialEvent,
+  samples,
+  trialEventSamples,
+  type CaseStage,
+} from '@affidavit/contracts';
 import { describe, expect, it } from 'vitest';
 import { run, watchCase, type CliDeps } from './commands.js';
 import { ExitCode } from './exit.js';
@@ -151,6 +157,13 @@ describe('sanitize and renderEvent', () => {
       },
     });
     expect(CONTROL.test(renderEvent(esc))).toBe(false);
+  });
+
+  it('renders the contracts v1.2 cost-released and halted events', () => {
+    const released = TrialEvent.parse(trialEventSamples['cost-released']);
+    expect(renderEvent(released)).toContain('released from #9 (model-call-failed)');
+    const halted = TrialEvent.parse(trialEventSamples['halted']);
+    expect(renderEvent(halted)).toContain('model-refusal');
   });
 
   it('renders a verify-result event and neutralizes a hostile patch id in it', () => {

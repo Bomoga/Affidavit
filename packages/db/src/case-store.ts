@@ -6,6 +6,7 @@ import {
   Exhibit as ExhibitSchema,
   ExhibitResult as ExhibitResultSchema,
   IllegalTransitionError,
+  ReleaseRejectedError,
   StageCost as StageCostSchema,
   Verdict as VerdictSchema,
   VerdictAlreadyWrittenError,
@@ -139,10 +140,56 @@ export class PgCaseStore implements CaseStore {
     });
   }
 
+  /**
+   * The budget the port reports: `case_budgets`, the gross columns on `cases` plus every release
+   * (v1.2, CR-T1), with `exhausted` recomputed from the net amounts as `FakeCaseStore` does.
+   */
+  private async netBudget(tx: Tx, caseId: CaseId): Promise<BudgetState> {
+    const res = await tx.execute(sql`
+      select remaining_input_tokens, remaining_output_tokens, remaining_usd, exhausted
+      from public.case_budgets where tenant_id = ${this.tenantId} and case_id = ${caseId}`);
+    const row = res.rows[0] as
+      | {
+          remaining_input_tokens: string | number;
+          remaining_output_tokens: string | number;
+          remaining_usd: string;
+          exhausted: boolean;
+        }
+      | undefined;
+    if (!row) throw unknownCase(caseId);
+    return BudgetState.parse({
+      remainingInputTokens: Number(row.remaining_input_tokens),
+      remainingOutputTokens: Number(row.remaining_output_tokens),
+      remainingUsd: Number(row.remaining_usd),
+      exhausted: row.exhausted,
+    });
+  }
+
+  /**
+   * Locks the case row (the budget) for the rest of the transaction; returns its stage.
+   * FOR UPDATE, not FOR NO KEY UPDATE: a verdict insert's foreign key check takes FOR KEY SHARE
+   * on this row, and only FOR UPDATE makes it wait, so a release can never commit after a verdict
+   * it did not see (migration 0011 keeps the guard on the same lock).
+   */
+  private async lockCase(tx: Tx, caseId: CaseId): Promise<CaseStage> {
+    const [row] = await tx
+      .select({ stage: t.cases.stage })
+      .from(t.cases)
+      .where(this.caseWhere(caseId))
+      .for('update');
+    if (!row) throw unknownCase(caseId);
+    return CaseStageSchema.parse(row.stage);
+  }
+
   async chargeBudget(caseId: CaseId, costIn: StageCost) {
     const cost = StageCostSchema.parse(costIn);
     return this.run(async (tx) => {
-      // One atomic UPDATE: concurrent charges never lose a deduction.
+      // The budget row is locked first, so a charge and a release of the same case run one at a
+      // time and each reads the other's committed rows.
+      await this.lockCase(tx, caseId);
+      // The columns on cases stay gross (charges only, never credited), so they only decrease;
+      // `cases.exhausted` is the gross flag and never clears. The budget returned is net of
+      // releases (case_budgets).
       const updated = await tx.execute(sql`
         update public.cases set
           remaining_input_tokens = remaining_input_tokens - ${cost.inputTokens},
@@ -155,16 +202,8 @@ export class PgCaseStore implements CaseStore {
           ),
           updated_at = now()
         where tenant_id = ${this.tenantId} and id = ${caseId}
-        returning remaining_input_tokens, remaining_output_tokens, remaining_usd, exhausted`);
-      const row = updated.rows[0] as
-        | {
-            remaining_input_tokens: string | number;
-            remaining_output_tokens: string | number;
-            remaining_usd: string;
-            exhausted: boolean;
-          }
-        | undefined;
-      if (!row) throw unknownCase(caseId);
+        returning id`);
+      if (updated.rows.length === 0) throw unknownCase(caseId);
       await tx.insert(t.costRows).values({
         tenantId: this.tenantId,
         caseId,
@@ -175,13 +214,135 @@ export class PgCaseStore implements CaseStore {
         usd: String(cost.usd),
         wallMs: cost.wallMs,
       });
-      return BudgetState.parse({
-        remainingInputTokens: Number(row.remaining_input_tokens),
-        remainingOutputTokens: Number(row.remaining_output_tokens),
-        remainingUsd: Number(row.remaining_usd),
-        exhausted: row.exhausted,
-      });
+      return this.netBudget(tx, caseId);
     });
+  }
+
+  /**
+   * v1.2 (CR-T1). Gives back `refund`, the unspent part of the charge recorded by the
+   * `cost-charged` event at `reservationSeq`, as an insert-only `cost_releases` row (charges are
+   * never changed). One transaction, under a lock on the case row:
+   * - a release already recorded for (tenant, case, reservationSeq) changes nothing and returns
+   *   the current budget, whatever refund it carries (idempotent);
+   * - otherwise it throws ReleaseRejectedError, changing nothing, when the seq is not a
+   *   non-negative integer, the refund is not a valid StageCost (negative, NaN, non-finite), the
+   *   case is closed (a terminal stage or a verdict), the event at that seq is not a
+   *   `cost-charged` event of this case, the refund names another stage or attempt, a field
+   *   exceeds that charge, or the case's releases would exceed its charges;
+   * - and returns the budget net of releases. The caller emits `cost-released`.
+   * An insert trigger (migration 0009) repeats the checks for any other writer.
+   */
+  async releaseCharge(
+    caseId: CaseId,
+    refundIn: StageCost,
+    reservationSeq: number,
+  ): Promise<BudgetState> {
+    const reject = (why: string) => new ReleaseRejectedError(caseId, reservationSeq, why);
+    if (!Number.isInteger(reservationSeq) || reservationSeq < 0 || reservationSeq > INT4_MAX) {
+      throw reject('reservationSeq is not a non-negative integer');
+    }
+    try {
+      return await this.run(async (tx) => {
+        const stage = await this.lockCase(tx, caseId);
+        const [done] = await tx
+          .select({ seq: t.costReleases.reservationSeq })
+          .from(t.costReleases)
+          .where(
+            and(
+              eq(t.costReleases.tenantId, this.tenantId),
+              eq(t.costReleases.caseId, caseId),
+              eq(t.costReleases.reservationSeq, reservationSeq),
+            ),
+          );
+        if (done) return this.netBudget(tx, caseId);
+
+        const parsed = StageCostSchema.safeParse(refundIn);
+        if (!parsed.success || !finiteCost(parsed.data)) {
+          throw reject('refund is not a valid StageCost (finite, non-negative amounts)');
+        }
+        const refund = parsed.data;
+        if (TERMINAL_STAGES.includes(stage)) throw reject(`the case is closed (${stage})`);
+        const [verdict] = await tx
+          .select({ caseId: t.verdicts.caseId })
+          .from(t.verdicts)
+          .where(and(eq(t.verdicts.tenantId, this.tenantId), eq(t.verdicts.caseId, caseId)));
+        if (verdict) throw reject('the case is closed (it has a verdict)');
+
+        const [event] = await tx
+          .select({ type: t.events.type, event: t.events.event })
+          .from(t.events)
+          .where(
+            and(
+              eq(t.events.tenantId, this.tenantId),
+              eq(t.events.caseId, caseId),
+              eq(t.events.seq, reservationSeq),
+            ),
+          );
+        if (event?.type !== 'cost-charged') throw reject('no cost-charged event at that seq');
+        const charge = StageCostSchema.safeParse(
+          (event.event as { payload?: { cost?: unknown } }).payload?.cost,
+        );
+        if (!charge.success) throw reject('the cost-charged event at that seq has no valid cost');
+        const c = charge.data;
+        if (c.stage !== refund.stage || c.attempt !== refund.attempt) {
+          throw reject('refund names a different stage or attempt than the charge');
+        }
+        if (
+          refund.inputTokens > c.inputTokens ||
+          refund.outputTokens > c.outputTokens ||
+          round6(refund.usd) > round6(c.usd) ||
+          refund.wallMs > c.wallMs
+        ) {
+          throw reject('refund exceeds the charge it releases');
+        }
+
+        // The ledger never goes negative: releases never exceed charges, field by field.
+        const totals = await tx.execute(sql`
+          select
+            (select coalesce(sum(input_tokens), 0) from public.cost_rows
+              where tenant_id = ${this.tenantId} and case_id = ${caseId})
+              - (select coalesce(sum(input_tokens), 0) from public.cost_releases
+              where tenant_id = ${this.tenantId} and case_id = ${caseId})
+              - ${refund.inputTokens} < 0 as over_in,
+            (select coalesce(sum(output_tokens), 0) from public.cost_rows
+              where tenant_id = ${this.tenantId} and case_id = ${caseId})
+              - (select coalesce(sum(output_tokens), 0) from public.cost_releases
+              where tenant_id = ${this.tenantId} and case_id = ${caseId})
+              - ${refund.outputTokens} < 0 as over_out,
+            round((select coalesce(sum(usd), 0) from public.cost_releases
+              where tenant_id = ${this.tenantId} and case_id = ${caseId}) + ${refund.usd}::numeric, 6)
+              > round((select coalesce(sum(usd), 0) from public.cost_rows
+              where tenant_id = ${this.tenantId} and case_id = ${caseId}), 6) as over_usd`);
+        const over = totals.rows[0] as
+          { over_in: boolean; over_out: boolean; over_usd: boolean } | undefined;
+        if (!over || over.over_in || over.over_out || over.over_usd) {
+          throw reject('would release more than the case was charged');
+        }
+
+        await tx.insert(t.costReleases).values({
+          tenantId: this.tenantId,
+          caseId,
+          reservationSeq,
+          stage: refund.stage,
+          attempt: refund.attempt,
+          inputTokens: refund.inputTokens,
+          outputTokens: refund.outputTokens,
+          usd: String(refund.usd),
+          wallMs: refund.wallMs,
+        });
+        return this.netBudget(tx, caseId);
+      });
+    } catch (err) {
+      // The insert guard's refusals (any writer's backstop) surface as the contract error.
+      // Drizzle wraps the driver error; the Postgres message is on `cause`.
+      const cause = err instanceof Error ? err.cause : undefined;
+      const msg = [err, cause].map((e) => (e instanceof Error ? e.message : '')).join(' ');
+      const m = /cost release rejected: ([^\n]*)/.exec(msg);
+      if (m && !(err instanceof ReleaseRejectedError)) {
+        throw reject(m[1]!.trim());
+      }
+      throw err;
+    }
   }
 
   async nextSeq(caseId: CaseId): Promise<number> {
@@ -296,6 +457,12 @@ export class PgCaseStore implements CaseStore {
     });
   }
 }
+
+const INT4_MAX = 2_147_483_647;
+const TERMINAL_STAGES: readonly CaseStage[] = ['verdict', 'dismissed', 'escalated'];
+const round6 = (n: number): number => Math.round(n * 1e6) / 1e6;
+const finiteCost = (c: StageCost): boolean =>
+  [c.inputTokens, c.outputTokens, c.usd, c.wallMs].every((n) => Number.isFinite(n) && n >= 0);
 
 function unknownCase(caseId: string): Error {
   return new Error(`unknown case ${caseId}`);

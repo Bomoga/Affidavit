@@ -5,15 +5,23 @@
  * The orchestrator loops a case to the end, and there is no single-stage entry yet (CR-7). One
  * Orchestrator is built per process (it keeps the per-case cost ledger and prompt versions in
  * memory), and each stage job runs `Orchestrator.run` with the job's own lease-guarded ports,
- * routed through AsyncLocalStorage, and `stageScopedPorts` from @affidavit/db: the kill switch it
- * sees also reads "the case has moved", so one job moves the case one stage, and the repeated
- * `stage-entered` at the start of each run is not stored twice.
+ * routed through AsyncLocalStorage, and `stageScopedPorts` from @affidavit/db: the orchestrator
+ * stops once the case has moved (`stopAfterTransition`, or the kill switch until the trial package
+ * reads that), so one job moves the case one stage, and the repeated `stage-entered` at the start
+ * of each run is not stored twice.
  *
- * A halt that did not move the case (the kill switch, or `model-unconfigured`: no API key or a
- * key the provider refused) fails the job with TrialHaltedError. Nothing is charged for a missing
- * key: the port refuses before the orchestrator charges. Recovery retries up to
- * AFFIDAVIT_MAX_STAGE_ATTEMPTS (each retry is a zero-amount cost row) and then flags the stage for
- * review. The case is never dismissed or escalated by a halt.
+ * A halt that did not move the case fails the job with TrialHaltedError, whose message names the
+ * reason. Nothing is charged for a missing key: the port refuses before the orchestrator charges.
+ * For `kill-switch` and `model-unconfigured`, recovery retries up to AFFIDAVIT_MAX_STAGE_ATTEMPTS
+ * (each retry is a zero-amount cost row) and then flags the stage for review. A `model-refusal`
+ * is not retried: the stage is flagged for review at once (`reviewReason`). The case is never
+ * dismissed or escalated by a halt.
+ *
+ * Settlement (contracts v1.2, CR-T1): the orchestrator charges each model turn up front at the
+ * turn cap. When a call fails and the port reported what it spent, the orchestrator gives the
+ * unspent part back through `settlement.release`, wired here to the job store's `releaseCharge`
+ * (an insert-only `cost_releases` row; the budget is read net of releases). The store also
+ * exposes `releaseCharge` directly; both reach the same idempotent call.
  *
  * Known limits, from @affidavit/trial: the hand-off between stages (`InMemoryWorkspace`) and the
  * cost ledger live in this process only, so a case whose worker restarts mid-trial fails at the
@@ -22,12 +30,16 @@
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type {
+  BudgetState,
   CaseFileSource,
+  CaseId,
   CaseStage,
   CaseStore,
   EventSink,
+  HaltReason as ContractHaltReason,
   JudgePort,
   ModelPort,
+  StageCost,
 } from '@affidavit/contracts';
 import { stageScopedPorts, type StageCore } from '@affidavit/db';
 import { renderPrompt } from '@affidavit/prompts';
@@ -39,7 +51,6 @@ import {
   createRemedyHandler,
   createVerifyHandler,
   modelFor,
-  type HaltReason,
   type ModelTable,
 } from '@affidavit/trial';
 import type { TrialSettings } from '../config.js';
@@ -47,17 +58,37 @@ import type { TrialSettings } from '../config.js';
 /** The orchestrator stopped before the stage moved the case. */
 const TERMINAL: readonly CaseStage[] = ['verdict', 'dismissed', 'escalated'];
 
+/** What the job error says for each halt reason. Names variables only, never values. */
+function haltMessage(stage: CaseStage, reason: ContractHaltReason): string {
+  switch (reason) {
+    case 'model-unconfigured':
+      return `stage ${stage} halted: the model is not configured (ANTHROPIC_API_KEY missing or refused); nothing was charged for the refused call`;
+    case 'kill-switch':
+      return `stage ${stage} halted: the kill switch is on`;
+    case 'model-refusal':
+      return `stage ${stage} halted: the model refused the request on safety grounds; flagged for review, not retried (a retry asks the same model again)`;
+    case 'budget-exhausted':
+      return `stage ${stage} halted: the case budget is exhausted`;
+    default:
+      return `stage ${stage} halted (${String(reason)})`;
+  }
+}
+
+/**
+ * A halt that did not move the case. `model-refusal` is not retryable: it carries
+ * `reviewReason`, so `@affidavit/db`'s stage handler flags the stage for review at once instead of
+ * letting recovery retry it. Every other reason is retried as an ordinary failure.
+ */
 export class TrialHaltedError extends Error {
+  readonly reviewReason: 'model-refusal' | undefined;
+
   constructor(
     readonly stage: CaseStage,
-    readonly reason: HaltReason,
+    readonly reason: ContractHaltReason,
   ) {
-    super(
-      reason === 'model-unconfigured'
-        ? `stage ${stage} halted: the model is not configured (ANTHROPIC_API_KEY missing or refused); nothing was charged for the refused call`
-        : `stage ${stage} halted: the kill switch is on`,
-    );
+    super(haltMessage(stage, reason));
     this.name = 'TrialHaltedError';
+    this.reviewReason = reason === 'model-refusal' ? 'model-refusal' : undefined;
   }
 }
 
@@ -87,11 +118,23 @@ export function realTrialCores(w: TrialWiring): Partial<Record<CaseStage, StageC
     if (!s) throw new Error('a trial port was used outside a stage job');
     return s;
   };
+  // v1.2 (CR-T1): give back the unspent part of an up-front charge through the job's own store
+  // (stage-scoped, lease-guarded, tenant-scoped PgCaseStore). The seq is the one the orchestrator
+  // got for its `cost-charged` event; the stage-scoped store maps it to the stored seq. A store
+  // without releaseCharge refuses, and the orchestrator keeps the charge (over-counting).
+  const release = (id: CaseId, refund: StageCost, seq: number): Promise<BudgetState> => {
+    const s = scope().store;
+    if (!s.releaseCharge) {
+      return Promise.reject(new Error('this case store cannot release a charge'));
+    }
+    return s.releaseCharge(id, refund, seq);
+  };
   const store: CaseStore = {
     open: (cf, b) => scope().store.open(cf, b),
     stage: (id) => scope().store.stage(id),
     transition: (id, to) => scope().store.transition(id, to),
     chargeBudget: (id, c) => scope().store.chargeBudget(id, c),
+    releaseCharge: (id, r, seq) => release(id, r, seq),
     nextSeq: (id) => scope().store.nextSeq(id),
     appendVerdict: (v) => scope().store.appendVerdict(v),
     getVerdict: (id) => scope().store.getVerdict(id),
@@ -105,11 +148,35 @@ export function realTrialCores(w: TrialWiring): Partial<Record<CaseStage, StageC
   const s = w.settings;
   const workspace = new InMemoryWorkspace();
   const model = (id: Parameters<typeof modelFor>[1]) => modelFor(w.modelTable, id);
-  const orchestrator = new Orchestrator({
+  // One job moves the case one stage. The quiet way is `stopAfterTransition` (Lane 3, being added
+  // after PR #84: stop with no `halted` event). Until the installed @affidavit/trial calls it, the
+  // kill switch also reads "the case has moved", as before; from the first call on (this process
+  // then knows the orchestrator supports it), the kill switch is the real switch only, so moving
+  // the case is never reported as a kill-switch halt.
+  let quietStop = false;
+  const stopAfterTransition = (): boolean => {
+    quietStop = true;
+    return scope().advanced();
+  };
+  const killSwitch = async (): Promise<boolean> =>
+    (await w.killSwitch()) || (!quietStop && scope().advanced());
+  // Typed wider than OrchestratorDeps so the extra field compiles before and after Lane 3 adds
+  // it. It is passed at the top level (the dependency) and in `config`, so either placement works.
+  type Deps = ConstructorParameters<typeof Orchestrator>[0];
+  type QuietStop = { stopAfterTransition?: () => boolean };
+  const config: Deps['config'] & QuietStop = {
+    killSwitch,
+    stopAfterTransition,
+    maxStageAttempts: w.maxStageAttempts,
+  };
+  const deps: Deps & QuietStop = {
     store,
     sink,
     model: w.model,
     workspace,
+    settlement: { release },
+    stopAfterTransition,
+    config,
     handlers: {
       defense: createDefenseHandler({
         caseFiles,
@@ -152,12 +219,8 @@ export function realTrialCores(w: TrialWiring): Partial<Record<CaseStage, StageC
       }),
       verify: createVerifyHandler({ store, workspace, jury: 'disabled' }),
     },
-    config: {
-      // Stops the loop once this job's stage has moved the case, as well as on the real switch.
-      killSwitch: async () => (await w.killSwitch()) || scope().advanced(),
-      maxStageAttempts: w.maxStageAttempts,
-    },
-  });
+  };
+  const orchestrator = new Orchestrator(deps);
 
   const core: StageCore = async (env) => {
     const ports = stageScopedPorts(env);

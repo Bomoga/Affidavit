@@ -67,6 +67,20 @@ export interface CaseStore {
   transition(caseId: CaseId, to: CaseStage): Promise<void>;
   /** Called BEFORE the retry it pays for. Returns what is left; never throws on exhaustion. */
   chargeBudget(caseId: CaseId, cost: StageCost): Promise<BudgetState>;
+  /**
+   * v1.2 (CR-T1). Gives back `refund`, the unspent part of the charge recorded by the
+   * `cost-charged` event with seq `reservationSeq`, and returns the budget after it (with
+   * `exhausted` recomputed). Rules every store enforces:
+   * - Idempotent on (caseId, reservationSeq): a second call changes nothing and returns the
+   *   current budget, whatever refund it carries.
+   * - A refund never exceeds the charge it releases, field by field, and names the same stage and
+   *   attempt; otherwise it throws ReleaseRejectedError and changes nothing.
+   * - The ledger never goes negative: what a case has had released never exceeds what it was
+   *   charged.
+   * The caller emits the `cost-released` event after this returns. Optional in v1.2 so existing
+   * stores keep compiling; a store without it releases nothing (the charge stands, over-counting).
+   */
+  releaseCharge?(caseId: CaseId, refund: StageCost, reservationSeq: number): Promise<BudgetState>;
   nextSeq(caseId: CaseId): Promise<number>;
   /** Append-only. A second verdict for a case throws VerdictAlreadyWrittenError. */
   appendVerdict(verdict: Verdict): Promise<void>;
@@ -118,6 +132,18 @@ export class IllegalTransitionError extends Error {
   ) {
     super(`illegal transition ${from} -> ${to}: ${why}`);
     this.name = 'IllegalTransitionError';
+  }
+}
+
+/** v1.2 (CR-T1): a release that would give back more than was charged, or names no charge. */
+export class ReleaseRejectedError extends Error {
+  constructor(
+    readonly caseId: CaseId,
+    readonly reservationSeq: number,
+    readonly why: string,
+  ) {
+    super(`release of reservation ${reservationSeq} for case ${caseId} rejected: ${why}`);
+    this.name = 'ReleaseRejectedError';
   }
 }
 
