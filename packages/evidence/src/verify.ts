@@ -1,11 +1,16 @@
-import { createPublicKey } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
 import { Attestation, type Verdict } from '@affidavit/contracts';
 import { publicKeyId, verifyAttestation } from './attestation.js';
 import { MANIFEST_PATH, openBundle, type OpenedBundle } from './bundle.js';
 import { canonicalBytes, sha256Hex, SHA256_HEX } from './canonical.js';
 import { BundleIntegrityError } from './errors.js';
-import { KEY_ID, MAX_KEYS_FILE_BYTES, parseKeysFile, type PublishedKey } from './keys.js';
+import {
+  KEY_ID,
+  MAX_KEYS_FILE_BYTES,
+  parseKeysFile,
+  publicKeyProblem,
+  type PublishedKey,
+} from './keys.js';
 import { DEFAULT_TAR_LIMITS, readTar } from './tar.js';
 
 /**
@@ -113,17 +118,15 @@ export async function verifyPublic(
   if (!parsed.success) return fail('the attestation file is not an attestation');
   const attestation = parsed.data;
 
+  // Checked again here for callers that did not go through parseKeysFile.
   const keys = new Map<string, PublishedKey>();
   for (const [i, key] of publishedKeys.entries()) {
-    try {
-      createPublicKey(key.publicKey);
-    } catch {
-      return fail(`published key ${i + 1} is not a PEM public key`);
-    }
-    // Checked again here for callers that did not go through parseKeysFile.
+    const problem = publicKeyProblem(key.publicKey);
+    if (problem !== undefined) return fail(`published key ${i + 1} ${problem}`);
     if (publicKeyId(key.publicKey) !== key.keyId) {
       return fail(`published key ${i + 1} has a keyId that is not its key's id`);
     }
+    if (keys.has(key.keyId)) return fail(`published key ${i + 1} repeats ${key.keyId}`);
     keys.set(key.keyId, key);
   }
   if (keys.size === 0) return fail('no published key given');
@@ -132,7 +135,11 @@ export async function verifyPublic(
     return fail(`signed by key ${attestation.keyId}, which is revoked`);
   }
   if (key === undefined) {
-    return fail(`signed by key ${attestation.keyId}, which is none of the published keys`);
+    // The attestation's keyId is any non-empty string until it matches a published key.
+    const shown = KEY_ID.test(attestation.keyId)
+      ? attestation.keyId
+      : JSON.stringify(attestation.keyId);
+    return fail(`signed by key ${shown}, which is none of the published keys`);
   }
   if (key.status !== 'active') {
     return fail(`signed by key ${attestation.keyId}, which is revoked`);
@@ -166,18 +173,34 @@ export async function verifyPublic(
   };
 }
 
-/** Plain-text lines for a result. Values come from a bundle that passed every check. */
+/**
+ * `text` with every control, format (bidi controls such as U+202E and U+061C, zero-width
+ * characters) and line or paragraph separator character written as a visible `\u{...}` escape,
+ * so text from a bundle or attestation cannot add a line such as `VERIFIED` or reorder what a
+ * terminal shows.
+ */
+export function printable(text: string): string {
+  return text.replace(
+    /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}؜]/gu,
+    (c) => `\\u{${c.codePointAt(0)!.toString(16).padStart(4, '0')}}`,
+  );
+}
+
+/**
+ * Plain-text lines for a result. Every value that can come from the bundle or the attestation
+ * goes through `printable`, even after every check passed.
+ */
 export function renderVerification(v: PublicVerification): string[] {
   const lines = [`bundle sha256:${v.bundleSha256}`];
   if (!v.ok) {
-    lines.push(`NOT VERIFIED: ${v.reason}`);
+    lines.push(`NOT VERIFIED: ${printable(v.reason)}`);
     return lines;
   }
   lines.push(
-    `case ${v.caseId}`,
+    `case ${printable(v.caseId)}`,
     `verdict ${v.outcome}${v.severity === undefined ? '' : ` (severity ${v.severity})`}`,
     `exhibits ${v.exhibits}, every one matching its signed digest`,
-    `signed by ${v.keyId}`,
+    `signed by ${printable(v.keyId)}`,
     'VERIFIED',
   );
   return lines;

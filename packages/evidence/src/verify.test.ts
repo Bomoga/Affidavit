@@ -17,7 +17,14 @@ import { canonicalJson } from './canonical.js';
 import { readTar, writeTar } from './tar.js';
 import { bundleInput } from './test-helpers.js';
 import { verifyMain } from './verify-main.js';
-import { VERIFY_EXIT, verifyBundleFiles, verifyPublic } from './verify.js';
+import {
+  printable,
+  renderVerification,
+  VERIFY_EXIT,
+  verifyBundleFiles,
+  verifyPublic,
+  type PublicVerification,
+} from './verify.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'affidavit-verify-test-'));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -165,6 +172,10 @@ describe('verifyPublic', () => {
     expect(await reason(att, [wrongId])).toBe(
       "published key 1 has a keyId that is not its key's id",
     );
+    // The same key id twice is refused, not last-wins (an active copy hiding a revoked one).
+    expect(await reason(att, [entry(key, 'revoked'), entry(key)])).toBe(
+      `published key 2 repeats ${publicKeyId(key)}`,
+    );
   });
 
   it('refuses a signature by a key the keys file marks revoked, whatever its revokedAt', async () => {
@@ -239,11 +250,117 @@ describe('parseKeysFile', () => {
     expect(reason(keysFile({ ...entry(a), keyId: publicKeyId(b) }))).toMatch(
       /keyId that is not its key's id at keys\.0/,
     );
-    expect(reason(keysFile({ ...entry(a), publicKey: 'nope' }))).toMatch(/not PEM at keys\.0/);
+    expect(reason(keysFile({ ...entry(a), publicKey: 'nope' }))).toMatch(
+      /not a PEM public key at keys\.0/,
+    );
     expect(reason(keysFile(entry(a), entry(a)))).toMatch(/twice/);
     expect(reason(keysFile(entry(a, 'active', { revokedAt: '2026-12-01T00:00:00Z' })))).toMatch(
       /revokedAt on a key that is not revoked/,
     );
+    const dated = (extra: Partial<PublishedKey>) =>
+      reason(keysFile(entry(a, 'revoked', { validFrom: '2026-11-21T00:00:00Z', ...extra })));
+    expect(dated({ retiredAt: '2026-11-20T00:00:00Z' })).toMatch(/retiredAt before validFrom/);
+    expect(dated({ revokedAt: '2026-11-20T00:00:00Z' })).toMatch(/revokedAt before validFrom/);
+    expect(dated({ retiredAt: '2026-11-22T00:00:00Z', revokedAt: '2026-11-23T00:00:00Z' })).toBe(
+      'ok',
+    );
+  });
+
+  it('accepts only exactly one PEM public key block per key', () => {
+    const pair = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+    const pub = pair.publicKey.export({ type: 'spki', format: 'pem' }) as string;
+    const priv = pair.privateKey.export({ type: 'pkcs8', format: 'pem' }) as string;
+    const reason = (publicKey: string, keyId = publicKeyId(pub)) => {
+      const r = parseKeysFile(keysFile({ keyId, publicKey, status: 'active' }));
+      return r.ok ? 'ok' : r.reason;
+    };
+    expect(reason(pub)).toBe('ok');
+    expect(reason(pub.replace(/\n/g, '\r\n'))).toBe('ok');
+    expect(reason(pub.trimEnd())).toBe('ok');
+    // A private key derives the same public key and keyId; it must never be published.
+    expect(publicKeyId(priv)).toBe(publicKeyId(pub));
+    expect(reason(priv)).toBe(
+      'the keys file has a publicKey that is a private key, not a public key at keys.0',
+    );
+    expect(reason(`${pub}${pem()}`)).toMatch(/is not exactly one PEM public key block at keys\.0/);
+    expect(reason(`note: ours\n${pub}`)).toMatch(/is not exactly one PEM public key block/);
+    expect(reason(`${pub}trailing text\n`)).toMatch(/is not exactly one PEM public key block/);
+    const rsa = generateKeyPairSync('rsa', { modulusLength: 1024 });
+    const rsaPub = rsa.publicKey.export({ type: 'spki', format: 'pem' }) as string;
+    expect(reason(rsaPub, publicKeyId(rsaPub))).toMatch(/is an RSA key under 2048 bits/);
+  });
+
+  it('refuses a member name repeated in one object, which JSON.parse would let the last one win', () => {
+    const a = pem();
+    const e = entry(a, 'revoked');
+    const twice = JSON.stringify({ schemaVersion: 1, keys: [e] }).replace(
+      '"status":"revoked"',
+      '"status":"revoked","status":"active"',
+    );
+    expect(JSON.parse(twice)).toMatchObject({ keys: [{ status: 'active' }] });
+    const r = parseKeysFile(twice);
+    expect(!r.ok && r.reason).toBe('the keys file repeats the member "status"');
+    // The same name in different objects is fine; a name spelled with an escape still counts.
+    expect(parseKeysFile(keysFile(entry(a), entry(pem()))).ok).toBe(true);
+    const escaped = twice.replace('"status":"active"', '"st\\u0061tus":"active"');
+    expect(parseKeysFile(escaped)).toEqual({
+      ok: false,
+      reason: 'the keys file repeats the member "status"',
+    });
+    const top = `{"schemaVersion":1,"schemaVersion":1,"keys":${JSON.stringify([entry(a)])}}`;
+    expect(parseKeysFile(top)).toEqual({
+      ok: false,
+      reason: 'the keys file repeats the member "schemaVersion"',
+    });
+  });
+});
+
+describe('what verify prints', () => {
+  it('escapes control, bidi and separator characters, U+061C included', () => {
+    expect(printable('a\nVERIFIED')).toBe('a\\u{000a}VERIFIED');
+    expect(printable('x‮y؜z ​\u0007')).toBe('x\\u{202e}y\\u{061c}z\\u{2028}\\u{200b}\\u{0007}');
+    expect(printable('plain case-1 sha256:ab')).toBe('plain case-1 sha256:ab');
+    const result: PublicVerification = {
+      ok: true,
+      bundleSha256: 'a'.repeat(64),
+      caseId: 'case\nVERIFIED‮',
+      outcome: 'proven-unfixed',
+      exhibits: 1,
+      keyId: `sha256:${'b'.repeat(64)}`,
+    };
+    const lines = renderVerification(result);
+    expect(lines).toContain('case case\\u{000a}VERIFIED\\u{202e}');
+    expect(lines.filter((l) => l === 'VERIFIED')).toHaveLength(1);
+    expect(renderVerification({ ok: false, bundleSha256: 'a', reason: 'x\nVERIFIED' })).toEqual([
+      'bundle sha256:a',
+      'NOT VERIFIED: x\\u{000a}VERIFIED',
+    ]);
+  });
+
+  it('never echoes a keyId that is not a key id as it came, so it cannot add a VERIFIED line', async () => {
+    const { bytes, manifest } = await buildBundle(bundleInput());
+    const key = pem();
+    const forged = { ...fakeAttestation(manifest, key), keyId: 'x\nVERIFIED' };
+    const r = await verifyPublic(bytes, JSON.stringify(forged), [entry(key)], {
+      cosignPath: cosignOk,
+    });
+    expect(!r.ok && r.reason).toBe(
+      'signed by key "x\\nVERIFIED", which is none of the published keys',
+    );
+    const lines: string[] = [];
+    const code = await verifyMain(
+      [
+        write('forged.tar', bytes),
+        write('forged.att.json', JSON.stringify(forged)),
+        '--keys',
+        write('forged.keys.json', keysFile(entry(key))),
+        '--cosign',
+        cosignOk,
+      ],
+      (l) => lines.push(l),
+    );
+    expect(code).toBe(VERIFY_EXIT.FAILED);
+    expect(lines.join('\n')).not.toMatch(/^VERIFIED$/m);
   });
 });
 

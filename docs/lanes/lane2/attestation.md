@@ -24,6 +24,8 @@ Verdicts are private. The signer runs cosign with a signing config that lists no
 
 ## Verifying
 
+To check a verdict, use `verify --keys` ("Public verification" below). The raw cosign command here only shows what happens underneath: it checks one signature against one public key and knows nothing of the keys file, so it does not check revocation and will accept a signature by a revoked key. It also does not check the bundle's files against the manifest.
+
 With the bundle's `manifest.json` and the attestation's `signature` saved as `attestation.sigstore.json`:
 
 ```sh
