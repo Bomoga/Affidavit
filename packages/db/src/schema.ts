@@ -228,6 +228,45 @@ export const costRows = pgTable(
   ],
 ).enableRLS();
 
+/**
+ * v1.2 (CR-T1): the unspent part of an up-front charge, given back by `releaseCharge`. One row per
+ * `cost-charged` event released, keyed by that event's seq (idempotency), and insert-only like
+ * `cost_rows`: a charge is never updated or deleted, so the ledger is charges minus releases. An
+ * insert trigger (migration 0009) checks the row against the charge event and the case-wide
+ * totals, under a lock on the case row. The live budget is `case_budgets` (net of releases).
+ */
+export const costReleases = pgTable(
+  'cost_releases',
+  {
+    tenantId: tenantId(),
+    caseId: text('case_id').notNull(),
+    /** The seq of the `cost-charged` event whose charge this releases. */
+    reservationSeq: integer('reservation_seq').notNull(),
+    stage: text('stage').notNull(),
+    attempt: integer('attempt').notNull(),
+    inputTokens: bigint('input_tokens', { mode: 'number' }).notNull(),
+    outputTokens: bigint('output_tokens', { mode: 'number' }).notNull(),
+    usd: numeric('usd', { precision: 24, scale: 9 }).notNull(),
+    wallMs: bigint('wall_ms', { mode: 'number' }).notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.tenantId, t.caseId, t.reservationSeq] }),
+    caseRef(t),
+    // The released charge's event must exist (events are append-only, so this never dangles).
+    foreignKey({
+      name: 'cost_releases_charge_event_fk',
+      columns: [t.tenantId, t.caseId, t.reservationSeq],
+      foreignColumns: [events.tenantId, events.caseId, events.seq],
+    }),
+    check('cost_releases_stage_valid', sql`${t.stage} in (${stageList})`),
+    check(
+      'cost_releases_values_valid',
+      sql`${t.reservationSeq} >= 0 and ${t.attempt} >= 1 and ${t.inputTokens} >= 0 and ${t.outputTokens} >= 0 and ${t.usd} >= 0 and ${t.usd} <> 'NaN'::numeric and ${t.wallMs} >= 0`,
+    ),
+  ],
+).enableRLS();
+
 /** Keyed by the seq of the `escalated` or `budget-exhausted` event that recorded it. */
 export const escalations = pgTable(
   'escalations',
@@ -384,7 +423,7 @@ export const reviewFlags = pgTable(
     check('review_flags_visit_valid', sql`${t.visit} >= 0`),
     check(
       'review_flags_reason_valid',
-      sql`${t.reason} in ('attempts-exhausted', 'budget-exhausted', 'f3-hold')`,
+      sql`${t.reason} in ('attempts-exhausted', 'budget-exhausted', 'f3-hold', 'model-refusal')`,
     ),
   ],
 ).enableRLS();

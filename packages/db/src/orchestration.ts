@@ -29,6 +29,7 @@ import {
   flagForReview,
   isFlaggedForReview,
   listOpenCases,
+  REVIEW_REASONS,
   stageAttemptState,
   type OpenCaseCursor,
   type ReviewReason,
@@ -59,10 +60,24 @@ function check(signal: AbortSignal): void {
 
 /** A CaseStore whose writes are refused once the job's signal aborted. Reads pass through. */
 export class GuardedCaseStore implements CaseStore {
+  /**
+   * v1.2 (CR-T1). Present only when the inner store has it, so a store that cannot release still
+   * reads as one that cannot (the charge stands). Lease-guarded like `chargeBudget`.
+   */
+  readonly releaseCharge?: CaseStore['releaseCharge'];
+
   constructor(
     private readonly inner: CaseStore,
     private readonly signal: AbortSignal,
-  ) {}
+  ) {
+    const release = inner.releaseCharge?.bind(inner);
+    if (release) {
+      this.releaseCharge = (caseId, refund, reservationSeq) => {
+        check(this.signal);
+        return release(caseId, refund, reservationSeq);
+      };
+    }
+  }
   open(caseFile: CaseFile, budget: Budget) {
     check(this.signal);
     return this.inner.open(caseFile, budget);
@@ -193,6 +208,30 @@ export class StageDidNotAdvanceError extends Error {
 }
 
 /**
+ * Stage work that a retry cannot help (for example a model safety refusal: a retry asks the same
+ * model again). `stageHandler` flags this attempt's visit for review at once, so recovery neither
+ * retries it nor sweeps it; the case stays where it is and is never dismissed. Any error with a
+ * valid `reviewReason` property is treated the same way (`reviewReasonOf`).
+ */
+export class NeedsReviewError extends Error {
+  constructor(
+    readonly reviewReason: ReviewReason,
+    message: string,
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+    this.name = 'NeedsReviewError';
+  }
+}
+
+/** The review reason an error from stage work carries, or undefined for an ordinary failure. */
+export function reviewReasonOf(err: unknown): ReviewReason | undefined {
+  if (typeof err !== 'object' || err === null) return undefined;
+  const r = (err as { reviewReason?: unknown }).reviewReason;
+  return REVIEW_REASONS.find((x) => x === r);
+}
+
+/**
  * Makes sure the case's current stage has a job for the current visit, enqueuing the next unused
  * attempt number if there is none. Safe to call from several processes: enqueueing is idempotent
  * on the attempt key. Returns the payload it enqueued, or null if a job already exists, the case
@@ -241,18 +280,32 @@ export function stageHandler(core: StageCore, options: StageHandlerOptions): Sta
     const pgSink = new PgEventSink(appPool, job.tenantId);
     const store = new GuardedCaseStore(pgStore, ctx.signal);
     await hooks?.beforeStageWork?.(job);
-    await core({
-      job,
-      store,
-      sink: new GuardedEventSink(pgSink, ctx.signal),
-      caseFiles: new PgCaseFileSource(appPool, job.tenantId),
-      signal: ctx.signal,
-      events: (caseId) => visitEvents(appPool, pgSink, job.tenantId, caseId),
-      checkpoint: async (name) => {
-        check(ctx.signal);
-        await hooks?.checkpoint?.(job, name);
-      },
-    });
+    try {
+      await core({
+        job,
+        store,
+        sink: new GuardedEventSink(pgSink, ctx.signal),
+        caseFiles: new PgCaseFileSource(appPool, job.tenantId),
+        signal: ctx.signal,
+        events: (caseId) => visitEvents(appPool, pgSink, job.tenantId, caseId),
+        checkpoint: async (name) => {
+          check(ctx.signal);
+          await hooks?.checkpoint?.(job, name);
+        },
+      });
+    } catch (err) {
+      const reason = reviewReasonOf(err);
+      if (reason !== undefined) {
+        // Not retryable: flag this attempt's visit now (only while it is still the case's current
+        // stage and latest attempt), then fail the attempt as usual.
+        const s = await stageAttemptState(appPool, job.tenantId, job.caseId);
+        if (s.stage === job.stage && s.latestAttempt === job.attempt) {
+          const detail = err instanceof Error ? err.message : String(reason);
+          await flagForReview(appPool, { ...job, visit: s.visit }, reason, detail);
+        }
+      }
+      throw err;
+    }
     await hooks?.afterStageWork?.(job);
     const now = await store.stage(job.caseId);
     if (now === job.stage) throw new StageDidNotAdvanceError(job.stage);

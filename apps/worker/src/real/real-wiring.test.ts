@@ -7,14 +7,16 @@ import {
   type CaseId,
   type CaseStage,
   type CaseStore,
+  type ModelPort,
   type RescanPort,
+  type StageCost,
   type TrialEvent,
 } from '@affidavit/contracts';
-import { parseStagePayload, type StageEnv } from '@affidavit/db';
+import { GuardedCaseStore, parseStagePayload, reviewReasonOf, type StageEnv } from '@affidavit/db';
 import { DiscoveryRescan, type DiscoverCaseOutcome } from '@affidavit/discovery';
-import { FakeRescan } from '@affidavit/testing';
+import { FakeCaseStore, FakeEventSink, FakeRescan } from '@affidavit/testing';
 import { DEFAULT_TRACE_ROOT } from '@affidavit/sandbox';
-import { createModelPortFromEnv, resolveModelTable } from '@affidavit/trial';
+import { ModelCallError, createModelPortFromEnv, resolveModelTable } from '@affidavit/trial';
 import { describe, expect, it } from 'vitest';
 import {
   ConfigError,
@@ -865,5 +867,128 @@ describe('real trial cores', () => {
       killSwitch: () => false,
     });
     await expect(cores.jury!(stageEnv('jury', { stage: 'jury' }).env)).rejects.toThrow(/L3-11/);
+  });
+
+  it('names the halt reason, and only a model refusal skips the retries', () => {
+    const cases = [
+      ['kill-switch', /kill switch is on/, undefined],
+      ['model-unconfigured', /ANTHROPIC_API_KEY missing or refused/, undefined],
+      [
+        'model-refusal',
+        /refused the request on safety grounds; flagged for review/,
+        'model-refusal',
+      ],
+      ['budget-exhausted', /case budget is exhausted/, undefined],
+    ] as const;
+    for (const [reason, text, review] of cases) {
+      const err = new TrialHaltedError('defense', reason);
+      expect(err.message).toMatch(text);
+      expect(err.message, reason).not.toMatch(reason === 'kill-switch' ? /model/ : /kill switch/);
+      expect(err.message).not.toContain('—');
+      expect(reviewReasonOf(err)).toBe(review);
+    }
+  });
+
+  describe('settlement of an up-front charge (contracts v1.2, CR-T1)', () => {
+    /** A Defense job over the reference fakes, at the case's defense stage. */
+    async function defenseJob(withRelease = true) {
+      const events = new FakeEventSink();
+      const fake = new FakeCaseStore({ events, juryEnabled: false });
+      await fake.open(stored, { maxInputTokens: 1_000_000, maxOutputTokens: 200_000, maxUsd: 2 });
+      for (const to of ['map', 'arraign', 'defense'] as const) await fake.transition(stored.id, to);
+      // Earlier stages' events, so stored seqs and the orchestrator's placeholders differ.
+      for (const stage of ['map', 'arraign'] as const) {
+        await events.emit({
+          schemaVersion: 1,
+          caseId: stored.id,
+          seq: await fake.nextSeq(stored.id),
+          stage,
+          at: new Date(0).toISOString(),
+          actor: 'stenographer',
+          type: 'stage-entered',
+          payload: {},
+        });
+      }
+      const inner: CaseStore = withRelease
+        ? fake
+        : ({
+            open: (f, b) => fake.open(f, b),
+            stage: (id) => fake.stage(id),
+            transition: (id, to) => fake.transition(id, to),
+            chargeBudget: (id, c) => fake.chargeBudget(id, c),
+            nextSeq: (id) => fake.nextSeq(id),
+            appendVerdict: (v) => fake.appendVerdict(v),
+            getVerdict: (id) => fake.getVerdict(id),
+          } satisfies CaseStore);
+      const signal = new AbortController().signal;
+      const env: StageEnv = {
+        job: parseStagePayload({
+          tenantId: stored.tenantId,
+          caseId: stored.id,
+          stage: 'defense',
+          attempt: 1,
+        }),
+        store: new GuardedCaseStore(inner, signal),
+        sink: events,
+        caseFiles: { next: () => Promise.resolve(null), get: () => Promise.resolve(stored) },
+        signal,
+        events: (id) => Promise.resolve(events.events(id).filter((e) => e.stage === 'defense')),
+        checkpoint: () => Promise.resolve(),
+      };
+      return { env, fake, events };
+    }
+
+    /** A port that fails every call and reports what it spent (illustrative amounts). */
+    const spent: StageCost = {
+      stage: 'defense',
+      attempt: 1,
+      inputTokens: 1_000,
+      outputTokens: 0,
+      usd: 0.003,
+      wallMs: 5,
+    };
+    const failingModel: ModelPort = {
+      runTurn: () =>
+        Promise.reject(new ModelCallError('the provider refused the request', { cost: spent })),
+    };
+
+    function cores() {
+      return realTrialCores({
+        model: failingModel,
+        judge: fakeJudge(),
+        modelTable: resolveModelTable({}),
+        settings: trialSettings,
+        maxStageAttempts: 3,
+        killSwitch: () => false,
+      });
+    }
+
+    it('gives back the unspent part of the charge, naming the stored seq of its event', async () => {
+      const { env, fake, events } = await defenseJob();
+      await cores().defense!(env).catch(() => undefined);
+      const charges = events.events(stored.id).filter((e) => e.type === 'cost-charged');
+      expect(charges.length).toBeGreaterThan(0);
+      const charged = charges[0]!;
+      if (charged.type !== 'cost-charged') throw new Error('unreachable');
+      expect(charged.seq).toBeGreaterThanOrEqual(2);
+      const released = fake.releases(stored.id);
+      expect([...released.keys()]).toContain(charged.seq);
+      const refund = released.get(charged.seq)!;
+      const cap = charged.payload.cost;
+      expect(refund).toMatchObject({ stage: 'defense', attempt: 1 });
+      expect(refund.inputTokens).toBe(cap.inputTokens - spent.inputTokens);
+      expect(refund.outputTokens).toBe(cap.outputTokens);
+      expect(refund.usd).toBeCloseTo(cap.usd - spent.usd, 6);
+      // Every release names a charge event this job really stored.
+      const chargeSeqs = charges.map((e) => e.seq);
+      for (const seq of released.keys()) expect(chargeSeqs).toContain(seq);
+    });
+
+    it('leaves the charge standing when the store cannot release', async () => {
+      const { env, fake, events } = await defenseJob(false);
+      await cores().defense!(env).catch(() => undefined);
+      expect(events.events(stored.id).some((e) => e.type === 'cost-charged')).toBe(true);
+      expect(fake.releases(stored.id).size).toBe(0);
+    });
   });
 });

@@ -57,6 +57,27 @@
       "when": 1795270907319,
       "tag": "0007_review_flags_f3_hold",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1795318088100,
+      "tag": "0008_cost_releases",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1795318089976,
+      "tag": "0009_cost_releases_security",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1795319388801,
+      "tag": "0010_review_flags_model_refusal",
+      "breakpoints": true
     }
   ]
 }
