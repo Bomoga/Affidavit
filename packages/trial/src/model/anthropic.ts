@@ -187,12 +187,19 @@ function resultUsage(result: SDKResultMessage): Usage {
 /**
  * One token field of a turn that produced a result. The larger of the result's figure and the
  * streamed count when both are known. When the result's figure is unknown (NaN), the streamed
- * count when the stream saw any, else the turn's cap: unknown spend is never reported as zero,
- * because the orchestrator gives back whatever a call reports it did not spend.
+ * count when the stream saw any and it is complete, else the turn's cap: unknown spend is never
+ * under-reported, because the orchestrator gives back whatever a call reports it did not spend.
+ * `streamPartial` says the streamed count is only a lower bound (a streamed input count whose
+ * cache fields were missing and counted as zero), so it cannot stand in for an unknown total.
  */
-export function tokenField(fromResult: number, fromStream: number, cap: number): number {
+export function tokenField(
+  fromResult: number,
+  fromStream: number,
+  cap: number,
+  streamPartial = false,
+): number {
   if (Number.isFinite(fromResult)) return Math.max(fromResult, fromStream);
-  return fromStream > 0 ? fromStream : cap;
+  return fromStream > 0 && !streamPartial ? fromStream : Math.max(cap, fromStream);
 }
 
 const toInt = (n: number): number => (Number.isFinite(n) && n > 0 ? Math.ceil(n) : 0);
@@ -606,6 +613,8 @@ export class AnthropicModelPort implements PreflightModelPort {
       parentEnv: this.env(),
     });
 
+    // Set when any streamed usage lacked a cache field, so the streamed input is a lower bound.
+    let streamInputPartial = false;
     const tokens = (): Usage => {
       let inputTokens = 0;
       let outputTokens = 0;
@@ -664,6 +673,14 @@ export class AnthropicModelPort implements PreflightModelPort {
             otherModel ??= new RegExp(`^${MODEL_ID}$`).test(served) ? served : 'another model';
           }
           const u = msg.message.usage;
+          // A streamed input count without its cache fields under-counts the input, so it can
+          // never stand in for an unknown result total (see `tokenField`).
+          if (
+            typeof u.cache_read_input_tokens !== 'number' ||
+            typeof u.cache_creation_input_tokens !== 'number'
+          ) {
+            streamInputPartial = true;
+          }
           seen.set(msg.message.id, {
             inputTokens:
               (u.input_tokens ?? 0) +
@@ -725,6 +742,7 @@ export class AnthropicModelPort implements PreflightModelPort {
           fromResult.inputTokens,
           fromStream.inputTokens,
           req.budget.maxInputTokens,
+          streamInputPartial,
         ),
         outputTokens: tokenField(
           fromResult.outputTokens,

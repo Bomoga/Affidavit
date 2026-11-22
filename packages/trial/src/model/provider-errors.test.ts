@@ -678,6 +678,43 @@ describe('a result whose figures are not finite is unknown spend for that field 
     expect(out.cost.usd).toBe(0.01);
   });
 
+  it('an unknown input total with a stream that also lacks cache fields reports the cap', async () => {
+    // The streamed input (250) counts missing cache fields as zero, so it is only a lower bound;
+    // with the result's total unknown too, the cap is reported, never an under-count.
+    const { port } = makePort(async function* (h) {
+      const a = assistant('m1', 250, 30) as unknown as {
+        message: { usage: Record<string, unknown> };
+      };
+      delete a.message.usage.cache_read_input_tokens;
+      yield a as unknown as SDKMessage;
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      const r = result('success', { usd: 0.01, input: 300, output: 40 }) as unknown as Record<
+        string,
+        unknown
+      >;
+      const mu = r.modelUsage as Record<string, Record<string, unknown>>;
+      delete mu['claude-opus-5-5']!.cacheReadInputTokens;
+      yield r as unknown as SDKMessage;
+    });
+    const out = await port.runTurn(requestFor('defense'));
+    expect(out.cost.inputTokens).toBe(cap.maxInputTokens);
+    expect(out.cost.outputTokens).toBe(40);
+  });
+
+  it('a known result total still wins over a partial stream', async () => {
+    const { port } = makePort(async function* (h) {
+      const a = assistant('m1', 250, 30) as unknown as {
+        message: { usage: Record<string, unknown> };
+      };
+      delete a.message.usage.cache_creation_input_tokens;
+      yield a as unknown as SDKMessage;
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      yield result('success', { usd: 0.01, input: 300, output: 40 });
+    });
+    const out = await port.runTurn(requestFor('defense'));
+    expect(out.cost.inputTokens).toBe(300);
+  });
+
   it('an unknown token total with nothing streamed reports the cap for that field', async () => {
     const port = withResult([0, 0], (r) => {
       const mu = r.modelUsage as Record<string, Record<string, unknown>>;

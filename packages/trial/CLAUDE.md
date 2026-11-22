@@ -76,10 +76,10 @@ Tests: `src/orchestrator-settlement.test.ts` and the settlement block of `src/mo
 - A release that throws emits nothing; on a failed call it is `settlementError` and never replaces the call error; on a success it does not fail the call. Each reservation seq is released once.
 - `Verdict.cost` and `ctx.costs()`: one row per call, its charges minus its releases, so the verdict equals a replay of the stream.
 - `halted` (actor stenographer, current stage, no stage move) for `kill-switch`, `model-unconfigured`, `model-refusal` (unrouted refusal, allowlisted `refusalCategory`, never dismissed) and `budget-exhausted` (before, never instead of, the `budget-exhausted` escalation). Detail is fixed text only. The same halt at the same stage is recorded once per case per instance, not on every rerun.
-- `config.killSwitch` is only the real kill switch. `config.stopAfterTransition` (optional) ends a run quietly after a stage's `stage-entered` (after the terminal check), returning `{ status: 'stopped' }` with no event; the worker should use it for "one stage per job".
-- The reservation seq is what the sink's `emit` returns (seq or stored event), else the parsed seq. When a case's seqs are not strictly increasing (a sink that assigns seqs and returns nothing), nothing is released.
-- An invalid `result.cost` on success is unknown spend (no release). Refunds are capped at the reservation here. The port never reports an unknown USD or token figure as zero (`tokenField` in `anthropic.ts`).
-- Per-case maps (`released`, `haltedAt`, `seqs`) are dropped when the case reaches a terminal stage.
+- `config.killSwitch` is only the real kill switch. `config.stopAfterTransition` (optional) ends a run quietly after a stage's `stage-entered` (after the terminal check), returning `{ status: 'stopped' }` with no event; it is read only after a transition this run made. The worker should use it for "one stage per job".
+- The reservation seq is what the sink's `emit` returns (seq or stored event). Once a sink has reported a seq for a case, a missing one means the event was dropped (not noted), and a `stage-entered` at or below the last seq is the dropped duplicate. The parsed seq is used only for a sink that never reports one, and a `stage-entered` that is an instance's first event for a case is not noted (a restarted worker's dropped duplicate carries the store's placeholder). Any other seq that is not strictly increasing means nothing more is released for the case.
+- An invalid `result.cost` on success is unknown spend (no release). Refunds are capped at the reservation here. The port never reports an unknown USD or token figure as zero (`tokenField` in `anthropic.ts`; a field missing from the result and from a partial stream gets the turn cap).
+- Per-case state (`released`, `haltedAt`, `seqs`, ledgers, run infos, dismissals, seen exhibits) is dropped when the case reaches a terminal stage.
 
 ## Model probe (L3-17)
 

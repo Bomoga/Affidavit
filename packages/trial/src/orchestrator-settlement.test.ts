@@ -537,8 +537,10 @@ describe('stopping after a transition is not a halt (#84 review)', () => {
     expect(ofType(events(), 'halted')).toHaveLength(1);
   });
 
-  it('is read after the terminal check, so a terminal stage still returns terminal', async () => {
-    const { make } = await setup({ stopAfterTransition: () => true });
+  it('is honoured only after this run moved the case, and after the terminal check', async () => {
+    // Already true at the start: the run still does its stage's work, then reaches a terminal
+    // stage, which returns terminal with its verdict rather than stopping.
+    const { store, make } = await setup({ stopAfterTransition: () => true });
     const defense: StageHandler = {
       run: () =>
         Promise.resolve({
@@ -547,11 +549,31 @@ describe('stopping after a transition is not a halt (#84 review)', () => {
           detail: 'x',
         }),
     };
-    // At defense (not terminal) the run stops before the handler runs.
     expect(await make({ defense }, scripted([])).run(CASE)).toEqual({
-      status: 'stopped',
-      stage: 'defense',
+      status: 'terminal',
+      stage: 'escalated',
     });
+    expect(Verdict.parse(await store.getVerdict(CASE)).outcome).toBe('escalated');
+  });
+
+  it('stops at the next stage once a transition happened, before its handler runs', async () => {
+    const { store, make } = await setup({ stopAfterTransition: () => true });
+    let prosecutionRan = false;
+    const handlers: Partial<Record<CaseStage, StageHandler>> = {
+      defense: { run: () => Promise.resolve({ kind: 'advance', next: 'prosecution' }) },
+      prosecution: {
+        run: () => {
+          prosecutionRan = true;
+          return Promise.resolve({ kind: 'advance', next: 'remedy' });
+        },
+      },
+    };
+    expect(await make(handlers, scripted([])).run(CASE)).toEqual({
+      status: 'stopped',
+      stage: 'prosecution',
+    });
+    expect(prosecutionRan).toBe(false);
+    expect(await store.stage(CASE)).toBe('prosecution');
   });
 
   it('records a kill-switch halt once per case, not on every rerun while the switch stays on', async () => {
@@ -608,6 +630,262 @@ describe('a sink that assigns the seq itself (#84 review, stage-scoped ports)', 
     expect(store.releases(CASE).size).toBe(0);
     const verdict = Verdict.parse(await store.getVerdict(CASE));
     expect(verdict.cost[0]).toMatchObject({ usd: TURN_BUDGET.maxUsd });
+  });
+});
+
+describe('a long-lived orchestrator across worker jobs (#84 re-review)', () => {
+  /**
+   * The worker's shape: ONE Orchestrator for its life, and per job stage-scoped ports. The store
+   * hands out a placeholder seq 0; the sink assigns the real seq, reports it, and drops the
+   * duplicate `stage-entered` that starts every job after the first (reporting nothing, or the
+   * seq of the event it duplicates). One job moves the case at most one stage.
+   */
+  async function worker(dropReports: 'nothing' | 'duplicate-seq') {
+    const sink = new FakeEventSink();
+    const store = new LoggingCaseStore([], { events: sink, juryEnabled: false });
+    await openAt(store, CF, BIG_BUDGET, PATH_TO.defense);
+    let next = 0;
+    let job = { stage: 'defense' as CaseStage, moved: false };
+    const entered = new Map<CaseStage, number>();
+    const transition = store.transition.bind(store);
+    store.transition = async (id, to) => {
+      await transition(id, to);
+      job.moved = true;
+    };
+    store.nextSeq = () => Promise.resolve(0);
+    const scopedSink: ReportingEventSink = {
+      emit: async (e) => {
+        if (e.type === 'stage-entered' && e.stage === job.stage && !job.moved) {
+          const seen = entered.get(e.stage);
+          if (seen !== undefined) return dropReports === 'nothing' ? undefined : seen;
+        }
+        const seq = next++;
+        if (e.type === 'stage-entered') entered.set(e.stage, seq);
+        await sink.emit({ ...e, seq });
+        return seq;
+      },
+    };
+    const turn = (actor: 'defense' | 'prosecution'): AgentRequest =>
+      actor === 'defense'
+        ? req()
+        : req({
+            actor: 'prosecution',
+            promptId: 'prosecution',
+            tools: ['submit_counterexample'],
+            outputSchemaRef: 'Exhibit',
+          });
+    const orch = new Orchestrator({
+      store,
+      sink: scopedSink,
+      model: scripted([
+        { outcome: 'no-submission', cost: spent(0.001) },
+        { outcome: 'no-submission', cost: { ...spent(0.002), stage: 'prosecution' } },
+      ]),
+      handlers: {
+        defense: {
+          async run(ctx) {
+            await ctx.runAgent(turn('defense'));
+            return { kind: 'advance', next: 'prosecution' };
+          },
+        },
+        prosecution: {
+          async run(ctx) {
+            await ctx.runAgent(turn('prosecution'));
+            return { kind: 'advance', next: 'remedy' };
+          },
+        },
+      },
+      config: {
+        killSwitch: () => false,
+        stopAfterTransition: () => job.moved,
+        maxStageAttempts: 1,
+        now: () => NOW,
+      },
+    });
+    expect(await orch.run(CASE)).toEqual({ status: 'stopped', stage: 'prosecution' });
+    job = { stage: 'prosecution', moved: false };
+    expect(await orch.run(CASE)).toEqual({ status: 'stopped', stage: 'remedy' });
+    return { store, events: assertSchemaValid(sink.events(CASE)) };
+  }
+
+  it.each(['nothing', 'duplicate-seq'] as const)(
+    'releases every job reservation with its real seq when the duplicate stage-entered reports %s',
+    async (dropReports) => {
+      const { store, events } = await worker(dropReports);
+      // The second job's stage-entered was dropped: one per stage in the stream.
+      expect(ofType(events, 'stage-entered').filter((e) => e.stage === 'prosecution')).toHaveLength(
+        1,
+      );
+      const charged = ofType(events, 'cost-charged');
+      const released = ofType(events, 'cost-released');
+      expect(charged.map((e) => e.stage)).toEqual(['defense', 'prosecution']);
+      expect(released.map((e) => e.payload.reservationSeq)).toEqual(charged.map((e) => e.seq));
+      expect([...store.releases(CASE).keys()]).toEqual(charged.map((e) => e.seq));
+      expect(events.map((e) => e.seq)).toEqual(events.map((_, i) => i));
+    },
+  );
+
+  /**
+   * The production shape after #85 and #84: the store hands out the placeholder seq 2^30, the
+   * case starts at arraign, and each job moves it one stage. The arraign job stores the real
+   * `stage-entered` for defense, so every later job's own `stage-entered` is a duplicate the
+   * sink drops, resolving to undefined. Run on one Orchestrator for the worker's life, and on a
+   * new one per job (a worker restart between jobs).
+   */
+  it.each(['one orchestrator', 'a new orchestrator per job'] as const)(
+    'production shape: releases every later reservation with its real seq on %s',
+    async (lifetime) => {
+      const PLACEHOLDER = 2 ** 30;
+      const sink = new FakeEventSink();
+      const store = new LoggingCaseStore([], { events: sink, juryEnabled: false });
+      await openAt(store, CF, BIG_BUDGET, ['map', 'arraign']);
+      let next = 0;
+      let job = { stage: 'arraign' as CaseStage, moved: false };
+      const transition = store.transition.bind(store);
+      store.transition = async (id, to) => {
+        await transition(id, to);
+        job.moved = true;
+      };
+      store.nextSeq = () => Promise.resolve(PLACEHOLDER);
+      const stored = (stage: CaseStage) =>
+        sink.events(CASE).some((e) => e.type === 'stage-entered' && e.stage === stage);
+      const dropped: CaseStage[] = [];
+      const scopedSink: ReportingEventSink = {
+        emit: async (e) => {
+          if (e.type === 'stage-entered' && e.stage === job.stage && stored(e.stage)) {
+            dropped.push(e.stage);
+            return undefined;
+          }
+          const seq = next++;
+          await sink.emit({ ...e, seq });
+          return seq;
+        },
+      };
+      const call = (stage: 'defense' | 'prosecution' | 'remedy'): StageHandler => ({
+        async run(ctx) {
+          await ctx.runAgent(
+            stage === 'defense'
+              ? req()
+              : req({
+                  actor: stage,
+                  promptId: stage,
+                  tools: [stage === 'prosecution' ? 'submit_counterexample' : 'submit_patch'],
+                  outputSchemaRef: stage === 'prosecution' ? 'Exhibit' : 'Patch',
+                }),
+          );
+          return {
+            kind: 'advance',
+            next:
+              stage === 'defense' ? 'prosecution' : stage === 'prosecution' ? 'remedy' : 'verify',
+          };
+        },
+      });
+      const model = scripted([
+        { outcome: 'no-submission', cost: spent(0.001) },
+        { outcome: 'no-submission', cost: { ...spent(0.002), stage: 'prosecution' } },
+        { outcome: 'no-submission', cost: { ...spent(0.003), stage: 'remedy' } },
+      ]);
+      const make = () =>
+        new Orchestrator({
+          store,
+          sink: scopedSink,
+          model,
+          handlers: {
+            arraign: { run: () => Promise.resolve({ kind: 'advance', next: 'defense' }) },
+            defense: call('defense'),
+            prosecution: call('prosecution'),
+            remedy: call('remedy'),
+          },
+          config: {
+            killSwitch: () => false,
+            stopAfterTransition: () => job.moved,
+            maxStageAttempts: 1,
+            now: () => NOW,
+          },
+        });
+      const shared = make();
+      const jobs: [CaseStage, CaseStage][] = [
+        ['arraign', 'defense'],
+        ['defense', 'prosecution'],
+        ['prosecution', 'remedy'],
+        ['remedy', 'verify'],
+      ];
+      for (const [at, to] of jobs) {
+        job = { stage: at, moved: false };
+        const orch = lifetime === 'one orchestrator' ? shared : make();
+        expect(await orch.run(CASE)).toEqual({ status: 'stopped', stage: to });
+      }
+
+      const events = assertSchemaValid(sink.events(CASE));
+      // Every job after the arraign one started with a duplicate the sink dropped.
+      expect(dropped).toEqual(['defense', 'prosecution', 'remedy']);
+      // openAt stores no events, so the arraign job's own stage-entered is the first stored.
+      expect(ofType(events, 'stage-entered').map((e) => e.stage)).toEqual([
+        'arraign',
+        'defense',
+        'prosecution',
+        'remedy',
+        'verify',
+      ]);
+      const charged = ofType(events, 'cost-charged');
+      const released = ofType(events, 'cost-released');
+      expect(charged.map((e) => e.stage)).toEqual(['defense', 'prosecution', 'remedy']);
+      expect(charged.every((e) => e.seq < PLACEHOLDER)).toBe(true);
+      expect(released.map((e) => e.payload.reservationSeq)).toEqual(charged.map((e) => e.seq));
+      expect(released.map((e) => e.payload.reason)).toEqual([
+        'reservation-unspent',
+        'reservation-unspent',
+        'reservation-unspent',
+      ]);
+      expect([...store.releases(CASE).keys()]).toEqual(charged.map((e) => e.seq));
+      // Each release is the reservation less the reported spend, so the stream nets to the spend.
+      released.forEach((r, i) => {
+        expect(r.payload.cost.usd).toBeCloseTo(TURN_BUDGET.maxUsd - [0.001, 0.002, 0.003][i]!, 9);
+        expect(r.seq).toBeGreaterThan(charged[i]!.seq);
+      });
+      expect(events.map((e) => e.seq)).toEqual(events.map((_, i) => i));
+    },
+  );
+
+  it('a sink that reports a repeated seq for a real event disables release (fails closed)', async () => {
+    const sink = new FakeEventSink();
+    const store = new LoggingCaseStore([], { events: sink, juryEnabled: false });
+    await openAt(store, CF, BIG_BUDGET, PATH_TO.defense);
+    let next = 0;
+    let last = -1;
+    const lying: ReportingEventSink = {
+      emit: async (e) => {
+        const seq = next++;
+        await sink.emit({ ...e, seq });
+        // Reports the previous event's seq for the charge: not above the last one.
+        const reported = e.type === 'cost-charged' ? last : seq;
+        last = seq;
+        return reported;
+      },
+    };
+    const calls: number[] = [];
+    const orch = new Orchestrator({
+      store,
+      sink: lying,
+      model: scripted([{ outcome: 'no-submission', cost: spent(0.001) }]),
+      handlers: { defense: callingDefense(1) },
+      config: { killSwitch: () => false, maxStageAttempts: 1, now: () => NOW },
+      // Accepts anything, so only the orchestrator's own guard can stop the release.
+      settlement: {
+        release: (id, refund, seq) => {
+          calls.push(seq);
+          return store.releaseCharge(id, refund, seq).catch(() => ({
+            remainingInputTokens: 0,
+            remainingOutputTokens: 0,
+            remainingUsd: 0,
+            exhausted: false,
+          }));
+        },
+      },
+    });
+    await orch.run(CASE);
+    expect(calls).toEqual([]);
+    expect(ofType(assertSchemaValid(sink.events(CASE)), 'cost-released')).toHaveLength(0);
   });
 });
 

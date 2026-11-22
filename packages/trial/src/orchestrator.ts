@@ -349,7 +349,14 @@ export class Orchestrator {
    * seqs are not trustworthy nothing is released and the charge stands (fail closed). Dropped
    * when the case reaches a terminal stage.
    */
-  private readonly seqs = new Map<CaseId, { last: number; untrusted: boolean }>();
+  private readonly seqs = new Map<
+    CaseId,
+    {
+      last: number;
+      untrusted: boolean;
+      /** The sink has reported a seq for this case. */ reported: boolean;
+    }
+  >();
 
   constructor(private readonly deps: OrchestratorDeps) {}
 
@@ -375,7 +382,13 @@ export class Orchestrator {
         this.forgetCase(caseId);
         return { status: 'terminal', stage };
       }
-      if (config.stopAfterTransition !== undefined && (await config.stopAfterTransition())) {
+      // Only after this run moved the case: a stop hook that is already true cannot stop a run
+      // before it has done anything.
+      if (
+        from !== undefined &&
+        config.stopAfterTransition !== undefined &&
+        (await config.stopAfterTransition())
+      ) {
         return { status: 'stopped', stage };
       }
 
@@ -418,11 +431,20 @@ export class Orchestrator {
     }
   }
 
-  /** Drops the per-case bookkeeping that only matters while a case is in progress. */
+  /**
+   * Drops the per-case bookkeeping once a terminal case has its verdict (called only after the
+   * terminal verdict was written or found), so a long-lived instance holds state only for cases
+   * still in progress. A later run of the same terminal case finds the stored verdict and needs
+   * none of it.
+   */
   private forgetCase(caseId: CaseId): void {
     this.released.delete(caseId);
     this.haltedAt.delete(caseId);
     this.seqs.delete(caseId);
+    this.ledgers.delete(caseId);
+    this.runInfos.delete(caseId);
+    this.dismissals.delete(caseId);
+    this.exhibitsSeen.delete(caseId);
   }
 
   private async runStage(
@@ -710,7 +732,7 @@ export class Orchestrator {
     attempt: number,
     role: Role,
     reservation: StageCost,
-    reservationSeq: number,
+    reservationSeq: number | undefined,
     actual: StageCost,
     row: StageCost,
     reason: CostReleaseReason,
@@ -738,13 +760,14 @@ export class Orchestrator {
     };
     const settlement = this.settlement();
     let releasedSeqs = this.released.get(caseId);
-    if (isZero(unspent) || settlement === undefined || releasedSeqs?.has(reservationSeq)) {
+    if (isZero(unspent) || settlement === undefined) return { overdrawn: overdrew };
+    if (reservationSeq !== undefined && releasedSeqs?.has(reservationSeq)) {
       return { overdrawn: overdrew };
     }
-    if (this.seqs.get(caseId)?.untrusted !== false) {
-      // The store keys a release by the reservation's seq. Seqs that are not unique (a sink that
-      // assigns the real seq and does not return it, as the worker's stage-scoped sink did) would
-      // release against the wrong charge, so nothing is released and the charge stands.
+    if (reservationSeq === undefined || this.seqs.get(caseId)?.untrusted !== false) {
+      // The store keys a release by the reservation's seq. With no seq (the sink dropped the
+      // charge event) or seqs that are not unique (a sink that assigns the real seq and does not
+      // return it), a release would name the wrong charge, so nothing is released.
       return {
         overdrawn: overdrew,
         releaseError: new Error(
@@ -806,7 +829,7 @@ export class Orchestrator {
     attempt: number,
     role: Role,
     reservation: StageCost,
-    reservationSeq: number,
+    reservationSeq: number | undefined,
     row: StageCost,
     err: unknown,
     started: number,
@@ -948,7 +971,7 @@ export class Orchestrator {
     type: T,
     payload: EventPayload<T>,
     actor: Role = EVENT_ACTOR_FOR_STAGE[stage],
-  ): Promise<number> {
+  ): Promise<number | undefined> {
     const { store, sink, config } = this.deps;
     const at = new Date((config.now ?? Date.now)()).toISOString();
     // Parse before emitting so a malformed event is a bug here, not a surprise downstream.
@@ -964,10 +987,9 @@ export class Orchestrator {
     });
     // The contract sink returns nothing, but a sink that assigns the seq itself (the worker's
     // stage-scoped sink, whose store hands out a placeholder) may return the stored event or its
-    // seq. That is the seq a release must name; otherwise the parsed one is.
+    // seq. That is the seq a release must name.
     const returned: unknown = await sink.emit(event);
-    const seq = assignedSeq(returned) ?? event.seq;
-    this.noteSeq(caseId, seq);
+    const seq = this.assigned(caseId, event, assignedSeq(returned));
     this.noteExhibits(event);
     if (event.type === 'dismissed') {
       // Kept where another instance can read it back, so a dismissed case can be repaired.
@@ -977,13 +999,48 @@ export class Orchestrator {
     return seq;
   }
 
-  /** Records an assigned seq; one that is not above the last seen marks the case's seqs unusable. */
-  private noteSeq(caseId: CaseId, seq: number): void {
+  /**
+   * The seq an emitted event got, or undefined when the sink dropped it, and the trust record.
+   * - The sink reported a seq: that one. A `stage-entered` whose reported seq is not above the
+   *   last one is the duplicate a stage-scoped sink drops (it may report the seq of the event it
+   *   duplicates); it is not noted. Any other event with such a seq marks the case's seqs
+   *   untrustworthy, so nothing is released for it again (fail closed).
+   * - The sink reported nothing, after it has reported a seq for this case: the event was
+   *   dropped. Nothing is noted, so a dropped duplicate never poisons the record.
+   * - The sink has never reported a seq for this case (a contract `EventSink`): the seq parsed
+   *   from `store.nextSeq`, held to the same strictly increasing rule. A `stage-entered` that is
+   *   the first event this instance sees for the case is not noted (it may be a dropped duplicate
+   *   carrying the store's placeholder, as on a worker job after a restart).
+   */
+  private assigned(
+    caseId: CaseId,
+    event: TrialEvent,
+    reported: number | undefined,
+  ): number | undefined {
+    const s = this.seqs.get(caseId);
+    if (reported === undefined) {
+      if (s?.reported === true) return undefined;
+      // The first event this instance emits for a case is the `stage-entered` that starts the
+      // job. A stage-scoped sink drops it when it duplicates the stored one and reports nothing,
+      // so its parsed seq is the store's placeholder. Noting it would make every real seq after
+      // it look out of order and disable release, so it is not noted.
+      if (s === undefined && event.type === 'stage-entered') return event.seq;
+      this.noteSeq(caseId, event.seq, false);
+      return event.seq;
+    }
+    if (event.type === 'stage-entered' && s !== undefined && reported <= s.last) return undefined;
+    this.noteSeq(caseId, reported, true);
+    return reported;
+  }
+
+  /** Records a seq; one that is not above the last seen marks the case's seqs unusable. */
+  private noteSeq(caseId: CaseId, seq: number, reported: boolean): void {
     const s = this.seqs.get(caseId);
     if (s === undefined) {
-      this.seqs.set(caseId, { last: seq, untrusted: false });
+      this.seqs.set(caseId, { last: seq, untrusted: false, reported });
       return;
     }
+    if (reported) s.reported = true;
     if (seq <= s.last) s.untrusted = true;
     else s.last = seq;
   }
