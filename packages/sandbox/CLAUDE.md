@@ -29,6 +29,7 @@ Run from this directory, or add `--filter @affidavit/sandbox` from the repo root
 - Dependency bundles are built only by the human-run `scripts/build-dependency-bundle.ts` on a networked host. Nothing under `src/` fetches; a build verifies the bundle sha256 against `docker/sandbox/dependency-bundles/pins.json` before using it and installs with `npm ci --offline --ignore-scripts` in the jail.
 - `bundle-exclusions.json` (reviewed dev packages left out of a bundle) is security relevant: it is under the dev section digest, and a change to it needs human review with the manifest.
 - `egress-guard.test.ts` is an allowlist lint over `src/` here and `packages/judge/src` (modules, globals, docker and tar argv), not a security boundary (that is gVisor with `--network none`); extend its allowlists only with a reviewed reason.
+- Every child process gets `env: dockerEnv()` (`src/docker-env.ts`), never `process.env` (CR-12); the egress guard checks it.
 - `buildGvisorRunArgs` refuses unknown run spec keys.
 - Target bases are official `node` images without `ONBUILD`.
 

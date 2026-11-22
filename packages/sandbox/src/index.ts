@@ -12,3 +12,4 @@ export * from './gvisor/network.js';
 export * from './boot/index.js';
 export * from './bundle/index.js';
 export * from './gvisor/usage.js';
+export * from './docker-env.js';

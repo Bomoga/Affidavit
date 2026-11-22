@@ -139,6 +139,12 @@ Docker's `--pids-limit` is enforced on the host, where it counts gVisor's own th
 
 `GvisorToolRunner` uses the plain `runsc` runtime with the same flags. Tool results are not judged, and tracing every file a scanner opens in a large repo would be slow and could exceed the trace cap, which would let a repo block its own scan. A repo file name with a newline would also mark the trace tampered. Only the image allowlist (optional), the mount allowlist and the jail apply. Exit codes: 124 when the runner's timeout stopped the tool, 137 when it was OOM-killed.
 
+## Child process environment (CR-12)
+
+Lane 2 host code never hands its own environment to a child process. Every `docker` and `tar` call in `packages/sandbox` and `packages/judge` passes `env: dockerEnv()` (`src/docker-env.ts`): `PATH`, `HOME` and the variables the Docker CLI reads (`DOCKER_HOST`, `DOCKER_CONFIG`, `DOCKER_CONTEXT`, `DOCKER_CERT_PATH`, `DOCKER_TLS_VERIFY`, `XDG_RUNTIME_DIR`), plus fixed settings such as `DOCKER_BUILDKIT=1` for target builds. The worker's API key, database URLs and repository sources therefore never reach the Docker CLI, its plugins or its logs, even without the worker's `sealSecrets`. The compose precheck already ran with its own minimal environment.
+
+`egress-guard.test.ts` enforces it: a spawn without an options object holding `env`, an `env` that mentions `process.env`, or a spread placed after `env` is a finding.
+
 ## Open items
 
 - Shared sandbox host and CI runner (P0-10, open decision 1). Until then `runner.integration.test.ts` is skipped in `pnpm test` (see `PROGRESS.md`).

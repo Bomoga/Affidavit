@@ -469,6 +469,8 @@ interface ArgWord {
  *   `process`, `Reflect`, `module` or `require` other than `x.member`, `typeof x` or (for
  *   `require`) a direct call, so destructuring or aliasing one is a finding;
  * - `dockerode`, although declared;
+ * - a spawn without an options object whose `env` is set after any spread and does not mention
+ *   `process.env` (`dockerEnv`, CR-12);
  * - in the sanctioned files, a spawn whose executable is not a literal in `ALLOWED_EXECUTABLES`;
  *   whose argv is not an inline array literal or a `const` array literal in scope in the same file,
  *   so a variable of unknown origin is a finding. Spreads of other such `const` arrays are
@@ -738,6 +740,32 @@ export function findEgress(
     if (cmd === 'tar') checkTar(argv);
   };
 
+  // Every spawn passes an explicit environment that does not mention process.env, so no child
+  // inherits the worker's secrets (CR-12; `dockerEnv` in docker-env.ts). A spread after `env`
+  // could replace it, so `env` must be the last spread-free word on the options object.
+  const checkSpawnEnv = (call: ts.CallExpression): void => {
+    const opts = call.arguments[2];
+    if (opts === undefined || !ts.isObjectLiteralExpression(opts)) {
+      return add(call, 'spawn without env');
+    }
+    const props = opts.properties;
+    const at = props.findIndex(
+      (p) =>
+        (ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p)) &&
+        ts.isIdentifier(p.name) &&
+        p.name.text === 'env',
+    );
+    if (at === -1) return add(call, 'spawn without env');
+    if (props.slice(at + 1).some((p) => ts.isSpreadAssignment(p))) {
+      return add(call, 'spawn env overridable by a spread');
+    }
+    const envProp = props[at] as ts.PropertyAssignment | ts.ShorthandPropertyAssignment;
+    const value = ts.isPropertyAssignment(envProp) ? envProp.initializer : envProp.name;
+    if (/\bprocess\s*\.\s*env\b|\bprocess\s*\[/.test(src(value))) {
+      add(call, 'spawn env from process.env');
+    }
+  };
+
   const isNameOnly = (node: ts.Identifier): boolean => {
     const p = node.parent;
     return (
@@ -807,7 +835,10 @@ export function findEgress(
           if (problem !== null) add(node, problem);
         }
       }
-      if (ts.isIdentifier(callee) && childFns.has(callee.text)) checkSpawn(node);
+      if (ts.isIdentifier(callee) && childFns.has(callee.text)) {
+        checkSpawn(node);
+        checkSpawnEnv(node);
+      }
     }
 
     if (ts.isIdentifier(node) && !isNameOnly(node)) {

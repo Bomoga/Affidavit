@@ -1,3 +1,4 @@
+import { dockerEnv } from '../docker-env.js';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
@@ -513,7 +514,7 @@ async function buildIn(
       await exec('docker', assembleBuildArgs(dockerfile, tree, iid), {
         timeout: 600_000,
         maxBuffer: 16 * 1024 * 1024,
-        env: { ...process.env, DOCKER_BUILDKIT: '1' },
+        env: dockerEnv({ DOCKER_BUILDKIT: '1' }),
       });
     } catch (err) {
       // stderr only: the error message repeats the command line, with every host path in it.

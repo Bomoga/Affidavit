@@ -1,3 +1,4 @@
+import { dockerEnv } from '../docker-env.js';
 import { execFile, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { promisify } from 'node:util';
@@ -38,12 +39,11 @@ function capture(stream: NodeJS.ReadableStream): () => string {
 
 async function readState(name: string): Promise<{ oomKilled: boolean; exitCode: number } | null> {
   try {
-    const { stdout } = await exec('docker', [
-      'inspect',
-      '--format',
-      '{{.State.OOMKilled}} {{.State.ExitCode}}',
-      name,
-    ]);
+    const { stdout } = await exec(
+      'docker',
+      ['inspect', '--format', '{{.State.OOMKilled}} {{.State.ExitCode}}', name],
+      { env: dockerEnv() },
+    );
     const [oom, code] = stdout.trim().split(' ');
     return { oomKilled: oom === 'true', exitCode: Number(code) };
   } catch {
@@ -60,6 +60,7 @@ export class PlainDockerRunner implements JailRunner {
     const started = Date.now();
     const child = spawn('docker', buildProbeDockerArgs(name, JSON.stringify(req.args)), {
       stdio: ['pipe', 'pipe', 'pipe'],
+      env: dockerEnv(),
     });
     const stdout = capture(child.stdout);
     const stderr = capture(child.stderr);
@@ -68,7 +69,7 @@ export class PlainDockerRunner implements JailRunner {
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
-      void exec('docker', ['kill', name]).catch(() => undefined);
+      void exec('docker', ['kill', name], { env: dockerEnv() }).catch(() => undefined);
     }, req.timeoutMs);
 
     await new Promise<void>((resolve) => child.once('close', () => resolve()));
@@ -76,7 +77,9 @@ export class PlainDockerRunner implements JailRunner {
     const durationMs = Date.now() - started;
 
     const state = await readState(name);
-    await exec('docker', ['rm', '--force', '--volumes', name]).catch(() => undefined);
+    await exec('docker', ['rm', '--force', '--volumes', name], { env: dockerEnv() }).catch(
+      () => undefined,
+    );
 
     return {
       exitCode: timedOut || state === null ? null : state.exitCode,

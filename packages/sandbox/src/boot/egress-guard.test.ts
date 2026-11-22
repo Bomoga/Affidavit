@@ -190,15 +190,15 @@ describe('egress guard self-test: each snippet must be caught', () => {
     ],
     [
       'docker run npm install',
-      `import { execFile } from 'node:child_process'; execFile('docker', ['run', 'node:22', 'npm', 'install']);`,
+      `import { execFile } from 'node:child_process'; execFile('docker', ['run', 'node:22', 'npm', 'install'], { env: {} });`,
     ],
     [
       'docker on the host network',
-      `import { execFile } from 'node:child_process'; execFile('docker', ['run', '--network', 'host', 'x']);`,
+      `import { execFile } from 'node:child_process'; execFile('docker', ['run', '--network', 'host', 'x'], { env: {} });`,
     ],
     [
       'docker args spread',
-      `import { execFile } from 'node:child_process'; execFile('docker', ['run', ...more]);`,
+      `import { execFile } from 'node:child_process'; execFile('docker', ['run', ...more], { env: {} });`,
     ],
     [
       'an aliased spawn function',
@@ -246,42 +246,92 @@ describe('egress guard self-test: each snippet must be caught', () => {
   });
 
   const sanctionedCaught: [string, string][] = [
-    ['docker pull', `spawn('docker', ['pull', 'x']);`],
+    ['docker pull', `spawn('docker', ['pull', 'x'], { env: {} });`],
     [
       'docker run with no --network none',
-      `spawn('docker', ['run', 'alpine', 'nc', 'evil', '80']);`,
+      `spawn('docker', ['run', 'alpine', 'nc', 'evil', '80'], { env: {} });`,
     ],
-    ['docker create with no --network none', `spawn('docker', ['create', 'alpine']);`],
-    ['docker build with no --network none', `spawn('docker', ['build', '.']);`],
-    ['docker exec', `spawn('docker', ['exec', name, 'sh']);`],
-    ['docker cp', `spawn('docker', ['cp', '/etc/passwd', 'c:/x']);`],
-    ['docker push', `spawn('docker', ['push', 'x']);`],
-    ['docker network create without --internal', `spawn('docker', ['network', 'create', 'n']);`],
-    ['docker with a non-literal subcommand', `spawn('docker', [sub, 'x']);`],
-    ['tar --to-command', `spawn('tar', ['-x', '-f', f, '--to-command=sh -c id']);`],
-    ['tar -I', `spawn('tar', ['-I', 'sh -c id', '-x', '-f', f]);`],
-    ['tar --use-compress-program', `spawn('tar', ['--use-compress-program=x', '-xf', f]);`],
-    ['tar --checkpoint-action', `spawn('tar', ['--checkpoint-action=exec=id', '-xf', f]);`],
-    ['tar -T', `spawn('tar', ['-c', '-f', f, '-T', '/etc/list']);`],
-    ['tar --files-from', `spawn('tar', ['-c', '-f', f, '--files-from=/etc/list']);`],
+    ['docker create with no --network none', `spawn('docker', ['create', 'alpine'], { env: {} });`],
+    ['docker build with no --network none', `spawn('docker', ['build', '.'], { env: {} });`],
+    ['docker exec', `spawn('docker', ['exec', name, 'sh'], { env: {} });`],
+    ['docker cp', `spawn('docker', ['cp', '/etc/passwd', 'c:/x'], { env: {} });`],
+    ['docker push', `spawn('docker', ['push', 'x'], { env: {} });`],
+    [
+      'docker network create without --internal',
+      `spawn('docker', ['network', 'create', 'n'], { env: {} });`,
+    ],
+    ['docker with a non-literal subcommand', `spawn('docker', [sub, 'x'], { env: {} });`],
+    ['tar --to-command', `spawn('tar', ['-x', '-f', f, '--to-command=sh -c id'], { env: {} });`],
+    ['tar -I', `spawn('tar', ['-I', 'sh -c id', '-x', '-f', f], { env: {} });`],
+    [
+      'tar --use-compress-program',
+      `spawn('tar', ['--use-compress-program=x', '-xf', f], { env: {} });`,
+    ],
+    [
+      'tar --checkpoint-action',
+      `spawn('tar', ['--checkpoint-action=exec=id', '-xf', f], { env: {} });`,
+    ],
+    ['tar -T', `spawn('tar', ['-c', '-f', f, '-T', '/etc/list'], { env: {} });`],
+    ['tar --files-from', `spawn('tar', ['-c', '-f', f, '--files-from=/etc/list'], { env: {} });`],
   ];
   it.each(sanctionedCaught)('catches %s in a sanctioned file', (_label, call) => {
     const code = `import { spawn } from 'node:child_process'; ${call}`;
     expect(findEgress('gvisor/runner.ts', code, [])).not.toEqual([]);
   });
 
+  // CR-12: no child inherits the parent environment (worker secrets).
   it.each([
-    ['docker run --network none', `spawn('docker', ['run', '--rm', '--network', 'none', img]);`],
-    ['docker run --network=none', `spawn('docker', ['run', '--network=none', img]);`],
+    ['no options', `spawn('docker', ['ps']);`, 'spawn without env'],
+    ['options without env', `spawn('docker', ['ps'], { timeout: 5 });`, 'spawn without env'],
+    ['options in a variable', `spawn('docker', ['ps'], o);`, 'spawn without env'],
+    [
+      'env from process.env',
+      `spawn('docker', ['ps'], { env: process.env });`,
+      'spawn env from process.env',
+    ],
+    [
+      'env spreading process.env',
+      `spawn('docker', ['ps'], { env: { ...process.env, A: '1' } });`,
+      'spawn env from process.env',
+    ],
+    [
+      'process.env by bracket',
+      `spawn('docker', ['ps'], { env: { P: process['env'].PATH } });`,
+      'spawn env from process.env',
+    ],
+    [
+      'a spread after env',
+      `spawn('docker', ['ps'], { env: {}, ...o });`,
+      'spawn env overridable by a spread',
+    ],
+  ])('catches a spawn with %s', (_label, call, what) => {
+    const code = `import { spawn } from 'node:child_process'; declare const o: object; ${call}`;
+    expect(findEgress('gvisor/runner.ts', code, []).map((f) => f.what)).toContain(what);
+  });
+
+  it('allows env after a spread, and a shorthand env', () => {
+    const code = `import { spawn } from 'node:child_process'; declare const o: object, env: Record<string, string>; spawn('docker', ['ps'], { ...o, env: {} }); spawn('docker', ['ps'], { env });`;
+    expect(findEgress('gvisor/runner.ts', code, [])).toEqual([]);
+  });
+
+  it.each([
+    [
+      'docker run --network none',
+      `spawn('docker', ['run', '--rm', '--network', 'none', img], { env: {} });`,
+    ],
+    ['docker run --network=none', `spawn('docker', ['run', '--network=none', img], { env: {} });`],
     [
       'docker network create --internal',
-      `spawn('docker', ['network', 'create', '--internal', n]);`,
+      `spawn('docker', ['network', 'create', '--internal', n], { env: {} });`,
     ],
-    ['docker image inspect', `spawn('docker', ['image', 'inspect', '--format', '{{.Id}}', ref]);`],
-    ['docker rm', `spawn('docker', ['rm', '--force', '--volumes', name]);`],
+    [
+      'docker image inspect',
+      `spawn('docker', ['image', 'inspect', '--format', '{{.Id}}', ref], { env: {} });`,
+    ],
+    ['docker rm', `spawn('docker', ['rm', '--force', '--volumes', name], { env: {} });`],
     [
       'tar extract',
-      `spawn('tar', ['-x', '-f', f, '-C', dir, '--no-same-owner', '--no-same-permissions']);`,
+      `spawn('tar', ['-x', '-f', f, '-C', dir, '--no-same-owner', '--no-same-permissions'], { env: {} });`,
     ],
   ])('allows %s in a sanctioned file', (_label, call) => {
     const code = `import { spawn } from 'node:child_process'; ${TYPED} ${call}`;
@@ -289,7 +339,7 @@ describe('egress guard self-test: each snippet must be caught', () => {
   });
 
   it('child_process is a finding outside the sanctioned files, even calling docker', () => {
-    const code = `import { execFile } from 'node:child_process'; execFile('docker', ['ps']);`;
+    const code = `import { execFile } from 'node:child_process'; execFile('docker', ['ps'], { env: {} });`;
     expect(findEgress('bundle/open.ts', code, [])).not.toEqual([]);
     expect(findEgress('gvisor/runner.ts', code, [])).toEqual([]);
   });
@@ -319,11 +369,11 @@ describe('egress guard self-test: each snippet must be caught', () => {
   it.each([
     [
       'docker with --network none, in a sanctioned file',
-      `import { execFile } from 'node:child_process'; execFile('docker', ['build', '--network', 'none']);`,
+      `import { execFile } from 'node:child_process'; execFile('docker', ['build', '--network', 'none'], { env: {} });`,
     ],
     [
       'promisified docker with typed values, in a sanctioned file',
-      `import { execFile } from 'node:child_process'; import { promisify } from 'node:util'; const exec = promisify(execFile); export async function rm(name: string) { await exec('docker', ['rm', '--force', name]).catch(() => undefined); }`,
+      `import { execFile } from 'node:child_process'; import { promisify } from 'node:util'; const exec = promisify(execFile); export async function rm(name: string) { await exec('docker', ['rm', '--force', name], { env: {} }).catch(() => undefined); }`,
     ],
   ])('allows %s', (_label, code) => {
     expect(findEgress('gvisor/runner.ts', code, [])).toEqual([]);
@@ -386,37 +436,43 @@ describe('egress guard self-test: final delta review', () => {
   it.each([
     [
       'a const array on the host network',
-      `const args = ['run', '--network', 'host', 'x']; spawn('docker', args);`,
+      `const args = ['run', '--network', 'host', 'x']; spawn('docker', args, { env: {} });`,
     ],
-    ['a parameter', `export function f(args: string[]) { spawn('docker', args); }`],
-    ['a let array', `let args = ['run', '--network', 'none', 'x']; spawn('docker', args);`],
-    ['a const of unknown origin', `const args = make(); spawn('docker', args);`],
-    ['an undeclared name', `spawn('docker', args);`],
+    ['a parameter', `export function f(args: string[]) { spawn('docker', args, { env: {} }); }`],
+    [
+      'a let array',
+      `let args = ['run', '--network', 'none', 'x']; spawn('docker', args, { env: {} });`,
+    ],
+    ['a const of unknown origin', `const args = make(); spawn('docker', args, { env: {} });`],
+    ['an undeclared name', `spawn('docker', args, { env: {} });`],
     [
       'a spread of a const array on the host network',
-      `const NET = ['--network', 'host']; spawn('docker', ['run', ...NET, 'x']);`,
+      `const NET = ['--network', 'host']; spawn('docker', ['run', ...NET, 'x'], { env: {} });`,
     ],
     [
       'a const array pulling an image',
-      `const ARGS = ['pull', 'evil/image']; spawn('docker', ARGS);`,
+      `const ARGS = ['pull', 'evil/image']; spawn('docker', ARGS, { env: {} });`,
     ],
     [
       'a shadowed name: the inner const is checked',
-      `const args = ['ps']; export function f() { const args = ['run', '--network', 'host', 'x']; spawn('docker', args); }`,
+      `const args = ['ps']; export function f() { const args = ['run', '--network', 'host', 'x']; spawn('docker', args, { env: {} }); }`,
     ],
-    ['a tar const array', `const T = ['-x', '--to-command=sh']; spawn('tar', T);`],
+    ['a tar const array', `const T = ['-x', '--to-command=sh']; spawn('tar', T, { env: {} });`],
   ])('catches %s', (_label, body) => {
     expect(findEgress('gvisor/runner.ts', spawnIt(body), [])).not.toEqual([]);
   });
   it.each([
-    ['a const array', `const ARGS = ['ps', '--quiet'] as const; spawn('docker', ARGS);`],
+    [
+      'a const array',
+      `const ARGS = ['ps', '--quiet'] as const; spawn('docker', ARGS, { env: {} });`,
+    ],
     [
       'a spread of a const array',
-      `const NET = ['--network', 'none']; spawn('docker', ['run', ...NET, img]);`,
+      `const NET = ['--network', 'none']; spawn('docker', ['run', ...NET, img], { env: {} });`,
     ],
     [
       'nested const arrays',
-      `const NET = ['--rm', '--network', 'none']; const ARGS = ['run', ...NET, img]; spawn('docker', ARGS);`,
+      `const NET = ['--rm', '--network', 'none']; const ARGS = ['run', ...NET, img]; spawn('docker', ARGS, { env: {} });`,
     ],
   ])('allows %s', (_label, body) => {
     expect(findEgress('gvisor/runner.ts', spawnIt(`${TYPED} ${body}`), [])).toEqual([]);
@@ -424,11 +480,11 @@ describe('egress guard self-test: final delta review', () => {
 
   it('a reviewed exception covers one call site, not every finding with its label', () => {
     expect(findEgress('boot/images.ts', read('boot/images.ts'))).toEqual([]);
-    const extra = `export async function more(r: string) { await exec('docker', ['pull', '--quiet', r]); }`;
+    const extra = `export async function more(r: string) { await exec('docker', ['pull', '--quiet', r], { env: {} }); }`;
     expect(findEgress('boot/images.ts', `${read('boot/images.ts')}\n${extra}`)).not.toEqual([]);
     const twice = read('boot/images.ts').replace(
-      "await exec('docker', ['pull', '--quiet', ref], { timeout: 600_000 });\n  const { stdout }",
-      "await exec('docker', ['pull', '--quiet', ref], { timeout: 600_000 });\n  await exec('docker', ['pull', '--quiet', ref]);\n  const { stdout }",
+      "await exec('docker', ['pull', '--quiet', ref], { timeout: 600_000, env: dockerEnv() });\n  const { stdout }",
+      "await exec('docker', ['pull', '--quiet', ref], { timeout: 600_000, env: dockerEnv() });\n  await exec('docker', ['pull', '--quiet', ref], { env: {} });\n  const { stdout }",
     );
     expect(twice).not.toBe(read('boot/images.ts'));
     expect(findEgress('boot/images.ts', twice)).not.toEqual([]);
@@ -436,9 +492,9 @@ describe('egress guard self-test: final delta review', () => {
 
   it('a variable named args in runner.ts is checked, not waved through by name', () => {
     expect(findEgress('gvisor/runner.ts', read('gvisor/runner.ts'))).toEqual([]);
-    const host = `export function more() { const args = ['run', '--network', 'host', 'x']; spawn('docker', args); }`;
+    const host = `export function more() { const args = ['run', '--network', 'host', 'x']; spawn('docker', args, { env: {} }); }`;
     expect(findEgress('gvisor/runner.ts', `${read('gvisor/runner.ts')}\n${host}`)).not.toEqual([]);
-    const param = `export function more(args: string[]) { spawn('docker', args); }`;
+    const param = `export function more(args: string[]) { spawn('docker', args, { env: {} }); }`;
     expect(findEgress('gvisor/runner.ts', `${read('gvisor/runner.ts')}\n${param}`)).not.toEqual([]);
   });
 
@@ -480,47 +536,47 @@ describe('egress guard self-test: last round', () => {
   it.each([
     [
       'a push onto an argv array',
-      `const a = ['run', '--network', 'none', 'x']; a.push('--network=host'); spawn('docker', a);`,
+      `const a = ['run', '--network', 'none', 'x']; a.push('--network=host'); spawn('docker', a, { env: {} });`,
       'args mutation a.push',
     ],
     [
       'an index assignment into an argv array',
-      `const a = ['run', '--network', 'none', 'x']; a[2] = 'host'; spawn('docker', a);`,
+      `const a = ['run', '--network', 'none', 'x']; a[2] = 'host'; spawn('docker', a, { env: {} });`,
       'args mutation a[...] =',
     ],
     [
       'unshift onto a spread source',
-      `const NET = ['--network', 'none']; NET.unshift('--privileged'); spawn('docker', ['run', ...NET, 'x']);`,
+      `const NET = ['--network', 'none']; NET.unshift('--privileged'); spawn('docker', ['run', ...NET, 'x'], { env: {} });`,
       'args mutation NET.unshift',
     ],
     [
       'splice on an argv array',
-      `const a = ['run', '--network', 'none', 'x']; a.splice(2, 1, 'host'); spawn('docker', a);`,
+      `const a = ['run', '--network', 'none', 'x']; a.splice(2, 1, 'host'); spawn('docker', a, { env: {} });`,
       'args mutation a.splice',
     ],
     [
       'a const string flag as an element',
-      `const NET = '--network=host'; spawn('docker', ['run', NET, 'x']);`,
+      `const NET = '--network=host'; spawn('docker', ['run', NET, 'x'], { env: {} });`,
       'args --network host',
     ],
     [
       'a const string tar flag',
-      `export function x(f: string) { const T = '--to-command=sh'; spawn('tar', ['-x', '-f', f, T]); }`,
+      `export function x(f: string) { const T = '--to-command=sh'; spawn('tar', ['-x', '-f', f, T], { env: {} }); }`,
       'tar flag --to-command',
     ],
     [
       'a const string subcommand',
-      `const SUB = 'pull'; spawn('docker', [SUB, 'evil/image']);`,
+      `const SUB = 'pull'; spawn('docker', [SUB, 'evil/image'], { env: {} });`,
       'docker pull',
     ],
     [
       'an unresolved identifier element',
-      `spawn('docker', ['rm', '--force', who]);`,
+      `spawn('docker', ['rm', '--force', who], { env: {} });`,
       'args unresolved identifier who',
     ],
     [
       'a spread of a non-const',
-      `let NET = ['--network', 'none']; spawn('docker', ['run', ...NET, 'x']);`,
+      `let NET = ['--network', 'none']; spawn('docker', ['run', ...NET, 'x'], { env: {} });`,
       'args spread ...NET',
     ],
   ])('catches %s', (_label, body, what) => {
@@ -529,15 +585,15 @@ describe('egress guard self-test: last round', () => {
   it.each([
     [
       'a const string value',
-      `export function f(img: string) { const NONE = 'none'; spawn('docker', ['run', '--network', NONE, img]); }`,
+      `export function f(img: string) { const NONE = 'none'; spawn('docker', ['run', '--network', NONE, img], { env: {} }); }`,
     ],
     [
       'a parameter element',
-      `export function f(who: string) { spawn('docker', ['rm', '--force', who]); }`,
+      `export function f(who: string) { spawn('docker', ['rm', '--force', who], { env: {} }); }`,
     ],
     [
       'reading an argv array',
-      `const a = ['ps', '--quiet']; const n = a.length; spawn('docker', a);`,
+      `const a = ['ps', '--quiet']; const n = a.length; spawn('docker', a, { env: {} });`,
     ],
   ])('allows %s', (_label, body) => {
     expect(whats('gvisor/runner.ts', spawnIt(body))).toEqual([]);
@@ -575,7 +631,7 @@ describe('egress guard self-test: last round', () => {
     expect(
       whats('snippet.ts', `import { trace } from '@opentelemetry/api'; void trace;`),
     ).not.toEqual([]);
-    const ps = `import { execFile } from 'node:child_process'; execFile('docker', ['ps']);`;
+    const ps = `import { execFile } from 'node:child_process'; execFile('docker', ['ps'], { env: {} });`;
     expect(whats('judge:jail/harness.ts', ps)).toEqual([]);
     expect(whats('judge:patch/diff.ts', ps)).not.toEqual([]);
   });

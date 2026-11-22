@@ -1,3 +1,4 @@
+import { dockerEnv } from '../docker-env.js';
 import { execFile, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { readFile, readdir, rm, stat } from 'node:fs/promises';
@@ -94,12 +95,11 @@ async function inspect(
   name: string,
 ): Promise<{ id: string; oomKilled: boolean; exitCode: number } | null> {
   try {
-    const { stdout } = await exec('docker', [
-      'inspect',
-      '--format',
-      '{{.Id}} {{.State.OOMKilled}} {{.State.ExitCode}}',
-      name,
-    ]);
+    const { stdout } = await exec(
+      'docker',
+      ['inspect', '--format', '{{.Id}} {{.State.OOMKilled}} {{.State.ExitCode}}', name],
+      { env: dockerEnv() },
+    );
     const [id, oom, code] = stdout.trim().split(' ');
     if (id === undefined || !/^[0-9a-f]{64}$/.test(id)) return null;
     return { id, oomKilled: oom === 'true', exitCode: Number(code) };
@@ -177,13 +177,11 @@ const UNTRACED: TraceObservations = {
 export async function refuseImageVolumes(image: string): Promise<void> {
   let stdout: string;
   try {
-    ({ stdout } = await exec('docker', [
-      'image',
-      'inspect',
-      '--format',
-      '{{json .Config.Volumes}}',
-      image,
-    ]));
+    ({ stdout } = await exec(
+      'docker',
+      ['image', 'inspect', '--format', '{{json .Config.Volumes}}', image],
+      { env: dockerEnv() },
+    ));
   } catch (e) {
     throw new Error(`cannot inspect image ${image}`, { cause: e });
   }
@@ -192,7 +190,9 @@ export async function refuseImageVolumes(image: string): Promise<void> {
 
 /** Volumes mounted in a container, read before it is removed. */
 async function containerVolumes(name: string): Promise<string[]> {
-  const { stdout } = await exec('docker', ['inspect', '--format', '{{json .Mounts}}', name]);
+  const { stdout } = await exec('docker', ['inspect', '--format', '{{json .Mounts}}', name], {
+    env: dockerEnv(),
+  });
   return parseContainerVolumes(stdout);
 }
 
@@ -204,17 +204,15 @@ export async function verifyTeardown(
   runId: string,
   volumes: readonly string[] = [],
 ): Promise<void> {
-  const { stdout } = await exec('docker', [
-    'ps',
-    '--all',
-    '--quiet',
-    '--filter',
-    `label=${RUN_LABEL}=${runId}`,
-  ]);
+  const { stdout } = await exec(
+    'docker',
+    ['ps', '--all', '--quiet', '--filter', `label=${RUN_LABEL}=${runId}`],
+    { env: dockerEnv() },
+  );
   if (stdout.trim() !== '') throw new Error(`containers left behind for run ${runId}: ${stdout}`);
   const left: string[] = [];
   for (const v of volumes) {
-    const exists = await exec('docker', ['volume', 'inspect', v]).then(
+    const exists = await exec('docker', ['volume', 'inspect', v], { env: dockerEnv() }).then(
       () => true,
       () => false,
     );
@@ -258,7 +256,7 @@ export async function runJailed(
   });
 
   const started = Date.now();
-  const child = spawn('docker', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn('docker', args, { stdio: ['pipe', 'pipe', 'pipe'], env: dockerEnv() });
   const stdout = capture(child.stdout);
   const stderr = capture(child.stderr);
   child.stdin.on('error', () => undefined);
@@ -298,7 +296,8 @@ export async function runJailed(
           }
         }
       }
-      if (killing) await exec('docker', ['kill', name]).catch(() => undefined);
+      if (killing)
+        await exec('docker', ['kill', name], { env: dockerEnv() }).catch(() => undefined);
     })().finally(() => {
       busy = false;
     });
@@ -324,7 +323,9 @@ export async function runJailed(
           volumeError = e;
           return [];
         });
-  await exec('docker', ['rm', '--force', '--volumes', name]).catch(() => undefined);
+  await exec('docker', ['rm', '--force', '--volumes', name], { env: dockerEnv() }).catch(
+    () => undefined,
+  );
   if (state === null) {
     throw new Error(`container ${name} was never created: ${stderr().slice(0, 2000)}`);
   }

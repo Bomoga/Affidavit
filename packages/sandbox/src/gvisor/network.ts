@@ -1,3 +1,4 @@
+import { dockerEnv } from '../docker-env.js';
 import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { networkInterfaces } from 'node:os';
@@ -84,27 +85,35 @@ export function parseCaseNetworkInspect(name: string, stdout: string): string[] 
 export async function createCaseNetwork(): Promise<CaseNetwork> {
   const runId = randomBytes(8).toString('hex');
   const name = `affidavit-net-${runId}`;
-  await exec('docker', [
-    'network',
-    'create',
-    '--driver',
-    'bridge',
-    '--internal',
-    '--ipv6=false',
-    '--opt',
-    'com.docker.network.bridge.inhibit_ipv4=true',
-    '--label',
-    `${RUN_LABEL}=${runId}`,
-    name,
-  ]);
-  try {
-    const { stdout } = await exec('docker', [
+  await exec(
+    'docker',
+    [
       'network',
-      'inspect',
-      '--format',
-      '{{.Internal}} {{.EnableIPv6}} {{range .IPAM.Config}}{{.Subnet}} {{end}}',
+      'create',
+      '--driver',
+      'bridge',
+      '--internal',
+      '--ipv6=false',
+      '--opt',
+      'com.docker.network.bridge.inhibit_ipv4=true',
+      '--label',
+      `${RUN_LABEL}=${runId}`,
       name,
-    ]);
+    ],
+    { env: dockerEnv() },
+  );
+  try {
+    const { stdout } = await exec(
+      'docker',
+      [
+        'network',
+        'inspect',
+        '--format',
+        '{{.Internal}} {{.EnableIPv6}} {{range .IPAM.Config}}{{.Subnet}} {{end}}',
+        name,
+      ],
+      { env: dockerEnv() },
+    );
     const subnets = parseCaseNetworkInspect(name, stdout);
     if (subnets.length !== 1) {
       throw new Error(`network ${name} has more than one subnet: ${subnets.join(', ')}`);
@@ -113,7 +122,7 @@ export async function createCaseNetwork(): Promise<CaseNetwork> {
     assertHostNotOnSubnet(subnet);
     return { name, runId, subnet };
   } catch (err) {
-    await exec('docker', ['network', 'rm', name]).catch(() => undefined);
+    await exec('docker', ['network', 'rm', name], { env: dockerEnv() }).catch(() => undefined);
     throw err;
   }
 }
@@ -121,11 +130,16 @@ export async function createCaseNetwork(): Promise<CaseNetwork> {
 /** Removes the network and every container still labelled with its run id, then checks. */
 export async function removeCaseNetwork(net: CaseNetwork): Promise<void> {
   const filter = `label=${RUN_LABEL}=${net.runId}`;
-  const { stdout } = await exec('docker', ['ps', '--all', '--quiet', '--filter', filter]);
+  const { stdout } = await exec('docker', ['ps', '--all', '--quiet', '--filter', filter], {
+    env: dockerEnv(),
+  });
   const ids = stdout.split('\n').filter((l) => l !== '');
-  if (ids.length > 0) await exec('docker', ['rm', '--force', '--volumes', ...ids]);
-  await exec('docker', ['network', 'rm', net.name]).catch(() => undefined);
-  const left = await exec('docker', ['network', 'ls', '--quiet', '--filter', filter]);
+  if (ids.length > 0)
+    await exec('docker', ['rm', '--force', '--volumes', ...ids], { env: dockerEnv() });
+  await exec('docker', ['network', 'rm', net.name], { env: dockerEnv() }).catch(() => undefined);
+  const left = await exec('docker', ['network', 'ls', '--quiet', '--filter', filter], {
+    env: dockerEnv(),
+  });
   if (left.stdout.trim() !== '') throw new Error(`network ${net.name} was left behind`);
 }
 
@@ -136,7 +150,9 @@ export async function removeCaseNetwork(net: CaseNetwork): Promise<void> {
  */
 export async function listCaseNetworkRuns(): Promise<string[]> {
   const filter = `label=${RUN_LABEL}`;
-  const ls = await exec('docker', ['network', 'ls', '--format', '{{.Name}}', '--filter', filter]);
+  const ls = await exec('docker', ['network', 'ls', '--format', '{{.Name}}', '--filter', filter], {
+    env: dockerEnv(),
+  });
   return ls.stdout
     .split('\n')
     .filter((l) => CASE_NETWORK.test(l))
@@ -187,13 +203,11 @@ export async function startJailedService(
   // container. A service image may declare VOLUME only if every path is covered by a tmpfs.
   let declared: string[];
   try {
-    const { stdout } = await exec('docker', [
-      'image',
-      'inspect',
-      '--format',
-      '{{json .Config.Volumes}}',
-      spec.image,
-    ]);
+    const { stdout } = await exec(
+      'docker',
+      ['image', 'inspect', '--format', '{{json .Config.Volumes}}', spec.image],
+      { env: dockerEnv() },
+    );
     declared = parseImageVolumes(stdout);
   } catch (e) {
     throw new Error(`cannot inspect image ${spec.image}`, { cause: e });
@@ -219,19 +233,22 @@ export async function startJailedService(
     tmpfs: spec.tmpfs,
     writableTmpMb: spec.writableTmpMb,
   });
-  await exec('docker', [args[0] ?? 'run', '--detach', ...args.slice(1)]);
-  const mounts = await exec('docker', ['inspect', '--format', '{{json .Mounts}}', name]);
+  await exec('docker', [args[0] ?? 'run', '--detach', ...args.slice(1)], { env: dockerEnv() });
+  const mounts = await exec('docker', ['inspect', '--format', '{{json .Mounts}}', name], {
+    env: dockerEnv(),
+  });
   const volumes = parseContainerVolumes(mounts.stdout);
   if (volumes.length > 0) {
-    await exec('docker', ['rm', '--force', '--volumes', name]).catch(() => undefined);
+    await exec('docker', ['rm', '--force', '--volumes', name], { env: dockerEnv() }).catch(
+      () => undefined,
+    );
     throw new Error(`service ${name} got Docker volumes (${volumes.join(', ')}); refused`);
   }
-  const { stdout } = await exec('docker', [
-    'inspect',
-    '--format',
-    `{{(index .NetworkSettings.Networks "${net.name}").IPAddress}}`,
-    name,
-  ]);
+  const { stdout } = await exec(
+    'docker',
+    ['inspect', '--format', `{{(index .NetworkSettings.Networks "${net.name}").IPAddress}}`, name],
+    { env: dockerEnv() },
+  );
   const ip = stdout.trim();
   if (ipv4ToInt(ip) === null || !inCidr(ip, net.subnet)) {
     throw new Error(`service ${name} has no address on ${net.name}: ${ip}`);
@@ -246,7 +263,7 @@ async function waitReady(name: string, command: readonly string[], timeoutMs: nu
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
-      await exec('docker', ['exec', name, ...command], { timeout: 10_000 });
+      await exec('docker', ['exec', name, ...command], { timeout: 10_000, env: dockerEnv() });
       return;
     } catch {
       if (Date.now() > deadline) throw new Error(`service ${name} not ready in ${timeoutMs} ms`);
