@@ -16,7 +16,13 @@ import { FakeRescan } from '@affidavit/testing';
 import { DEFAULT_TRACE_ROOT } from '@affidavit/sandbox';
 import { createModelPortFromEnv, resolveModelTable } from '@affidavit/trial';
 import { describe, expect, it } from 'vitest';
-import { ConfigError, describeConfig, loadConfig, startupWarnings } from '../config.js';
+import {
+  ConfigError,
+  DEPENDENCY_SCAN_WARNING,
+  describeConfig,
+  loadConfig,
+  startupWarnings,
+} from '../config.js';
 import { fakeJudge } from '../fakes/stages.js';
 import { prepareCores } from '../handlers.js';
 import {
@@ -109,7 +115,7 @@ describe('real wiring config', () => {
     // Scanners run under gVisor unless plain Docker is asked for by name.
     expect(c.intakeSettings?.toolRunner).toBe('gvisor');
     expect(c.intakeSettings?.toolRunnerExplicit).toBe(false);
-    expect(startupWarnings(c)).toEqual([]);
+    expect(startupWarnings(c)).toEqual([DEPENDENCY_SCAN_WARNING]);
     expect(c.trialSettings?.killSwitch).toBe(false);
     expect(c.trialSettings?.turnBudget).toEqual({
       maxInputTokens: 100_000,
@@ -394,11 +400,14 @@ describe('startup prerequisites', () => {
     expect(docker.intakeSettings?.toolRunnerExplicit).toBe(true);
     await expect(checkPrerequisites(docker, h.probe, h.judge)).resolves.toBeUndefined();
     expect(startupWarnings(docker)).toEqual([
+      DEPENDENCY_SCAN_WARNING,
       expect.stringContaining(
         'AFFIDAVIT_TOOLRUNNER=docker: scanners run on untrusted repository content under plain Docker',
       ),
     ]);
-    expect(startupWarnings(loadConfig({ ...env, AFFIDAVIT_TOOLRUNNER: 'gvisor' }))).toEqual([]);
+    expect(startupWarnings(loadConfig({ ...env, AFFIDAVIT_TOOLRUNNER: 'gvisor' }))).toEqual([
+      DEPENDENCY_SCAN_WARNING,
+    ]);
     expect(() => loadConfig({ ...env, AFFIDAVIT_TOOLRUNNER: 'runc' })).toThrow(
       /AFFIDAVIT_TOOLRUNNER must be "docker" or "gvisor"/,
     );
@@ -430,7 +439,10 @@ describe('startup prerequisites', () => {
     );
     await prepared.close();
     // The key is named, never valued, and only when it is missing.
-    expect(logs).toEqual([expect.stringContaining('ANTHROPIC_API_KEY is not set')]);
+    expect(logs).toEqual([
+      `warning: ${DEPENDENCY_SCAN_WARNING}`,
+      expect.stringContaining('ANTHROPIC_API_KEY is not set'),
+    ]);
     logs.length = 0;
     const ok = host();
     await prepareCores(config, {
@@ -441,7 +453,8 @@ describe('startup prerequisites', () => {
       judge: fakeJudge(),
       log: (m) => logs.push(m),
     });
-    expect(logs).toEqual([]);
+    // Real intake always says the dependency scan is not run.
+    expect(logs).toEqual([`warning: ${DEPENDENCY_SCAN_WARNING}`]);
   });
 
   /** A RealJudge stand-in that records whether it was closed. */

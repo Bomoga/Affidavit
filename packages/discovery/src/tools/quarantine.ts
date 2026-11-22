@@ -1,4 +1,14 @@
-import { lstat, mkdir, readdir, rename } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import {
+  chmod,
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  rename,
+  writeFile,
+  type FileHandle,
+} from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { listDir } from './walk.js';
 
@@ -172,19 +182,148 @@ async function requireNewOrEmpty(dir: string, fail: () => Error): Promise<void> 
   }
 }
 
+/*
+ * Modes. The scanners run as nobody (uid 65534) in the gVisor jail, and as root under plain
+ * Docker, while the worker that reads their reports is a third user. Every mode below is set with
+ * chmod, never left to the worker's umask (which is 077 on hardened hosts), so the same layout
+ * works under any umask. These directories sit inside a per-run directory made by mkdtemp (0700),
+ * so no other host user can reach them whatever their own mode.
+ */
+/** Mounted directories the jail only reads, and the scratch root (not mounted). */
+export const READ_DIR_MODE = 0o755;
+/** Per-run scratch subdirectories the jail writes into (fresh and empty for every run). */
+export const SCRATCH_DIR_MODE = 0o777;
+/** The report file, pre-created by the worker so it stays the worker's own and readable. */
+export const REPORT_FILE_MODE = 0o666;
+
 /** Creates the per-run scratch subdirectories. The scratch dir must not exist or must be empty. */
 export async function prepareScratch(
   scratchDir: string,
   subdirs: readonly string[],
 ): Promise<void> {
   await requireNewOrEmpty(scratchDir, () => new ScratchNotFreshError(scratchDir));
-  for (const sub of subdirs) await mkdir(join(scratchDir, sub), { recursive: true });
+  await mkdir(scratchDir, { recursive: true, mode: READ_DIR_MODE });
+  await chmod(scratchDir, READ_DIR_MODE);
+  for (const sub of subdirs) {
+    const dir = join(scratchDir, sub);
+    await mkdir(dir, { recursive: true, mode: SCRATCH_DIR_MODE });
+    await chmod(dir, SCRATCH_DIR_MODE);
+  }
 }
 
-/** Creates the output directory if needed. It must not exist or must be empty. */
-export async function prepareOutput(outputDir: string): Promise<void> {
+/**
+ * Creates the output directory if needed (it must not exist or must be empty) and, when
+ * `reportFile` is given, pre-creates that one empty report file. The directory is 0755, so the
+ * jail can create nothing else in it, and the report file is 0666 and owned by the worker: the
+ * scanner writes into it in place, and the worker can read it and rewrite it (path remapping)
+ * afterwards, whatever user the scanner ran as. A report still empty after the run is a missing
+ * report (`readJsonReport`).
+ */
+export async function prepareOutput(outputDir: string, reportFile?: string): Promise<void> {
   await requireNewOrEmpty(outputDir, () => new OutputNotFreshError(outputDir));
-  await mkdir(outputDir, { recursive: true });
+  await mkdir(outputDir, { recursive: true, mode: READ_DIR_MODE });
+  await chmod(outputDir, READ_DIR_MODE);
+  if (reportFile !== undefined) {
+    if (basename(reportFile) !== reportFile || reportFile === '..' || reportFile === '.') {
+      throw new Error(`report file must be a plain name: ${reportFile}`);
+    }
+    const file = join(outputDir, reportFile);
+    await writeFile(file, '', { flag: 'wx', mode: REPORT_FILE_MODE });
+    await chmod(file, REPORT_FILE_MODE);
+  }
+}
+
+/**
+ * Lets the jail's user read a snapshot the worker made: every directory the owner can enter and
+ * read gets read and enter for group and others too, and every regular file the owner can read
+ * gets read for group and others. Nothing gets write or execute it did not have, and what the
+ * owner cannot read stays unreadable (so gitleaks' `unreadable` check keeps its meaning).
+ *
+ * Symlinks are never followed or changed: every entry is opened with O_NOFOLLOW, checked to be
+ * the same inode `lstat` saw and of the same type, and changed with fchmod on that handle, so a
+ * path swapped for a link after the listing changes nothing outside the tree. Any entry that is
+ * not a directory, regular file or symlink (FIFO, socket, device) is refused with
+ * UnshareableEntryError rather than skipped. Mutates modes only, so pass only a private scan copy,
+ * as for quarantineSnapshot. A no-op on Windows, which has no such modes.
+ */
+export async function shareForJailRead(dir: string): Promise<void> {
+  if (process.platform === 'win32') return;
+  const st = await lstat(dir);
+  if (!st.isDirectory()) throw new Error(`not a directory: ${dir}`);
+  await shareDir(dir, '');
+}
+
+/** A scan copy holds an entry the jail's user cannot be given read access to safely. */
+export class UnshareableEntryError extends Error {
+  readonly path: string;
+  constructor(path: string, why: string) {
+    super(`cannot share ${path || '.'} with the jail: ${why}`);
+    this.name = 'UnshareableEntryError';
+    this.path = path;
+  }
+}
+
+const OPEN_NOFOLLOW = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+
+/**
+ * Opens `path` without following a final symlink and checks it is the inode lstat reported, of
+ * the expected kind. Null when the owner itself cannot open it (EACCES): it is left as it is.
+ */
+async function openSame(
+  path: string,
+  rel: string,
+  seen: { dev: number; ino: number },
+  kind: 'dir' | 'file',
+): Promise<FileHandle | null> {
+  let fh: FileHandle;
+  try {
+    fh = await open(path, OPEN_NOFOLLOW | (kind === 'dir' ? constants.O_DIRECTORY : 0));
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === 'EACCES') return null;
+    throw new UnshareableEntryError(rel, `cannot open it without following links (${code})`);
+  }
+  const st = await fh.stat();
+  const ok = kind === 'dir' ? st.isDirectory() : st.isFile();
+  if (!ok || st.dev !== seen.dev || st.ino !== seen.ino) {
+    await fh.close();
+    throw new UnshareableEntryError(rel, 'it changed while being shared');
+  }
+  return fh;
+}
+
+async function shareDir(path: string, rel: string): Promise<void> {
+  const seen = await lstat(path);
+  const fh = await openSame(path, rel, seen, 'dir');
+  if (fh === null) return; // the owner cannot read it: leave it as it is
+  try {
+    const mode = (await fh.stat()).mode & 0o7777;
+    if ((mode & 0o500) !== 0o500) return; // the owner cannot list it: leave it as it is
+    if ((mode | 0o055) !== mode) await fh.chmod(mode | 0o055);
+  } finally {
+    await fh.close();
+  }
+  for (const e of await listDir(path)) {
+    const child = join(path, e.name);
+    const childRel = rel === '' ? e.name : `${rel}/${e.name}`;
+    const st = await lstat(child);
+    if (st.isSymbolicLink()) continue; // never followed, never changed
+    if (st.isDirectory()) {
+      await shareDir(child, childRel);
+    } else if (st.isFile()) {
+      const m = st.mode & 0o7777;
+      if ((m & 0o400) === 0 || (m & 0o044) === 0o044) continue;
+      const f = await openSame(child, childRel, st, 'file');
+      if (f === null) continue;
+      try {
+        await f.chmod(m | 0o044);
+      } finally {
+        await f.close();
+      }
+    } else {
+      throw new UnshareableEntryError(childRel, 'it is not a directory, file or symlink');
+    }
+  }
 }
 
 /**

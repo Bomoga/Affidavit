@@ -65,6 +65,16 @@ Invariants, each covered by a test in `src/model/anthropic.test.ts` with a stubb
 - The first submission is captured raw and ends the turn (PreToolUse, PostToolUseFailure or PostToolUse, whichever the runtime reaches); a malformed one becomes `exhibit-inadmissible`, never a silent retry.
 - Submissions are never rewritten or pattern-redacted. One containing the exact key value throws `ModelCallError` and is not recorded.
 - Provider failures (timeout, abort, hung or broken stream, no result, any assistant `error` code other than `authentication_failed`) throw `ModelCallError` unless the agent already submitted; only an agent that used its turns is `turn-cap`. An outage cannot dismiss a candidate.
+- A provider error always carries its class and HTTP status. Provider text is shown only as fragments rebuilt from the allowlisted `TEMPLATES` in `anthropic.ts` (after JSON decoding and redaction), capped at 300 characters; anything else is `provider message withheld (does not match a known-safe shape)` (`provider-errors.test.ts`). A key that is not printable ASCII without spaces fails `preflight` before any charge.
+- `ModelCallError.cost` is the reported spend of a failed call, or undefined when unknown. Zero without a result only for classes decided before any work (`REFUSED_BEFORE_WORK`). The orchestrator trusts it only when it is a valid finite non-negative `StageCost`, charges any overage (overdrawing is `budget-exhausted`), and gives back the unspent part through the optional `settlement` dep (CR-T1; Lane 1 wires it). A settling failure is attached as `settlementError` and never replaces the call error. Unknown spend keeps the whole charge.
+
+## Model probe (L3-17)
+
+`scripts/probe-model.ts` (logic in `src/model/probe.ts`) is a human-run diagnostic: tiny live calls with synthetic input only, raw provider text shown after key redaction. Nothing in the trial imports it. It reuses `buildAgentOptions` from `anthropic.ts`, so keep the port's options built there. See the guide, "Probing a provider error". L3-18 adds opt-in P7 (`--fixture-case`, only a file directly in `fixtures/casefiles/`): the worker's Defense turn replayed through `defenseBlocks` from `defense.ts`, so keep the Defense user message built there.
+
+A model safety refusal (`stop_reason: "refusal"`, which the runtime reports as `invalid_request`) is class `refusal` (`REFUSAL_CLASS`) with an allowlisted category (else `other`), never zero spend, and never returns a submission. A runtime fallback to another model, or any assistant message from a model other than the requested one (`model_mismatch`), fails the turn (`provider-errors.test.ts`). What a refusal should do to a case is open (CR-T13). `--fixture-case` also requires a checked-in, unmodified file (git).
+
+L3-19 adds opt-in P8 (`--model-matrix`, needs `--fixture-case`): the P7a input on every distinct table model, the second-attempt prompt on its model, and `claude-fable-5-2` as a labelled extra, each through the real port with a probe-only model table. Measurement only; Prosecution, Remedy and jurors are reported as SKIP because their input needs earlier-stage artifacts.
 
 ## Intended libraries (notes for later, not installed yet)
 

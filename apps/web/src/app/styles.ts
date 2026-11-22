@@ -1,4 +1,5 @@
 import { toCssVariables } from '../design/tokens.js';
+import { TERMINAL_CSS } from '../terminal/terminalCss.js';
 
 // Every color comes from a design token, so the contrast pairs are checkable in tests
 // (a11y/check.ts reads this string). Green is reserved for the VERIFIED stamp, links and focus.
@@ -164,4 +165,4 @@ th { color: var(--color-muted); font-weight: 600; }
 .site-footer { color: var(--color-muted); font-size: 0.875rem; border-top: 1px solid var(--color-muted); margin-top: 3rem; }
 `;
 
-export const APP_CSS = `${toCssVariables()}\n${RULES}`;
+export const APP_CSS = `${toCssVariables()}\n${RULES}\n${TERMINAL_CSS}`;
