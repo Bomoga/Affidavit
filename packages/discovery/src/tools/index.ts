@@ -2,6 +2,9 @@
 // supported way to run a tool outside this module is runTool, which takes a QuarantinedSnapshot.
 export * from './manifest.js';
 export {
+  SEMGREP_CANARY,
+  SEMGREP_NO_TMP_EXIT,
+  canaryRoot,
   ToolDisabledError,
   ToolOptionError,
   type ToolInvocation,

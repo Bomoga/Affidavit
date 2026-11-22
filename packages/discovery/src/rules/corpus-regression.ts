@@ -486,6 +486,11 @@ export function regressionInputsDigest(repo: string): string {
     }
   }
   files.push(`${rules}/corpus-expectations.json`, `${rules}/generate-idor-rules.mjs`);
+  // The Semgrep liveness canary runs next to every scan and decides whether a report counts.
+  files.push(
+    'packages/discovery/canary/semgrep/canary.yaml',
+    'packages/discovery/canary/semgrep/canary.js',
+  );
 
   const nodegoat = 'packages/corpus/data/nodegoat';
   files.push(`${nodegoat}/pin.json`, `${nodegoat}/app.json`);

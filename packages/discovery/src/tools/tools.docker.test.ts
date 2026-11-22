@@ -31,6 +31,8 @@ import {
   loadToolManifest,
   prepareOutput,
   prepareScratch,
+  SEMGREP_CANARY,
+  SEMGREP_NO_TMP_EXIT,
   SnapshotNotCleanError,
   ToolFailedError,
   quarantineSnapshot,
@@ -238,6 +240,8 @@ describe.skipIf(!enabled)('tool images, offline', () => {
   /** A fresh snapshot, per-tool output and scratch dirs for one scenario. */
   function scenario(fixture: string, extra?: (src: string) => void) {
     const id = `s${++counter}`;
+    // runTool wants the parent of its output and scratch dirs private to the worker (0700).
+    mkdirSync(join(work, id), { mode: 0o700 });
     const src = join(work, id, 'src');
     materialize(join(smoke, fixture), src);
     extra?.(src);
@@ -294,7 +298,9 @@ describe.skipIf(!enabled)('tool images, offline', () => {
     const o = s.options(tool);
     const inv = buildInvocation(manifest, tool, o);
     await prepareScratch(o.scratchDir, inv.scratchSubdirs);
-    await prepareOutput(o.outputDir);
+    // The report file is pre-created as runTool does: /out is 0755, and the container's root has
+    // no CAP_DAC_OVERRIDE, so it can write only the 0666 report file there.
+    await prepareOutput(o.outputDir, inv.outputFile);
     // Deliberately bypasses runTool's snapshot gate to see what the flags alone achieve.
     const res = await s.runner.run(inv.image, inv.args, inv.mounts);
     expect(isOkExit(manifest, tool, res.exitCode), `${tool} exit ${res.exitCode}`).toBe(true);
@@ -391,11 +397,14 @@ describe.skipIf(!enabled)('tool images, offline', () => {
     expect(results['osv-scanner']?.partial).toBe(false);
     expect(results.gitleaks?.partial).toBe(false);
     expect(results.semgrep?.partial).toBe(false);
+    // Semgrep really scanned under plain Docker (the TMPDIR wrapper gave it /var/tmp): a finding
+    // of our rule, and the liveness canary matched (runTool checked it) and was stripped.
     expect(
       sarifFindings(read(s, 'semgrep', 'semgrep.sarif')).some((f) =>
         f.ruleId?.endsWith('affidavit.smoke.no-eval'),
       ),
     ).toBe(true);
+    expect(read(s, 'semgrep', 'semgrep.sarif')).not.toContain(SEMGREP_CANARY.ruleId);
     expect(read(s, 'osv-scanner', 'osv-scanner.json')).toContain('AFFIDAVIT-SMOKE-0001');
     expect(
       sarifFindings(read(s, 'gitleaks', 'gitleaks.sarif')).some(
@@ -452,6 +461,29 @@ describe.skipIf(!enabled)('tool images, offline', () => {
     expectHostileFindingsSurvive(s, 'tree');
     expectNoGoToolchain();
   }, 240_000);
+
+  it('semgrep refuses to start (exit 97, a failure) when its temp directory is not writable', async () => {
+    const s = scenario('repo');
+    const snap = await quarantineSnapshot(s.src);
+    const o = s.options('semgrep');
+    // The same invocation, but /var/tmp read-only: what Semgrep would see with no usable TMPDIR.
+    const ro: ToolRunnerPort = {
+      run: (image, args, mounts) =>
+        s.runner.run(
+          image,
+          args,
+          mounts.map((m) => (m.containerPath === '/var/tmp' ? { ...m, readOnly: true } : m)),
+        ),
+    };
+    const { sourceDir: _ignored, ...rest } = o;
+    void _ignored;
+    const err = await runTool(ro, manifest, 'semgrep', { ...rest, snapshot: snap }).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ToolFailedError);
+    expect((err as ToolFailedError).message).toMatch(/no writable temp directory/);
+    expect((err as ToolFailedError).exitCode).toBe(SEMGREP_NO_TMP_EXIT);
+  }, 120_000);
 
   it('gitleaks still honors a repo .gitleaksignore despite our flags, which is why runTool demands quarantine', async () => {
     const s = scenario('hostile');

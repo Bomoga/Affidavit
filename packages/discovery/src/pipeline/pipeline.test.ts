@@ -25,6 +25,7 @@ import {
   tmpDir,
   type Files,
 } from '../ingest/testkit.js';
+import { withSemgrepCanary } from '../tools/testkit.js';
 import {
   DiscoveryPipelineError,
   caseFileDiff,
@@ -61,30 +62,32 @@ function fakeSemgrep(findings: { file: string; line: number }[]): ToolRunnerPort
       mkdirSync(out, { recursive: true });
       writeFileSync(
         join(out, 'semgrep.sarif'),
-        JSON.stringify({
-          version: '2.1.0',
-          runs: [
-            {
-              tool: {
-                driver: {
-                  name: 'semgrep',
-                  rules: [{ id: RULE, properties: { tags: ['CWE-89'] } }],
-                },
-              },
-              results: findings.map((f) => ({
-                ruleId: RULE,
-                locations: [
-                  {
-                    physicalLocation: {
-                      artifactLocation: { uri: `/src/${f.file}` },
-                      region: { startLine: f.line, endLine: f.line },
-                    },
+        JSON.stringify(
+          withSemgrepCanary({
+            version: '2.1.0',
+            runs: [
+              {
+                tool: {
+                  driver: {
+                    name: 'semgrep',
+                    rules: [{ id: RULE, properties: { tags: ['CWE-89'] } }],
                   },
-                ],
-              })),
-            },
-          ],
-        }),
+                },
+                results: findings.map((f) => ({
+                  ruleId: RULE,
+                  locations: [
+                    {
+                      physicalLocation: {
+                        artifactLocation: { uri: `/src/${f.file}` },
+                        region: { startLine: f.line, endLine: f.line },
+                      },
+                    },
+                  ],
+                })),
+              },
+            ],
+          }),
+        ),
       );
       return Promise.resolve({ exitCode: 0, outputPath: out });
     },

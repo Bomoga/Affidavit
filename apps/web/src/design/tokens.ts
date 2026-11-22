@@ -10,6 +10,16 @@ export const TOKENS = {
     accent: '#3ddc84',
     focus: '#3ddc84',
     warn: '#e0b04a',
+    // Trial terminal (L3-13): data colors and one hue per agent. All are light enough to pass
+    // AA as text on bg and surface; the two *-bg tokens are row grounds for diff lines.
+    'term-amber': '#f5a623',
+    'term-pos': '#5fd68a',
+    'term-neg': '#ff7a6b',
+    'term-cyan': '#62c6e8',
+    'term-violet': '#b9a2f5',
+    'term-yellow': '#e8d06a',
+    'term-add-bg': '#10291b',
+    'term-del-bg': '#321614',
   },
   font: {
     mono: "ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'Liberation Mono', monospace",

@@ -39,10 +39,11 @@ describe('live case page', () => {
     expect(screen.getByRole('heading', { level: 1 }).textContent).toContain(
       'Verified: weakness proven and fix confirmed',
     );
-    expect(screen.getByText('VERIFIED')).toBeTruthy();
+    expect(screen.getAllByText('VERIFIED')[0]).toBeTruthy();
     openAll();
     expect(checkAccessibility(container, APP_CSS)).toEqual([]);
-  });
+    // The first render of the terminal in jsdom is slow; the stream itself is not.
+  }, 15000);
 
   it('shows Reconnecting after a drop, resumes from the last seq, and loses nothing', async () => {
     const transport = createFakeTransport({ events: GATE, scripts: [{ dropAfter: 7 }] });
@@ -125,7 +126,9 @@ describe('live case page', () => {
     await waitFor(() => expect(status().textContent).toContain('Complete'), SLOW);
     fireEvent.click(screen.getByRole('button', { name: /Docket/ }));
     expect(
-      screen.getByText(/The Prosecution objected, citing exhibit-counterexample-001/),
+      within(screen.getByRole('region', { name: 'Docket' })).getByText(
+        /The Prosecution objected, citing exhibit-counterexample-001/,
+      ),
     ).toBeTruthy();
     const show = screen.getAllByRole('button', { name: 'Show exhibit exhibit-counterexample-001' });
     expect(show).toHaveLength(3);
@@ -133,7 +136,9 @@ describe('live case page', () => {
     if (!target) throw new Error('no objection entry');
     fireEvent.click(target);
     expect(target.getAttribute('aria-expanded')).toBe('true');
-    expect(screen.getByText(/counterexample family/)).toBeTruthy();
+    expect(
+      within(screen.getByRole('region', { name: 'Docket' })).getByText(/counterexample family/),
+    ).toBeTruthy();
     openAll();
     expect(checkAccessibility(container, APP_CSS)).toEqual([]);
   });
