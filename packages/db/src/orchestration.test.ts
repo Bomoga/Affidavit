@@ -6,7 +6,10 @@ import {
   LeaseLostError,
   NeedsReviewError,
   reviewReasonOf,
+  stageHandler,
 } from './orchestration.js';
+import { parseStagePayload, type StageContext } from './queue.js';
+import type { AppPool } from './tenant.js';
 
 describe('reviewReasonOf', () => {
   it('reads a valid review reason from any error, and nothing from an ordinary one', () => {
@@ -19,6 +22,48 @@ describe('reviewReasonOf', () => {
     );
     expect(reviewReasonOf(new Error('x'))).toBeUndefined();
     expect(reviewReasonOf('model-refusal')).toBeUndefined();
+  });
+
+  it('accepts only the reasons stage work may raise, not those recovery or intake write', () => {
+    for (const r of ['f3-hold', 'attempts-exhausted', 'budget-exhausted']) {
+      expect(reviewReasonOf(Object.assign(new Error('x'), { reviewReason: r })), r).toBeUndefined();
+    }
+  });
+});
+
+describe('stageHandler, non-retryable failures', () => {
+  it('rethrows the stage work error even when flagging it for review fails, and logs that', async () => {
+    const down = new Error('database unreachable');
+    // A pool that cannot be reached: stageAttemptState (and so the flag) fails.
+    const pool = {
+      connect: () => Promise.reject(down),
+      query: () => Promise.reject(down),
+    } as unknown as AppPool;
+    const refusal = new NeedsReviewError('model-refusal', 'the model refused');
+    const logs: string[] = [];
+    const handler = stageHandler(() => Promise.reject(refusal), {
+      appPool: pool,
+      log: (m) => logs.push(m),
+    });
+    const ctx = {
+      workerId: 'w',
+      signal: new AbortController().signal,
+      inTenantTx: () => Promise.reject(new Error('not reached')),
+      complete: () => Promise.reject(new Error('not reached')),
+    } as unknown as StageContext;
+    const job = parseStagePayload({ tenantId: 't', caseId: 'c', stage: 'defense', attempt: 1 });
+    await expect(handler(job, ctx)).rejects.toBe(refusal);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatch(/could not flag defense attempt 1 .*model-refusal/);
+
+    // An ordinary error is rethrown untouched, with no flag attempted.
+    const plain = new Error('boom');
+    const quiet = stageHandler(() => Promise.reject(plain), {
+      appPool: pool,
+      log: (m) => logs.push(m),
+    });
+    await expect(quiet(job, ctx)).rejects.toBe(plain);
+    expect(logs).toHaveLength(1);
   });
 });
 

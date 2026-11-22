@@ -3,10 +3,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   CaseFile,
+  ExhibitResult,
   samples,
   type CaseId,
   type CaseStage,
   type CaseStore,
+  type JudgePort,
   type ModelPort,
   type RescanPort,
   type StageCost,
@@ -14,9 +16,22 @@ import {
 } from '@affidavit/contracts';
 import { GuardedCaseStore, parseStagePayload, reviewReasonOf, type StageEnv } from '@affidavit/db';
 import { DiscoveryRescan, type DiscoverCaseOutcome } from '@affidavit/discovery';
-import { FakeCaseStore, FakeEventSink, FakeRescan } from '@affidavit/testing';
+import {
+  FakeCaseStore,
+  FakeEventSink,
+  FakeJudge,
+  FakeRescan,
+  readFixtureJson,
+} from '@affidavit/testing';
 import { DEFAULT_TRACE_ROOT } from '@affidavit/sandbox';
-import { ModelCallError, createModelPortFromEnv, resolveModelTable } from '@affidavit/trial';
+import {
+  ModelCallError,
+  Orchestrator,
+  createModelPortFromEnv,
+  resolveModelTable,
+  witnessExhibitId,
+  witnessSha256,
+} from '@affidavit/trial';
 import { describe, expect, it } from 'vitest';
 import {
   ConfigError,
@@ -889,55 +904,61 @@ describe('real trial cores', () => {
     }
   });
 
-  describe('settlement of an up-front charge (contracts v1.2, CR-T1)', () => {
-    /** A Defense job over the reference fakes, at the case's defense stage. */
-    async function defenseJob(withRelease = true) {
-      const events = new FakeEventSink();
-      const fake = new FakeCaseStore({ events, juryEnabled: false });
-      await fake.open(stored, { maxInputTokens: 1_000_000, maxOutputTokens: 200_000, maxUsd: 2 });
-      for (const to of ['map', 'arraign', 'defense'] as const) await fake.transition(stored.id, to);
-      // Earlier stages' events, so stored seqs and the orchestrator's placeholders differ.
-      for (const stage of ['map', 'arraign'] as const) {
-        await events.emit({
-          schemaVersion: 1,
-          caseId: stored.id,
-          seq: await fake.nextSeq(stored.id),
-          stage,
-          at: new Date(0).toISOString(),
-          actor: 'stenographer',
-          type: 'stage-entered',
-          payload: {},
-        });
-      }
-      const inner: CaseStore = withRelease
-        ? fake
-        : ({
-            open: (f, b) => fake.open(f, b),
-            stage: (id) => fake.stage(id),
-            transition: (id, to) => fake.transition(id, to),
-            chargeBudget: (id, c) => fake.chargeBudget(id, c),
-            nextSeq: (id) => fake.nextSeq(id),
-            appendVerdict: (v) => fake.appendVerdict(v),
-            getVerdict: (id) => fake.getVerdict(id),
-          } satisfies CaseStore);
-      const signal = new AbortController().signal;
-      const env: StageEnv = {
-        job: parseStagePayload({
-          tenantId: stored.tenantId,
-          caseId: stored.id,
-          stage: 'defense',
-          attempt: 1,
-        }),
-        store: new GuardedCaseStore(inner, signal),
-        sink: events,
-        caseFiles: { next: () => Promise.resolve(null), get: () => Promise.resolve(stored) },
-        signal,
-        events: (id) => Promise.resolve(events.events(id).filter((e) => e.stage === 'defense')),
-        checkpoint: () => Promise.resolve(),
-      };
-      return { env, fake, events };
+  /**
+   * A Defense job over the reference fakes, at the case's defense stage. `seedEntered` stores a
+   * `stage-entered` for defense first, as the arraign job leaves behind in production (its
+   * orchestrator run emits the next stage's entry before the job stops).
+   */
+  async function defenseJob(withRelease = true, seedEntered = false) {
+    const events = new FakeEventSink();
+    const fake = new FakeCaseStore({ events, juryEnabled: false });
+    await fake.open(stored, { maxInputTokens: 1_000_000, maxOutputTokens: 200_000, maxUsd: 2 });
+    for (const to of ['map', 'arraign', 'defense'] as const) await fake.transition(stored.id, to);
+    // Earlier stages' events, so stored seqs and the orchestrator's placeholders differ.
+    for (const stage of seedEntered
+      ? (['map', 'arraign', 'defense'] as const)
+      : (['map', 'arraign'] as const)) {
+      await events.emit({
+        schemaVersion: 1,
+        caseId: stored.id,
+        seq: await fake.nextSeq(stored.id),
+        stage,
+        at: new Date(0).toISOString(),
+        actor: 'stenographer',
+        type: 'stage-entered',
+        payload: stage === 'defense' ? { from: 'arraign' } : {},
+      });
     }
+    const inner: CaseStore = withRelease
+      ? fake
+      : ({
+          open: (f, b) => fake.open(f, b),
+          stage: (id) => fake.stage(id),
+          transition: (id, to) => fake.transition(id, to),
+          chargeBudget: (id, c) => fake.chargeBudget(id, c),
+          nextSeq: (id) => fake.nextSeq(id),
+          appendVerdict: (v) => fake.appendVerdict(v),
+          getVerdict: (id) => fake.getVerdict(id),
+        } satisfies CaseStore);
+    const signal = new AbortController().signal;
+    const env: StageEnv = {
+      job: parseStagePayload({
+        tenantId: stored.tenantId,
+        caseId: stored.id,
+        stage: 'defense',
+        attempt: 1,
+      }),
+      store: new GuardedCaseStore(inner, signal),
+      sink: events,
+      caseFiles: { next: () => Promise.resolve(null), get: () => Promise.resolve(stored) },
+      signal,
+      events: (id) => Promise.resolve(events.events(id).filter((e) => e.stage === 'defense')),
+      checkpoint: () => Promise.resolve(),
+    };
+    return { env, fake, events };
+  }
 
+  describe('settlement of an up-front charge (contracts v1.2, CR-T1)', () => {
     /** A port that fails every call and reports what it spent (illustrative amounts). */
     const spent: StageCost = {
       stage: 'defense',
@@ -963,14 +984,17 @@ describe('real trial cores', () => {
       });
     }
 
-    it('gives back the unspent part of the charge, naming the stored seq of its event', async () => {
-      const { env, fake, events } = await defenseJob();
-      await cores().defense!(env).catch(() => undefined);
+    /** The settlement checks shared by the shapes below. */
+    function expectReleasedAgainstStoredCharges(
+      fake: FakeCaseStore,
+      events: FakeEventSink,
+      minSeq: number,
+    ) {
       const charges = events.events(stored.id).filter((e) => e.type === 'cost-charged');
       expect(charges.length).toBeGreaterThan(0);
       const charged = charges[0]!;
       if (charged.type !== 'cost-charged') throw new Error('unreachable');
-      expect(charged.seq).toBeGreaterThanOrEqual(2);
+      expect(charged.seq).toBeGreaterThanOrEqual(minSeq);
       const released = fake.releases(stored.id);
       expect([...released.keys()]).toContain(charged.seq);
       const refund = released.get(charged.seq)!;
@@ -982,6 +1006,28 @@ describe('real trial cores', () => {
       // Every release names a charge event this job really stored.
       const chargeSeqs = charges.map((e) => e.seq);
       for (const seq of released.keys()) expect(chargeSeqs).toContain(seq);
+    }
+
+    it('gives back the unspent part of the charge, naming the stored seq of its event', async () => {
+      const { env, fake, events } = await defenseJob();
+      await cores().defense!(env).catch(() => undefined);
+      expectReleasedAgainstStoredCharges(fake, events, 2);
+    });
+
+    it('settles in the production shape: the arraign job already stored the defense stage-entered', async () => {
+      const { env, fake, events } = await defenseJob(true, true);
+      await cores().defense!(env).catch(() => undefined);
+      // The orchestrator's own stage-entered for defense was dropped (the visit has one), so its
+      // placeholder seq has no stored event; the release still names the stored charge.
+      const entered = events
+        .events(stored.id)
+        .filter((e) => e.type === 'stage-entered' && e.stage === 'defense');
+      expect(entered).toHaveLength(1);
+      expect(entered[0]!.seq).toBe(2);
+      expectReleasedAgainstStoredCharges(fake, events, 3);
+      // Stored seqs have no gap where the dropped event would have been.
+      const seqs = events.events(stored.id).map((e) => e.seq);
+      expect(seqs).toEqual([...seqs.keys()]);
     });
 
     it('leaves the charge standing when the store cannot release', async () => {
@@ -990,5 +1036,118 @@ describe('real trial cores', () => {
       expect(events.events(stored.id).some((e) => e.type === 'cost-charged')).toBe(true);
       expect(fake.releases(stored.id).size).toBe(0);
     });
+  });
+
+  describe('one stage per job (the stop hook), against the installed orchestrator', () => {
+    const W = { template: 'witness template', params: [{ name: 'n', values: [1, 2] }] };
+    const ADMITTED = ExhibitResult.parse(readFixtureJson('exhibit-results/admissible.json'));
+    const turnCost: StageCost = {
+      stage: 'defense',
+      attempt: 1,
+      inputTokens: 10,
+      outputTokens: 5,
+      usd: 0.01,
+      wallMs: 1,
+    };
+
+    /** Defense submits a witness the Judge admits, so the stage advances to prosecution. */
+    function advancingCores(killSwitch: () => boolean | Promise<boolean>) {
+      const requests: string[] = [];
+      const model: ModelPort = {
+        runTurn: (req) => {
+          requests.push(req.promptId);
+          return Promise.resolve({ outcome: 'submitted', submission: W, cost: turnCost });
+        },
+      };
+      const fakeJ = new FakeJudge({
+        witnessResults: { [witnessSha256(W.template, W.params)]: ADMITTED },
+      });
+      // The Judge stamps the exhibit id it ran, as the real one does.
+      const judge: JudgePort = {
+        runCounterexample: fakeJ.runCounterexample.bind(fakeJ),
+        verifyPatch: fakeJ.verifyPatch.bind(fakeJ),
+        runWitness: async (...a: Parameters<FakeJudge['runWitness']>) => ({
+          ...(await fakeJ.runWitness(...a)),
+          exhibitId: witnessExhibitId(a[0].id, a[1].template, a[1].params),
+        }),
+      };
+      const cores = realTrialCores({
+        model,
+        judge,
+        modelTable: resolveModelTable({}),
+        settings: trialSettings,
+        maxStageAttempts: 3,
+        killSwitch,
+      });
+      return { cores, requests };
+    }
+
+    /** Whether the installed @affidavit/trial reads `stopAfterTransition` (PR #84). */
+    const orchestratorReadsStopHook = /stopAfterTransition/.test(Orchestrator.toString());
+
+    async function runDefense(killSwitch: () => boolean | Promise<boolean>) {
+      const { env, fake, events } = await defenseJob(true, true);
+      const { cores, requests } = advancingCores(killSwitch);
+      const error = await cores.defense!(env).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      return { error, fake, events, requests };
+    }
+
+    it('moves the case exactly one stage, then the job ends', async () => {
+      const { error, fake, events, requests } = await runDefense(() => false);
+      expect(error).toBeUndefined();
+      expect(await fake.stage(stored.id)).toBe('prosecution');
+      // Only Defense ran a model turn; Prosecution is the next job's.
+      expect(requests.length).toBeGreaterThan(0);
+      expect(requests.every((p) => p.startsWith('defense'))).toBe(true);
+      const all = events.events(stored.id);
+      expect(all.filter((e) => e.type === 'stage-exited').map((e) => e.stage)).toEqual(['defense']);
+      expect(all.some((e) => e.stage === 'prosecution' && e.type !== 'stage-entered')).toBe(false);
+    });
+
+    it('never reports a normal advance as a kill-switch halt', async () => {
+      const { error, events } = await runDefense(() => false);
+      expect(error).toBeUndefined();
+      expect(events.events(stored.id).filter((e) => e.type === 'halted')).toEqual([]);
+    });
+
+    it('still halts on a real kill switch, without moving the case', async () => {
+      const { error, fake, events, requests } = await runDefense(() => true);
+      expect(error).toBeInstanceOf(TrialHaltedError);
+      expect((error as TrialHaltedError).reason).toBe('kill-switch');
+      expect(reviewReasonOf(error)).toBeUndefined();
+      expect(await fake.stage(stored.id)).toBe('defense');
+      expect(requests).toEqual([]);
+      expect(events.events(stored.id).some((e) => e.type === 'cost-charged')).toBe(false);
+    });
+
+    it('still halts when the kill switch turns on during the stage, before it moves', async () => {
+      let calls = 0;
+      // Off for the stage's first check, on from the next check (before the model call) on.
+      const { error, fake, requests } = await runDefense(() => ++calls > 1);
+      expect(error).toBeInstanceOf(TrialHaltedError);
+      expect((error as TrialHaltedError).reason).toBe('kill-switch');
+      expect(await fake.stage(stored.id)).toBe('defense');
+      expect(requests).toEqual([]);
+    });
+
+    // Runs only once #84 (Lane 3, `stopAfterTransition`) is installed; make it unconditional when
+    // it merges. Its orchestrator emits a `halted` event when the kill switch stops a run, so this
+    // proves the worker stops through the quiet hook. Then drop the kill-switch fallback in
+    // trial.ts (see docs/lanes/lane1/contract-requests.md).
+    it.runIf(orchestratorReadsStopHook)(
+      '#84: stops through stopAfterTransition, with no halted event of any reason',
+      async () => {
+        const { error, fake, events } = await runDefense(() => false);
+        expect(error).toBeUndefined();
+        expect(await fake.stage(stored.id)).toBe('prosecution');
+        expect(events.events(stored.id).filter((e) => e.type === 'halted')).toEqual([]);
+        // The real switch still halts with the hook in place.
+        const killed = await runDefense(() => true);
+        expect((killed.error as TrialHaltedError).reason).toBe('kill-switch');
+      },
+    );
   });
 });

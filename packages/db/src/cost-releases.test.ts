@@ -60,3 +60,30 @@ describe('cost_releases migration', () => {
     }
   });
 });
+
+describe('cost_releases guard review fixes (migration 0011)', () => {
+  const fix = readFileSync(
+    fileURLToPath(new URL('../drizzle/0011_cost_releases_guard_fields.sql', import.meta.url)),
+    'utf8',
+  );
+
+  it('replaces only the release insert guard, and changes no data', () => {
+    const replaced = [...fix.matchAll(/CREATE OR REPLACE FUNCTION (\w+)/g)].map((m) => m[1]);
+    expect(replaced).toEqual(['cost_releases_insert_guard']);
+    expect(fix).not.toMatch(/\bDROP\b|DELETE FROM|UPDATE public\.|\bGRANT\b|SECURITY DEFINER/i);
+    expect(fix).toContain('SET search_path = pg_catalog, public');
+  });
+
+  it('locks the case row FOR NO KEY UPDATE, so child foreign key checks are not blocked', () => {
+    expect(fix).toMatch(/FROM public\.cases c[\s\S]*?FOR NO KEY UPDATE;/);
+    const code = fix.replace(/--[^\n]*/g, '');
+    expect(code).not.toMatch(/\bFOR UPDATE\b/);
+  });
+
+  it('refuses a charge cost with a missing or non-numeric amount instead of comparing NULL', () => {
+    for (const f of ['attempt', 'inputTokens', 'outputTokens', 'usd', 'wallMs']) {
+      expect(fix).toContain(`jsonb_typeof(v_cost->'${f}') IS DISTINCT FROM 'number'`);
+    }
+    expect(fix).toContain(`jsonb_typeof(v_cost->'stage') IS DISTINCT FROM 'string'`);
+  });
+});

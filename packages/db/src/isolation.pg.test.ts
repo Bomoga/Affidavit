@@ -232,6 +232,51 @@ describePg('cross-tenant isolation (tenant A against tenant B data)', () => {
     });
   }
 
+  // The v1.2 budget views (CR-T1) read as the invoker, so the same isolation must hold for them.
+  for (const view of ['case_budgets', 'case_cost_ledger']) {
+    it(`both tenants have rows in the ${view} view (seen by the superuser)`, async () => {
+      for (const tenant of [A, B]) {
+        const { rows } = await db().admin.query<{ n: string }>(
+          `select count(*)::text as n from ${view} where tenant_id = $1`,
+          [tenant],
+        );
+        expect(Number(rows[0]!.n), `${view} ${tenant}`).toBeGreaterThan(0);
+      }
+    });
+
+    it(`raw select on the ${view} view as tenant A returns no tenant B row`, async () => {
+      const rows = await withTenant(db().app, A, async (tx) => {
+        const r = await tx.execute(sql.raw(`select tenant_id, case_id from ${view}`));
+        return r.rows as { tenant_id: string; case_id: string }[];
+      });
+      expect(rows.length).toBeGreaterThan(0);
+      expect(rows.every((r) => r.tenant_id === A && r.case_id !== caseB.id)).toBe(true);
+      const named = await withTenant(db().app, A, async (tx) => {
+        const r = await tx.execute(sql`select 1 from ${sql.raw(view)} where case_id = ${caseB.id}`);
+        return r.rows.length;
+      });
+      expect(named).toBe(0);
+    });
+
+    it(`select on the ${view} view with no tenant set returns no rows`, async () => {
+      const { rows } = await db().app.query(`select tenant_id from ${view}`);
+      expect(rows).toHaveLength(0);
+    });
+
+    it(`select on the ${view} view with an empty tenant returns no rows`, async () => {
+      const client = await db().app.connect();
+      try {
+        await client.query('begin');
+        await client.query(`select set_config('app.tenant_id', '', true)`);
+        const { rows } = await client.query(`select tenant_id from ${view}`);
+        await client.query('rollback');
+        expect(rows).toHaveLength(0);
+      } finally {
+        client.release();
+      }
+    });
+  }
+
   it('joins and subqueries as tenant A cannot reach B rows', async () => {
     const client = await db().app.connect();
     try {

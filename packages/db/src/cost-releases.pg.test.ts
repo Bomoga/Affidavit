@@ -470,4 +470,146 @@ describePg('PgCaseStore.releaseCharge (contracts v1.2, CR-T1)', () => {
     expect(await insert(seq2, '0.1')).toBe('no error');
     expect(await releaseRows(id)).toBe(2);
   });
+
+  it('refuses a release against a charge event whose cost lacks an amount or has a non-numeric one', async () => {
+    const id = await defenseCase();
+    // The gross charge is real, so only the event's shape can refuse the release.
+    await store().chargeBudget(id, TURN);
+    const raw = (text: string) =>
+      withTenant(db().app, A, (tx) => tx.execute(sql.raw(text))).then(
+        () => 'no error',
+        (e: Error) => (e.cause as Error | undefined)?.message ?? e.message,
+      );
+    /** A cost-charged event written straight to the events table, with the given cost blob. */
+    const badCharge = async (cost: Record<string, unknown>): Promise<number> => {
+      const seq = await store().nextSeq(id);
+      const event = {
+        schemaVersion: 1,
+        caseId: id,
+        seq,
+        stage: 'defense',
+        at: '2026-11-21T12:00:00.000Z',
+        actor: 'defense',
+        type: 'cost-charged',
+        payload: { cost },
+      };
+      const json = JSON.stringify(event).replace(/'/g, "''");
+      expect(
+        await raw(`insert into events (tenant_id, case_id, seq, type, event)
+          values ('${A}', '${id}', ${seq}, 'cost-charged', '${json}'::jsonb)`),
+      ).toBe('no error');
+      return seq;
+    };
+    const shapes: Record<string, unknown>[] = [
+      { stage: 'defense', attempt: 1 }, // every amount missing
+      { ...TURN, usd: undefined }, // usd missing (JSON.stringify drops it)
+      { ...TURN, inputTokens: '100000' }, // a string, not a number
+      { ...TURN, wallMs: null },
+      { ...TURN, outputTokens: { n: 8000 } },
+    ];
+    for (const cost of shapes) {
+      const seq = await badCharge(cost);
+      const label = JSON.stringify(cost);
+      expect(
+        await raw(`insert into cost_releases
+          (tenant_id, case_id, reservation_seq, stage, attempt, input_tokens, output_tokens, usd, wall_ms)
+          values ('${A}', '${id}', ${seq}, 'defense', 1, 0, 0, 0, 0)`),
+        label,
+      ).toMatch(/cost release rejected: the cost-charged event at seq \d+ has no valid cost/);
+      // The store refuses it too, before the guard.
+      expect((await rejection(store().releaseCharge(id, UNSPENT, seq))).message, label).toMatch(
+        /no valid cost/,
+      );
+    }
+    expect(await releaseRows(id)).toBe(0);
+  });
+
+  it('locks the budget FOR NO KEY UPDATE: charges and releases serialise, child inserts do not wait', async () => {
+    const id = await defenseCase();
+    const seq = await charge(id);
+    // Allocated before the lock is taken: nextSeq updates the case row, so it would wait.
+    const nextEventSeq = await store().nextSeq(id);
+
+    const asApp = async () => {
+      const c = await db().admin.connect();
+      await c.query('begin');
+      await c.query('set local role affidavit_app');
+      await c.query(`select set_config('app.tenant_id', $1, true)`, [A]);
+      await c.query(`set local lock_timeout = '500ms'`);
+      return c;
+    };
+    const outcome = (p: Promise<unknown>) =>
+      p.then(
+        () => 'no error',
+        (e: Error) => e.message,
+      );
+
+    // The lock chargeBudget and releaseCharge take, held open by another transaction.
+    const holder = await asApp();
+    try {
+      await holder.query(`select stage from public.cases where id = $1 for no key update`, [id]);
+
+      // An event insert (its foreign key check takes FOR KEY SHARE on the case row) goes through.
+      const child = await asApp();
+      try {
+        const event = JSON.stringify({
+          schemaVersion: 1,
+          caseId: id,
+          seq: nextEventSeq,
+          stage: 'defense',
+          at: '2026-11-21T12:00:00.000Z',
+          actor: 'stenographer',
+          type: 'stage-entered',
+          payload: {},
+        });
+        expect(
+          await outcome(
+            child.query(
+              `insert into public.events (tenant_id, case_id, seq, type, event)
+               values ($1, $2, $3, 'stage-entered', $4::jsonb)`,
+              [A, id, nextEventSeq, event],
+            ),
+          ),
+        ).toBe('no error');
+      } finally {
+        await child.query('rollback');
+        child.release();
+      }
+
+      // A second charge or release of the same case still waits for the holder.
+      const rival = await asApp();
+      try {
+        expect(
+          await outcome(
+            rival.query(`select stage from public.cases where id = $1 for no key update`, [id]),
+          ),
+        ).toMatch(/lock timeout/);
+      } finally {
+        await rival.query('rollback');
+        rival.release();
+      }
+      const raced = await asApp();
+      try {
+        expect(
+          await outcome(
+            raced.query(
+              `insert into public.cost_releases
+                (tenant_id, case_id, reservation_seq, stage, attempt, input_tokens, output_tokens, usd, wall_ms)
+               values ($1, $2, $3, 'defense', 1, 0, 0, 0.1, 0)`,
+              [A, id, seq],
+            ),
+          ),
+        ).toMatch(/lock timeout/);
+      } finally {
+        await raced.query('rollback');
+        raced.release();
+      }
+    } finally {
+      await holder.query('rollback');
+      holder.release();
+    }
+
+    // Once the holder is gone, the store's own release goes through.
+    expect((await store().releaseCharge(id, UNSPENT, seq)).remainingUsd).toBe(1.997);
+  });
 });

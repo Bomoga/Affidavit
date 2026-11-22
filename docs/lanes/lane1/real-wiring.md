@@ -174,6 +174,9 @@ The orchestrator charges each model turn up front at the turn cap (`AFFIDAVIT_TU
 - For cost reports use the `case_cost_ledger` view (charged, released and net per stage attempt). A bare sum of `cost_rows` counts every up-front charge in full.
 - A release is refused, with nothing changed, when the case is closed (terminal stage or verdict), when the seq is not a `cost-charged` event of the case, when the refund names another stage or attempt or exceeds the charge in any field, or when the case's releases would exceed its charges. A refused release never fails the call: the orchestrator attaches it to the call error as `settlementError` and the charge stands.
 - The trial does not emit `cost-released` yet (Lane 3, CR-T1 step 2), so the event stream still shows only the up-front `cost-charged`; `case_budgets` and `case_cost_ledger` already show the release.
+- Even once it does, the stream can lack a `cost-released` for good: the release commits in its own transaction and the event is emitted after it, so a crash between the two leaves the release recorded and no event, and nothing re-emits it. The ledger (`cost_releases`, `case_budgets`, `case_cost_ledger`) is authoritative. A total computed from the event stream can only over-count spend, never under-count it, which is the safe direction for a budget.
+- The guard reads the charge event's cost (migration 0011): a cost with a missing or non-numeric amount, stage or attempt refuses the release instead of comparing as NULL.
+- Charges and releases lock the case row `FOR NO KEY UPDATE` (migration 0011), so they run one at a time per case but do not block event inserts and other child rows, whose foreign key checks only need `FOR KEY SHARE`.
 
 ```sql
 -- as affidavit_app, with the tenant set
