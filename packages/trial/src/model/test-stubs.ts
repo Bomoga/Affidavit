@@ -389,6 +389,8 @@ export function assistant(
   inputTokens: number,
   outputTokens: number,
   error?: string,
+  /** Text content, as the runtime puts the provider's error text on a synthetic message. */
+  text?: string,
 ): SDKMessage {
   return {
     type: 'assistant',
@@ -400,13 +402,40 @@ export function assistant(
         cache_read_input_tokens: 0,
         cache_creation_input_tokens: 0,
       },
-      content: [],
+      content: text === undefined ? [] : [{ type: 'text', text }],
     },
     parent_tool_use_id: null,
     ...(error === undefined ? {} : { error }),
     uuid: '00000000-0000-0000-0000-000000000001',
     session_id: 's',
   } as unknown as SDKMessage;
+}
+
+/**
+ * What the runtime (claude-agent-sdk 0.3.318) yields for a response that ended with
+ * `stop_reason: "refusal"`: a synthetic assistant message with error `invalid_request`, the
+ * refusal text as content, and the response's stop_reason and stop_details kept on the message.
+ */
+export function refusalAssistant(
+  opts: { category?: unknown; explanation?: string; text?: string; withDetails?: boolean } = {},
+): SDKMessage {
+  const base = assistant(
+    'm-refused',
+    0,
+    0,
+    'invalid_request',
+    opts.text ??
+      "API Error: Claude Opus 5.5's safeguards flagged this message (https://www.anthropic.com/legal/aup). This sometimes happens with safe, normal conversations. Claude Code can't respond to this message with Claude Opus 5.5.",
+  ) as unknown as { message: Record<string, unknown> };
+  base.message.stop_reason = 'refusal';
+  base.message.stop_details =
+    opts.withDetails === false
+      ? null
+      : {
+          ...(opts.category === undefined ? { category: 'cyber' } : { category: opts.category }),
+          explanation: opts.explanation ?? null,
+        };
+  return base as unknown as SDKMessage;
 }
 
 export function result(
@@ -419,6 +448,7 @@ export function result(
     errors?: string[];
     isError?: boolean;
     text?: string;
+    apiErrorStatus?: number;
   } = {},
 ): SDKMessage {
   const input = opts.input ?? 100;
@@ -449,6 +479,7 @@ export function result(
     permission_denials: [],
     errors: opts.errors ?? [],
     result: opts.text ?? '',
+    ...(opts.apiErrorStatus === undefined ? {} : { api_error_status: opts.apiErrorStatus }),
     uuid: '00000000-0000-0000-0000-000000000002',
     session_id: 's',
   } as unknown as SDKMessage;

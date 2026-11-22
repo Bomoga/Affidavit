@@ -15,7 +15,7 @@ import {
 import { join } from 'node:path';
 import type { RescanPort, ToolRunnerPort } from '@affidavit/contracts';
 import { afterAll, describe, expect, it } from 'vitest';
-import { cleanupTmp, symlinks, tmp } from '../tools/testkit.js';
+import { cleanupTmp, symlinks, tmp, withSemgrepCanary } from '../tools/testkit.js';
 import { classifyHead } from '../tools/index.js';
 import { DiscoveryRescan, hasOddControlByte, rescanPatchedTree, type RescanDeps } from './index.js';
 import {
@@ -60,7 +60,7 @@ function replay(
       mkdirSync(out, { recursive: true });
       const doc = JSON.parse(sarifFor(variant)) as Record<string, unknown>;
       edit(doc);
-      writeFileSync(join(out, 'semgrep.sarif'), JSON.stringify(doc));
+      writeFileSync(join(out, 'semgrep.sarif'), JSON.stringify(withSemgrepCanary(doc)));
       return Promise.resolve({ exitCode, outputPath: out });
     },
   };

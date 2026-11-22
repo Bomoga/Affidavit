@@ -8,6 +8,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { AdmissibilityRule, samples, type TrialEvent } from '@affidavit/contracts';
 import { FIXTURES_DIR } from '../src/fixtures.js';
+import { sha256Hex } from '../src/hash.js';
 
 function write(rel: string, value: unknown): void {
   const file = join(FIXTURES_DIR, rel);
@@ -98,6 +99,50 @@ write('trials/nodegoat-sqli-001.events.json', [
   ev('verify', 'judge', 'verify-result', { result: { ...verify, counterexamples: [] } }),
   ev('verify', 'judge', 'stage-exited', { to: 'verdict' }),
   ev('verdict', 'stenographer', 'verdict-written', { verdict }),
+]);
+
+// Exhibit content for the gate trial, same ids as its events. The event stream carries only ids,
+// so a client needs this to show the patch. Synthetic: the witness code is a placeholder and the
+// diff is a short illustrative patch, not one recorded from a run. sha256 is of `code`.
+const witnessCode = '/* witness recorded from run [id] */';
+const patchCode = '/* patch recorded from run [id] */';
+const patchDiff = [
+  'diff --git a/app/data/allocations-dao.js b/app/data/allocations-dao.js',
+  '--- a/app/data/allocations-dao.js',
+  '+++ b/app/data/allocations-dao.js',
+  '@@ -12,6 +12,6 @@ function AllocationsDAO(db) {',
+  '   // Synthetic fixture patch [id], not recorded from a run.',
+  '   this.getByUserId = (userId, threshold, callback) => {',
+  '-    const sql = "SELECT * FROM allocations WHERE userId = " + userId + " AND stocks > " + threshold;',
+  '-    db.query(sql, callback);',
+  '+    const sql = "SELECT * FROM allocations WHERE userId = ? AND stocks > ?";',
+  '+    db.query(sql, [userId, threshold], callback);',
+  '   };',
+  ' }',
+  '',
+].join('\n');
+write('exhibits/nodegoat-sqli-001.exhibits.json', [
+  {
+    schemaVersion: 1,
+    id: 'exhibit-witness-001',
+    caseId: caseFile.id,
+    author: 'defense',
+    code: witnessCode,
+    sha256: sha256Hex(witnessCode),
+    kind: 'witness',
+  },
+  {
+    schemaVersion: 1,
+    id: 'exhibit-patch-001',
+    caseId: caseFile.id,
+    author: 'remedy',
+    code: patchCode,
+    sha256: sha256Hex(patchCode),
+    kind: 'patch',
+    diff: patchDiff,
+    filesTouched: ['app/data/allocations-dao.js'],
+    linesChanged: 4,
+  },
 ]);
 
 seq = 0;

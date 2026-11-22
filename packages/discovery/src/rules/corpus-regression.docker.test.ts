@@ -19,6 +19,7 @@
  */
 import { execFile } from 'node:child_process';
 import {
+  chmodSync,
   cpSync,
   existsSync,
   mkdirSync,
@@ -148,8 +149,12 @@ describe.skipIf(!enabled)('own Semgrep rules, Docker and corpus', { timeout: 900
 
   it("passes Semgrep's own rule tests (ruleid and ok annotations)", async () => {
     const scratch = join(work, 'ruletests');
-    mkdirSync(join(scratch, 'tmp'), { recursive: true });
-    mkdirSync(join(scratch, 'semgrep-home'), { recursive: true });
+    // Writable for the container's root, which runs without CAP_DAC_OVERRIDE (--cap-drop ALL), so
+    // a directory left at the umask's 0755 would be read-only to it on a Linux host.
+    for (const sub of ['tmp', 'semgrep-home']) {
+      mkdirSync(join(scratch, sub), { recursive: true });
+      chmodSync(join(scratch, sub), 0o777);
+    }
     const stdout = await new Promise<string>((resolve, reject) => {
       execFile(
         'docker',

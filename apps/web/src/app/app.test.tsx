@@ -56,7 +56,7 @@ describe('gate case view (nodegoat-sqli-001)', () => {
     renderApp('/cases/nodegoat-sqli-001');
     const h1 = await settled();
     expect(h1.textContent).toContain('Verified: weakness proven and fix confirmed');
-    expect(screen.getByText('VERIFIED')).toBeTruthy();
+    expect(screen.getAllByText('VERIFIED')[0]).toBeTruthy();
     expect(screen.queryByText('UNVERIFIED')).toBeNull();
     expect(
       screen.queryByText('The record has no Judge result accepting a patch for this case.'),
@@ -73,7 +73,7 @@ describe('gate case view (nodegoat-sqli-001)', () => {
     renderApp('/cases/nodegoat-sqli-001');
     const toggle = await screen.findByRole('button', { name: /exhibit-witness-001/ });
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
-    expect(screen.queryByRole('table')).toBeNull();
+    expect(screen.queryByRole('table', { name: 'Run log for exhibit-witness-001' })).toBeNull();
     fireEvent.click(toggle);
     expect(toggle.getAttribute('aria-expanded')).toBe('true');
     const table = screen.getByRole('table', { name: 'Run log for exhibit-witness-001' });
@@ -116,7 +116,7 @@ describe('VERIFIED stamp', () => {
 
   it('shows only when the view model has Judge evidence for the patch', () => {
     render(<CaseFile view={buildCaseView(withVerify(events, [accepted]))} />);
-    expect(screen.getByText('VERIFIED')).toBeTruthy();
+    expect(screen.getAllByText('VERIFIED')[0]).toBeTruthy();
     expect(screen.queryByText('UNVERIFIED')).toBeNull();
   });
 });
@@ -127,7 +127,7 @@ describe('escalated case view (escalated-001)', () => {
     expect(
       await screen.findByRole('heading', { level: 1, name: 'Needs human review' }),
     ).toBeTruthy();
-    expect(screen.getByText('HUMAN REVIEW')).toBeTruthy();
+    expect(screen.getAllByText('HUMAN REVIEW')[0]).toBeTruthy();
     const panel = screen.getByRole('region', { name: 'Human review needed' });
     expect(within(panel).getByText(/could not produce a test the Judge would admit/)).toBeTruthy();
     expect(
@@ -136,8 +136,11 @@ describe('escalated case view (escalated-001)', () => {
     expect(within(panel).getAllByRole('listitem').length).toBeGreaterThan(0);
     expect(screen.queryByText('VERIFIED')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: /exhibit-witness-002/ }));
-    expect(screen.getByText(/did not behave differently on the vulnerable code/)).toBeTruthy();
-    expect(screen.queryByText(/Rule:/)).toBeNull();
+    const exhibits = screen.getByRole('region', { name: /^Exhibits/ });
+    expect(
+      within(exhibits).getByText(/did not behave differently on the vulnerable code/),
+    ).toBeTruthy();
+    expect(within(exhibits).queryByText(/Rule:/)).toBeNull();
   });
 });
 

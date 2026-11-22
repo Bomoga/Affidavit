@@ -1,0 +1,1 @@
+affidavitSemgrepCanary('scanned');
