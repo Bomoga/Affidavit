@@ -11,14 +11,14 @@ import {
   type TrialEvent,
 } from '@affidavit/contracts';
 import { FakeEventSink } from '@affidavit/testing';
-import { REFUSAL_CLASS } from './model/anthropic.js';
-import { ModelCallError, ModelUnconfiguredError } from './model/errors.js';
+import { ModelCallError, ModelUnconfiguredError, REFUSAL_CLASS } from './model/errors.js';
 import {
   Orchestrator,
   RetryStageError,
   type AgentRequest,
   type BudgetSettlement,
   type ModelTurnResult,
+  type ReportingEventSink,
   type StageHandler,
 } from './orchestrator.js';
 import {
@@ -83,6 +83,7 @@ async function setup(
     stage?: readonly CaseStage[];
     settlement?: BudgetSettlement;
     killSwitch?: () => boolean;
+    stopAfterTransition?: () => boolean;
     maxStageAttempts?: number;
   } = {},
 ) {
@@ -99,6 +100,9 @@ async function setup(
         killSwitch: opts.killSwitch ?? (() => false),
         maxStageAttempts: opts.maxStageAttempts ?? 1,
         now: () => NOW,
+        ...(opts.stopAfterTransition === undefined
+          ? {}
+          : { stopAfterTransition: opts.stopAfterTransition }),
       },
       ...(opts.settlement === undefined ? {} : { settlement: opts.settlement }),
     });
@@ -483,5 +487,169 @@ describe('halted events (CR-T12)', () => {
     const halted = ofType(events(), 'halted')[0]!;
     expect(halted.payload.reason).toBe('budget-exhausted');
     expect(halted.payload.refusalCategory).toBeUndefined();
+  });
+});
+
+describe('stopping after a transition is not a halt (#84 review)', () => {
+  const ORDER: CaseStage[] = ['intake', 'map', 'arraign', 'defense'];
+  const advance = (): Partial<Record<CaseStage, StageHandler>> =>
+    Object.fromEntries(
+      ORDER.map((s, i) => [
+        s,
+        { run: () => Promise.resolve({ kind: 'advance', next: ORDER[i + 1] ?? 'prosecution' }) },
+      ]),
+    );
+
+  it('a normal advance with stopAfterTransition ends quietly: no halted event', async () => {
+    // As the worker runs it: stop once this job's stage has moved the case.
+    let moved = false;
+    const { store, events, make } = await setup({ stage: [], stopAfterTransition: () => moved });
+    const transition = store.transition.bind(store);
+    store.transition = async (id, to) => {
+      await transition(id, to);
+      moved = true;
+    };
+    expect(await make(advance(), scripted([])).run(CASE)).toEqual({
+      status: 'stopped',
+      stage: 'map',
+    });
+    expect(await store.stage(CASE)).toBe('map');
+    const evs = events();
+    expect(evs.some((e) => e.type === 'halted')).toBe(false);
+    expect(evs.map((e) => [e.type, e.stage])).toEqual([
+      ['stage-entered', 'intake'],
+      ['stage-exited', 'intake'],
+      ['stage-entered', 'map'],
+    ]);
+  });
+
+  it('the kill switch still halts, with its event, when stopAfterTransition is wired', async () => {
+    const { events, make } = await setup({
+      stage: [],
+      killSwitch: () => true,
+      stopAfterTransition: () => false,
+    });
+    expect(await make(advance(), scripted([])).run(CASE)).toEqual({
+      status: 'halted',
+      stage: 'intake',
+      reason: 'kill-switch',
+    });
+    expect(ofType(events(), 'halted')).toHaveLength(1);
+  });
+
+  it('is read after the terminal check, so a terminal stage still returns terminal', async () => {
+    const { make } = await setup({ stopAfterTransition: () => true });
+    const defense: StageHandler = {
+      run: () =>
+        Promise.resolve({
+          kind: 'escalate',
+          reason: 'no-admissible-witness-above-floor',
+          detail: 'x',
+        }),
+    };
+    // At defense (not terminal) the run stops before the handler runs.
+    expect(await make({ defense }, scripted([])).run(CASE)).toEqual({
+      status: 'stopped',
+      stage: 'defense',
+    });
+  });
+
+  it('records a kill-switch halt once per case, not on every rerun while the switch stays on', async () => {
+    const { events, make } = await setup({ killSwitch: () => true });
+    const orch = make({ defense: callingDefense(1) }, scripted([]));
+    for (let i = 0; i < 3; i++) {
+      expect((await orch.run(CASE)).status).toBe('halted');
+    }
+    expect(ofType(events(), 'halted')).toHaveLength(1);
+    expect(ofType(events(), 'stage-entered')).toHaveLength(1);
+  });
+});
+
+describe('a sink that assigns the seq itself (#84 review, stage-scoped ports)', () => {
+  /** Like the worker's stage-scoped ports: the store hands out 0, the sink assigns the real seq. */
+  async function scoped(returnsSeq: boolean) {
+    const sink = new FakeEventSink();
+    const store = new LoggingCaseStore([], { events: sink, juryEnabled: false });
+    await openAt(store, CF, BIG_BUDGET, PATH_TO.defense);
+    let next = 0;
+    const scopedSink: ReportingEventSink = {
+      emit: async (e) => {
+        const seq = next++;
+        await sink.emit({ ...e, seq });
+        return returnsSeq ? seq : undefined;
+      },
+    };
+    store.nextSeq = () => Promise.resolve(0);
+    const orch = new Orchestrator({
+      store,
+      sink: scopedSink,
+      model: scripted([{ outcome: 'no-submission', cost: spent(0.001) }]),
+      handlers: { defense: callingDefense(1) },
+      config: { killSwitch: () => false, maxStageAttempts: 1, now: () => NOW },
+    });
+    await orch.run(CASE);
+    return { store, events: assertSchemaValid(sink.events(CASE)) };
+  }
+
+  it('names the seq the sink assigned when the sink returns it', async () => {
+    const { store, events } = await scoped(true);
+    const charged = ofType(events, 'cost-charged');
+    const released = ofType(events, 'cost-released');
+    expect(charged).toHaveLength(1);
+    expect(charged[0]!.seq).toBeGreaterThan(0);
+    expect(released).toHaveLength(1);
+    expect(released[0]!.payload.reservationSeq).toBe(charged[0]!.seq);
+    expect([...store.releases(CASE).keys()]).toEqual([charged[0]!.seq]);
+  });
+
+  it('releases nothing when the sink assigns seqs but does not say which (fails closed)', async () => {
+    const { store, events } = await scoped(false);
+    expect(ofType(events, 'cost-released')).toHaveLength(0);
+    expect(store.releases(CASE).size).toBe(0);
+    const verdict = Verdict.parse(await store.getVerdict(CASE));
+    expect(verdict.cost[0]).toMatchObject({ usd: TURN_BUDGET.maxUsd });
+  });
+});
+
+describe('a reported cost on a successful call that is not valid is unknown spend', () => {
+  it.each([
+    ['negative usd', { ...spent(0.01), usd: -0.4 }],
+    ['NaN usd', { ...spent(0.01), usd: Number.NaN }],
+    ['infinite input tokens', { ...spent(0.01), inputTokens: Number.POSITIVE_INFINITY }],
+    ['negative output tokens', { ...spent(0.01), outputTokens: -5 }],
+  ])('%s: nothing is released and the whole charge stands', async (_kind, cost) => {
+    const { store, events, make } = await setup();
+    const seen = { costs: [] as readonly StageCost[] };
+    await make(
+      { defense: callingDefense(1, seen) },
+      scripted([{ outcome: 'no-submission', cost }]),
+    ).run(CASE);
+    expect(ofType(events(), 'cost-released')).toHaveLength(0);
+    expect(store.charges(CASE)).toHaveLength(1);
+    expect(seen.costs[0]).toMatchObject({
+      inputTokens: TURN_BUDGET.maxInputTokens,
+      outputTokens: TURN_BUDGET.maxOutputTokens,
+      usd: TURN_BUDGET.maxUsd,
+    });
+  });
+
+  it('a huge reported field is charged as an overage and overdraws the case', async () => {
+    const { store, events, make } = await setup();
+    const huge = { ...spent(0.01), inputTokens: 1e15 };
+    const out = await make(
+      { defense: callingDefense(1) },
+      scripted([{ outcome: 'no-submission', cost: huge }]),
+    ).run(CASE);
+    expect(out).toEqual({ status: 'terminal', stage: 'escalated' });
+    expect(store.charges(CASE)[1]).toMatchObject({
+      inputTokens: 1e15 - TURN_BUDGET.maxInputTokens,
+    });
+    // Only the fields under the reservation come back, never more than was reserved.
+    const released = ofType(events(), 'cost-released');
+    expect(released).toHaveLength(1);
+    expect(released[0]!.payload.cost.inputTokens).toBe(0);
+    expect(released[0]!.payload.cost.usd).toBeLessThanOrEqual(TURN_BUDGET.maxUsd);
+    expect(released[0]!.payload.cost.outputTokens).toBeLessThanOrEqual(TURN_BUDGET.maxOutputTokens);
+    expect(ofType(events(), 'budget-exhausted')).toHaveLength(1);
   });
 });

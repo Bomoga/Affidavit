@@ -21,7 +21,7 @@ import {
 } from '@affidavit/contracts';
 import { digestOf } from './canonical.js';
 import type { SubmissionSpec } from './envelope.js';
-import { ModelCallError, ModelUnconfiguredError } from './model/errors.js';
+import { ModelCallError, ModelUnconfiguredError, isModelRefusal } from './model/errors.js';
 import { hasPreflight } from './model/preflight.js';
 import { assertAllowedTools, type ModelRole } from './roles.js';
 import { buildVerdict, finalizeVerdict } from './verdict.js';
@@ -96,8 +96,19 @@ export interface StageHandler {
 }
 
 export interface OrchestratorConfig {
-  /** Global kill switch, read before every stage and every model call. */
+  /**
+   * Global kill switch, read before every stage and every model call. Only the real switch: a
+   * tripped switch records a `halted` event with reason `kill-switch`. Use `stopAfterTransition`
+   * to end a run early for any other reason.
+   */
   killSwitch: () => boolean | Promise<boolean>;
+  /**
+   * Optional: ends the run quietly once it returns true, read at the top of each stage after its
+   * `stage-entered` (and after the terminal check, so a terminal stage still writes its verdict).
+   * No `halted` event, no kill-switch semantics; `run` returns `{ status: 'stopped' }`. The worker
+   * uses it to move the case at most one stage per job (CR-7).
+   */
+  stopAfterTransition?: () => boolean | Promise<boolean>;
   /** Total runs of one stage, including the first. */
   maxStageAttempts: number;
   now?: () => number;
@@ -105,7 +116,11 @@ export interface OrchestratorConfig {
 
 export interface OrchestratorDeps {
   store: CaseStore;
-  sink: EventSink;
+  /**
+   * Any contract `EventSink`, or a sink that assigns the seq itself and reports it: its `emit`
+   * may resolve to the seq it assigned, or to the stored event (CR-T1, see `ReportingEventSink`).
+   */
+  sink: EventSink | ReportingEventSink;
   model: ModelPort;
   handlers: Partial<Record<CaseStage, StageHandler>>;
   config: OrchestratorConfig;
@@ -122,6 +137,16 @@ export interface OrchestratorDeps {
    * under-counts.
    */
   settlement?: BudgetSettlement;
+}
+
+/**
+ * A sink that assigns each event's seq itself (the worker's stage-scoped sink, whose store hands
+ * out a placeholder) and resolves to the seq it assigned, or the stored event, or nothing for an
+ * event it dropped. A release names its reservation by that seq, so a sink that assigns seqs must
+ * report them.
+ */
+export interface ReportingEventSink {
+  emit(event: TrialEvent): Promise<number | { seq: number } | void>;
 }
 
 /**
@@ -158,6 +183,8 @@ export type RunHaltReason = Exclude<HaltReason, 'budget-exhausted'>;
  */
 export type RunOutcome =
   | { status: 'terminal'; stage: CaseStage }
+  /** `config.stopAfterTransition` ended the run at `stage`. Nothing is recorded for it. */
+  | { status: 'stopped'; stage: CaseStage }
   | {
       status: 'halted';
       stage: CaseStage;
@@ -241,18 +268,10 @@ export const EVENT_ACTOR_FOR_STAGE: Readonly<Record<CaseStage, Role>> = {
 type RunHalt = Halt & { reason: RunHaltReason };
 type StageRun = StageResult | { kind: 'halted'; halt: RunHalt };
 
-/**
- * `REFUSAL_CLASS` in `model/anthropic.ts`, repeated here because that module imports this one.
- * The orchestrator tests build their refusal from `REFUSAL_CLASS`, so the two cannot drift apart
- * unnoticed.
- */
-const PROVIDER_REFUSAL_CLASS = 'refusal';
-
 /** The allowlisted category of a provider refusal, or undefined when `err` is not one. */
 function refusalOf(err: unknown): RefusalCategory | undefined {
-  if (!(err instanceof ModelCallError)) return undefined;
-  if (err.provider?.errorClass !== PROVIDER_REFUSAL_CLASS) return undefined;
-  const parsed = RefusalCategory.safeParse(err.provider.refusalCategory);
+  if (!isModelRefusal(err)) return undefined;
+  const parsed = RefusalCategory.safeParse(err.provider?.refusalCategory);
   return parsed.success ? parsed.data : 'other';
 }
 
@@ -310,14 +329,27 @@ export class Orchestrator {
    * TrialWorkspace (separate from the admitted-only getExhibits); not done here.
    */
   private readonly exhibitsSeen = new Map<CaseId, ExhibitId[]>();
-  /** Reservation seqs this instance already released, so a seq is never released twice. */
-  private readonly released = new Set<string>();
   /**
-   * The stage each case was halted at by this instance. A halt moves no stage, so the next run
-   * resumes inside the stage it already entered and does not emit a second `stage-entered`.
-   * In memory only: a new instance emits `stage-entered` again on resume.
+   * Per case, the reservation seqs this instance already released, so a seq is never released
+   * twice. Dropped when the case reaches a terminal stage, so a long-lived instance holds entries
+   * only for cases still in progress.
    */
-  private readonly haltedAt = new Map<CaseId, CaseStage>();
+  private readonly released = new Map<CaseId, Set<number>>();
+  /**
+   * The last halt this instance recorded per case, until the case moves on. A halt moves no
+   * stage, so the next run resumes inside the stage it already entered (no second
+   * `stage-entered`), and the same halt at the same stage is recorded once, not on every rerun
+   * while the kill switch stays on. Dropped on the next transition or terminal stage. In memory
+   * only: a new instance emits `stage-entered` and the halt again.
+   */
+  private readonly haltedAt = new Map<CaseId, { stage: CaseStage; reason: HaltReason }>();
+  /**
+   * Per case, the highest event seq this instance saw assigned, and whether seqs proved not to be
+   * unique (a seq not above the last one). A release is keyed by its reservation's seq, so when
+   * seqs are not trustworthy nothing is released and the charge stands (fail closed). Dropped
+   * when the case reaches a terminal stage.
+   */
+  private readonly seqs = new Map<CaseId, { last: number; untrusted: boolean }>();
 
   constructor(private readonly deps: OrchestratorDeps) {}
 
@@ -326,8 +358,8 @@ export class Orchestrator {
     const { store, handlers, config } = this.deps;
     let stage = await store.stage(caseId);
     let from: CaseStage | undefined;
-    let resumed = this.haltedAt.get(caseId) === stage;
-    this.haltedAt.delete(caseId);
+    let resumed = this.haltedAt.get(caseId)?.stage === stage;
+    if (!resumed) this.haltedAt.delete(caseId);
 
     for (;;) {
       if (!resumed) {
@@ -340,7 +372,11 @@ export class Orchestrator {
         if (stage === 'dismissed' || stage === 'escalated') {
           await this.writeTerminalVerdict(caseId, stage, stage);
         }
+        this.forgetCase(caseId);
         return { status: 'terminal', stage };
+      }
+      if (config.stopAfterTransition !== undefined && (await config.stopAfterTransition())) {
+        return { status: 'stopped', stage };
       }
 
       if (await config.killSwitch()) {
@@ -374,10 +410,19 @@ export class Orchestrator {
         next = 'escalated';
         await this.escalate(caseId, stage, outcome.reason, outcome.detail);
       }
+      // The case moved on, so an earlier halt no longer describes it.
+      this.haltedAt.delete(caseId);
       await this.emit(caseId, stage, 'stage-exited', { to: next });
       from = stage;
       stage = next;
     }
+  }
+
+  /** Drops the per-case bookkeeping that only matters while a case is in progress. */
+  private forgetCase(caseId: CaseId): void {
+    this.released.delete(caseId);
+    this.haltedAt.delete(caseId);
+    this.seqs.delete(caseId);
   }
 
   private async runStage(
@@ -600,11 +645,21 @@ export class Orchestrator {
       );
       throw replacement ?? err;
     }
+    // A reported cost that is not a valid StageCost with finite, non-negative numbers is unknown
+    // spend, as on the failure path: nothing is charged or released and the whole charge stands.
+    const reported = validCost(result.cost);
+    if (reported === undefined) {
+      row.wallMs = Math.max(0, now() - started);
+      if (result.outcome === 'budget-exhausted') {
+        throw new BudgetExhaustedError(`the model reported its turn budget exhausted in ${stage}`);
+      }
+      return result;
+    }
     const actual: StageCost = {
-      ...result.cost,
+      ...reported,
       stage,
       attempt,
-      wallMs: result.cost.wallMs || now() - started,
+      wallMs: reported.wallMs || Math.max(0, now() - started),
     };
     row.wallMs = actual.wallMs;
 
@@ -673,14 +728,29 @@ export class Orchestrator {
 
     // Not rounded: a release gives back exactly the unspent part, so a sub-micro-dollar spend
     // (5e-7) still shows in the stream and the verdict instead of rounding away to zero.
+    // Capped at the reservation here, field by field, whatever the store would allow.
+    const gap = excess(stage, attempt, reservation, actual);
     const unspent: StageCost = {
-      ...excess(stage, attempt, reservation, actual),
-      usd: Math.max(0, reservation.usd - actual.usd),
+      ...gap,
+      inputTokens: Math.min(gap.inputTokens, reservation.inputTokens),
+      outputTokens: Math.min(gap.outputTokens, reservation.outputTokens),
+      usd: Math.min(Math.max(0, reservation.usd - actual.usd), reservation.usd),
     };
     const settlement = this.settlement();
-    const key = `${caseId}:${reservationSeq}`;
-    if (isZero(unspent) || settlement === undefined || this.released.has(key)) {
+    let releasedSeqs = this.released.get(caseId);
+    if (isZero(unspent) || settlement === undefined || releasedSeqs?.has(reservationSeq)) {
       return { overdrawn: overdrew };
+    }
+    if (this.seqs.get(caseId)?.untrusted !== false) {
+      // The store keys a release by the reservation's seq. Seqs that are not unique (a sink that
+      // assigns the real seq and does not return it, as the worker's stage-scoped sink did) would
+      // release against the wrong charge, so nothing is released and the charge stands.
+      return {
+        overdrawn: overdrew,
+        releaseError: new Error(
+          'event seqs are not unique for this case, so the reservation cannot be named; the charge stands',
+        ),
+      };
     }
     let refund: StageCost;
     let remaining: BudgetState;
@@ -691,7 +761,11 @@ export class Orchestrator {
       return { overdrawn: overdrew, releaseError };
     }
     // Released in the store: never release this seq again, even if the event below fails.
-    this.released.add(key);
+    if (releasedSeqs === undefined) {
+      releasedSeqs = new Set();
+      this.released.set(caseId, releasedSeqs);
+    }
+    releasedSeqs.add(reservationSeq);
     try {
       await this.emit(
         caseId,
@@ -774,8 +848,13 @@ export class Orchestrator {
 
   /** Records a halt at `stage` (a `halted` event, no stage change) and returns the outcome. */
   private async halt(caseId: CaseId, stage: CaseStage, halt: RunHalt): Promise<RunOutcome> {
-    await this.emit(caseId, stage, 'halted', Halt.parse(halt), 'stenographer');
-    this.haltedAt.set(caseId, stage);
+    const prior = this.haltedAt.get(caseId);
+    // Once per case: a rerun that halts again at the same stage for the same reason (the kill
+    // switch still on) records nothing new.
+    if (prior?.stage !== stage || prior.reason !== halt.reason) {
+      await this.emit(caseId, stage, 'halted', Halt.parse(halt), 'stenographer');
+    }
+    this.haltedAt.set(caseId, { stage, reason: halt.reason });
     return {
       status: 'halted',
       stage,
@@ -883,13 +962,40 @@ export class Orchestrator {
       type,
       payload,
     });
-    await sink.emit(event);
+    // The contract sink returns nothing, but a sink that assigns the seq itself (the worker's
+    // stage-scoped sink, whose store hands out a placeholder) may return the stored event or its
+    // seq. That is the seq a release must name; otherwise the parsed one is.
+    const returned: unknown = await sink.emit(event);
+    const seq = assignedSeq(returned) ?? event.seq;
+    this.noteSeq(caseId, seq);
     this.noteExhibits(event);
     if (event.type === 'dismissed') {
       // Kept where another instance can read it back, so a dismissed case can be repaired.
       this.dismissals.set(caseId, event.payload.dismissal);
       await this.deps.workspace?.saveDismissal(caseId, event.payload.dismissal);
     }
-    return event.seq;
+    return seq;
   }
+
+  /** Records an assigned seq; one that is not above the last seen marks the case's seqs unusable. */
+  private noteSeq(caseId: CaseId, seq: number): void {
+    const s = this.seqs.get(caseId);
+    if (s === undefined) {
+      this.seqs.set(caseId, { last: seq, untrusted: false });
+      return;
+    }
+    if (seq <= s.last) s.untrusted = true;
+    else s.last = seq;
+  }
+}
+
+/** The seq a sink reports it assigned: a non-negative integer, or a stored event carrying one. */
+function assignedSeq(returned: unknown): number | undefined {
+  const ok = (n: unknown): n is number => Number.isInteger(n) && (n as number) >= 0;
+  if (ok(returned)) return returned;
+  if (typeof returned === 'object' && returned !== null) {
+    const seq = (returned as { seq?: unknown }).seq;
+    if (ok(seq)) return seq;
+  }
+  return undefined;
 }

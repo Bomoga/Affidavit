@@ -635,6 +635,76 @@ describe('a refusal anywhere in the stream', () => {
   });
 });
 
+describe('a result whose figures are not finite is unknown spend for that field (#84 review)', () => {
+  /** A submitted turn whose result is edited by `edit` before the port reads it. */
+  function withResult(streamed: [number, number], edit: (r: Record<string, unknown>) => void) {
+    return makePort(async function* (h) {
+      yield assistant('m1', streamed[0], streamed[1]);
+      await h.callTool(qualifiedToolName('submit_witness'), GOOD_WITNESS);
+      const r = result('success', { usd: 0.01, input: 300, output: 40 }) as unknown as Record<
+        string,
+        unknown
+      >;
+      edit(r);
+      yield r as unknown as SDKMessage;
+    }).port;
+  }
+  const cap = requestFor('defense').budget;
+
+  it.each([
+    ['NaN', Number.NaN],
+    ['infinite', Number.POSITIVE_INFINITY],
+    ['negative', -1],
+    ['missing', undefined],
+  ])('a %s total_cost_usd reports the whole USD budget, never zero', async (_k, usd) => {
+    const port = withResult([300, 40], (r) => {
+      r.total_cost_usd = usd;
+    });
+    const out = await port.runTurn(requestFor('defense'));
+    expect(out.cost.usd).toBe(cap.maxUsd);
+    // The token figures were known, so they stay as reported.
+    expect(out.cost.inputTokens).toBe(300);
+    expect(out.cost.outputTokens).toBe(40);
+  });
+
+  it('a missing cache field falls back to the streamed tokens, not zero', async () => {
+    const port = withResult([250, 30], (r) => {
+      const mu = r.modelUsage as Record<string, Record<string, unknown>>;
+      delete mu['claude-opus-5-5']!.cacheReadInputTokens;
+    });
+    const out = await port.runTurn(requestFor('defense'));
+    expect(out.cost.inputTokens).toBe(250);
+    expect(out.cost.outputTokens).toBe(40);
+    expect(out.cost.usd).toBe(0.01);
+  });
+
+  it('an unknown token total with nothing streamed reports the cap for that field', async () => {
+    const port = withResult([0, 0], (r) => {
+      const mu = r.modelUsage as Record<string, Record<string, unknown>>;
+      mu['claude-opus-5-5']!.outputTokens = Number.NaN;
+    });
+    const out = await port.runTurn(requestFor('defense'));
+    expect(out.cost.outputTokens).toBe(cap.maxOutputTokens);
+    expect(out.cost.inputTokens).toBe(300);
+  });
+
+  it('a refusal whose dollars are not finite stays unknown spend', async () => {
+    const { port } = makePort(async function* () {
+      await Promise.resolve();
+      yield refusalAssistant({ category: 'cyber' });
+      const r = result('success', { usd: 0.02 }) as unknown as Record<string, unknown>;
+      r.total_cost_usd = Number.NaN;
+      yield r as unknown as SDKMessage;
+    });
+    const err: unknown = await port.runTurn(requestFor('defense')).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ModelCallError);
+    expect((err as ModelCallError).cost).toBeUndefined();
+  });
+});
+
 describe('settling the up-front charge in a trial', () => {
   async function runFailingDefense(
     script: Script | ModelPort,

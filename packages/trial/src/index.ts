@@ -15,6 +15,7 @@ export type {
   ModelTurnResult,
   OrchestratorConfig,
   OrchestratorDeps,
+  ReportingEventSink,
   HaltReason,
   RunHaltReason,
   RunOutcome,

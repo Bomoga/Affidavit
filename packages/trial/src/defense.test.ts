@@ -6,6 +6,7 @@ import {
   type ModelPort,
   type ParamSpace,
   type StageCost,
+  type TrialEvent,
 } from '@affidavit/contracts';
 import { getPrompt, renderPrompt } from '@affidavit/prompts';
 import {
@@ -356,18 +357,27 @@ async function runScripted(
     run: () => Promise.resolve({ kind: 'advance', next: to }),
   });
   const kill = opts.killAfterCalls;
+  const inner = createDefenseHandler({
+    caseFiles: new FakeCaseFileSource([cf]),
+    judge: withRecipeIds(judge),
+    render: renderPrompt,
+    config: opts.cfg ?? SECOND_ATTEMPT,
+    workspace,
+  });
+  // What Defense itself threw, before the orchestrator turned it into a halt (L3-21).
+  let handlerError: unknown;
   const orch = new Orchestrator({
     store,
     sink,
     model,
     handlers: {
-      defense: createDefenseHandler({
-        caseFiles: new FakeCaseFileSource([cf]),
-        judge: withRecipeIds(judge),
-        render: renderPrompt,
-        config: opts.cfg ?? SECOND_ATTEMPT,
-        workspace,
-      }),
+      defense: {
+        run: (ctx) =>
+          inner.run(ctx).catch((e: unknown) => {
+            handlerError = e;
+            throw e;
+          }),
+      },
       prosecution: next('remedy'),
       remedy: next('verify'),
       verify: next('jury'),
@@ -382,7 +392,27 @@ async function runScripted(
   const run = () => orch.run(cf.id);
   const events = () => assertSchemaValid(sink.events(cf.id));
   const calls = () => model.requests.map((r) => [r.promptId, r.model]);
-  return { run, store, events, model, calls, judge, workspace };
+  const thrown = () => handlerError;
+  return { run, store, events, model, calls, judge, workspace, thrown };
+}
+
+/**
+ * Since L3-21 an unrouted refusal (Defense's `DefenseRefusedError` below the floor) halts the case
+ * with a `halted` event, reason `model-refusal`, instead of failing the job: the queue no longer
+ * retries the stage, so the refused model is not asked again, and the worker flags review.
+ */
+function expectRefusalHalt(
+  evs: readonly TrialEvent[],
+  category: string,
+): Extract<TrialEvent, { type: 'halted' }> {
+  const halted = evs.filter((e) => e.type === 'halted');
+  expect(halted).toHaveLength(1);
+  const h = halted[0]!;
+  if (h.type !== 'halted') throw new Error('unreachable');
+  expect(h.stage).toBe('defense');
+  expect(h.payload).toMatchObject({ reason: 'model-refusal', refusalCategory: category });
+  expect(evs.some((e) => e.type === 'dismissed' || e.type === 'escalated')).toBe(false);
+  return h;
 }
 
 describe('Defense after a provider refusal, default route review (L3-20, CR-T13)', () => {
@@ -428,15 +458,20 @@ describe('Defense after a provider refusal, default route review (L3-20, CR-T13)
     expect(detail).not.toContain('weather');
 
     const below = await runScripted(caseFile(0.2), [refusal('weather')], {}, { cfg: config });
-    const err: unknown = await below.run().then(
-      () => undefined,
-      (e: unknown) => e,
-    );
+    expect(await below.run()).toEqual({
+      status: 'halted',
+      stage: 'defense',
+      reason: 'model-refusal',
+      refusalCategory: 'other',
+    });
+    const err = below.thrown();
     expect((err as Error).message).toContain('(category other)');
     expect((err as Error).message).not.toContain('weather');
+    const h = expectRefusalHalt(below.events(), 'other');
+    expect(h.payload.detail ?? '').not.toContain('weather');
   });
 
-  it('fails the stage below the floor without dismissing or calling another model', async () => {
+  it('halts the stage below the floor without dismissing or calling another model', async () => {
     const cf = caseFile(0.2);
     const t = await runScripted(
       cf,
@@ -446,10 +481,14 @@ describe('Defense after a provider refusal, default route review (L3-20, CR-T13)
         cfg: config,
       },
     );
-    const err: unknown = await t.run().then(
-      () => undefined,
-      (e: unknown) => e,
-    );
+    expect(await t.run()).toEqual({
+      status: 'halted',
+      stage: 'defense',
+      reason: 'model-refusal',
+      refusalCategory: 'cyber',
+    });
+    expectRefusalHalt(t.events(), 'cyber');
+    const err = t.thrown();
     expect(err).toBeInstanceOf(DefenseRefusedError);
     expect(isModelRefusal(err)).toBe(true);
     expect((err as Error).message).toContain('attempt one on model-a was refused');
@@ -584,13 +623,18 @@ describe('Defense after a provider refusal, opt-in route second-attempt (L3-20, 
     expect(detail.includes(String.fromCharCode(0x2014))).toBe(false);
   });
 
-  it('lets a double refusal below the floor fail the stage, never dismissing', async () => {
+  it('lets a double refusal below the floor halt the stage, never dismissing', async () => {
     const cf = caseFile(0.2);
-    const t = await runScripted(cf, [refusal(), refusal(), submit(W1)], {});
-    const err: unknown = await t.run().then(
-      () => undefined,
-      (e: unknown) => e,
-    );
+    const t = await runScripted(cf, [refusal(), refusal('bio'), submit(W1)], {});
+    // The halt names the category of the last refusal, the one that ended the stage.
+    expect(await t.run()).toEqual({
+      status: 'halted',
+      stage: 'defense',
+      reason: 'model-refusal',
+      refusalCategory: 'bio',
+    });
+    expectRefusalHalt(t.events(), 'bio');
+    const err = t.thrown();
     expect(err).toBeInstanceOf(DefenseRefusedError);
     expect(isModelRefusal(err)).toBe(true);
     expect((err as Error).message).toContain('attempt one on model-a was refused');
@@ -625,11 +669,33 @@ describe('Defense after a provider refusal, opt-in route second-attempt (L3-20, 
     const reported = turnCost('defense', 0.03);
     const t = await runScripted(cf, [refusal('cyber', reported), refusal('cyber')], {});
     expect((await t.run()).stage).toBe('escalated');
-    const charges = t.events().filter((e) => e.type === 'cost-charged');
+    const evs = t.events();
+    const charges = evs.filter((e) => e.type === 'cost-charged');
     expect(charges).toHaveLength(2);
+    // Only the refusal that reported its spend gets the unspent part of its reservation back.
+    const released = evs.filter((e) => e.type === 'cost-released');
+    expect(released).toHaveLength(1);
+    expect(released[0]?.payload).toMatchObject({
+      reservationSeq: charges[0]!.seq,
+      reason: 'model-call-failed',
+    });
     const verdict = await t.store.getVerdict(cf.id);
-    // The first refusal reported its spend; the second did not, so only its charge stands.
-    expect(verdict?.cost).toEqual([reported]);
+    // One verdict row per call, each its charges minus its releases, as in the stream (L3-21).
+    // Call one reported its spend, so its row is that spend. Call two's spend is unknown, so
+    // nothing was released and its row is its whole up-front reservation. Both Defense attempts
+    // run inside one orchestrator stage attempt, so both rows are stage attempt 1.
+    const { maxInputTokens, maxOutputTokens, maxUsd } = config.turnBudget;
+    expect(verdict?.cost).toEqual([
+      reported,
+      {
+        stage: 'defense',
+        attempt: 1,
+        inputTokens: maxInputTokens,
+        outputTokens: maxOutputTokens,
+        usd: maxUsd,
+        wallMs: 0,
+      },
+    ]);
   });
 
   it('leaves other call errors alone: no second attempt', async () => {

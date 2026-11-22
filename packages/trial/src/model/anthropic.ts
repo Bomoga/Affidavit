@@ -149,21 +149,50 @@ interface Usage {
   outputTokens: number;
 }
 
+/** A sum of reported counts, or NaN when any of them is missing or not a finite non-negative. */
+function reportedSum(...values: unknown[]): number {
+  let total = 0;
+  for (const v of values) {
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) return Number.NaN;
+    total += v;
+  }
+  return total;
+}
+
+/**
+ * Token totals as the result reports them. A field is NaN (unknown) when any count it sums is
+ * missing or not a finite non-negative number, so a missing cache field can never read as zero.
+ */
 function resultUsage(result: SDKResultMessage): Usage {
   let inputTokens = 0;
   let outputTokens = 0;
   const models = Object.values(result.modelUsage ?? {});
   if (models.length > 0) {
     for (const m of models) {
-      inputTokens += m.inputTokens + m.cacheReadInputTokens + m.cacheCreationInputTokens;
-      outputTokens += m.outputTokens;
+      inputTokens += reportedSum(m.inputTokens, m.cacheReadInputTokens, m.cacheCreationInputTokens);
+      outputTokens += reportedSum(m.outputTokens);
     }
   } else {
-    const u = result.usage;
-    inputTokens = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens;
-    outputTokens = u.output_tokens;
+    const u = (result.usage ?? {}) as Partial<SDKResultMessage['usage']>;
+    inputTokens = reportedSum(
+      u.input_tokens,
+      u.cache_read_input_tokens,
+      u.cache_creation_input_tokens,
+    );
+    outputTokens = reportedSum(u.output_tokens);
   }
   return { inputTokens, outputTokens };
+}
+
+/**
+ * One token field of a turn that produced a result. The larger of the result's figure and the
+ * streamed count when both are known. When the result's figure is unknown (NaN), the streamed
+ * count when the stream saw any, else the turn's cap: unknown spend is never reported as zero,
+ * because the orchestrator gives back whatever a call reports it did not spend.
+ */
+export function tokenField(fromResult: number, fromStream: number, cap: number): number {
+  if (Number.isFinite(fromResult)) return Math.max(fromResult, fromStream);
+  return fromStream > 0 ? fromStream : cap;
 }
 
 const toInt = (n: number): number => (Number.isFinite(n) && n > 0 ? Math.ceil(n) : 0);
@@ -686,14 +715,28 @@ export class AnthropicModelPort implements PreflightModelPort {
     const wallMs = Math.max(0, Math.round(result?.duration_ms ?? now() - started));
     let used: Usage;
     let usd: number;
+    // False when the result's dollar figure is missing or not a finite non-negative number.
+    let usdKnown = true;
     if (result !== undefined) {
       const fromResult = resultUsage(result);
       const fromStream = tokens();
       used = {
-        inputTokens: Math.max(fromResult.inputTokens, fromStream.inputTokens),
-        outputTokens: Math.max(fromResult.outputTokens, fromStream.outputTokens),
+        inputTokens: tokenField(
+          fromResult.inputTokens,
+          fromStream.inputTokens,
+          req.budget.maxInputTokens,
+        ),
+        outputTokens: tokenField(
+          fromResult.outputTokens,
+          fromStream.outputTokens,
+          req.budget.maxOutputTokens,
+        ),
       };
-      usd = Number.isFinite(result.total_cost_usd) ? Math.max(0, result.total_cost_usd) : 0;
+      const reportedUsd: unknown = result.total_cost_usd;
+      usdKnown =
+        typeof reportedUsd === 'number' && Number.isFinite(reportedUsd) && reportedUsd >= 0;
+      // Unknown dollars are reported as the turn's whole USD budget, so none of it is given back.
+      usd = usdKnown ? (reportedUsd as number) : req.budget.maxUsd;
     } else {
       // Cut off before the runtime reported a cost. The true figure is unknown, so report the
       // whole turn budget rather than a number nobody measured.
@@ -732,7 +775,7 @@ export class AnthropicModelPort implements PreflightModelPort {
     // Tokens without dollars still under-report the bill, so a refusal needs a reported USD.
     const failureCost: StageCost | undefined =
       result !== undefined
-        ? (refused || refusalFallback) && !(usd > 0)
+        ? (refused || refusalFallback) && !(usdKnown && usd > 0)
           ? undefined
           : cost
         : refusedBeforeUsage

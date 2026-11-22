@@ -151,3 +151,23 @@ Contracts v1.2 (`packages/contracts/CHANGELOG.md`) is additive: nothing in Lane 
 6. **`apps/api` and SSE:** no change needed; the two new event types pass through as `TrialEvent`.
 
 Done in the v1.2 PR inside Lane 1, only so the build stays green: `apps/cli/src/render.ts` gained `cost-released` and `halted` cases in its total switch (one detail line each, through `sanitize`), with a render test in `cli.test.ts`.
+
+## Lane 3 L3-21 follow-ups (from Lane 3, PR #84)
+
+Written by Lane 3 at the coordinator's request; nothing in Lane 1 packages was edited. `@affidavit/trial` now settles every model call's reservation, emits `cost-released` and `halted`, and has a separate stop hook. What `apps/worker` and `packages/db` need:
+
+1. **`apps/worker/src/real/trial.ts`, stop after one transition without a false halt.** Today `config.killSwitch` is `async () => (await w.killSwitch()) || scope().advanced()`, so after every normal advance the orchestrator records `halted { reason: 'kill-switch' }`. Change the `Orchestrator` config to:
+
+   ```ts
+   config: {
+     killSwitch: w.killSwitch,
+     stopAfterTransition: () => scope().advanced(),
+     maxStageAttempts: w.maxStageAttempts,
+   },
+   ```
+
+   `run` then returns `{ status: 'stopped', stage }` after the move, with no event. The `outcome.status === 'halted' && !ports.advanced()` check in `core` is unchanged; a `stopped` outcome is a normal end of the job.
+
+2. **`apps/worker/src/real/trial.ts`, a refusal halt is review, not a retry.** For `outcome.status === 'halted'` with `reason: 'model-refusal'` (it carries `refusalCategory`), flag the stage for review at once instead of throwing the retryable `TrialHaltedError`: each recovery retry (up to `AFFIDAVIT_MAX_STAGE_ATTEMPTS`) reruns Defense and asks the refused model again. Also word `TrialHaltedError` by reason; today every reason other than `model-unconfigured` reads as the kill switch.
+3. **`packages/db` `stageScopedPorts`, return the assigned seq.** The scoped store's `nextSeq` returns a placeholder 0 and the scoped sink assigns the real seq, so the orchestrator cannot tell which seq a `cost-charged` event got. Have the scoped sink's `emit` return the seq it assigned (or the stored event), for example `const seq = await inner.nextSeq(event.caseId); await env.sink.emit(TrialEvent.parse({ ...event, seq })); return seq;`, and return nothing for a dropped `stage-entered`. A `Promise<number>` emit does not type-check as a contract `EventSink` (checked with tsc), so type `StageScopedPorts.sink` (and the worker's `Scope.sink`) structurally as `{ emit(event: TrialEvent): Promise<number | void> }`. `OrchestratorDeps.sink` accepts that shape (`ReportingEventSink` in `@affidavit/trial`) as well as any `EventSink`. Until this lands the orchestrator sees repeated seqs and releases nothing (it fails closed), so a Postgres case keeps today's over-count.
+4. **`packages/db` `stageScopedPorts`, forward `releaseCharge`** (item 2 of the v1.2 follow-ups above), or pass `settlement` from the worker (item 3): the scoped store has no `releaseCharge` today, so without one of the two nothing is released.
