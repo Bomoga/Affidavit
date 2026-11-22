@@ -4,6 +4,8 @@ import {
   BUNDLE_FORMAT_KEY,
   CASEFILE_ENTRY_ID,
   buildBundle,
+  caseUsage,
+  egressFullyObserved,
   loadBundle,
   openBundle,
   storeBundle,
@@ -267,5 +269,155 @@ describe('storeBundle and loadBundle', () => {
     const loaded = await loadBundle(store, built.sha256);
     expect(loaded?.sha256).toBe(built.sha256);
     expect(await loadBundle(store, '0'.repeat(64))).toBeNull();
+  });
+});
+
+describe('egress log in exhibit records (L2-11)', () => {
+  const entry = {
+    variant: 'safe',
+    attempt: 2,
+    syscall: 'connect',
+    family: 'ipv4',
+    address: '1.1.1.1',
+    port: 443,
+    outcome: 'blocked',
+    errno: 101,
+    dns: false,
+  } as const;
+  const observedRun = (variant: string, attempt: number, egressObserved = true) => ({
+    variant,
+    attempt,
+    wallMs: 1000,
+    cpuMs: null,
+    memoryPeakBytes: null,
+    egressObserved,
+  });
+  const allRuns = (observed = true) =>
+    (['vulnerable', 'safe'] as const).flatMap((v) =>
+      [1, 2, 3].map((a) => observedRun(v, a, observed)),
+    );
+  const withLog = (egress: unknown[], count = 1, usage: unknown[] | null = allRuns()) => {
+    const [w, ...rest] = records();
+    return bundleInput({
+      exhibits: [
+        {
+          ...w!,
+          egress,
+          ...(usage === null ? {} : { usage }),
+          result: { ...w!.result, egressAttempts: count },
+        } as (typeof rest)[0],
+        ...rest,
+      ],
+    });
+  };
+
+  it('carries the log inside the exhibit, under its digest, and reads it back', async () => {
+    const { bytes } = await buildBundle(withLog([entry]));
+    const opened = await openBundle(bytes);
+    expect(opened.exhibits.get('exhibit-witness-001')?.egress).toEqual([entry]);
+    const changed = await tamper(bytes, (files) => {
+      const name = 'exhibits/exhibit-witness-001.json';
+      files.set(
+        name,
+        Buffer.from(Buffer.from(files.get(name)!).toString().replace('1.1.1.1', '9.9.9.9')),
+      );
+    });
+    await expect(openBundle(changed)).rejects.toThrow(/exhibit-witness-001/);
+  });
+
+  it('keeps bundles without a log valid, and an empty log means nothing tried', async () => {
+    const { bytes } = await buildBundle(bundleInput());
+    const bare = (await openBundle(bytes)).exhibits.get('exhibit-witness-001')!;
+    expect(bare.egress).toBeUndefined();
+    expect(egressFullyObserved(bare)).toBe(false);
+    const empty = await buildBundle(withLog([], 0));
+    const r = (await openBundle(empty.bytes)).exhibits.get('exhibit-witness-001')!;
+    expect(r.egress).toEqual([]);
+    expect(egressFullyObserved(r)).toBe(true);
+  });
+
+  it('never lets [] claim nothing tried for a run whose egress was not observed', async () => {
+    // One run with no complete trace (tracing off, over its cap, or tampered with).
+    const runs = allRuns();
+    runs[4] = observedRun('safe', 2, false);
+    const partial = await buildBundle(withLog([], 0, runs));
+    const r = (await openBundle(partial.bytes)).exhibits.get('exhibit-witness-001')!;
+    expect(r.egress).toEqual([]);
+    expect(egressFullyObserved(r)).toBe(false);
+    expect(caseUsage([r]).egressUnobservedRuns).toBe(1);
+    // The flag is signed with the record: flipping it changes the exhibit digest.
+    const flipped = await tamper(partial.bytes, (files) => {
+      const name = 'exhibits/exhibit-witness-001.json';
+      const text = Buffer.from(files.get(name)!).toString();
+      files.set(name, Buffer.from(text.replace('"egressObserved":false', '"egressObserved":true')));
+    });
+    await expect(openBundle(flipped)).rejects.toThrow(/exhibit-witness-001/);
+    // A usage entry must say whether its egress was observed.
+    const unflagged: Partial<ReturnType<typeof observedRun>> = observedRun('safe', 1);
+    delete unflagged.egressObserved;
+    await expect(buildBundle(withLog([], 0, [unflagged]))).rejects.toThrow();
+  });
+
+  it('refuses an egress log with no usage log, which could not say which runs it covers', async () => {
+    await expect(buildBundle(withLog([], 0, null))).rejects.toThrow(
+      /egress log without a usage log/,
+    );
+  });
+
+  it('accepts a failed attempt with its errno', async () => {
+    const failed = { ...entry, outcome: 'failed', errno: 115 } as const;
+    const { bytes } = await buildBundle(withLog([failed]));
+    expect((await openBundle(bytes)).exhibits.get('exhibit-witness-001')?.egress).toEqual([failed]);
+  });
+
+  it('refuses a log that does not fit its record', async () => {
+    await expect(buildBundle(withLog([entry, entry], 1))).rejects.toThrow(
+      /more attempts than the result counted/,
+    );
+    await expect(buildBundle(withLog([{ ...entry, variant: 'patched' }]))).rejects.toThrow(
+      /variant this exhibit never runs on/,
+    );
+    await expect(buildBundle(withLog([{ ...entry, port: 70000 }]))).rejects.toThrow();
+  });
+});
+
+describe('run usage in exhibit records (L2-11)', () => {
+  const run = (variant: string, attempt: number, measured = true) => ({
+    variant,
+    attempt,
+    wallMs: 1000 * attempt,
+    cpuMs: measured ? 300 : null,
+    memoryPeakBytes: measured ? 50_000_000 * attempt : null,
+    egressObserved: measured,
+  });
+
+  it('carries usage under the exhibit digest and totals it per case, never guessing', async () => {
+    const [w, c, p] = records();
+    const exhibits = [
+      { ...w!, usage: [run('vulnerable', 1), run('safe', 2)] },
+      { ...c!, usage: [run('vulnerable', 3, false)] },
+      p!,
+    ] as ReturnType<typeof records>;
+    const { bytes } = await buildBundle(bundleInput({ exhibits }));
+    const opened = await openBundle(bytes);
+    expect(opened.exhibits.get('exhibit-witness-001')?.usage).toHaveLength(2);
+    expect(caseUsage([...opened.exhibits.values()])).toEqual({
+      runs: 3,
+      wallMs: 6000,
+      cpuMs: 600,
+      memoryPeakBytes: 100_000_000,
+      unmeasuredRuns: 1,
+      egressAttempts: 0,
+      recordsWithoutUsage: 1,
+      egressUnobservedRuns: 1,
+    });
+  });
+
+  it('refuses usage for a variant the exhibit never runs on', async () => {
+    const [w, ...rest] = records();
+    const exhibits = [{ ...w!, usage: [run('patched', 1)] }, ...rest] as ReturnType<typeof records>;
+    await expect(buildBundle(bundleInput({ exhibits }))).rejects.toThrow(
+      /usage log names a variant this exhibit never runs on/,
+    );
   });
 });

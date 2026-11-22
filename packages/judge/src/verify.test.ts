@@ -4,7 +4,7 @@ import type { Exhibit, ParamSpace, PatchExhibit, Witness } from '@affidavit/cont
 import { canonicalJson, sha256Hex } from './canonical.js';
 import { counterexampleParamsHeader } from './counterexample.js';
 import type { ExecutionRequest, RawAttempt } from './executor.js';
-import { Judge, counterexampleExhibitId, patchExhibitId } from './judge.js';
+import { Judge, counterexampleExhibitId, patchExhibitId, type ExhibitRunLog } from './judge.js';
 import { parseUnifiedDiff, renderDiff } from './patch/diff.js';
 import { DEFAULT_POLICY } from './rules.js';
 import {
@@ -862,5 +862,39 @@ describe('Judge.verifyPatch', () => {
     );
     expect(r.rejectedBy).toBeUndefined();
     expect(r.familyFlipped).toBe(true);
+  });
+});
+
+describe('verifyPatch run log (L2-11)', () => {
+  it('records one log for the patch, covering the family and counterexample runs', async () => {
+    const event = {
+      syscall: 'sendto',
+      family: 'ipv4',
+      address: '127.0.0.11',
+      port: 53,
+      outcome: 'sent',
+      errno: null,
+      dns: true,
+    } as const;
+    const exec = new ScriptedExecutor((req) => ({
+      ...fixedByPatch(req),
+      ...(req.variant === 'patched' && req.attempt === 1
+        ? { egressAttempts: 1, egress: [event] }
+        : {}),
+    }));
+    const calls: [string, ExhibitRunLog][] = [];
+    const judge = new Judge(
+      exec,
+      DEFAULT_POLICY,
+      { workbench: new ScriptedWorkbench({}), rescan: new RecordingRescan(true) },
+      { record: (id, log) => calls.push([id, log]) },
+    );
+    await judge.verifyPatch(gateCaseFile(), patchExhibit(), witness(), [counterexample()]);
+    expect(calls.map(([id]) => id)).toEqual([PATCH_ID]);
+    // Family on patched attempt 1, then the counterexample's own patched attempt 1.
+    expect(calls[0]?.[1].egress).toEqual([
+      { ...event, variant: 'patched', attempt: 1 },
+      { ...event, variant: 'patched', attempt: 1 },
+    ]);
   });
 });

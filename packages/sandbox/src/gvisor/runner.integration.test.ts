@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { PROBE_IMAGE } from '../containment/probes.js';
 import { DEFAULT_TRACE_ROOT, RUN_LABEL } from './args.js';
-import { GvisorRunner, GvisorToolRunner } from './runner.js';
+import { GvisorRunner, GvisorToolRunner, runJailed } from './runner.js';
 
 // Needs a sandbox host: Docker with the runsc-affidavit runtime (see docs/lanes/lane2/sandbox-runner.md).
 // Run with `pnpm --filter @affidavit/sandbox test:sandbox-host`. Skipped in plain `pnpm test`, which
@@ -49,6 +49,24 @@ describe.runIf(onSandboxHost)('gVisor runner on a sandbox host', { timeout: 120_
     expect(r.stdout).toMatch(/kernel .*gvisor/);
     expect(leftovers()).toBe('');
     expect(readdirSync(DEFAULT_TRACE_ROOT).length).toBe(before);
+  });
+
+  it('samples peak memory and CPU time from the cgroup while the run goes (L2-11)', async () => {
+    const r = await runJailed({
+      image: PROBE_IMAGE,
+      command: [
+        'node',
+        '-e',
+        'const b = Buffer.alloc(160 * 1024 * 1024, 1); let x = 0; for (let i = 0; i < 2e8; i++) x += b[i % 1000]; setTimeout(() => {}, 1500);',
+      ],
+      mounts: [],
+      timeoutMs: 60_000,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.usage.memoryPeakBytes).toBeGreaterThan(160 * 1024 * 1024);
+    expect(r.usage.cpuMs).toBeGreaterThan(100);
+    expect(r.usage.cpuMs).toBeLessThanOrEqual(r.durationMs * 4);
+    expect(leftovers()).toBe('');
   });
 
   it('records an egress attempt and a refused write', async () => {

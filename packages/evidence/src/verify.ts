@@ -78,7 +78,13 @@ export async function verifyPublic(
   opts: { expectedSha256?: string; cosignPath?: string; revokedKeyIds?: readonly string[] } = {},
 ): Promise<PublicVerification> {
   const bundleSha256 = sha256Hex(bundleBytes);
-  const fail = (reason: string): PublicVerification => ({ ok: false, bundleSha256, reason });
+  // Reasons can quote exhibit ids, tar entry names and key ids read before any signature check,
+  // so they are escaped where they are made, and again when rendered.
+  const fail = (reason: string): PublicVerification => ({
+    ok: false,
+    bundleSha256,
+    reason: printable(reason),
+  });
 
   if (opts.expectedSha256 !== undefined && !SHA256_HEX.test(opts.expectedSha256)) {
     return fail('the expected bundle digest is not 64 lowercase hex characters');

@@ -12,7 +12,8 @@ import type {
 import { familySize } from './artifact.js';
 import { EXHIBIT_ID_HEX_CHARS, canonicalJson, mintExhibitId, sha256Hex } from './canonical.js';
 import { readCounterexampleParams } from './counterexample.js';
-import type { ExecutionVariant, WitnessExecutor } from './executor.js';
+import type { Attempt, ExecutionVariant, WitnessExecutor } from './executor.js';
+import type { EgressEvent } from '@affidavit/sandbox';
 import { addedLines, parseUnifiedDiff, selectFiles } from './patch/diff.js';
 import type { ParsedDiff } from './patch/diff.js';
 import {
@@ -32,6 +33,54 @@ import {
   rejectBeforeRunning,
 } from './rules.js';
 import type { JudgePolicy, ObservedAttempt } from './rules.js';
+
+/** One egress attempt of one run, with the run it came from. */
+export interface EgressEntry extends EgressEvent {
+  variant: ExecutionVariant;
+  attempt: Attempt;
+}
+
+/** Time and resources of one run. `cpuMs` and `memoryPeakBytes` are null when not measured. */
+export interface RunUsageEntry {
+  variant: ExecutionVariant;
+  attempt: Attempt;
+  wallMs: number;
+  cpuMs: number | null;
+  memoryPeakBytes: number | null;
+  /**
+   * The run's whole syscall trace was read and intact, so its egress attempts are all in the log
+   * (up to the per-run cap). False when tracing was off, the trace overflowed its cap or was
+   * tampered with: that run's egress was not observed, and its absence from `egress` proves
+   * nothing.
+   */
+  egressObserved: boolean;
+}
+
+/** What the Judge observed across every run of one exhibit, in run order. */
+export interface ExhibitRunLog {
+  /**
+   * Egress attempts gVisor listed (up to 50 per run; the result's count covers every one). Only
+   * the runs whose entry in `runs` has `egressObserved` are covered: an empty list means nothing
+   * tried to leave only when every run was observed.
+   */
+  egress: EgressEntry[];
+  /** One entry per run. */
+  runs: RunUsageEntry[];
+}
+
+/**
+ * Receives the run log of every exhibit the Judge ran (L2-11), so the caller can file it with
+ * the exhibit in the evidence bundle and total a case's sandbox time. Called once per judged
+ * exhibit, after its runs. An exhibit refused before any run gets no call. For a patch, the log
+ * covers every run verifyPatch made: the family on both variants and each counterexample's runs.
+ * The log is a record only: `no-egress` is decided from the counts and the trace check, never
+ * from it.
+ */
+export interface RunLogRecorder {
+  record(exhibitId: ExhibitId, log: ExhibitRunLog): void;
+}
+
+const emptyLog = (): ExhibitRunLog => ({ egress: [], runs: [] });
 
 /** What verifyPatch needs besides the executor: somewhere to build the patch, and Lane 1's re-scan. */
 export interface PatchVerification {
@@ -101,11 +150,13 @@ export class Judge implements JudgePort {
   readonly #executor: WitnessExecutor;
   readonly #policy: Readonly<JudgePolicy>;
   readonly #verify: PatchVerification | undefined;
+  readonly #recorder: RunLogRecorder | undefined;
 
   constructor(
     executor: WitnessExecutor,
     policy: Readonly<JudgePolicy> = DEFAULT_POLICY,
     verify?: PatchVerification,
+    recorder?: RunLogRecorder,
   ) {
     if (policy.timeBudgetMs >= policy.hardTimeoutMs) {
       throw new Error('timeBudgetMs must be below hardTimeoutMs');
@@ -116,6 +167,7 @@ export class Judge implements JudgePort {
     this.#executor = executor;
     this.#policy = policy;
     this.#verify = verify;
+    this.#recorder = recorder;
   }
 
   async runWitness(
@@ -329,6 +381,7 @@ export class Judge implements JudgePort {
     const outcome = await deps.workbench.prepare(cf, p.data, plan);
     if (!outcome.ok) return reject(outcome.stage === 'apply' ? 'schema' : 'suite-fails');
     const prepared = outcome.prepared;
+    const log = emptyLog();
     try {
       checkPrepared(cf, prepared);
       const params = w.data.params;
@@ -345,6 +398,7 @@ export class Judge implements JudgePort {
             ],
             w.data.template,
             params,
+            log,
           ),
         },
         this.#policy,
@@ -381,7 +435,7 @@ export class Judge implements JudgePort {
           {
             exhibitId,
             familySize: familySize(space),
-            attempts: await this.#attempts(cf, this.#targets(cf, ['vulnerable']), code, space),
+            attempts: await this.#attempts(cf, this.#targets(cf, ['vulnerable']), code, space, log),
           },
           this.#policy,
         );
@@ -397,7 +451,7 @@ export class Judge implements JudgePort {
           const fresh = q.values.filter((v) => !familyValues.has(canonicalJson(v)));
           if (fresh.length > 0) admittedParams.push({ name: q.name, values: fresh });
         }
-        const attempts = await this.#attempts(cf, [['patched', prepared.target]], code, space);
+        const attempts = await this.#attempts(cf, [['patched', prepared.target]], code, space, log);
         const survived = counterexampleSurvives(
           { exhibitId, familySize: familySize(space), attempts },
           this.#policy,
@@ -428,6 +482,7 @@ export class Judge implements JudgePort {
         counterexamples: results,
         ...(rejectedBy === undefined ? {} : { rejectedBy }),
       });
+      this.#recorder?.record(patchId, log);
       return { result, suite: suiteStatus };
     } finally {
       await deps.workbench.release(prepared);
@@ -472,6 +527,7 @@ export class Judge implements JudgePort {
     targets: readonly [ExecutionVariant, TargetRef][],
     template: string,
     params: ParamSpace,
+    log?: ExhibitRunLog,
   ): Promise<ObservedAttempt[]> {
     const attempts: ObservedAttempt[] = [];
     for (const [variant, target] of targets) {
@@ -488,6 +544,17 @@ export class Judge implements JudgePort {
           maxArtifactBytes: this.#policy.maxArtifactBytes,
         });
         attempts.push({ ...raw, variant, attempt });
+        if (log !== undefined) {
+          for (const e of raw.egress ?? []) log.egress.push({ ...e, variant, attempt });
+          log.runs.push({
+            variant,
+            attempt,
+            wallMs: Math.round(raw.durationMs),
+            cpuMs: raw.usage?.cpuMs ?? null,
+            memoryPeakBytes: raw.usage?.memoryPeakBytes ?? null,
+            egressObserved: raw.egressObserved === true && !raw.traceTampered,
+          });
+        }
       }
     }
     return attempts;
@@ -498,11 +565,14 @@ export class Judge implements JudgePort {
     targets: readonly [ExecutionVariant, TargetRef][],
     r: Runnable,
   ): Promise<ExhibitResult> {
-    const attempts = await this.#attempts(caseFile, targets, r.template, r.params);
-    return judgeEvidence(
+    const log = emptyLog();
+    const attempts = await this.#attempts(caseFile, targets, r.template, r.params, log);
+    const result = judgeEvidence(
       { exhibitId: r.exhibitId, familySize: familySize(r.params), attempts },
       this.#policy,
     );
+    this.#recorder?.record(r.exhibitId, log);
+    return result;
   }
 }
 

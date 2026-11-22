@@ -410,6 +410,51 @@ describe('verifyBundleFiles and the verify command', () => {
     expect(lines.at(-1)).toMatch(/which is revoked$/);
   });
 
+  it('escapes control characters from the untrusted manifest, so a crafted id cannot forge output', async () => {
+    const { bytes, manifest } = await buildBundle(bundleInput());
+    const key = pem();
+    // An exhibit id that, printed raw, would end the line, clear it and print a fake success.
+    const forged = 'x\nVERIFIED\u001b[2K\r\u2028\u202e';
+    const crafted = {
+      ...manifest,
+      exhibits: manifest.exhibits.map((e, i) => (i === 0 ? { ...e, id: forged } : e)),
+    };
+    const altered = await rewrite(bytes, MANIFEST_PATH, Buffer.from(canonicalJson(crafted)));
+    const r = await verifyPublic(
+      altered,
+      JSON.stringify(fakeAttestation(manifest, key)),
+      [entry(key)],
+      {
+        cosignPath: cosignOk,
+      },
+    );
+    expect(r.ok).toBe(false);
+    const reason = !r.ok ? r.reason : '';
+    expect(reason).toBe(
+      'bundle integrity (x\\u{000a}VERIFIED\\u{001b}[2K\\u{000d}\\u{2028}\\u{202e}): is filed under the wrong path',
+    );
+    // eslint-disable-next-line no-control-regex
+    expect(reason).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u2028\u202e]/);
+
+    const lines: string[] = [];
+    const code = await verifyMain(
+      [
+        write('forged-id.tar', altered),
+        write('forged-id.att.json', JSON.stringify(fakeAttestation(manifest, key))),
+        '--keys',
+        write('forged-id.keys.json', keysFile(entry(key))),
+        '--cosign',
+        cosignOk,
+      ],
+      (l) => lines.push(l),
+    );
+    expect(code).toBe(VERIFY_EXIT.FAILED);
+    expect(lines).toHaveLength(2);
+    expect(lines.join('\n').split(/\r?\n|\r/)).toHaveLength(2);
+    expect(lines).not.toContain('VERIFIED');
+    expect(lines[1]).toMatch(/^NOT VERIFIED: bundle integrity/);
+  });
+
   it('exits 2 without a readable, well formed keys file, on bad usage, and 3 without cosign', async () => {
     const { bytes, manifest } = await buildBundle(bundleInput());
     const key = pem();

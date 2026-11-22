@@ -22,8 +22,52 @@
 
 import { inCidr } from './cidr.js';
 
+/**
+ * One attempt to reach outside the jail, as gVisor's kernel recorded it. Only fields gVisor
+ * renders itself: never the command name or any path, which the jailed process controls.
+ */
+export interface EgressEvent {
+  syscall: 'connect' | 'sendto' | 'sendmsg' | 'sendmmsg';
+  family: 'ipv4' | 'ipv6';
+  /** The destination address, checked to be a well-formed IP address. */
+  address: string;
+  /** The destination port, when gVisor printed one. */
+  port: number | null;
+  /**
+   * `blocked`: refused with an unreachable or permission errno (`BLOCKED_ERRNOS`); `failed`: any
+   * other error, for example EINPROGRESS (115) from a non-blocking connect, which says nothing
+   * about whether the packet left; `sent`: it returned success (for example a UDP send).
+   */
+  outcome: 'blocked' | 'failed' | 'sent';
+  /** The errno of a blocked or failed attempt (101 is ENETUNREACH), else null. */
+  errno: number | null;
+  /** Sent to Docker's embedded DNS resolver, which forwards names to the host. */
+  dns: boolean;
+}
+
+/** Most egress events kept per run; `egressAttempts` still counts every one. */
+export const MAX_EGRESS_EVENTS = 50;
+
+/**
+ * Errnos that mean the jail refused the attempt: EPERM (1), EACCES (13), ENETUNREACH (101) and
+ * EHOSTUNREACH (113). Any other error is listed as `failed`, never as `blocked`.
+ */
+export const BLOCKED_ERRNOS: ReadonlySet<number> = new Set([1, 13, 101, 113]);
+
 export interface TraceObservations {
   egressAttempts: number;
+  /**
+   * The first `MAX_EGRESS_EVENTS` egress attempts in trace order. Fewer entries than
+   * `egressAttempts` means the rest were counted but not listed.
+   */
+  egress: EgressEvent[];
+  /**
+   * True only when this run's whole trace was read and parsed. False when tracing was off or the
+   * trace passed its size cap: then `egress` is empty because nothing was observed, not because
+   * nothing tried to leave. A tampered trace is read but may hide lines, so a complete egress log
+   * also needs `tampered` false (see `egressObserved`).
+   */
+  traced: boolean;
   deniedReads: number;
   deniedWrites: number;
   pidsLimitHit: boolean;
@@ -102,24 +146,59 @@ function firstPath(args: string): string | null {
 }
 
 /**
- * An address outside the jail: an IPv4 or IPv6 socket address that is neither loopback nor inside
- * the case network. IPv4-mapped IPv6 addresses are judged as the IPv4 address they carry.
+ * The destination of a send when it is outside the jail: an IPv4 or IPv6 socket address that is
+ * neither loopback nor inside the case network. IPv4-mapped IPv6 addresses are judged as the IPv4
+ * address they carry. Null for a local destination or one gVisor did not render as an address.
  */
-function isRemoteAddress(args: string, localNetworks: readonly string[]): boolean {
-  const m = /Family: (AF_INET6?), Addr: ([^,}]+)/.exec(args);
-  if (!m) return false;
-  let addr = (m[2] ?? '').trim();
-  if (m[1] === 'AF_INET6') {
-    if (addr === '::1') return false;
-    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(addr);
-    if (mapped === null) return true;
-    addr = mapped[1] ?? '';
+function remoteDestination(
+  args: string,
+  localNetworks: readonly string[],
+): { family: 'ipv4' | 'ipv6'; address: string; port: number | null } | null {
+  const m = /Family: (AF_INET6?), Addr: ([^,}]+)(?:, Port: (\d+))?/.exec(args);
+  if (!m) return null;
+  const family = m[1] === 'AF_INET6' ? 'ipv6' : 'ipv4';
+  const address = (m[2] ?? '').trim();
+  const portNum = m[3] === undefined ? null : Number(m[3]);
+  const port = portNum !== null && portNum <= 65535 ? portNum : null;
+  const dest = { family, address, port } as const;
+  let v4 = address;
+  if (family === 'ipv6') {
+    if (address === '::1') return null;
+    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address);
+    if (mapped === null) return dest;
+    v4 = mapped[1] ?? '';
   }
   // Docker's embedded DNS resolver sits on loopback inside every container on a user-defined
   // network and forwards queries to the host's resolvers, so a DNS query is a channel out.
-  if (addr === DOCKER_EMBEDDED_DNS) return true;
-  if (addr.startsWith('127.')) return false;
-  return !localNetworks.some((net) => inCidr(addr, net));
+  if (v4 === DOCKER_EMBEDDED_DNS) return dest;
+  if (v4.startsWith('127.')) return null;
+  return localNetworks.some((net) => inCidr(v4, net)) ? null : dest;
+}
+
+const IPV4 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
+
+/**
+ * A well-formed IPv4 or IPv6 address (`node:net` is outside the egress guard's allowlist). IPv6:
+ * hex groups of 1 to 4 digits, at most one `::`, eight groups in all, a dotted IPv4 tail counting
+ * as two.
+ */
+export function isIpAddress(s: string): boolean {
+  if (IPV4.test(s)) return true;
+  if (s.length > 45 || !/^[0-9A-Fa-f:.]+$/.test(s)) return false;
+  let groups = s;
+  let tail = 0;
+  const lastColon = s.lastIndexOf(':');
+  if (s.slice(lastColon + 1).includes('.')) {
+    if (!IPV4.test(s.slice(lastColon + 1))) return false;
+    groups = s.slice(0, lastColon + 1) + '0';
+    tail = 1;
+  }
+  const halves = groups.split('::');
+  if (halves.length > 2) return false;
+  const parts = halves.map((h) => (h === '' ? [] : h.split(':')));
+  if (!parts.every((ps) => ps.every((g) => /^[0-9A-Fa-f]{1,4}$/.test(g)))) return false;
+  const count = parts.reduce((n, ps) => n + ps.length, 0) + tail;
+  return halves.length === 2 ? count <= 7 : count === 8;
 }
 
 /**
@@ -131,9 +210,19 @@ export const DOCKER_EMBEDDED_DNS = '127.0.0.11';
 const under = (path: string, root: string): boolean =>
   path === root || path.startsWith(root.endsWith('/') ? root : `${root}/`);
 
+/**
+ * Whether a run's egress log is a complete record of its attempts: the whole trace was read and
+ * parsed, and no line of it was malformed or split. Only then does an empty `egress` mean nothing
+ * tried to leave.
+ */
+export const egressObserved = (t: Pick<TraceObservations, 'traced' | 'tampered'>): boolean =>
+  t.traced && !t.tampered;
+
 export function parseTrace(text: string, opts: TraceOptions): TraceObservations {
   const out: TraceObservations = {
     egressAttempts: 0,
+    egress: [],
+    traced: true,
     deniedReads: 0,
     deniedWrites: 0,
     pidsLimitHit: false,
@@ -168,7 +257,25 @@ export function parseTrace(text: string, opts: TraceOptions): TraceObservations 
     const denied = failed && errno !== null && DENIED.has(errno);
 
     if (SENDS.has(name)) {
-      if (isRemoteAddress(args, opts.localNetworks ?? [])) out.egressAttempts += 1;
+      const dest = remoteDestination(args, opts.localNetworks ?? []);
+      if (dest !== null) {
+        out.egressAttempts += 1;
+        // Counted either way; listed only with an address that is really an IP address.
+        if (out.egress.length < MAX_EGRESS_EVENTS && isIpAddress(dest.address)) {
+          out.egress.push({
+            syscall: name as EgressEvent['syscall'],
+            ...dest,
+            outcome: !failed
+              ? 'sent'
+              : errno !== null && BLOCKED_ERRNOS.has(errno)
+                ? 'blocked'
+                : 'failed',
+            errno: failed ? errno : null,
+            dns:
+              dest.address === DOCKER_EMBEDDED_DNS || /^::ffff:127\.0\.0\.11$/i.test(dest.address),
+          });
+        }
+      }
     } else if (OPENS.has(name)) {
       const path = firstPath(args);
       const sensitive = path !== null && opts.sensitivePaths.some((p) => under(path, p));
