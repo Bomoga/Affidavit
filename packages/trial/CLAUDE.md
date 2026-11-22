@@ -68,6 +68,10 @@ Invariants, each covered by a test in `src/model/anthropic.test.ts` with a stubb
 - A provider error always carries its class and HTTP status. Provider text is shown only as fragments rebuilt from the allowlisted `TEMPLATES` in `anthropic.ts` (after JSON decoding and redaction), capped at 300 characters; anything else is `provider message withheld (does not match a known-safe shape)` (`provider-errors.test.ts`). A key that is not printable ASCII without spaces fails `preflight` before any charge.
 - `ModelCallError.cost` is the reported spend of a failed call, or undefined when unknown. Zero without a result only for classes decided before any work (`REFUSED_BEFORE_WORK`). The orchestrator trusts it only when it is a valid finite non-negative `StageCost`, charges any overage (overdrawing is `budget-exhausted`), and gives back the unspent part through the optional `settlement` dep (CR-T1; Lane 1 wires it). A settling failure is attached as `settlementError` and never replaces the call error. Unknown spend keeps the whole charge.
 
+## Model probe (L3-17)
+
+`scripts/probe-model.ts` (logic in `src/model/probe.ts`) is a human-run diagnostic: tiny live calls with synthetic input only, raw provider text shown after key redaction. Nothing in the trial imports it. It reuses `buildAgentOptions` from `anthropic.ts`, so keep the port's options built there. See the guide, "Probing a provider error".
+
 ## Intended libraries (notes for later, not installed yet)
 
 - Graphile Worker

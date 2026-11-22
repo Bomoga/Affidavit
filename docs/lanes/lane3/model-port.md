@@ -86,6 +86,33 @@ The shapes that can be shown, and what each means for the first real run's `inva
 
 A `<path>` reason outside the fixed list (`JSON schema is invalid`, `Field required`, `Extra inputs are not permitted` and a few more) is shown as `(reason withheld)`.
 
+## Probing a provider error (L3-17)
+
+When the port's message is withheld, run the diagnostic probe. It makes a short ladder of tiny live calls with fixed synthetic text only (no case file, no repository content) and prints, for each probe, PASS or FAIL, the error class, the HTTP status, the request id, the runtime's version, model, key source and betas, the runtime's stderr tail, and the provider's raw error message after key and credential redaction. Raw provider text is safe to show here only because the input is synthetic; the probe refuses any probe whose input it did not build itself.
+
+Export the key in the shell first. Never put it in the command, a file in the repo, or shell history:
+
+```sh
+# >>> API KEY GOES HERE, from the secrets store, typed into this shell only. <<<
+export ANTHROPIC_API_KEY="<from the secrets store>"
+# PowerShell: $env:ANTHROPIC_API_KEY = "<from the secrets store>"
+node --import tsx packages/trial/scripts/probe-model.ts
+```
+
+The same model overrides as the worker apply (`ANTHROPIC_MODEL_*`, `AFFIDAVIT_MODEL_CONFIG`), so export them too if the worker has them. Flags: `--max-usd <n>` (total cap, default 0.50, at most 2), `--filler-kb <n>` (P5 size, default 16, 1 to 64), `--no-fetch` (skip P6). `pnpm --filter @affidavit/trial probe:model` runs the same script.
+
+| Probe | What it sends                                                                                                                                                     |
+| ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P1    | Bare SDK request on `claude-haiku-5-5`, "Reply with the single word ok", no tools                                                                                 |
+| P2    | The same bare request once per distinct model id in the resolved model table                                                                                      |
+| P3    | The port's own option set (`buildAgentOptions`) on the Defense model, trivial prompt, no submit tools                                                             |
+| P4a   | P3 plus the Defense `submit_witness` tool, trivial system prompt                                                                                                  |
+| P4b   | The real `AnthropicModelPort.runTurn` with the packaged Defense prompt and a synthetic user message                                                               |
+| P5    | P4b with about 16 KiB of lorem filler, to rule out size                                                                                                           |
+| P6a-c | Direct HTTPS to `https://api.anthropic.com/v1/messages`, bypassing the SDK: no tools, the advertised tool schema, and that schema without its top-level `$schema` |
+
+Every probe runs (no early stop). Each SDK probe gets `maxBudgetUsd` 0.05, fetch probes `max_tokens` 16, and a probe is skipped once the total charged (reported spend, or the full 0.05 reserve when spend is unknown) would pass the cap. These are caps, not estimates; real cost per probe is [metric] until it has run. The run ends with a summary table and one interpretation line per pattern: P1 fails means a key or organization problem; P2 lists which model ids work; P3 failing with P1 passing means the SDK option set; P4a failing with P3 passing means the tool schema; P4b failing with P4a passing means the Defense system prompt; P5 alone failing means size; P6b failing with P6c passing means the `$schema` keyword. Exit code 0 when every probe passes, 1 when any fails, 2 for a missing or malformed key.
+
 ## Record and replay
 
 - `live`: real calls, nothing written. The only mode allowed unless `AFFIDAVIT_ENV` is `development` or `test`.
