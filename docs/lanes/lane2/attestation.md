@@ -37,6 +37,28 @@ cosign verify-blob-attestation \
 
 `verifyAttestation` in `@affidavit/evidence` does the same, after the structural checks (statement matches the manifest, signed payload matches the statement, key hint matches `keyId`, no log entries). It is the base for the public verification helper (L2-12).
 
+## Public verification (L2-12)
+
+Anyone holding a bundle can check it without access to our systems: no database, store, signer, sandbox or network. They need the bundle tar, the attestation (the `Attestation` JSON), the published public key(s), cosign, and this repository's `@affidavit/evidence` package.
+
+```sh
+pnpm --filter @affidavit/evidence verify bundle.tar attestation.json \
+  --key affidavit-signer.pub [--key affidavit-signer-2025.pub] \
+  [--expect-sha256 <the verdict's bundleSha256>]
+```
+
+`verifyPublic` (`src/verify.ts`) stops at the first failure:
+
+1. With `--expect-sha256`, the bundle hashes to it, so it is the bundle the verdict names.
+2. `openBundle`: every file is listed in the manifest and hashes to its digest, the verdict hashes to `verdictSha256`, and the case file, manifest and verdict agree. A tampered file is named.
+3. `manifest.json` is byte for byte the canonical form of the manifest that parsed, so a field the schema would drop cannot ride along unsigned.
+4. The attestation parses and its `keyId` is one of the given keys. Pass every published key; the attestation names the one that signed (rotation).
+5. `verifyAttestation`: structural checks, then `cosign verify-blob-attestation` offline with that key.
+
+It prints the bundle digest, case, verdict outcome and severity, exhibit count and key id, then `VERIFIED` or `NOT VERIFIED: <reason>`. Exit codes: 0 verified, 1 not verified, 2 usage or unreadable file, 3 cosign not installed (never reported as verified).
+
+Verification checks that the evidence is the evidence we signed. It does not rerun the exhibits; `affidavit replay` with a sandbox host does that.
+
 ## The signer service
 
 `apps/signer` is the only process that can use the key.
@@ -66,3 +88,4 @@ Either way, rotation means a new key pair, the new public key published next to 
 ## Results from real runs
 
 - 2026-11-18, owner's workstation: evidence 5/5 attestation unit tests, signer 6/6 unit, 6/6 with cosign v3.1.4 (also inside a network namespace with only loopback), 1/1 isolation in Docker.
+- 2026-11-21, sandbox host: `verify.test.ts` 9/9 (1 with real cosign v3.1.4: signature from files alone verifies with an older key also passed, a flipped signature byte fails), also inside a network namespace with only loopback.
