@@ -26,7 +26,7 @@ import {
 import { DEFAULT_TRACE_ROOT } from '@affidavit/sandbox';
 import {
   ModelCallError,
-  Orchestrator,
+  REFUSAL_CLASS,
   createModelPortFromEnv,
   resolveModelTable,
   witnessExhibitId,
@@ -141,6 +141,31 @@ describe('real wiring config', () => {
     });
     expect(c.judgeSettings?.nodegoatBundle).toBeNull();
     expect(c.caseBudget.maxUsd).toBe(10);
+  });
+
+  it('reads the Defense refusal route, review by default, and refuses any other value by name', () => {
+    expect(loadConfig(realEnv).trialSettings?.refusalRoute).toBe('review');
+    expect(
+      loadConfig({ ...realEnv, AFFIDAVIT_REFUSAL_ROUTE: '' }).trialSettings?.refusalRoute,
+    ).toBe('review');
+    for (const v of ['second-attempt', ' Second-Attempt ']) {
+      const c = loadConfig({ ...realEnv, AFFIDAVIT_REFUSAL_ROUTE: v });
+      expect(c.trialSettings?.refusalRoute).toBe('second-attempt');
+      expect(describeConfig(c).refusalRoute).toBe('second-attempt');
+    }
+    let err: unknown;
+    try {
+      loadConfig({ ...realEnv, AFFIDAVIT_REFUSAL_ROUTE: `dismiss-${SECRET}` });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ConfigError);
+    const message = (err as Error).message;
+    expect(message).toContain('AFFIDAVIT_REFUSAL_ROUTE must be one of review, second-attempt');
+    // Never the value, nor any other variable's value.
+    expect(message).not.toContain(SECRET);
+    expect(message).not.toContain('dismiss');
+    expect(message).not.toContain('—');
   });
 
   it('refuses trial=real with the jury enabled (no jury handler yet)', () => {
@@ -909,10 +934,10 @@ describe('real trial cores', () => {
    * `stage-entered` for defense first, as the arraign job leaves behind in production (its
    * orchestrator run emits the next stage's entry before the job stops).
    */
-  async function defenseJob(withRelease = true, seedEntered = false) {
+  async function defenseJob(withRelease = true, seedEntered = false, file: CaseFile = stored) {
     const events = new FakeEventSink();
     const fake = new FakeCaseStore({ events, juryEnabled: false });
-    await fake.open(stored, { maxInputTokens: 1_000_000, maxOutputTokens: 200_000, maxUsd: 2 });
+    await fake.open(file, { maxInputTokens: 1_000_000, maxOutputTokens: 200_000, maxUsd: 2 });
     for (const to of ['map', 'arraign', 'defense'] as const) await fake.transition(stored.id, to);
     // Earlier stages' events, so stored seqs and the orchestrator's placeholders differ.
     for (const stage of seedEntered
@@ -950,7 +975,7 @@ describe('real trial cores', () => {
       }),
       store: new GuardedCaseStore(inner, signal),
       sink: events,
-      caseFiles: { next: () => Promise.resolve(null), get: () => Promise.resolve(stored) },
+      caseFiles: { next: () => Promise.resolve(null), get: () => Promise.resolve(file) },
       signal,
       events: (id) => Promise.resolve(events.events(id).filter((e) => e.stage === 'defense')),
       checkpoint: () => Promise.resolve(),
@@ -1038,6 +1063,95 @@ describe('real trial cores', () => {
     });
   });
 
+  describe('a Defense refusal below the escalation floor', () => {
+    /** Below the sample's floor (0.7), so a refusal on the `review` route cannot escalate. */
+    const belowFloor = CaseFile.parse({
+      ...stored,
+      candidate: { ...stored.candidate, score: 0.5 },
+    });
+    /** A port whose every call is refused by the provider's safeguards, spend not reported. */
+    function refusingModel() {
+      const requests: string[] = [];
+      const model: ModelPort = {
+        runTurn: (req) => {
+          requests.push(req.promptId);
+          return Promise.reject(
+            new ModelCallError('the provider declined the request', {
+              provider: { errorClass: REFUSAL_CLASS, refusalCategory: 'cyber' },
+            }),
+          );
+        },
+      };
+      return { model, requests };
+    }
+
+    async function refusedDefense(env: Record<string, string> = realEnv) {
+      const { env: job, fake, events } = await defenseJob(true, true, belowFloor);
+      const { model, requests } = refusingModel();
+      const cores = realTrialCores({
+        model,
+        judge: fakeJudge(),
+        modelTable: resolveModelTable({}),
+        settings: loadConfig(env).trialSettings!,
+        maxStageAttempts: 3,
+        killSwitch: () => false,
+      });
+      const error = await failure(cores.defense!(job));
+      return { error, fake, events, requests };
+    }
+
+    it('halts with model-refusal, flags review at once, never dismisses or releases', async () => {
+      const { error, fake, events, requests } = await refusedDefense();
+      expect(error).toBeInstanceOf(TrialHaltedError);
+      expect((error as TrialHaltedError).reason).toBe('model-refusal');
+      // stageHandler reads this and flags the visit for review instead of letting recovery retry.
+      expect(reviewReasonOf(error)).toBe('model-refusal');
+      // The refused model was asked once: no retry inside the orchestrator either.
+      expect(requests).toEqual(['defense']);
+      expect(await fake.stage(stored.id)).toBe('defense');
+      const all = events.events(stored.id);
+      const halted = all.filter((e) => e.type === 'halted');
+      expect(halted).toHaveLength(1);
+      expect(halted[0]!.payload).toMatchObject({ reason: 'model-refusal' });
+      for (const type of ['dismissed', 'escalated', 'cost-released', 'stage-exited']) {
+        expect(
+          all.some((e) => e.type === type),
+          type,
+        ).toBe(false);
+      }
+      // The spend is unknown, so the up-front charge stands (over-counting, never under).
+      expect(all.some((e) => e.type === 'cost-charged')).toBe(true);
+      expect(fake.releases(stored.id).size).toBe(0);
+    });
+
+    it('with AFFIDAVIT_REFUSAL_ROUTE=second-attempt, asks the second Defense prompt once, then halts', async () => {
+      const { error, fake, events, requests } = await refusedDefense({
+        ...realEnv,
+        AFFIDAVIT_REFUSAL_ROUTE: 'second-attempt',
+      });
+      expect(requests).toEqual(['defense', 'defense-second-attempt']);
+      expect(reviewReasonOf(error)).toBe('model-refusal');
+      expect(await fake.stage(stored.id)).toBe('defense');
+      expect(events.events(stored.id).some((e) => e.type === 'dismissed')).toBe(false);
+    });
+
+    it('an ordinary model failure stays an ordinary, retryable failure', async () => {
+      const { env: job, fake } = await defenseJob(true, true, belowFloor);
+      const cores = realTrialCores({
+        model: { runTurn: () => Promise.reject(new ModelCallError('the provider timed out')) },
+        judge: fakeJudge(),
+        modelTable: resolveModelTable({}),
+        settings: trialSettings,
+        maxStageAttempts: 3,
+        killSwitch: () => false,
+      });
+      const error = await failure(cores.defense!(job));
+      expect(error).not.toBeInstanceOf(TrialHaltedError);
+      expect(reviewReasonOf(error)).toBeUndefined();
+      expect(await fake.stage(stored.id)).toBe('defense');
+    });
+  });
+
   describe('one stage per job (the stop hook), against the installed orchestrator', () => {
     const W = { template: 'witness template', params: [{ name: 'n', values: [1, 2] }] };
     const ADMITTED = ExhibitResult.parse(readFixtureJson('exhibit-results/admissible.json'));
@@ -1081,14 +1195,6 @@ describe('real trial cores', () => {
       });
       return { cores, requests };
     }
-
-    /**
-     * Whether the installed @affidavit/trial reads `stopAfterTransition` (PR #84). TEMPORARY and
-     * deliberately crude (a text search of the class source; a rename or minifier would fool it).
-     * Remove it, and make the gated test below unconditional, in the Lane 1 follow-up that drops
-     * the `quietStop` fallback in trial.ts once #84 is merged to main.
-     */
-    const orchestratorReadsStopHook = /stopAfterTransition/.test(Orchestrator.toString());
 
     async function runDefense(killSwitch: () => boolean | Promise<boolean>) {
       const { env, fake, events } = await defenseJob(true, true);
@@ -1138,21 +1244,14 @@ describe('real trial cores', () => {
       expect(requests).toEqual([]);
     });
 
-    // Runs only once #84 (Lane 3, `stopAfterTransition`) is installed; make it unconditional when
-    // it merges. Its orchestrator emits a `halted` event when the kill switch stops a run, so this
-    // proves the worker stops through the quiet hook. Then drop the kill-switch fallback in
-    // trial.ts (see docs/lanes/lane1/contract-requests.md).
-    it.runIf(orchestratorReadsStopHook)(
-      '#84: stops through stopAfterTransition, with no halted event of any reason',
-      async () => {
-        const { error, fake, events } = await runDefense(() => false);
-        expect(error).toBeUndefined();
-        expect(await fake.stage(stored.id)).toBe('prosecution');
-        expect(events.events(stored.id).filter((e) => e.type === 'halted')).toEqual([]);
-        // The real switch still halts with the hook in place.
-        const killed = await runDefense(() => true);
-        expect((killed.error as TrialHaltedError).reason).toBe('kill-switch');
-      },
-    );
+    it('stops through stopAfterTransition, with no halted event of any reason', async () => {
+      const { error, fake, events } = await runDefense(() => false);
+      expect(error).toBeUndefined();
+      expect(await fake.stage(stored.id)).toBe('prosecution');
+      expect(events.events(stored.id).filter((e) => e.type === 'halted')).toEqual([]);
+      // The real switch still halts with the hook in place.
+      const killed = await runDefense(() => true);
+      expect((killed.error as TrialHaltedError).reason).toBe('kill-switch');
+    });
   });
 });
