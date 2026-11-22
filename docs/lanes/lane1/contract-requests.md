@@ -131,3 +131,23 @@ Semgrep SARIF carries only a rule's `metadata.cwe` (as tags) in `properties.tags
 **Interim (L1-18).** Whenever intake is real, the worker and `open-case` log `intake: dependency scan not run` at startup (`DEPENDENCY_SCAN_WARNING` in `apps/worker/src/config.ts`), and `docs/lanes/lane1/real-wiring.md` lists it under what still blocks a real verdict.
 
 **Request.** Lead: a scanner-coverage note in the case file (for example the scanners run, with their pinned references, and the ones not run with a reason enum such as `not-supported-in-jail`), so the gap travels with the case. Lane 2: a way for the tool runner to give a tool a private writable temp directory that OSV-Scanner can use (it reads its offline database from `$TMPDIR/osv-scalibr`); Lane 1 then adds OSV to real intake.
+
+**Status (2026-11-21).** The contracts part landed in v1.2: optional `CaseFile.scanners: ScannerCoverage[]` (see `packages/contracts/CHANGELOG.md`). The Lane 2 temp-directory part is still open.
+
+## Contracts v1.2 follow-ups for Lane 1 (from the lead)
+
+Contracts v1.2 (`packages/contracts/CHANGELOG.md`) is additive: nothing in Lane 1 has to change to keep compiling, and nothing was implemented in Lane 1 packages beyond the line noted at the end. What Lane 1 should do with it:
+
+1. **`packages/db`: `PgCaseStore.releaseCharge(caseId, refund, reservationSeq)` (CR-T1).** One transaction that:
+   - returns the current budget and changes nothing when a release for `(tenant_id, case_id, reservationSeq)` already exists (a unique key; idempotent);
+   - throws `ReleaseRejectedError` (from contracts) when the event at `reservationSeq` is not a `cost-charged` event for this case, when the refund names another stage or attempt, or when any refund field exceeds that event's `cost`;
+   - throws `ReleaseRejectedError` when the case's total releases would exceed its total charges for input tokens, output tokens or usd (the ledger never goes negative);
+   - otherwise adds `refund` back to `remaining_input_tokens`, `remaining_output_tokens` and `remaining_usd`, recomputes `exhausted` with the same rule as `chargeBudget`, and records the release (a `cost_releases` table, or a `kind` column on `cost_rows` with the `usd >= 0` check kept for charges). Reports that sum `cost_rows` subtract releases.
+   - The method is optional on `CaseStore` in v1.2 so every store keeps compiling; the lead plans to make it required at the next major bump. `FakeCaseStore` in `packages/testing` is the reference behaviour (`new FakeCaseStore({ events })`).
+2. **`packages/db`: forward `releaseCharge`** through `GuardedCaseStore` (`orchestration.ts`) and `stageScopedPorts` (`stage-scope.ts`), with the same tenant and kill-switch guards as `chargeBudget`.
+3. **`apps/worker/src/real/trial.ts`: wire the settlement** (CR-T1 step 2): pass `settlement: { release: (id, r, seq) => store.releaseCharge(id, r, seq) }` to the `Orchestrator` once the store has it.
+4. **Intake writes `CaseFile.scanners` (CR-14).** For real intake: `semgrep` and `gitleaks` with `ran: true` and `ref` set to the pinned image digest; `osv` with `ran: false, reason: 'not-supported-in-jail'` until the tool runner gives it a temp directory. Fake intake may leave the field absent (absent means "not recorded", never "all ran"). Keep `DEPENDENCY_SCAN_WARNING` until OSV runs.
+5. **`apps/cli`: `halted` is not terminal.** `watchCase` keeps polling after a `halted` event, since the case resumes at the same stage. Consider printing it and exiting with a code of its own instead of waiting for the timeout; that is a Lane 1 choice.
+6. **`apps/api` and SSE:** no change needed; the two new event types pass through as `TrialEvent`.
+
+Done in the v1.2 PR inside Lane 1, only so the build stays green: `apps/cli/src/render.ts` gained `cost-released` and `halted` cases in its total switch (one detail line each, through `sanitize`), with a render test in `cli.test.ts`.

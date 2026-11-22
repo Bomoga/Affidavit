@@ -1,4 +1,4 @@
-import { TrialEvent } from '@affidavit/contracts';
+import { TrialEvent, trialEventSamples } from '@affidavit/contracts';
 import { readFixtureJson } from '@affidavit/testing';
 import { describe, expect, it } from 'vitest';
 import { PAYLOAD } from '../testing/poison.js';
@@ -102,6 +102,19 @@ describe('gate case view from the contracts fixture', () => {
 
   it('shows a docket entry per event in seq order', () => {
     expect(view.docket.map((d) => d.seq)).toEqual(GATE.map((e) => e.seq));
+  });
+
+  it('labels contracts v1.2 cost-released and halted events and changes nothing else', () => {
+    const extra = (['cost-released', 'halted'] as const).map((type, i) =>
+      TrialEvent.parse({ ...(trialEventSamples[type] as object), seq: GATE.length + i }),
+    );
+    const next = buildCaseView([...GATE, ...extra]);
+    expect(next.status).toBe(view.status);
+    expect(next.stamp).toBe(view.stamp);
+    expect(next.docket.slice(-2).map((d) => d.label)).toEqual([
+      'Unspent cost released for defense',
+      'Case halted: model-refusal',
+    ]);
   });
 });
 
