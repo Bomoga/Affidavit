@@ -304,14 +304,101 @@ describe('egress guard self-test: each snippet must be caught', () => {
       `spawn('docker', ['ps'], { env: {}, ...o });`,
       'spawn env overridable by a spread',
     ],
+    [
+      'env: undefined (Node inherits everything)',
+      `spawn('docker', ['ps'], { env: undefined });`,
+      'spawn env not dockerEnv() or a literal record: undefined',
+    ],
+    [
+      'env: null (Node inherits everything)',
+      `spawn('docker', ['ps'], { env: null });`,
+      'spawn env not dockerEnv() or a literal record: null',
+    ],
+    [
+      'an alias of process.env',
+      `const e = process.env; spawn('docker', ['ps'], { env: e });`,
+      'spawn env not dockerEnv() or a literal record: e',
+    ],
+    [
+      'a shorthand env',
+      `const env = process.env; spawn('docker', ['ps'], { env });`,
+      'spawn env not a plain property',
+    ],
+    [
+      'a spread inside the env record',
+      `spawn('docker', ['ps'], { env: { ...dockerEnv(), ...o } });`,
+      'spawn env not dockerEnv() or a literal record: { ...dockerEnv(), ...o }',
+    ],
+    [
+      'a non-literal value in the env record',
+      `const e = process.env; spawn('docker', ['ps'], { env: { K: e.SECRET } });`,
+      'spawn env not dockerEnv() or a literal record: { K: e.SECRET }',
+    ],
+    [
+      'dockerEnv with a variable',
+      `declare const x: string; spawn('docker', ['ps'], { env: dockerEnv({ SECRET: x }) });`,
+      'spawn env dockerEnv with non-literal arguments',
+    ],
+    [
+      'dockerEnv with a variable record',
+      `spawn('docker', ['ps'], { env: dockerEnv(o as Record<string, string>) });`,
+      'spawn env dockerEnv with non-literal arguments',
+    ],
+    [
+      'dockerEnv with a second source',
+      `const e = { A: '1' }; spawn('docker', ['ps'], { env: dockerEnv({}, e) });`,
+      'spawn env dockerEnv with non-literal arguments',
+    ],
+    [
+      'a local function named dockerEnv',
+      `{ const dockerEnv = () => ({}); spawn('docker', ['ps'], { env: dockerEnv() }); }`,
+      'spawn env not dockerEnv() or a literal record: dockerEnv()',
+    ],
+    [
+      'a second env key',
+      `spawn('docker', ['ps'], { env: {}, ['env']: o });`,
+      'spawn env overridable by another key',
+    ],
+    [
+      'a computed key that may be env',
+      `declare const k: string; spawn('docker', ['ps'], { env: {}, [k]: o });`,
+      'spawn env overridable by another key',
+    ],
+    [
+      'an env getter',
+      `spawn('docker', ['ps'], { get env() { return o; } });`,
+      'spawn env not a plain property',
+    ],
   ])('catches a spawn with %s', (_label, call, what) => {
-    const code = `import { spawn } from 'node:child_process'; declare const o: object; ${call}`;
+    const code = `import { spawn } from 'node:child_process'; import { dockerEnv } from '../docker-env.js'; declare const o: object; ${call}`;
     expect(findEgress('gvisor/runner.ts', code, []).map((f) => f.what)).toContain(what);
   });
 
-  it('allows env after a spread, and a shorthand env', () => {
-    const code = `import { spawn } from 'node:child_process'; declare const o: object, env: Record<string, string>; spawn('docker', ['ps'], { ...o, env: {} }); spawn('docker', ['ps'], { env });`;
+  it('catches dockerEnv that is not imported from docker-env', () => {
+    const code = `import { spawn } from 'node:child_process'; import { dockerEnv } from './elsewhere.js'; spawn('docker', ['ps'], { env: dockerEnv() });`;
+    expect(findEgress('gvisor/runner.ts', code, []).map((f) => f.what)).toContain(
+      'spawn env not dockerEnv() or a literal record: dockerEnv()',
+    );
+  });
+
+  it('allows env after a spread, dockerEnv() with literal settings, and a literal record', () => {
+    const code = [
+      `import { spawn } from 'node:child_process';`,
+      `import { dockerEnv } from '../docker-env.js';`,
+      `declare const o: object;`,
+      `spawn('docker', ['ps'], { ...o, env: {} });`,
+      `spawn('docker', ['ps'], { env: dockerEnv() });`,
+      `spawn('docker', ['ps'], { env: dockerEnv({ DOCKER_BUILDKIT: '1' }), timeout: 5 });`,
+      `spawn('docker', ['ps'], { env: { PATH: '/usr/bin' } });`,
+    ].join('\n');
     expect(findEgress('gvisor/runner.ts', code, [])).toEqual([]);
+  });
+
+  it('allows dockerEnv from @affidavit/sandbox in the judge', () => {
+    const code = `import { spawn } from 'node:child_process'; import { dockerEnv } from '@affidavit/sandbox'; spawn('docker', ['ps'], { env: dockerEnv() });`;
+    expect(
+      findEgress('judge:jail/harness.ts', code, []).filter((f) => f.what.startsWith('spawn env')),
+    ).toEqual([]);
   });
 
   it.each([
