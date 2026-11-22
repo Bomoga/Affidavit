@@ -142,7 +142,11 @@ digest; `loadBundle` gets the tar by digest and opens it.
 - **Run logs.** `RunRecord` carries stdout and stderr digests, but `JudgePort` does not return the
   logs, so they are not in the bundle.
 - **Signature.** L2-09 signs the manifest digest; `replay` will then check the attestation before
-  trusting the manifest.
+  trusting the manifest. Public verification of a bundle and its attestation (`verify`, L2-12)
+  already exists and needs the published keys file (`--keys docs/keys/keys.json`, format in
+  `docs/keys/README.md`): it refuses a bundle signed by a key whose status is `revoked`, and exits
+  2 when the keys file is missing, unreadable or malformed. See `attestation.md`, "Public
+  verification".
 
 ## Open questions for the lead
 
