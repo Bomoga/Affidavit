@@ -76,8 +76,17 @@ export async function stageAttemptState(
 /**
  * Why a person has to look. `f3-hold`: discovery held the candidate (a dismissal rule matched at or
  * above the escalation floor), so it was opened for review instead of being queued (`openHeldCase`).
+ * `model-refusal` (migration 0010): the model refused the stage's request on safety grounds; the
+ * attempt is flagged at once instead of retried, since a retry asks the same model again.
  */
-export type ReviewReason = 'attempts-exhausted' | 'budget-exhausted' | 'f3-hold';
+export type ReviewReason = 'attempts-exhausted' | 'budget-exhausted' | 'f3-hold' | 'model-refusal';
+
+export const REVIEW_REASONS: readonly ReviewReason[] = [
+  'attempts-exhausted',
+  'budget-exhausted',
+  'f3-hold',
+  'model-refusal',
+];
 
 /**
  * Records that a person has to look at a case stage (insert-only, once per attempt). Returns true

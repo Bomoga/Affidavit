@@ -28,6 +28,7 @@ describePg('migrations on a fresh Postgres', () => {
     expect(rows.map((r) => r.relname)).toEqual([
       'ballots',
       'cases',
+      'cost_releases',
       'cost_rows',
       'escalations',
       'events',
