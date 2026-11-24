@@ -79,22 +79,25 @@ async function rewrite(bytes: Uint8Array, name: string, data: Uint8Array): Promi
 }
 
 describe('verifyPublic', () => {
-  it('verifies an intact bundle and reports the signed verdict', async () => {
-    const { bytes, sha256, manifest } = await buildBundle(bundleInput());
-    const key = pem();
-    const att = JSON.stringify(fakeAttestation(manifest, key));
-    const r = await verifyPublic(bytes, att, [entry(pem()), entry(key)], {
-      expectedSha256: sha256,
-      cosignPath: cosignOk,
-    });
-    expect(r).toMatchObject({
-      ok: true,
-      bundleSha256: sha256,
-      caseId: manifest.caseId,
-      keyId: publicKeyId(key),
-      exhibits: manifest.exhibits.length,
-    });
-  });
+  it.skipIf(process.platform === 'win32')(
+    'verifies an intact bundle and reports the signed verdict',
+    async () => {
+      const { bytes, sha256, manifest } = await buildBundle(bundleInput());
+      const key = pem();
+      const att = JSON.stringify(fakeAttestation(manifest, key));
+      const r = await verifyPublic(bytes, att, [entry(pem()), entry(key)], {
+        expectedSha256: sha256,
+        cosignPath: cosignOk,
+      });
+      expect(r).toMatchObject({
+        ok: true,
+        bundleSha256: sha256,
+        caseId: manifest.caseId,
+        keyId: publicKeyId(key),
+        exhibits: manifest.exhibits.length,
+      });
+    },
+  );
 
   it('fails on a tampered exhibit and names it, before any signature check', async () => {
     const { bytes, manifest } = await buildBundle(bundleInput());
@@ -178,46 +181,55 @@ describe('verifyPublic', () => {
     );
   });
 
-  it('refuses a signature by a key the keys file marks revoked, whatever its revokedAt', async () => {
-    const { bytes, manifest } = await buildBundle(bundleInput());
-    const oldKey = pem();
-    const newKey = pem();
-    const att = JSON.stringify(fakeAttestation(manifest, oldKey));
-    const opts = { cosignPath: cosignOk };
-    const revokedEntry = entry(oldKey, 'revoked', { revokedAt: '2099-01-01T00:00:00Z' });
-    const r = await verifyPublic(bytes, att, [entry(newKey), revokedEntry], opts);
-    expect(!r.ok && r.reason).toBe(`signed by key ${publicKeyId(oldKey)}, which is revoked`);
-    // The same key, still active, verifies; revoking another key leaves this one verifying.
-    expect((await verifyPublic(bytes, att, [entry(newKey), entry(oldKey)], opts)).ok).toBe(true);
-    const fresh = JSON.stringify(fakeAttestation(manifest, newKey));
-    expect((await verifyPublic(bytes, fresh, [entry(newKey), revokedEntry], opts)).ok).toBe(true);
-  });
+  it.skipIf(process.platform === 'win32')(
+    'refuses a signature by a key the keys file marks revoked, whatever its revokedAt',
+    async () => {
+      const { bytes, manifest } = await buildBundle(bundleInput());
+      const oldKey = pem();
+      const newKey = pem();
+      const att = JSON.stringify(fakeAttestation(manifest, oldKey));
+      const opts = { cosignPath: cosignOk };
+      const revokedEntry = entry(oldKey, 'revoked', { revokedAt: '2099-01-01T00:00:00Z' });
+      const r = await verifyPublic(bytes, att, [entry(newKey), revokedEntry], opts);
+      expect(!r.ok && r.reason).toBe(`signed by key ${publicKeyId(oldKey)}, which is revoked`);
+      // The same key, still active, verifies; revoking another key leaves this one verifying.
+      expect((await verifyPublic(bytes, att, [entry(newKey), entry(oldKey)], opts)).ok).toBe(true);
+      const fresh = JSON.stringify(fakeAttestation(manifest, newKey));
+      expect((await verifyPublic(bytes, fresh, [entry(newKey), revokedEntry], opts)).ok).toBe(true);
+    },
+  );
 
-  it('refuses a key named by the revokedKeyIds override, even when the file says active', async () => {
-    const { bytes, manifest } = await buildBundle(bundleInput());
-    const oldKey = pem();
-    const newKey = pem();
-    const att = JSON.stringify(fakeAttestation(manifest, oldKey));
-    const opts = { cosignPath: cosignOk, revokedKeyIds: [publicKeyId(oldKey)] };
-    const keys = [entry(newKey), entry(oldKey)];
-    const r = await verifyPublic(bytes, att, keys, opts);
-    expect(!r.ok && r.reason).toBe(`signed by key ${publicKeyId(oldKey)}, which is revoked`);
-    const fresh = JSON.stringify(fakeAttestation(manifest, newKey));
-    expect((await verifyPublic(bytes, fresh, keys, opts)).ok).toBe(true);
-    const bad = await verifyPublic(bytes, fresh, keys, { ...opts, revokedKeyIds: ['k1'] });
-    expect(!bad.ok && bad.reason).toMatch(/revoked key id "k1" is not sha256:<64 hex>/);
-  });
+  it.skipIf(process.platform === 'win32')(
+    'refuses a key named by the revokedKeyIds override, even when the file says active',
+    async () => {
+      const { bytes, manifest } = await buildBundle(bundleInput());
+      const oldKey = pem();
+      const newKey = pem();
+      const att = JSON.stringify(fakeAttestation(manifest, oldKey));
+      const opts = { cosignPath: cosignOk, revokedKeyIds: [publicKeyId(oldKey)] };
+      const keys = [entry(newKey), entry(oldKey)];
+      const r = await verifyPublic(bytes, att, keys, opts);
+      expect(!r.ok && r.reason).toBe(`signed by key ${publicKeyId(oldKey)}, which is revoked`);
+      const fresh = JSON.stringify(fakeAttestation(manifest, newKey));
+      expect((await verifyPublic(bytes, fresh, keys, opts)).ok).toBe(true);
+      const bad = await verifyPublic(bytes, fresh, keys, { ...opts, revokedKeyIds: ['k1'] });
+      expect(!bad.ok && bad.reason).toMatch(/revoked key id "k1" is not sha256:<64 hex>/);
+    },
+  );
 
-  it('fails when cosign rejects the signature, and says cosign is missing rather than passing', async () => {
-    const { bytes, manifest } = await buildBundle(bundleInput());
-    const key = pem();
-    const att = JSON.stringify(fakeAttestation(manifest, key));
-    const r = await verifyPublic(bytes, att, [entry(key)], { cosignPath: cosignBad });
-    expect(!r.ok && r.reason).toBe('signature: cosign: invalid signature');
-    await expect(
-      verifyPublic(bytes, att, [entry(key)], { cosignPath: join(dir, 'no-such-cosign') }),
-    ).rejects.toThrow(/cosign is not installed/);
-  });
+  it.skipIf(process.platform === 'win32')(
+    'fails when cosign rejects the signature, and says cosign is missing rather than passing',
+    async () => {
+      const { bytes, manifest } = await buildBundle(bundleInput());
+      const key = pem();
+      const att = JSON.stringify(fakeAttestation(manifest, key));
+      const r = await verifyPublic(bytes, att, [entry(key)], { cosignPath: cosignBad });
+      expect(!r.ok && r.reason).toBe('signature: cosign: invalid signature');
+      await expect(
+        verifyPublic(bytes, att, [entry(key)], { cosignPath: join(dir, 'no-such-cosign') }),
+      ).rejects.toThrow(/cosign is not installed/);
+    },
+  );
 });
 
 describe('parseKeysFile', () => {
@@ -365,50 +377,55 @@ describe('what verify prints', () => {
 });
 
 describe('verifyBundleFiles and the verify command', () => {
-  it('prints the verdict and exits 0 when verified, 1 when not or when the key is revoked', async () => {
-    const { bytes, manifest, sha256 } = await buildBundle(bundleInput());
-    const key = pem();
-    const bundle = write('ok.tar', bytes);
-    const att = write('ok.att.json', JSON.stringify(fakeAttestation(manifest, key)));
-    const keys = write('ok.keys.json', keysFile(entry(pem()), entry(key)));
-    const lines: string[] = [];
-    const out = (l: string) => lines.push(l);
-    const ok = await verifyMain(
-      [bundle, att, '--keys', keys, '--expect-sha256', sha256, '--cosign', cosignOk],
-      out,
-    );
-    expect(ok).toBe(VERIFY_EXIT.VERIFIED);
-    expect(lines[0]).toBe(`bundle sha256:${sha256}`);
-    expect(lines.at(-1)).toBe('VERIFIED');
-    expect(lines).toContain(`signed by ${publicKeyId(key)}`);
+  it.skipIf(process.platform === 'win32')(
+    'prints the verdict and exits 0 when verified, 1 when not or when the key is revoked',
+    async () => {
+      const { bytes, manifest, sha256 } = await buildBundle(bundleInput());
+      const key = pem();
+      const bundle = write('ok.tar', bytes);
+      const att = write('ok.att.json', JSON.stringify(fakeAttestation(manifest, key)));
+      const keys = write('ok.keys.json', keysFile(entry(pem()), entry(key)));
+      const lines: string[] = [];
+      const out = (l: string) => lines.push(l);
+      const ok = await verifyMain(
+        [bundle, att, '--keys', keys, '--expect-sha256', sha256, '--cosign', cosignOk],
+        out,
+      );
+      expect(ok).toBe(VERIFY_EXIT.VERIFIED);
+      expect(lines[0]).toBe(`bundle sha256:${sha256}`);
+      expect(lines.at(-1)).toBe('VERIFIED');
+      expect(lines).toContain(`signed by ${publicKeyId(key)}`);
 
-    lines.length = 0;
-    const bad = await verifyMain([bundle, att, '--keys', keys, '--cosign', cosignBad], out);
-    expect(bad).toBe(VERIFY_EXIT.FAILED);
-    expect(lines.at(-1)).toBe('NOT VERIFIED: signature: cosign: invalid signature');
+      lines.length = 0;
+      const bad = await verifyMain([bundle, att, '--keys', keys, '--cosign', cosignBad], out);
+      expect(bad).toBe(VERIFY_EXIT.FAILED);
+      expect(lines.at(-1)).toBe('NOT VERIFIED: signature: cosign: invalid signature');
 
-    // Revoked in the keys file: refused with no --revoked flag at all.
-    lines.length = 0;
-    const revokedKeys = write(
-      'revoked.keys.json',
-      keysFile(entry(pem()), entry(key, 'revoked', { revokedAt: '2026-12-01T00:00:00Z' })),
-    );
-    const revoked = await verifyMain(
-      [bundle, att, '--keys', revokedKeys, '--cosign', cosignOk],
-      out,
-    );
-    expect(revoked).toBe(VERIFY_EXIT.FAILED);
-    expect(lines.at(-1)).toBe(`NOT VERIFIED: signed by key ${publicKeyId(key)}, which is revoked`);
+      // Revoked in the keys file: refused with no --revoked flag at all.
+      lines.length = 0;
+      const revokedKeys = write(
+        'revoked.keys.json',
+        keysFile(entry(pem()), entry(key, 'revoked', { revokedAt: '2026-12-01T00:00:00Z' })),
+      );
+      const revoked = await verifyMain(
+        [bundle, att, '--keys', revokedKeys, '--cosign', cosignOk],
+        out,
+      );
+      expect(revoked).toBe(VERIFY_EXIT.FAILED);
+      expect(lines.at(-1)).toBe(
+        `NOT VERIFIED: signed by key ${publicKeyId(key)}, which is revoked`,
+      );
 
-    // --revoked on top of a file that still says active.
-    lines.length = 0;
-    const override = await verifyMain(
-      [bundle, att, '--keys', keys, '--revoked', publicKeyId(key), '--cosign', cosignOk],
-      out,
-    );
-    expect(override).toBe(VERIFY_EXIT.FAILED);
-    expect(lines.at(-1)).toMatch(/which is revoked$/);
-  });
+      // --revoked on top of a file that still says active.
+      lines.length = 0;
+      const override = await verifyMain(
+        [bundle, att, '--keys', keys, '--revoked', publicKeyId(key), '--cosign', cosignOk],
+        out,
+      );
+      expect(override).toBe(VERIFY_EXIT.FAILED);
+      expect(lines.at(-1)).toMatch(/which is revoked$/);
+    },
+  );
 
   it('escapes control characters from the untrusted manifest, so a crafted id cannot forge output', async () => {
     const { bytes, manifest } = await buildBundle(bundleInput());

@@ -48,7 +48,9 @@ describe('3: all text of one JSX element is judged as one text', () => {
     expect(full).toBeLessThan(6_000);
     const deep = `const b = ${'<i>'.repeat(5_000)}z${'</i>'.repeat(5_000)};\n`;
     expect(await time(deep)).toBeLessThan(1_000);
-  });
+    // The test's own timeout must sit above its 6 s ceiling, or a loaded machine fails it on the
+    // runner's default 5 s before the assertions can judge the growth.
+  }, 30_000);
 
   it('a one-word element is still kept', async () => {
     const src = 'const a = <p>Save</p>;\n';

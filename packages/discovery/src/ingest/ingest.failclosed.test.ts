@@ -155,6 +155,21 @@ describe('snapshot findings are never dropped in favour of the windows pass', ()
   });
 });
 
+describe('a SARIF report of the wrong shape', () => {
+  it.each([
+    ['a JSON null', 'null'],
+    ['runs that is a string', '{"runs":"oops"}'],
+    ['results that is an object', '{"runs":[{"results":{}}]}'],
+    ['locations that is a string', '{"runs":[{"results":[{"ruleId":"x","locations":"y"}]}]}'],
+  ])('fails closed on %s instead of reading it as no findings', async (_name, text) => {
+    const dir = tmpDir();
+    writeFileSync(join(dir, 'bad.sarif'), text);
+    await expect(
+      readGitleaksFindings([{ file: join(dir, 'bad.sarif'), origin: 'snapshot' }]),
+    ).rejects.toThrow(/SARIF/);
+  });
+});
+
 describe('checkout ignores repo-controlled attributes', () => {
   it('eol, working-tree-encoding and ident do not change the bytes on disk', async () => {
     const text = 'line one\n\nline two\n\n'.repeat(11_000); // 220,000 bytes, blank lines so the scan is complete

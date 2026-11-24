@@ -637,6 +637,23 @@ describe('Judge.verifyPatch', () => {
     expect(workbench.released).toBe(1);
   });
 
+  it('still records the run log when the re-scan throws after the witness runs', async () => {
+    const calls: string[] = [];
+    const judge = new Judge(
+      new ScriptedExecutor(fixedByPatch),
+      DEFAULT_POLICY,
+      {
+        workbench: new ScriptedWorkbench({}),
+        rescan: { rescan: () => Promise.reject(new Error('rescan went away')) },
+      },
+      { record: (id) => calls.push(id) },
+    );
+    await expect(
+      judge.verifyPatch(gateCaseFile(), patchExhibit(), witness(), [counterexample()]),
+    ).rejects.toThrow('rescan went away');
+    expect(calls).toEqual([PATCH_ID]);
+  });
+
   it('refuses a workbench that hands back the wrong target', async () => {
     const { workbench, verify } = setup(fixedByPatch, {
       prepare: {

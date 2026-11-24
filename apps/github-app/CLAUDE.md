@@ -14,7 +14,7 @@ Run from this directory, or add `--filter @affidavit/github-app` from the repo r
 - `pnpm lint`
 - `pnpm test`
 
-## Intended libraries (notes for later, not installed yet)
+## Libraries
 
 - Octokit (GitHub App auth and webhooks)
 - Webhook HMAC verification

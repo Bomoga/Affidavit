@@ -1,5 +1,13 @@
 /* eslint-disable no-control-regex -- matching escape and control characters is the point of this file */
-import type { TrialEvent } from '@affidavit/contracts';
+import type { HaltReason, TrialEvent } from '@affidavit/contracts';
+
+/** The code stays (scripts grep it); the words after it are for the person reading. */
+const HALT_COPY: Record<HaltReason, string> = {
+  'kill-switch': 'the kill switch is on',
+  'model-unconfigured': 'no model credential is configured',
+  'model-refusal': 'the model provider declined the request',
+  'budget-exhausted': 'the budget cannot pay for the next call',
+};
 
 /**
  * Terminal rendering. Every string that came from a case, a repo, a model or a tool is untrusted:
@@ -134,7 +142,7 @@ function detail(event: TrialEvent): string {
       return `${sanitize(c.stage)} attempt ${c.attempt}, usd ${c.usd} released from #${event.payload.reservationSeq} (${sanitize(event.payload.reason)})`;
     }
     case 'halted':
-      return sanitize(event.payload.reason);
+      return sanitize(`${event.payload.reason}: ${HALT_COPY[event.payload.reason]}`);
   }
 }
 

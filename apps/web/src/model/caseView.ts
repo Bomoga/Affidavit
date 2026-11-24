@@ -2,10 +2,19 @@ import type {
   AdmissibilityRule,
   CaseStage,
   Escalation,
+  HaltReason,
   TrialEvent,
   Verdict,
   VerifyResult,
 } from '@affidavit/contracts';
+
+/** What a person reads for each halt reason; a new reason in the contract fails the build here. */
+const HALT_COPY: Record<HaltReason, string> = {
+  'kill-switch': 'the kill switch is on',
+  'model-unconfigured': 'no model credential is configured',
+  'model-refusal': 'the model provider declined the request',
+  'budget-exhausted': 'the budget cannot pay for the next call',
+};
 
 export type Outcome = Verdict['outcome'];
 
@@ -150,7 +159,7 @@ function label(
     case 'cost-released':
       return `Unspent cost released for ${e.payload.cost.stage}`;
     case 'halted':
-      return `Case halted: ${e.payload.reason}`;
+      return `Case halted: ${HALT_COPY[e.payload.reason]}`;
   }
 }
 

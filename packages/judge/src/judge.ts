@@ -482,9 +482,10 @@ export class Judge implements JudgePort {
         counterexamples: results,
         ...(rejectedBy === undefined ? {} : { rejectedBy }),
       });
-      this.#recorder?.record(patchId, log);
       return { result, suite: suiteStatus };
     } finally {
+      // The sandbox runs already happened, so their log is kept even when a later step threw.
+      this.#recorder?.record(patchId, log);
       await deps.workbench.release(prepared);
     }
   }

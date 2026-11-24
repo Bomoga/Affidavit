@@ -10,7 +10,9 @@ const repo = join(workspace, 'repo');
 const outside = join(base, 'outside');
 mkdirSync(repo, { recursive: true });
 mkdirSync(outside);
-symlinkSync(outside, join(workspace, 'escape'));
+// validateMounts is POSIX path logic and symlinks need a privilege Windows does not grant by default.
+const posix = process.platform !== 'win32';
+if (posix) symlinkSync(outside, join(workspace, 'escape'));
 
 afterAll(() => rmSync(base, { recursive: true, force: true }));
 
@@ -20,7 +22,7 @@ const m = (hostPath: string, containerPath = '/src', readOnly = true) => ({
   readOnly,
 });
 
-describe('validateMounts', () => {
+describe.skipIf(!posix)('validateMounts', () => {
   it('accepts a directory inside an allowed root', () => {
     expect(validateMounts([m(repo)], [workspace])).toEqual([m(repo)]);
   });

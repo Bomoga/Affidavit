@@ -14,7 +14,7 @@ Run from this directory, or add `--filter @affidavit/web` from the repo root.
 - `pnpm lint`
 - `pnpm test`
 
-## Intended libraries (notes for later, not installed yet)
+## Libraries
 
 - React
 - Vite

@@ -24,4 +24,6 @@ The canonical build plan is [docs/plan.md](docs/plan.md). Read it before startin
 
 ## Status
 
-Phase 0 (lead setup) is in place: contracts v1.0, ports, fakes, and fixtures. Every other package is still an empty stub. See [docs/implementation-plan.md](docs/implementation-plan.md) for the lane tasks and [docs/decisions.md](docs/decisions.md) for open decisions.
+All three lanes have working packages and apps in this repository; the contracts, ports, fakes and fixtures from Phase 0 are the seams between them. See [docs/implementation-plan.md](docs/implementation-plan.md) for the lane tasks and [docs/decisions.md](docs/decisions.md) for open decisions.
+
+On Windows, a few tests that need POSIX symlinks, unix sockets, shell stubs or POSIX path logic are skipped (they are marked with `process.platform === 'win32'`); CI on Linux runs them all.

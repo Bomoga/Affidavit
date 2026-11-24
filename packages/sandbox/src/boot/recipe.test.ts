@@ -216,27 +216,30 @@ describe('recipeProblem', () => {
 });
 
 describe('stageTree', () => {
-  it('copies regular files only and leaves out VCS data, modules, env files, npm config and links', async () => {
-    write('src/a.js', 'a');
-    write('run.sh', '#!/bin/sh');
-    write('.git/config', 'x');
-    write('node_modules/x/index.js', 'x');
-    write('.env', 'SECRET=1');
-    write('.env.production', 'SECRET=2');
-    write('.npmrc', 'registry=https://evil.example/');
-    symlinkSync('/etc/passwd', join(root, 'passwd'));
-    symlinkSync('/', join(root, 'src', 'rootlink'));
-    const dest = join(mkdtempSync(join(tmpdir(), 'affidavit-stage-')), 'tree');
-    try {
-      const report = await stageTree(root, dest);
-      expect(report).toEqual({ files: 2, bytes: 10, skippedLinks: 2 });
-      expect(readdirSync(dest).sort()).toEqual(['run.sh', 'src']);
-      expect(readdirSync(join(dest, 'src'))).toEqual(['a.js']);
-      expect(statSync(dest).mode & 0o777).toBe(0o777);
-      expect(statSync(join(dest, 'run.sh')).mode & 0o777).toBe(0o666);
-      expect(lstatSync(join(dest, 'src', 'a.js')).isFile()).toBe(true);
-    } finally {
-      rmSync(join(dest, '..'), { recursive: true, force: true });
-    }
-  });
+  it.skipIf(process.platform === 'win32')(
+    'copies regular files only and leaves out VCS data, modules, env files, npm config and links',
+    async () => {
+      write('src/a.js', 'a');
+      write('run.sh', '#!/bin/sh');
+      write('.git/config', 'x');
+      write('node_modules/x/index.js', 'x');
+      write('.env', 'SECRET=1');
+      write('.env.production', 'SECRET=2');
+      write('.npmrc', 'registry=https://evil.example/');
+      symlinkSync('/etc/passwd', join(root, 'passwd'));
+      symlinkSync('/', join(root, 'src', 'rootlink'));
+      const dest = join(mkdtempSync(join(tmpdir(), 'affidavit-stage-')), 'tree');
+      try {
+        const report = await stageTree(root, dest);
+        expect(report).toEqual({ files: 2, bytes: 10, skippedLinks: 2 });
+        expect(readdirSync(dest).sort()).toEqual(['run.sh', 'src']);
+        expect(readdirSync(join(dest, 'src'))).toEqual(['a.js']);
+        expect(statSync(dest).mode & 0o777).toBe(0o777);
+        expect(statSync(join(dest, 'run.sh')).mode & 0o777).toBe(0o666);
+        expect(lstatSync(join(dest, 'src', 'a.js')).isFile()).toBe(true);
+      } finally {
+        rmSync(join(dest, '..'), { recursive: true, force: true });
+      }
+    },
+  );
 });

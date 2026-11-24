@@ -114,6 +114,8 @@ export interface TrialWiring {
   killSwitch: () => boolean | Promise<boolean>;
   /** Called once this job's transition lands the case in a terminal stage. */
   caseEnded?: (caseId: string) => Promise<void>;
+  /** Where a swallowed teardown failure is reported. Never gets a secret: only the error's name. */
+  log?: (message: string) => void;
 }
 
 export function realTrialCores(w: TrialWiring): Partial<Record<CaseStage, StageCore>> {
@@ -239,7 +241,11 @@ export function realTrialCores(w: TrialWiring): Partial<Record<CaseStage, StageC
     if (w.caseEnded && TERMINAL.includes(await env.store.stage(env.job.caseId))) {
       // Best effort: a teardown failure must not undo a written verdict; the Judge keeps the case
       // tracked and retries the teardown on its next boot or release.
-      await w.caseEnded(env.job.caseId).catch(() => undefined);
+      await w.caseEnded(env.job.caseId).catch((err: unknown) => {
+        w.log?.(
+          `case teardown failed for ${env.job.caseId} (${err instanceof Error ? err.name : 'unknown error'}); the Judge retries it`,
+        );
+      });
     }
   };
 

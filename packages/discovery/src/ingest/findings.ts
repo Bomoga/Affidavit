@@ -50,6 +50,17 @@ function plainRel(uri: string): string | undefined {
   return rel;
 }
 
+const isRecord = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v);
+
+/** An absent list is empty; anything present that is not an array means the report is unreadable. */
+function listOf(value: unknown, what: string): unknown[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value))
+    throw new Error(`gitleaks SARIF report is malformed: ${what} is not a list`);
+  return value;
+}
+
 const posInt = (v: unknown): number | undefined =>
   typeof v === 'number' && Number.isInteger(v) && v >= 1 ? v : undefined;
 
@@ -68,12 +79,23 @@ export async function readGitleaksFindings(
   const findings: GitleaksFinding[] = [];
   let malformed = 0;
   for (const report of reports) {
-    const doc = JSON.parse(await readFile(report.file, 'utf8')) as SarifDoc;
-    for (const run of doc.runs ?? []) {
-      for (const result of run.results ?? []) {
+    const parsed: unknown = JSON.parse(await readFile(report.file, 'utf8'));
+    if (!isRecord(parsed)) throw new Error('gitleaks SARIF report is malformed: not an object');
+    const doc = parsed as SarifDoc;
+    for (const run of listOf(doc.runs, 'runs') as NonNullable<SarifDoc['runs']>) {
+      if (!isRecord(run))
+        throw new Error('gitleaks SARIF report is malformed: a run is not an object');
+      for (const result of listOf(run.results, 'results') as NonNullable<
+        NonNullable<SarifDoc['runs']>[number]['results']
+      >) {
+        if (!isRecord(result)) {
+          throw new Error('gitleaks SARIF report is malformed: a result is not an object');
+        }
         const ruleId =
           typeof result.ruleId === 'string' && result.ruleId ? result.ruleId : 'secret';
-        const locations = result.locations ?? [];
+        const locations = listOf(result.locations, 'locations') as NonNullable<
+          typeof result.locations
+        >;
         if (locations.length === 0) malformed++;
         for (const loc of locations) {
           const pl = loc.physicalLocation;

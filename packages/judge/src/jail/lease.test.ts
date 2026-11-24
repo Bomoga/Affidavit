@@ -1,7 +1,7 @@
 import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   LEASE_SCHEMA,
   WorkerLease,
@@ -179,6 +179,21 @@ describe('sweepOrphanedRuns', () => {
     expect(h.warnings.join('\n')).toMatch(/stale heartbeat but its pid is still the owner/);
     await stuck.close();
     await b.close();
+  });
+
+  it('reports a failed heartbeat instead of swallowing it', async () => {
+    const errors: unknown[] = [];
+    const lease = await WorkerLease.acquire(dir, {
+      pid: 101,
+      hostname: HOST,
+      identity: NS,
+      procStart: '10100',
+      heartbeatMs: 5,
+      onHeartbeatError: (err) => errors.push(err),
+    });
+    rmSync(dir, { recursive: true, force: true });
+    await vi.waitFor(() => expect(errors.length).toBeGreaterThan(0), { timeout: 2_000 });
+    await lease.close().catch(() => undefined);
   });
 
   it('a dead pid whose heartbeat is within the generous multiple of its interval is kept', async () => {

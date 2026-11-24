@@ -117,32 +117,38 @@ describe('signer service over a unix socket', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('signs a manifest for a client and the socket is owner and group only', async () => {
-    const signer = new FakeSigner();
-    await start(signer);
-    expect(statSync(socket).mode & 0o777).toBe(0o660);
-    const att = await new SignerClient(socket).sign(MANIFEST);
-    expect(att.statement.subject[0]?.name).toBe('affidavit/case-gate-001/manifest.json');
-    expect(signer.seen).toEqual([MANIFEST]);
-  });
+  it.skipIf(process.platform === 'win32')(
+    'signs a manifest for a client and the socket is owner and group only',
+    async () => {
+      const signer = new FakeSigner();
+      await start(signer);
+      expect(statSync(socket).mode & 0o777).toBe(0o660);
+      const att = await new SignerClient(socket).sign(MANIFEST);
+      expect(att.statement.subject[0]?.name).toBe('affidavit/case-gate-001/manifest.json');
+      expect(signer.seen).toEqual([MANIFEST]);
+    },
+  );
 
-  it('answers only POST application/json to the sign route, and only for a manifest', async () => {
-    await start(new FakeSigner(), 4096);
-    const cases: [Parameters<typeof raw>[1], number][] = [
-      [{ path: '/v1/keys' }, 404],
-      [{ method: 'GET' }, 405],
-      [{ type: 'text/plain', body: '{}' }, 415],
-      [{ body: 'not json' }, 400],
-      [{ body: JSON.stringify({ ...MANIFEST, caseId: undefined }) }, 400],
-      [{ body: JSON.stringify({ statement: { _type: 'chosen by the caller' } }) }, 400],
-      [{ body: 'x'.repeat(8192) }, 413],
-    ];
-    for (const [opts, status] of cases) {
-      expect((await raw(socket, opts)).status, JSON.stringify(opts).slice(0, 60)).toBe(status);
-    }
-  });
+  it.skipIf(process.platform === 'win32')(
+    'answers only POST application/json to the sign route, and only for a manifest',
+    async () => {
+      await start(new FakeSigner(), 4096);
+      const cases: [Parameters<typeof raw>[1], number][] = [
+        [{ path: '/v1/keys' }, 404],
+        [{ method: 'GET' }, 405],
+        [{ type: 'text/plain', body: '{}' }, 415],
+        [{ body: 'not json' }, 400],
+        [{ body: JSON.stringify({ ...MANIFEST, caseId: undefined }) }, 400],
+        [{ body: JSON.stringify({ statement: { _type: 'chosen by the caller' } }) }, 400],
+        [{ body: 'x'.repeat(8192) }, 413],
+      ];
+      for (const [opts, status] of cases) {
+        expect((await raw(socket, opts)).status, JSON.stringify(opts).slice(0, 60)).toBe(status);
+      }
+    },
+  );
 
-  it('never tells the client why signing failed', async () => {
+  it.skipIf(process.platform === 'win32')('never tells the client why signing failed', async () => {
     await start(new FakeSigner('throw'));
     const r = await raw(socket, { body: JSON.stringify(MANIFEST) });
     expect(r).toEqual({ status: 500, body: JSON.stringify({ error: 'signing failed' }) });
@@ -152,12 +158,15 @@ describe('signer service over a unix socket', () => {
     );
   });
 
-  it('client refuses an attestation for a different manifest', async () => {
-    await start(new FakeSigner('other-manifest'));
-    await expect(new SignerClient(socket).sign(MANIFEST)).rejects.toThrow(
-      'signer returned a bad attestation: statement does not match the manifest',
-    );
-  });
+  it.skipIf(process.platform === 'win32')(
+    'client refuses an attestation for a different manifest',
+    async () => {
+      await start(new FakeSigner('other-manifest'));
+      await expect(new SignerClient(socket).sign(MANIFEST)).rejects.toThrow(
+        'signer returned a bad attestation: statement does not match the manifest',
+      );
+    },
+  );
 
   it('client reports a signer that is not running', async () => {
     await expect(new SignerClient(join(dir, 'missing.sock')).sign(MANIFEST)).rejects.toBeInstanceOf(

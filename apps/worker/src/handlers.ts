@@ -208,6 +208,7 @@ export async function prepareCores(
         maxStageAttempts: config.maxStageAttempts,
         killSwitch: trialParts.killSwitch,
         caseEnded,
+        log,
       });
     } else {
       trial = fakeTrialCores({ judge, juryEnabled: config.juryEnabled });

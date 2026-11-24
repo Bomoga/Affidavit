@@ -386,7 +386,10 @@ export function stageTaskList(
         // expected then. False for an attempt that is still not completed (an expired lease) is
         // logged, and the attempt stays open for the orchestrator to adopt or abandon.
         if (!(await completeStageRun(options.appPool, job, token))) {
-          const info = await stageRunInfo(options.appPool, job).catch(() => null);
+          const info = await stageRunInfo(options.appPool, job).catch((infoErr: unknown) => {
+            log(`could not read the state of ${stageJobKey(job)}`, infoErr);
+            return null;
+          });
           if (info?.state !== 'completed') {
             log(`stage run ${stageJobKey(job)} was not completed after its handler returned`);
           }
