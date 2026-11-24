@@ -42,19 +42,22 @@ describe('MemoryEvidenceStore', () => {
 });
 
 describe('FsEvidenceStore', () => {
-  it('throws on corrupted bytes and refuses a symlink in place of an object', async () => {
-    const root = mkdtempSync(join(dir, 'fs-corrupt-'));
-    const store = new FsEvidenceStore(root);
-    await store.put(bytes);
-    const path = join(root, sha.slice(0, 2), sha);
-    chmodSync(path, 0o600);
-    writeFileSync(path, 'tampered');
-    await expect(store.get(sha)).rejects.toBeInstanceOf(EvidenceCorruptError);
-    rmSync(path);
-    writeFileSync(join(root, 'real'), bytes);
-    symlinkSync(join(root, 'real'), path);
-    await expect(store.get(sha)).rejects.toBeInstanceOf(EvidenceCorruptError);
-  });
+  it.skipIf(process.platform === 'win32')(
+    'throws on corrupted bytes and refuses a symlink in place of an object',
+    async () => {
+      const root = mkdtempSync(join(dir, 'fs-corrupt-'));
+      const store = new FsEvidenceStore(root);
+      await store.put(bytes);
+      const path = join(root, sha.slice(0, 2), sha);
+      chmodSync(path, 0o600);
+      writeFileSync(path, 'tampered');
+      await expect(store.get(sha)).rejects.toBeInstanceOf(EvidenceCorruptError);
+      rmSync(path);
+      writeFileSync(join(root, 'real'), bytes);
+      symlinkSync(join(root, 'real'), path);
+      await expect(store.get(sha)).rejects.toBeInstanceOf(EvidenceCorruptError);
+    },
+  );
 
   it('leaves no temporary files behind', async () => {
     const root = mkdtempSync(join(dir, 'fs-tmp-'));

@@ -65,6 +65,13 @@ export class FsEvidenceStore implements EvidenceStore {
       await rename(tmp, dest);
     } catch (err) {
       await rm(tmp, { force: true });
+      // Windows refuses to rename over an existing read-only object (EPERM, or EEXIST). The
+      // address is the content, so an object that is already there and verifies is the same put.
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'EPERM' || code === 'EEXIST' || code === 'EACCES') {
+        const existing = await this.get(sha).catch(() => null);
+        if (existing !== null) return sha;
+      }
       throw err;
     }
     return sha;

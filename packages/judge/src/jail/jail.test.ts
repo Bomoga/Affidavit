@@ -51,11 +51,14 @@ describe('readArtifact', () => {
     expect(await readArtifact(at('empty.json'), 100)).toBeNull();
   });
 
-  it('never follows a symlink, so a jail cannot point the Judge at a host file', async () => {
-    writeFileSync(at('secret'), 'host secret');
-    symlinkSync(at('secret'), at('link.json'));
-    expect(await readArtifact(at('link.json'), 100)).toBeNull();
-  });
+  it.skipIf(process.platform === 'win32')(
+    'never follows a symlink, so a jail cannot point the Judge at a host file',
+    async () => {
+      writeFileSync(at('secret'), 'host secret');
+      symlinkSync(at('secret'), at('link.json'));
+      expect(await readArtifact(at('link.json'), 100)).toBeNull();
+    },
+  );
 
   it('refuses a FIFO without blocking and a directory', async () => {
     execFileSync('mkfifo', [at('fifo.json')]);

@@ -14,7 +14,7 @@ Run from this directory, or add `--filter @affidavit/mcp` from the repo root.
 - `pnpm lint`
 - `pnpm test`
 
-## Intended libraries (notes for later, not installed yet)
+## Libraries
 
 - Model Context Protocol SDK
 - @affidavit/contracts (workspace dep)

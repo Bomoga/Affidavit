@@ -7,3 +7,5 @@ coverage
 !.env.example
 .turbo
 *.tsbuildinfo
+.claude/worktrees/
+.playwright-mcp/
