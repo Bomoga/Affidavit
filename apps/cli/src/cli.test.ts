@@ -163,7 +163,7 @@ describe('sanitize and renderEvent', () => {
     const released = TrialEvent.parse(trialEventSamples['cost-released']);
     expect(renderEvent(released)).toContain('released from #9 (model-call-failed)');
     const halted = TrialEvent.parse(trialEventSamples['halted']);
-    expect(renderEvent(halted)).toContain('model-refusal');
+    expect(renderEvent(halted)).toContain('model-refusal: the model provider declined the request');
   });
 
   it('renders a verify-result event and neutralizes a hostile patch id in it', () => {

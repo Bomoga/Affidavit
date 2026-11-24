@@ -1,4 +1,4 @@
-import { TrialEvent, trialEventSamples } from '@affidavit/contracts';
+import { HaltReason, TrialEvent, trialEventSamples } from '@affidavit/contracts';
 import { readFixtureJson } from '@affidavit/testing';
 import { describe, expect, it } from 'vitest';
 import { PAYLOAD } from '../testing/poison.js';
@@ -113,8 +113,21 @@ describe('gate case view from the contracts fixture', () => {
     expect(next.stamp).toBe(view.stamp);
     expect(next.docket.slice(-2).map((d) => d.label)).toEqual([
       'Unspent cost released for defense',
-      'Case halted: model-refusal',
+      'Case halted: the model provider declined the request',
     ]);
+  });
+
+  it('words every halt reason in plain language, never as a raw code', () => {
+    for (const reason of HaltReason.options) {
+      const halted = TrialEvent.parse({
+        ...(trialEventSamples['halted'] as object),
+        seq: GATE.length,
+        payload: { reason },
+      });
+      const label = buildCaseView([...GATE, halted]).docket.at(-1)!.label;
+      expect(label).toMatch(/^Case halted: [a-z]/);
+      expect(label).not.toContain(reason);
+    }
   });
 });
 

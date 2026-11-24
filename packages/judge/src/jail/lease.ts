@@ -127,6 +127,12 @@ export class WorkerLease implements LeaseHandle {
       procStart?: string | null;
       now?: () => number;
       heartbeatMs?: number;
+      /**
+       * Called when a heartbeat write fails. A lease that stops beating goes stale and its networks
+       * become sweepable, so the failure is reported, never dropped. Default: one warning line
+       * naming the error class only.
+       */
+      onHeartbeatError?: (err: unknown) => void;
     } = {},
   ): Promise<WorkerLease> {
     await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -155,7 +161,13 @@ export class WorkerLease implements LeaseHandle {
     );
     await lease.#write();
     if (every > 0) {
-      lease.#timer = setInterval(() => void lease.heartbeat().catch(() => undefined), every);
+      const report =
+        opts.onHeartbeatError ??
+        ((err: unknown) =>
+          console.error(
+            `[judge] lease heartbeat failed (${err instanceof Error ? err.name : 'unknown error'})`,
+          ));
+      lease.#timer = setInterval(() => void lease.heartbeat().catch(report), every);
       lease.#timer.unref();
     }
     return lease;
