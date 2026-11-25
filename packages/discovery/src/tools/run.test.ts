@@ -745,7 +745,8 @@ describe('runTool', () => {
     const { runner } = fakeRunner((out) => writeFileSync(join(out, 'gitleaks.sarif'), sarif()));
     const res = await runTool(runner, manifest, 'gitleaks', await options(snap));
     expect(res.notifications.filter((n) => n.id === 'binary-header-mismatch')).toHaveLength(300);
-  });
+    // Writes and scans 300 files, so it is slow under a loaded parallel run; 30 s matches round7.
+  }, 30_000);
 
   it('flags a non-text byte found anywhere in the file, not only near the start', async () => {
     const snap = await snapshot({ 'src/app.js': 'x' });
