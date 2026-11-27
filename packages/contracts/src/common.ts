@@ -63,7 +63,8 @@ export const TERMINAL_STAGES: readonly CaseStage[] = ['verdict', 'dismissed', 'e
 
 /**
  * Legal stage transitions. Stores must reject anything else. Extra rules the store enforces that
- * this table cannot express: defense to dismissed only below the case's escalation floor (F3);
+ * this table cannot express: every transition into dismissed (from arraign, defense or
+ * prosecution) only below the case's escalation floor (F3, CR-3);
  * verify to remedy at most MAX_APPEALS times; verify to verdict only when the jury is disabled.
  */
 export const STAGE_TRANSITIONS: Readonly<Record<CaseStage, readonly CaseStage[]>> = {

@@ -92,11 +92,8 @@ export class FakeCaseStore implements CaseStore {
       Promise.reject(new IllegalTransitionError(from, to, why));
 
     if (!isLegalTransition(from, to)) return fail('not in the transition table');
-    if (
-      from === 'defense' &&
-      to === 'dismissed' &&
-      r.caseFile.candidate.score >= r.caseFile.escalationFloor
-    ) {
+    // F3 applies to every way into `dismissed` (CR-3), not only defense.
+    if (to === 'dismissed' && r.caseFile.candidate.score >= r.caseFile.escalationFloor) {
       return fail(
         'score is at or above the escalation floor, so the case cannot be dismissed (F3)',
       );

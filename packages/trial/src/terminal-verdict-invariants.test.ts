@@ -213,16 +213,18 @@ describe('terminal verdict invariants', () => {
 
   it('refuses a dismissed verdict when no dismissal was recorded', async () => {
     const store = new FakeCaseStore({ juryEnabled: false });
-    await openAt(store, cf, BIG_BUDGET, PATH_TO.prosecution);
+    // `low` is below the floor: since CR-3 the store refuses any dismissal at or above it, which
+    // would hide the missing-dismissal check this test is about.
+    await openAt(store, low, BIG_BUDGET, PATH_TO.prosecution);
     const sink = new FakeEventSink();
     const toDismissed: StageHandler = {
       run: () => Promise.resolve({ kind: 'advance', next: 'dismissed' }),
     };
-    await expect(make(store, sink, { prosecution: toDismissed }).run(cf.id)).rejects.toThrow(
+    await expect(make(store, sink, { prosecution: toDismissed }).run(low.id)).rejects.toThrow(
       /no recorded dismissal/,
     );
-    expect(await store.getVerdict(cf.id)).toBeNull();
-    assertSchemaValid(sink.events(cf.id));
+    expect(await store.getVerdict(low.id)).toBeNull();
+    assertSchemaValid(sink.events(low.id));
   });
 
   it('throws when a terminal case has a verdict with a different outcome', async () => {

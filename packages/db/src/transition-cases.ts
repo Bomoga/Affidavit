@@ -39,6 +39,8 @@ const forbiddenPairs: TransitionCase[] = stages.flatMap((from) =>
     .map((to) => ({
       name: `${from} -> ${to} is not in the table`,
       path: P[from],
+      // Reaching `dismissed` is only possible below the floor (F3), so its path needs a low score.
+      ...(from === 'dismissed' ? { score: 0.5, floor: 0.7 } : {}),
       to,
       ok: false,
     })),
@@ -56,41 +58,47 @@ const legalPairs: TransitionCase[] = stages.flatMap((from) =>
   STAGE_TRANSITIONS[from].map((to) => ({
     name: `${from} -> ${to} is legal`,
     path: P[from],
-    ...(from === 'defense' && to === 'dismissed' ? { score: 0.5, floor: 0.7 } : {}),
+    ...(to === 'dismissed' ? { score: 0.5, floor: 0.7 } : {}),
     ...(from === 'verify' && to === 'verdict' ? { juryEnabled: false } : {}),
     to,
     ok: true,
   })),
 );
 
-export const transitionCases: readonly TransitionCase[] = [
-  ...forbiddenPairs,
-  ...legalPairs,
-  // F3: defense to dismissed only below the escalation floor.
+/** F3 (CR-3): every way into `dismissed` is refused at or above the floor, allowed below it. */
+const f3Sources = ['arraign', 'defense', 'prosecution'] as const;
+const f3Cases: TransitionCase[] = f3Sources.flatMap((from) => [
   {
-    name: 'defense -> dismissed below the floor',
-    path: P.defense,
+    name: `${from} -> dismissed below the floor`,
+    path: P[from],
     score: 0.5,
     floor: 0.7,
-    to: 'dismissed',
+    to: 'dismissed' as const,
     ok: true,
   },
   {
-    name: 'defense -> dismissed at the floor is rejected (F3)',
-    path: P.defense,
+    name: `${from} -> dismissed at the floor is rejected (F3)`,
+    path: P[from],
     score: 0.7,
     floor: 0.7,
-    to: 'dismissed',
+    to: 'dismissed' as const,
     ok: false,
   },
   {
-    name: 'defense -> dismissed above the floor is rejected (F3)',
-    path: P.defense,
+    name: `${from} -> dismissed above the floor is rejected (F3)`,
+    path: P[from],
     score: 0.95,
     floor: 0.7,
-    to: 'dismissed',
+    to: 'dismissed' as const,
     ok: false,
   },
+]);
+
+export const transitionCases: readonly TransitionCase[] = [
+  ...forbiddenPairs,
+  ...legalPairs,
+  // F3: arraign, defense and prosecution to dismissed only below the escalation floor.
+  ...f3Cases,
   // Appeals.
   { name: 'verify -> remedy (first appeal)', path: P.verify, to: 'remedy', ok: true },
   { name: 'verify -> remedy (second appeal)', path: verifyAfter1Appeal, to: 'remedy', ok: true },

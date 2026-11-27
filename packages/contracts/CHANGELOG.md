@@ -1,5 +1,11 @@
 # Contracts changelog
 
+## Unreleased (2026-11-27)
+
+Behaviour rule, no schema change: no type, field or `STAGE_TRANSITIONS` entry changes, so no fixture or schema export changes and `schemaVersion` stays `1`. Approved by the lead on 2026-11-27.
+
+- **CR-3 (problem 1), F3 on every transition into `dismissed`:** a case whose candidate score is at or above its escalation floor cannot be dismissed from `arraign`, `defense` or `prosecution`. Before this the rule covered `defense` to `dismissed` only, so `arraign` to `dismissed` and `prosecution` to `dismissed` could silently dismiss a high-score candidate. The `STAGE_TRANSITIONS` comment now says so; `FakeCaseStore` (packages/testing), `rejectTransition` and `PgCaseStore` (packages/db) and the SQL guard (migration `0012_f3_every_dismissal`) enforce it together. A caller that dismissed a high-score case from `arraign` or `prosecution` now gets `IllegalTransitionError` and must escalate or hold for review instead. CR-3 problem 2 (`verify` to `verdict`) is still open.
+
 ## v1.2 (2026-11-21)
 
 Additive minor bump under `docs/implementation-plan.md` section 3.4, approved by the lead (`docs/decisions.md`, 2026-11-21). No v1.0 or v1.1 member is renamed, removed or reordered; every stored case file, event stream, verdict and exhibit result still parses unchanged, and `schemaVersion` stays `1`. No fixture changes, so the generator output is unchanged.

@@ -15,7 +15,8 @@ export interface TransitionState {
  */
 export function rejectTransition(s: TransitionState): string | null {
   if (!isLegalTransition(s.from, s.to)) return 'not in the transition table';
-  if (s.from === 'defense' && s.to === 'dismissed' && s.score >= s.escalationFloor) {
+  // F3 applies to every way into `dismissed` (CR-3), not only defense.
+  if (s.to === 'dismissed' && s.score >= s.escalationFloor) {
     return 'score is at or above the escalation floor, so the case cannot be dismissed (F3)';
   }
   if (s.from === 'verify' && s.to === 'remedy' && s.appeals >= MAX_APPEALS) {
