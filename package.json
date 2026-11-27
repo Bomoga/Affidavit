@@ -12,7 +12,8 @@
     "format:check": "pnpm -r format:check",
     "test": "pnpm -r test",
     "e2e": "node scripts/e2e.mjs",
-    "demo": "node scripts/demo.mjs"
+    "demo": "node scripts/demo.mjs",
+    "gate": "node --import tsx scripts/gate-check.ts"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
