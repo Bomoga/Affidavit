@@ -24,6 +24,41 @@ jobs:
       - run: pnpm test
       - run: pnpm build
 
+  postgres:
+    # The Postgres suites (row-level security, queue, case store, worker and API end to end) skip
+    # themselves without AFFIDAVIT_TEST_DATABASE_URL, so `check` never runs them. This job gives
+    # them a throwaway server. The suites create and alter cluster-wide roles, so the server is
+    # private to this job and the packages run one after another, never in parallel.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # Same digest as docker/compose.yaml (postgres:16).
+        image: postgres:16@sha256:933463a6c8eba2b9f5cd414138738cd8d5519cd2c471214c222652f547a66a32
+        env:
+          # Not a secret: an empty, short-lived database that exists only inside this job.
+          POSTGRES_PASSWORD: ci-throwaway
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      AFFIDAVIT_TEST_DATABASE_URL: postgres://postgres:ci-throwaway@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @affidavit/db test:pg
+      - run: pnpm --filter @affidavit/api test:pg
+      - run: pnpm --filter @affidavit/worker test:pg
+      - run: pnpm --filter @affidavit/cli test:pg
+
   fixtures:
     # Fixtures are part of the contract: every fixture must parse, and the committed fixtures and
     # exported JSON Schema must match what the generators produce from the current contracts.
