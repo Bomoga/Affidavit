@@ -23,8 +23,9 @@ export function rejectTransition(s: TransitionState): string | null {
     return `appeal limit of ${MAX_APPEALS} reached`;
   }
   if (s.from === 'verify' && s.to === 'jury' && !s.juryEnabled) return 'jury is disabled';
-  if (s.from === 'verify' && s.to === 'verdict' && s.juryEnabled && s.appeals < MAX_APPEALS) {
-    return 'jury is enabled and appeals remain; verify must go to jury, remedy, or escalated';
+  // With the jury enabled every verdict passes through it, appeals exhausted or not (CR-3).
+  if (s.from === 'verify' && s.to === 'verdict' && s.juryEnabled) {
+    return 'jury is enabled; verify must go to jury, remedy, or escalated';
   }
   return null;
 }

@@ -103,10 +103,9 @@ export class FakeCaseStore implements CaseStore {
       r.appeals += 1;
     }
     if (from === 'verify' && to === 'jury' && !this.juryEnabled) return fail('jury is disabled');
-    if (from === 'verify' && to === 'verdict' && this.juryEnabled && r.appeals < MAX_APPEALS) {
-      return fail(
-        'jury is enabled and appeals remain; verify must go to jury, remedy, or escalated',
-      );
+    // With the jury enabled every verdict passes through it, appeals exhausted or not (CR-3).
+    if (from === 'verify' && to === 'verdict' && this.juryEnabled) {
+      return fail('jury is enabled; verify must go to jury, remedy, or escalated');
     }
     r.stage = to;
     return Promise.resolve();
