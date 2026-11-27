@@ -156,6 +156,18 @@ describe('FakeCaseStore', () => {
     await off.transition(caseFile.id, 'verdict');
   });
 
+  it('an enabled jury is not skipped when appeals are exhausted (CR-3)', async () => {
+    const store = await storeAt('verify');
+    for (let i = 0; i < 2; i++) {
+      await store.transition(caseFile.id, 'remedy');
+      await store.transition(caseFile.id, 'verify');
+    }
+    await expect(store.transition(caseFile.id, 'verdict')).rejects.toThrow(/jury is enabled/);
+    expect(await store.stage(caseFile.id)).toBe('verify');
+    await store.transition(caseFile.id, 'jury');
+    await store.transition(caseFile.id, 'verdict');
+  });
+
   it('charges the budget and reports exhaustion without throwing', async () => {
     const store = await storeAt('defense');
     const first = await store.chargeBudget(caseFile.id, cost());

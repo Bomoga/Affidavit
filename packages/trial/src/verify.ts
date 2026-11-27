@@ -18,8 +18,8 @@ export interface VerifyDeps {
   workspace: TrialWorkspace;
   /**
    * The jury (L3-11) is not built yet, so verify writes the verdict and moves straight to
-   * `verdict`. `STAGE_TRANSITIONS` allows verify to verdict only when the jury is disabled (or
-   * appeals are exhausted), so the CaseStore this runs against must be wired with the jury
+   * `verdict`. `STAGE_TRANSITIONS` allows verify to verdict only when the jury is disabled
+   * (CR-3: exhausted appeals no longer skip an enabled jury), so the CaseStore this runs against must be wired with the jury
    * disabled: `new FakeCaseStore({ juryEnabled: false })` in tests, and the same setting on the
    * Postgres store in apps/worker. With the jury enabled the transition is refused by the store.
    */

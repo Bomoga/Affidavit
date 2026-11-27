@@ -117,9 +117,15 @@ export const transitionCases: readonly TransitionCase[] = [
     ok: false,
   },
   {
-    name: 'verify -> verdict with jury enabled and appeals exhausted',
+    name: 'verify -> verdict with jury enabled and appeals exhausted is rejected (CR-3)',
     path: verifyAfter2Appeals,
     to: 'verdict',
+    ok: false,
+  },
+  {
+    name: 'verify -> jury with jury enabled and appeals exhausted',
+    path: verifyAfter2Appeals,
+    to: 'jury',
     ok: true,
   },
   { name: 'verify -> escalated', path: P.verify, to: 'escalated', ok: true },
