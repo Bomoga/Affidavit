@@ -17,7 +17,17 @@ import type { ToolInvocation } from './invocations.js';
  *     hashed is the one the container mounts, resolved from the invocation's own `--config` and
  *     mounts (mountedConfigFile). Any other config gets no proof.
  *  2. The file's longest line is at most PROOF_CAPS.line bytes and its longest whitespace run at
- *     most PROOF_CAPS.ws bytes. matchbound.test.ts bounds every rule of the analyzed config under
+ *     most PROOF_CAPS.ws bytes, counted in the raw bytes and in every decoded view of a line
+ *     (base64, hex, percent, to DECODE_DEPTH; a decoded run also counts the raw whitespace next to
+ *     it, but at depth 1 or deeper only 6 characters of it). gitleaks decodes the whole fragment and a newline is whitespace too, so pieces too
+ *     small to see one at a time add up. As well as that count, the proof is refused
+ *     (decodedWsSuspect) when any decoded base64 or hex segment, in any alignment, depth or
+ *     joined group, holds a whitespace run longer than MAX_DECODED_WS_SEGMENT (8 bytes), or the
+ *     whole file carries more than MAX_DECODED_WS_BURST_BYTES (64) bytes in decoded whitespace
+ *     runs of WS_BURST_MIN (4) or more, or more than MAX_PERCENT_WS (8) whitespace percent
+ *     escapes (lone ones included). The file-level budgets do not depend on the shortest segment
+ *     gitleaks decodes. Real encoded data is near random and carries almost none (see the
+ *     arithmetic at those constants). matchbound.test.ts bounds every rule of the analyzed config under
  *     these caps (maxMatchBytes in matchbound.ts) and checks that each bound is at most
  *     OVERLAP_BYTES. Lines this short also keep every window cut on a line boundary.
  *  3. The rules with no such bound (a `[^"]{3,}` or `[\s\S-]{64,}?` that runs on across lines) all
@@ -138,7 +148,10 @@ export async function usesAnalyzedConfig(hostFile: string | undefined): Promise<
 export interface TextStats {
   /** Longest line in bytes, newline not counted. */
   maxLine: number;
-  /** Longest run of bytes from tab, newline, vertical tab, form feed, carriage return, space. */
+  /**
+   * Longest run of bytes from tab, newline, vertical tab, form feed, carriage return, space, in
+   * the raw bytes or in any decoded view of a line (base64, hex, percent, to DECODE_DEPTH).
+   */
   maxWs: number;
   /** Gate words found in the file, in its raw bytes or in the decoded text of a line. */
   gates: string[];
@@ -147,7 +160,61 @@ export interface TextStats {
    * the decode budget ran out. No proof then.
    */
   decodeIncomplete: boolean;
+  /**
+   * True when the decoded text of the file carries too much whitespace: a decoded segment holds a
+   * run longer than MAX_DECODED_WS_SEGMENT, or decodedWsBytes is over MAX_DECODED_WS_BURST_BYTES,
+   * or percentWsBytes is over MAX_PERCENT_WS. No proof then.
+   */
+  decodedWsSuspect: boolean;
+  /** Bytes in whitespace runs of WS_BURST_MIN or more inside decoded views, all lines together. */
+  decodedWsBytes: number;
+  /** Whitespace escapes (%09, %0a to %0d, %20) found in the text of any view, all lines together. */
+  percentWsBytes: number;
 }
+
+/**
+ * The longest whitespace run one decoded segment may hold before the file gets no proof. gitleaks
+ * replaces every decoded segment of a line in one pass, and a newline is whitespace too, so
+ * whitespace-only segments that sit side by side (split by raw spaces or newlines, or by padding)
+ * read as one long run that no per-segment count sees. Rather than model that exactly, the proof
+ * refuses any file with such a segment. Lockfile integrity hashes, SVG data and other real
+ * encoded data decode to near-random bytes, where 6 of 256 byte values are whitespace, so a run of
+ * 9 has odds near (6/256)^9, about 3e-15, per position: a whitespace-only run this long is not
+ * benign. The shortest segment gitleaks decodes (16 base64 characters, 12 bytes) can be all
+ * whitespace, so a threshold under 12 sees every such segment. This is in addition to the
+ * PROOF_CAPS.ws count, which stays.
+ */
+export const MAX_DECODED_WS_SEGMENT = 8;
+
+/**
+ * File-level budgets. The per-segment limit above sees one segment at a time, but gitleaks decodes
+ * the whole fragment and a newline is whitespace, so many small whitespace pieces on many lines
+ * (a lone %20 per line, short hex segments split by raw spaces) read as one long run. These
+ * budgets count the pieces across the file instead, so they hold whatever the shortest segment
+ * gitleaks decodes (the hex minimum is not relied on).
+ *
+ * Bursts: decoded bytes inside whitespace runs of at least WS_BURST_MIN (4) are summed over the
+ * whole file, every decoded view counted. A run of 4 has odds (6/256)^4, about 3e-7, per decoded
+ * byte in near-random data, so a lockfile with N decoded bytes carries about 4 * 3e-7 * N burst
+ * bytes: about 1 for 1 MB. Budget 64 leaves wide room for real files. A chain of more than 256
+ * whitespace bytes made of distinct pieces of at least 4 bytes each (assumed: gitleaks decodes
+ * nothing shorter than 8 hex or 16 base64 characters, 4 and 12 bytes; its real hex minimum was not
+ * verified) spends more than 64 when each piece is counted once. KNOWN GAP: it is not counted once
+ * per occurrence. The `seen` set in searchDecoded dedupes a decoded text per line at depth 1 or
+ * deeper, so about 17 copies of one nested segment on a line count once, and the raw neighbours of a
+ * nested segment are only 6 characters wide. A review built files that this rule still proves while
+ * a simulated gitleaks decode shows a whitespace run over OVERLAP_BYTES (a four-line pnpm-lock.yaml
+ * of about 16 KB, and a ten-line hex one of about 37 KB). Pieces of 1 to 3 bytes cannot be decoded
+ * as segments (assumed), and a lone percent escape is bounded by the next budget.
+ *
+ * Percent: whitespace escapes are summed over the whole file, lone ones included. Real lockfile and
+ * SVG text escapes `/`, `@`, `=` and similar and almost never a space or newline, so 8 per file is
+ * a tiny budget; a file with more is not given a proof (an SVG with an inlined data URI, say, which
+ * is only less provable, never wrong).
+ */
+export const WS_BURST_MIN = 4;
+export const MAX_DECODED_WS_BURST_BYTES = 64;
+export const MAX_PERCENT_WS = 8;
 
 export interface MeasureOptions {
   /** Most decoded bytes produced for one file before the search gives up (no proof). */
@@ -230,9 +297,37 @@ function joinGroup(group: readonly RegExpExecArray[], mode: JoinMode): string {
  * segment can cross it. A group of more than MAX_JOINED_SEGMENTS runs returns undefined (no
  * proof), which also bounds the work.
  */
-function decodings(text: string): string[] | undefined {
+interface WsSink {
+  /** One decoded segment: its longest run with raw neighbours, on its own, and its burst bytes. */
+  segment(withNeighbours: number, own: number, burstBytes: number): void;
+  /** Whitespace escapes found in the text being decoded. */
+  percent(count: number): void;
+}
+
+const PCT_WS = /%(?:09|0[a-d]|20)/gi;
+/** Bytes inside whitespace runs of WS_BURST_MIN or more. */
+function wsBurstBytes(decoded: string): number {
+  let total = 0;
+  let run = 0;
+  for (let i = 0; i < decoded.length; i++) {
+    if (isWsChar(decoded.charAt(i))) run++;
+    else {
+      if (run >= WS_BURST_MIN) total += run;
+      run = 0;
+    }
+  }
+  return run >= WS_BURST_MIN ? total + run : total;
+}
+
+function decodings(text: string, sink: WsSink): string[] | undefined {
+  sink.percent((text.match(PCT_WS) ?? []).length);
   const out = new Set<string>();
   const around = (start: number, end: number, decoded: string): void => {
+    sink.segment(
+      wsRunWithNeighbours(decoded, rawWsBefore(text, start), rawWsAfter(text, end)),
+      wsRunWithNeighbours(decoded, 0, 0),
+      wsBurstBytes(decoded),
+    );
     out.add(
       text.slice(Math.max(0, start - CONTEXT), start) + decoded + text.slice(end, end + CONTEXT),
     );
@@ -283,15 +378,56 @@ function decodings(text: string): string[] | undefined {
     }
   }
   const pct = pctDecode(text);
-  if (pct !== text) out.add(pct);
+  if (pct !== text) {
+    // the whole line with every escape decoded: only the 256 cap applies (raw spaces are in it)
+    sink.segment(wsRunWithNeighbours(pct, 0, 0), 0, 0);
+    out.add(pct);
+  }
   return [...out];
+}
+
+const isWsChar = (c: string): boolean => isWs(c.charCodeAt(0));
+/** Whitespace characters directly before `end` in `text`. */
+function rawWsBefore(text: string, end: number): number {
+  let n = 0;
+  while (n < end && isWsChar(text.charAt(end - 1 - n))) n++;
+  return n;
+}
+/** Whitespace characters from `start` on in `text`. */
+function rawWsAfter(text: string, start: number): number {
+  let n = 0;
+  while (start + n < text.length && isWsChar(text.charAt(start + n))) n++;
+  return n;
+}
+/**
+ * Longest whitespace run of a decoded segment as gitleaks reads its line: a run touching either
+ * end of the segment continues into the raw whitespace next to it (`before`, `after`).
+ */
+function wsRunWithNeighbours(decoded: string, before: number, after: number): number {
+  let best = 0;
+  let run = 0;
+  for (let i = 0; i < decoded.length; i++) {
+    run = isWsChar(decoded.charAt(i)) ? run + 1 : 0;
+    const total = run + (run === i + 1 ? before : 0) + (i === decoded.length - 1 ? after : 0);
+    if (total > best) best = total;
+  }
+  return best;
 }
 
 /** Searches the decoded forms of one line, recursively to DECODE_DEPTH. False when out of budget. */
 function searchDecoded(text: string, depth: number, found: Set<string>, budget: Budget): boolean {
   if (depth === 0 || found.size === GATES.length) return true;
   if (Date.now() >= budget.deadline) return false;
-  const all = decodings(text);
+  const all = decodings(text, {
+    segment(run, own, burst) {
+      if (run > budget.maxWs) budget.maxWs = run;
+      if (own > MAX_DECODED_WS_SEGMENT) budget.wsSuspect = true;
+      budget.burstBytes += burst;
+    },
+    percent(count) {
+      budget.percentWs += count;
+    },
+  });
   if (all === undefined) return false;
   for (const d of all) {
     // A text already searched to at least this depth adds nothing (the same text recurs often:
@@ -314,6 +450,14 @@ interface Budget {
   deadline: number;
   /** Texts already searched, with the depth left, for this line. */
   seen: Set<string>;
+  /** Longest whitespace run in any decoded view of any line (see wsRunWithNeighbours). */
+  maxWs: number;
+  /** Some decoded segment holds a whitespace run over MAX_DECODED_WS_SEGMENT. */
+  wsSuspect: boolean;
+  /** Bytes in whitespace bursts of decoded views, all lines. */
+  burstBytes: number;
+  /** Whitespace escapes seen, all lines. */
+  percentWs: number;
 }
 
 /** Streams a file once and measures what the proof needs. Bounded memory. */
@@ -331,6 +475,10 @@ export async function measureText(path: string, opts: MeasureOptions = {}): Prom
       left: opts.decodeBudgetBytes ?? DEFAULT_DECODE_BUDGET,
       deadline: Date.now() + (opts.maxMillis ?? DEFAULT_MAX_MILLIS),
       seen: new Set(),
+      maxWs: 0,
+      wsSuspect: false,
+      burstBytes: 0,
+      percentWs: 0,
     };
     let decodeIncomplete = false;
     // the current line, kept up to PROOF_CAPS.line bytes for the decoded search
@@ -372,7 +520,19 @@ export async function measureText(path: string, opts: MeasureOptions = {}): Prom
       carry = text.slice(-(LONGEST_GATE - 1));
     }
     endLine();
-    return { maxLine, maxWs, gates: [...found].sort(), decodeIncomplete };
+    // the decoded views count too: gitleaks runs its rules on them (PROOF_CAPS.ws applies to both)
+    return {
+      maxLine,
+      maxWs: Math.max(maxWs, budget.maxWs),
+      gates: [...found].sort(),
+      decodeIncomplete,
+      decodedWsSuspect:
+        budget.wsSuspect ||
+        budget.burstBytes > MAX_DECODED_WS_BURST_BYTES ||
+        budget.percentWs > MAX_PERCENT_WS,
+      decodedWsBytes: budget.burstBytes,
+      percentWsBytes: budget.percentWs,
+    };
   } finally {
     await fh.close();
   }
@@ -384,6 +544,7 @@ export function statsProveCoverage(s: TextStats): boolean {
     s.maxLine <= PROOF_CAPS.line &&
     s.maxWs <= PROOF_CAPS.ws &&
     s.gates.length === 0 &&
-    !s.decodeIncomplete
+    !s.decodeIncomplete &&
+    !s.decodedWsSuspect
   );
 }

@@ -783,6 +783,120 @@ describe('runTool', () => {
     expect(res.partial).toBe(true);
   });
 
+  describe('window proof of a chunk-split-risk file (round 4)', () => {
+    // Each case is over 100,000 bytes with no blank line, so gitleaks may cut through a secret.
+    // The positive controls prove this harness reaches the lifting branch; each negative then
+    // breaks exactly one protection, so it cannot pass for another reason.
+    const plain = '    "name": "left-pad",\n'.repeat(5_000); // short lines, nothing risky
+    const secret = `AKIA${'Q'.repeat(20_000)}`; // longer than the 16,000 byte window overlap
+    const cases: {
+      name: string;
+      file: string;
+      body: string;
+      lifted: boolean;
+    }[] = [
+      {
+        name: 'short lines (positive control)',
+        file: 'package-lock.json',
+        body: plain,
+        lifted: true,
+      },
+      { name: 'short lines (positive control)', file: 'icon.svg', body: plain, lifted: true },
+      {
+        name: 'a line over 4096 bytes holding a 20,000 byte secret',
+        file: 'package-lock.json',
+        body: `${'a'.repeat(60_000)} ${secret} ${'b'.repeat(60_000)}`,
+        lifted: false,
+      },
+      {
+        name: 'a gate word (private) on a short line',
+        file: 'package-lock.json',
+        body: `${plain}    "note": "Private",\n`,
+        lifted: false,
+      },
+      {
+        name: 'a raw whitespace run over 256 bytes',
+        file: 'package-lock.json',
+        body: `${plain}    "a":${' '.repeat(300)}"b",\n`,
+        lifted: false,
+      },
+      {
+        name: 'lines of base64 that decode to thousands of spaces',
+        file: 'pnpm-lock.yaml',
+        body: `${'ICAg'.repeat(1000)}\n`.repeat(30),
+        lifted: false,
+      },
+      {
+        name: 'base64 chunks split by raw spaces, each 12 decoded spaces',
+        file: 'pnpm-lock.yaml',
+        body: `${'ICAgICAgICAgICAg '.repeat(240)}\n`.repeat(30),
+        lifted: false,
+      },
+      {
+        name: 'many lines, each base64 that decodes to about 200 spaces',
+        file: 'yarn.lock',
+        body: `${'ICAg'.repeat(67)}\n`.repeat(450),
+        lifted: false,
+      },
+      {
+        name: 'a lone %20 on each of 30,000 lines',
+        file: 'pnpm-lock.yaml',
+        body: '%20\n'.repeat(30_000),
+        lifted: false,
+      },
+      {
+        name: 'eight %20 in a row on each of 5,000 lines',
+        file: 'pnpm-lock.yaml',
+        body: '%20%20%20%20%20%20%20%20\n'.repeat(5_000),
+        lifted: false,
+      },
+      {
+        name: 'lone %0a, %09 and %0d among real integrity lines',
+        file: 'pnpm-lock.yaml',
+        body: `      integrity: sha512-${'Zm9vYmFy'.repeat(10)}fQ==\n%0a\n%09\n%0d\n`.repeat(1_000),
+        lifted: false,
+      },
+      {
+        name: 'short hex segments split by raw spaces, each 8 decoded spaces',
+        file: 'yarn.lock',
+        body: `${'2020202020202020 '.repeat(240)}\n`.repeat(30),
+        lifted: false,
+      },
+      {
+        name: 'real-looking integrity lines (sha512 base64 with padding)',
+        file: 'package-lock.json',
+        body: `      "integrity": "sha512-${'Zm9vYmFy'.repeat(10)}fQ==",\n`.repeat(1_500),
+        lifted: true,
+      },
+      {
+        name: 'a plain text file with short lines (not in the proof class)',
+        file: 'src/big.txt',
+        body: plain,
+        lifted: false,
+      },
+    ];
+
+    for (const c of cases) {
+      it(`${c.file}, ${c.name}: ${c.lifted ? 'proven, flag lifted' : 'flag kept, partial'}`, async () => {
+        const snap = await snapshot({ 'src/app.js': 'x' });
+        writeFileSync(join(snap.dir, ...c.file.split('/')), c.body);
+        const { runner } = fakeRunner((out) => writeFileSync(join(out, 'gitleaks.sarif'), sarif()));
+        const res = await runTool(runner, manifest, 'gitleaks', await options(snap));
+        const risk = res.notifications.filter(
+          (n) => n.id === 'chunk-split-risk' && n.message.includes(`/src/${c.file}`),
+        );
+        if (c.lifted) {
+          expect(res.windowProvenFiles).toContain(`/src/${c.file}`);
+          expect(risk).toEqual([]);
+        } else {
+          expect(res.windowProvenFiles).not.toContain(`/src/${c.file}`);
+          expect(risk.length).toBe(1);
+          expect(res.partial).toBe(true);
+        }
+      }, 30_000);
+    }
+  });
+
   it('does not make a normal clone partial: .git/index and other git bookkeeping are expected binary', async () => {
     const snap = await snapshot({
       'src/app.js': 'x',
