@@ -48,12 +48,11 @@ Branch `lane1/L1-01c-nodegoat-ingest`, stacked on #51 (`lane1/L1-07-casefile`). 
 
 ## Blocked
 
-- L1-01 (#32): round 4 review found one blocker and three majors. Waiting on lead decision about a fourth fix round.
-  - Blocker: gitleaks snapshot findings are dropped for "fully windowed" files when a secret longer than the window overlap is cut by every window.
-  - Major: the git floor still admits 2.37.7 and 2.38.5.
-  - Major: the library SIGTERM handler breaks worker graceful shutdown.
-  - Major: an in-repo `.gitattributes` changes checkout bytes.
-- Downstream of L1-01: L1-05 (map), L1-06, L1-07 (also gated on CR-1 and CR-2), L1-13, L1-16.
+- L1-01 round 4 (2026-11-25, branch `lane1/L1-01-round4`, not yet merged): #32 merged on 2026-11-17, so the "waiting on a fourth fix round" note is stale. The lead approved the round. None of the four findings reproduced on `main` (the git floor, the SIGTERM handler and `.gitattributes` are fixed in the code; the long-secret window case keeps `chunk-split-risk`); regression tests were added for each. Reviews of the window proof then found a real gap, narrowed here but not closed:
+  - The window proof's decoded-whitespace check is a heuristic. A four-line `pnpm-lock.yaml` of about 16 KB, built from repeated nested base64 segments, still gets a proof while a simulated gitleaks decode shows a whitespace run over the 16,000-byte overlap. The branch adds per-segment and file-level budgets (tighter than `main`) but not an exact model of gitleaks' decoding.
+  - Open before anyone relies on the proof for untrusted repos: one real gitleaks run on the reviewer's scratch files to settle its minimum hex and base64 segment lengths, whether it decodes ` ` or `%20` alone, and whether the hex route is real; then either an exact decode model or dropping the proof for YAML lockfiles.
+  - The regression stamp (`packages/discovery/rules/regression-stamp.json`) is stale because `windowproof.ts` changed; refresh needs the Docker and network corpus regression.
+- Downstream of L1-01 (these rows were listed as blocked; check their real status before relying on them): L1-05 (map), L1-06, L1-07 (also gated on CR-1 and CR-2), L1-13, L1-16.
 - Gated on external inputs: L1-14 (Juice Shop and DVNA licensing), L1-15 (App credentials).
 - Discovery minors follow-up (rules regression `handlerEndLine` fixes and normalizer minors) is committed locally on `lane1/L1-04b-discovery-minors` but not pushed. Its docker regression run needs a permission the agent did not have.
 - CI has no Postgres service, so `@affidavit/db` test:pg and the discovery docker tests only run locally. Waiting on lead decision.

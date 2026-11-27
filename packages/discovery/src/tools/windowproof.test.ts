@@ -7,6 +7,8 @@ import { loadToolManifest, repoRoot } from './manifest.js';
 import { cleanupTmp, tmp } from './testkit.js';
 import {
   inWindowProofClass,
+  MAX_DECODED_WS_BURST_BYTES,
+  MAX_DECODED_WS_SEGMENT,
   measureText,
   mountedConfigFile,
   PROOF_CAPS,
@@ -26,7 +28,15 @@ describe('measureText', () => {
   it('measures the longest line and whitespace run in bytes', async () => {
     const s = await measureText(file(`ab\n${'x'.repeat(50)}\n  \t \nyy`));
     // the whitespace run is newline, space, space, tab, space, newline
-    expect(s).toEqual({ maxLine: 50, maxWs: 6, gates: [], decodeIncomplete: false });
+    expect(s).toEqual({
+      maxLine: 50,
+      maxWs: 6,
+      gates: [],
+      decodeIncomplete: false,
+      decodedWsSuspect: false,
+      decodedWsBytes: 0,
+      percentWsBytes: 0,
+    });
   });
 
   it('a newline run counts as whitespace', async () => {
@@ -58,12 +68,150 @@ describe('statsProveCoverage', () => {
       maxWs: PROOF_CAPS.ws,
       gates: [],
       decodeIncomplete: false,
+      decodedWsSuspect: false,
+      decodedWsBytes: 0,
+      percentWsBytes: 0,
     };
     expect(statsProveCoverage(fine)).toBe(true);
     expect(statsProveCoverage({ ...fine, maxLine: PROOF_CAPS.line + 1 })).toBe(false);
     expect(statsProveCoverage({ ...fine, maxWs: PROOF_CAPS.ws + 1 })).toBe(false);
     expect(statsProveCoverage({ ...fine, gates: ['curl'] })).toBe(false);
     expect(statsProveCoverage({ ...fine, decodeIncomplete: true })).toBe(false);
+    expect(statsProveCoverage({ ...fine, decodedWsSuspect: true })).toBe(false);
+  });
+});
+
+describe('whitespace runs in decoded text (round 4, second pass)', () => {
+  // Every raw line is at most 4096 bytes with no raw whitespace run, but gitleaks reads the
+  // decoded text, where each line is a run of spaces far over PROOF_CAPS.ws.
+  const lines = {
+    base64: `${'ICAg'.repeat(1000)}\n`, // 4000 chars, 3000 spaces
+    hex: `${'20'.repeat(2000)}\n`, // 4000 chars, 2000 spaces
+    percent: `${'%20'.repeat(1300)}\n`, // 3900 chars, 1300 spaces
+  };
+  for (const [kind, line] of Object.entries(lines)) {
+    it(`${kind}: a line that decodes to spaces over the cap gives no proof`, async () => {
+      const s = await measureText(file(line.repeat(30)));
+      expect(s.maxLine).toBeLessThanOrEqual(PROOF_CAPS.line);
+      expect(s.gates).toEqual([]);
+      expect(s.decodeIncomplete).toBe(false);
+      expect(s.maxWs).toBeGreaterThan(PROOF_CAPS.ws);
+      expect(statsProveCoverage(s)).toBe(false);
+    });
+  }
+
+  it('raw whitespace next to a decoded run counts with it', async () => {
+    // 200 raw spaces + 200 decoded spaces (ICAg x 67 is 201 spaces) is over 256 in one view
+    const s = await measureText(file(`${' '.repeat(200)}${'ICAg'.repeat(67)}\n`));
+    expect(s.maxWs).toBeGreaterThan(PROOF_CAPS.ws);
+    expect(statsProveCoverage(s)).toBe(false);
+  });
+
+  it('ordinary lockfile text, and a few short decoded whitespace runs, still prove', async () => {
+    const hash = createHash('sha512').update('left-pad').digest('base64');
+    const real = `    "integrity": "sha512-${hash}",\n`.repeat(100);
+    const ws6 = `    "x": "${'ICAg'.repeat(2)}"\n`; // 6 decoded spaces, a burst of 6
+    const few = await measureText(file(real + ws6.repeat(10))); // 60 burst bytes, budget 64
+    expect(few.decodedWsBytes).toBeLessThanOrEqual(MAX_DECODED_WS_BURST_BYTES);
+    expect(statsProveCoverage(few)).toBe(true);
+    const many = await measureText(file(real + ws6.repeat(11))); // 66 burst bytes
+    expect(many.decodedWsBytes).toBeGreaterThan(MAX_DECODED_WS_BURST_BYTES);
+    expect(many.decodedWsSuspect).toBe(true);
+    expect(statsProveCoverage(many)).toBe(false);
+  });
+
+  it('more than 8 whitespace escapes in a file is refused, 8 is not', async () => {
+    const plain = '    "a": "b",\n'.repeat(50);
+    const eight = await measureText(file(`${plain}${'x%20y\n'.repeat(8)}`));
+    expect(eight.percentWsBytes).toBe(8);
+    expect(statsProveCoverage(eight)).toBe(true);
+    const nine = await measureText(file(`${plain}${'x%20y\n'.repeat(9)}`));
+    expect(nine.percentWsBytes).toBe(9);
+    expect(statsProveCoverage(nine)).toBe(false);
+  });
+});
+
+describe('decoded whitespace across segments, lines and padding (round 4, third pass)', () => {
+  // Each file has raw lines of at most 4096 bytes, raw whitespace runs of at most 256 and no
+  // gate word, but gitleaks reads whitespace-only text after decoding.
+  const refused = async (body: string): Promise<void> => {
+    const s = await measureText(file(body));
+    expect(s.maxLine).toBeLessThanOrEqual(PROOF_CAPS.line);
+    expect(s.gates).toEqual([]);
+    expect(s.decodeIncomplete).toBe(false);
+    expect(statsProveCoverage(s)).toBe(false);
+  };
+  const chunk64 = 'ICAgICAgICAgICAg'; // 16 chars, decodes to 12 spaces
+
+  it('A, base64: 16 character chunks split by one raw space, each 12 decoded spaces', async () => {
+    await refused(`${`${chunk64} `.repeat(240)}\n`);
+  });
+
+  it('A, hex: 32 character chunks split by one raw space, each 16 decoded spaces', async () => {
+    await refused(`${`${'20'.repeat(16)} `.repeat(110)}\n`);
+  });
+
+  it('A, percent: three escapes split by one raw space', async () => {
+    await refused(`${'%20%20%20 '.repeat(400)}\n`);
+  });
+
+  it('B: many lines, each a base64 string that decodes to about 200 spaces', async () => {
+    await refused(`${`${'ICAg'.repeat(67)}\n`.repeat(300)}`);
+  });
+
+  it('C: decoded spaces, then = padding, then raw spaces', async () => {
+    await refused(`${'ICAg'.repeat(33)}ICA=${' '.repeat(200)}\n`);
+  });
+
+  it('D: base64 of base64 of spaces, 100 decoded spaces', async () => {
+    const inner = 'ICAg'.repeat(34); // 102 spaces
+    await refused(`${Buffer.from(inner, 'latin1').toString('base64')}\n`);
+  });
+
+  it('pins MAX_DECODED_WS_SEGMENT: a segment of 9 whitespace bytes refuses, 8 proves', async () => {
+    const nine = 'ICAgICAgICAg'; // 12 characters
+    const eight = 'ICAgICAgICA='; // 11 characters and padding
+    expect(Buffer.from(nine, 'base64').toString('latin1')).toBe(' '.repeat(9));
+    expect(Buffer.from(eight, 'base64').toString('latin1')).toBe(' '.repeat(8));
+    expect(MAX_DECODED_WS_SEGMENT).toBe(8);
+    expect(statsProveCoverage(await measureText(file(`x: "${nine}"\n`)))).toBe(false);
+    expect(statsProveCoverage(await measureText(file(`x: "${eight}"\n`)))).toBe(true);
+  });
+});
+
+describe('percent escapes that decode to whitespace, file level (round 4, fourth pass)', () => {
+  // gitleaks decodes the whole fragment and a newline is whitespace, so many lines that each
+  // decode to a little whitespace read as one long run.
+  const refused = async (body: string): Promise<void> => {
+    const s = await measureText(file(body));
+    expect(s.maxLine).toBeLessThanOrEqual(PROOF_CAPS.line);
+    expect(s.gates).toEqual([]);
+    expect(s.decodeIncomplete).toBe(false);
+    expect(statsProveCoverage(s)).toBe(false);
+  };
+  it('a lone %20 on each of 9000 lines', async () => {
+    await refused('%20\n'.repeat(9000));
+  });
+  it('eight %20 in a row on each of 1000 lines', async () => {
+    await refused('%20%20%20%20%20%20%20%20\n'.repeat(1000));
+  });
+  for (const esc of ['%0a', '%0A', '%09', '%0d', '%0b', '%0c']) {
+    it(`a lone ${esc} on each of 3000 lines`, async () => {
+      await refused(`${esc}\n`.repeat(3000));
+    });
+  }
+  it('lone escapes among real integrity lines (mixed)', async () => {
+    const hash = createHash('sha512').update('left-pad').digest('base64');
+    const real = `    "integrity": "sha512-${hash}",\n`;
+    await refused(`${real}%20\n`.repeat(2000));
+  });
+  it('whitespace escapes with a raw space between them', async () => {
+    await refused('%20 %20 %20 %20\n'.repeat(1000));
+  });
+  it('ordinary percent escapes in lockfile text still prove', async () => {
+    const body = `    "resolved": "https://registry.npmjs.org/@types%2fnode/-/node-1.tgz",\n    "a": "x%40y%3Dz",\n`;
+    const s = await measureText(file(body.repeat(300)));
+    expect(statsProveCoverage(s)).toBe(true);
   });
 });
 
