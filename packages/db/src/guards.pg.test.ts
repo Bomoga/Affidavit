@@ -265,6 +265,29 @@ describePg('database guards behind the store', () => {
       );
     });
 
+    it('F3 holds in SQL for every way into dismissed (CR-3): arraign and prosecution too', async () => {
+      const paths = {
+        arraign: ['map', 'arraign'],
+        prosecution: ['map', 'arraign', 'defense', 'prosecution'],
+      } as const;
+      for (const [from, path] of Object.entries(paths)) {
+        const { store, file } = await openCase({ score: 0.9, floor: 0.7 });
+        for (const s of path) await store.transition(file.id, s);
+        expect(
+          await asApp(`update cases set stage = 'dismissed' where id = $1`, [file.id]),
+          `${from} -> dismissed at or above the floor`,
+        ).toMatch(/escalation floor/);
+      }
+    });
+
+    it('below the floor, arraign may still dismiss in SQL', async () => {
+      const { store, file } = await openCase({ score: 0.2, floor: 0.7 });
+      for (const s of ['map', 'arraign'] as const) await store.transition(file.id, s);
+      expect(await asApp(`update cases set stage = 'dismissed' where id = $1`, [file.id])).toBe(
+        'no error',
+      );
+    });
+
     it('the SQL transition table is exactly STAGE_TRANSITIONS', async () => {
       const { file } = await openCase({ score: 0.1, floor: 0.7 });
       const c = await db().admin.connect();

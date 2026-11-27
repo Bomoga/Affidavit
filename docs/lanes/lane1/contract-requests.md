@@ -27,6 +27,8 @@ The gate issue in NodeGoat at the pinned commit is MongoDB `$where` (NoSQL) inje
 
 **Interim.** Both stores keep the current behaviour (parity with the fake). The SQL guard in the database mirrors it too.
 
+**Problem 1 resolved (2026-11-27).** The lead chose the first option: F3 applies to every transition into `dismissed`. Landed in `packages/contracts` (comment), `packages/testing` (`FakeCaseStore`), `packages/db` (`rejectTransition`, the shared table, migration `0012_f3_every_dismissal`) with tests at each level. Callers that dismissed a high-score case from `arraign` or `prosecution` must escalate or hold for review; Lane 3 checks its own orchestrator paths. Problem 2 below is still open.
+
 **Problem 2, `verify` to `verdict`.** The contracts changelog says verify goes to verdict "when the jury is disabled or appeals are exhausted". The fake allows it when the jury is disabled, or when the jury is enabled and appeals are exhausted (`appeals >= MAX_APPEALS`). Whether a case with appeals exhausted must still pass through the jury, or may go straight to a `not-proven` verdict, is not stated precisely. The stores follow the fake.
 
 **Request.** Say which of the two paths is intended, and whether the jury-enabled setting belongs on the case (so a database can enforce it) or stays store configuration.

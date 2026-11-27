@@ -107,6 +107,25 @@ describe('FakeCaseStore', () => {
     await store.transition(caseFile.id, 'escalated');
   });
 
+  it('refuses to dismiss from arraign or prosecution at or above the floor too (CR-3)', async () => {
+    for (const stage of ['arraign', 'prosecution'] as const) {
+      const store = await storeAt(stage);
+      await expect(store.transition(caseFile.id, 'dismissed'), stage).rejects.toThrow(
+        /escalation floor/,
+      );
+      expect(await store.stage(caseFile.id)).toBe(stage);
+    }
+  });
+
+  it('allows dismissal from arraign and prosecution below the floor', async () => {
+    const low: CaseFile = { ...caseFile, candidate: { ...caseFile.candidate, score: 0.1 } };
+    for (const stage of ['arraign', 'prosecution'] as const) {
+      const store = await storeAt(stage, low);
+      await store.transition(low.id, 'dismissed');
+      expect(await store.stage(low.id), stage).toBe('dismissed');
+    }
+  });
+
   it('allows dismissal below the floor', async () => {
     const low: CaseFile = { ...caseFile, candidate: { ...caseFile.candidate, score: 0.1 } };
     const store = await storeAt('defense', low);
