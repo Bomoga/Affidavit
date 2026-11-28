@@ -1,4 +1,5 @@
 export * from './fixtures.js';
+export * from './gate.js';
 export * from './hash.js';
 export * from './infra.js';
 export * from './judge.js';
