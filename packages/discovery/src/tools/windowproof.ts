@@ -87,15 +87,18 @@ export const GATES: readonly Gate[] = [
 export const ANALYZED_GITLEAKS_CONFIG_SHA256 =
   'c5e9c1aeab014b8e1c85d0b1c9979b8399cd9c7c42fade18e329dd7a1e494114';
 
-/** Lockfile names (exact) whose chunk-split-risk the windows pass may prove away. */
+/**
+ * Lockfile names (exact) whose chunk-split-risk the windows pass may prove away. `yarn.lock` and
+ * `pnpm-lock.yaml` are deliberately absent: YAML lines are free to hold the nested decoded text
+ * that review found can slip past the whitespace budgets (known gap 2 in packages/discovery
+ * CLAUDE.md), so their chunk-split-risk is kept and the scan stays partial.
+ */
 export const WINDOW_PROOF_NAMES: ReadonlySet<string> = new Set([
   'package-lock.json',
   'npm-shrinkwrap.json',
-  'yarn.lock',
-  'pnpm-lock.yaml',
 ]);
 
-/** Generated data the proof applies to: the lockfiles above and SVG files. */
+/** Generated data the proof applies to: the JSON lockfiles above and SVG files. */
 export function inWindowProofClass(fileName: string): boolean {
   return WINDOW_PROOF_NAMES.has(fileName) || extname(fileName).toLowerCase() === '.svg';
 }

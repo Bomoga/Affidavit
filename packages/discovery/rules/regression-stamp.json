@@ -1,7 +1,7 @@
 {
-  "inputsSha256": "831a1a1374b1dd8b68e4af600aa53605d40fb50264b227d6c34adbbde709ca20",
+  "inputsSha256": "e077fe8f5f79c32556d964d9638e6afab0acd52f1e316d0de2dd9970bfcaa00d",
   "runOutputSha256": "ad656d2f2eb0a83b32366ee5c23c608b03a2888b53d38e6a5ac121d26da1c86b",
   "semgrepImage": "docker.io/semgrep/semgrep@sha256:cc1b68266f267878b39739373ea9985b9a78e5d64497dd875c8de100b22695ed",
   "nodegoatCommit": "c5cb68a7084e4ae7dcc60e6a98768720a81841e8",
-  "ranOn": "2026-11-26"
+  "ranOn": "2026-11-28"
 }
