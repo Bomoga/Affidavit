@@ -1,47 +1,15 @@
-import { generateKeyPairSync } from 'node:crypto';
-import type { Attestation, BundleManifest } from '@affidavit/contracts';
+import type { BundleManifest } from '@affidavit/contracts';
 import { describe, expect, it } from 'vitest';
 import {
-  IN_TOTO_PAYLOAD_TYPE,
   VERDICT_PREDICATE_TYPE,
   attestationProblem,
   manifestStatement,
-  publicKeyId,
   verifyAttestation,
 } from './attestation.js';
 import { buildBundle, MANIFEST_PATH } from './bundle.js';
 import { canonicalJson, sha256Hex } from './canonical.js';
 import { readTar } from './tar.js';
-import { bundleInput } from './test-helpers.js';
-
-const pem = (): string =>
-  generateKeyPairSync('ec', { namedCurve: 'P-256' }).publicKey.export({
-    type: 'spki',
-    format: 'pem',
-  }) as string;
-
-/** A Sigstore bundle shaped like cosign's output for `statement`, with a made-up signature. */
-function fakeAttestation(
-  manifest: BundleManifest,
-  publicKeyPem: string,
-  over: { payload?: unknown; payloadType?: string; hint?: string; tlog?: unknown[] } = {},
-): Attestation {
-  const statement = manifestStatement(manifest);
-  const keyId = publicKeyId(publicKeyPem);
-  const bundle = {
-    mediaType: 'application/vnd.dev.sigstore.bundle.v0.3+json',
-    verificationMaterial: {
-      publicKey: { hint: over.hint ?? Buffer.from(keyId.slice(7), 'hex').toString('base64') },
-      ...(over.tlog === undefined ? {} : { tlogEntries: over.tlog }),
-    },
-    dsseEnvelope: {
-      payload: Buffer.from(canonicalJson(over.payload ?? statement)).toString('base64'),
-      payloadType: over.payloadType ?? IN_TOTO_PAYLOAD_TYPE,
-      signatures: [{ sig: 'MEUCIQ' }],
-    },
-  };
-  return { schemaVersion: 1, statement, signature: JSON.stringify(bundle), keyId };
-}
+import { bundleInput, fakeAttestation, pem } from './test-helpers.js';
 
 describe('manifestStatement', () => {
   it('signs the exact manifest.json bytes of the bundle, with the manifest as predicate', async () => {

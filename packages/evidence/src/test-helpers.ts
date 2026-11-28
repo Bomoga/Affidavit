@@ -1,3 +1,4 @@
+import { generateKeyPairSync } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
@@ -6,13 +7,17 @@ import {
   VerifyResult,
   Verdict,
   samples,
+  type Attestation,
+  type BundleManifest,
   type Exhibit,
   type JudgePort,
   type PatchExhibit,
   type TargetVariant,
   type Witness,
 } from '@affidavit/contracts';
+import { IN_TOTO_PAYLOAD_TYPE, manifestStatement, publicKeyId } from './attestation.js';
 import type { BundleInput, ExhibitRecord } from './bundle.js';
+import { canonicalJson } from './canonical.js';
 
 // Test-only helpers. Not exported from index.ts.
 
@@ -148,4 +153,33 @@ export class ScriptedJudge implements JudgePort {
     this.calls.push({ method: 'verifyPatch', caseFile: cf, args: [p, w, cs] });
     return Promise.resolve().then(() => (this.override.verifyPatch ?? verifyResult)());
   }
+}
+
+export const pem = (): string =>
+  generateKeyPairSync('ec', { namedCurve: 'P-256' }).publicKey.export({
+    type: 'spki',
+    format: 'pem',
+  }) as string;
+
+/** A Sigstore bundle shaped like cosign's output for `statement`, with a made-up signature. */
+export function fakeAttestation(
+  manifest: BundleManifest,
+  publicKeyPem: string,
+  over: { payload?: unknown; payloadType?: string; hint?: string; tlog?: unknown[] } = {},
+): Attestation {
+  const statement = manifestStatement(manifest);
+  const keyId = publicKeyId(publicKeyPem);
+  const bundle = {
+    mediaType: 'application/vnd.dev.sigstore.bundle.v0.3+json',
+    verificationMaterial: {
+      publicKey: { hint: over.hint ?? Buffer.from(keyId.slice(7), 'hex').toString('base64') },
+      ...(over.tlog === undefined ? {} : { tlogEntries: over.tlog }),
+    },
+    dsseEnvelope: {
+      payload: Buffer.from(canonicalJson(over.payload ?? statement)).toString('base64'),
+      payloadType: over.payloadType ?? IN_TOTO_PAYLOAD_TYPE,
+      signatures: [{ sig: 'MEUCIQ' }],
+    },
+  };
+  return { schemaVersion: 1, statement, signature: JSON.stringify(bundle), keyId };
 }

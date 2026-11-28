@@ -11,7 +11,6 @@ import {
   type PatchExhibit,
 } from '@affidavit/contracts';
 import {
-  buildBundle,
   caseUsage,
   FsEvidenceStore,
   loadBundle,
@@ -19,12 +18,14 @@ import {
   publicKeyId,
   readTar,
   replay,
-  storeBundle,
+  sealingCaseStore,
   verifyBundleFiles,
   verifyPublic,
   VERIFY_EXIT,
   writeTar,
+  VerdictSealer,
   type ExhibitRecord,
+  type SealedVerdict,
 } from '@affidavit/evidence';
 import {
   buildPatchApplyImage,
@@ -263,13 +264,6 @@ describe.skipIf(SKIP_REASON !== null)(
     });
 
     it('builds and stores the bundle, and the signer service signs its manifest', async () => {
-      const booted = await real!.targets.boot(cf);
-      if (!booted.ok) throw new Error('targets are no longer booted');
-      const pinned = CaseFile.parse({
-        ...cf,
-        target: { ...cf.target, imageDigest: booted.digests.vulnerable },
-        safeVariant: { ...cf.safeVariant!, imageDigest: booted.digests.safe },
-      });
       const exhibitIds = records.map((r) =>
         r.kind === 'patch' ? r.result.patchExhibitId : r.result.exhibitId,
       );
@@ -286,19 +280,40 @@ describe.skipIf(SKIP_REASON !== null)(
         modelIds: {},
         cost: [],
       });
-      const bundle = await buildBundle({
-        caseFile: pinned,
-        verdict,
-        exhibits: records,
+      // Sealed the way the worker will: the pinned case file from the Judge's targets, the
+      // records from the case, and the attestation read back from the store by its digest.
+      let sealed: SealedVerdict | undefined;
+      const sealer = new VerdictSealer({
+        evidence: real!.evidence,
+        signer: real!.signer,
+        source: {
+          pinnedCaseFile: () => real!.targets.bind(cf),
+          records: () => Promise.resolve(records),
+        },
         toolVersions: { judge: 'e2e' },
-        createdAt: new Date().toISOString(),
+        onSealed: (s) => {
+          sealed = s;
+        },
       });
-      const sha256 = await storeBundle(real!.evidence, bundle);
+      const appended: Verdict[] = [];
+      const sealing = sealingCaseStore(
+        { appendVerdict: (v: Verdict) => Promise.resolve(void appended.push(v)) } as never,
+        sealer,
+      );
+      await sealing.appendVerdict(verdict);
+      expect(appended).toHaveLength(1);
+      const sha256 = appended[0]!.bundleSha256!;
+      expect(sha256).toBe(sealed!.bundleSha256);
       const loaded = await loadBundle(real!.evidence, sha256);
       expect(loaded?.sha256).toBe(sha256);
-      stored = { sha256, bytes: bundle.bytes };
-      const attestation = await real!.signer.sign(bundle.manifest);
-      attestationJson = JSON.stringify(attestation);
+      expect(Object.keys(loaded?.manifest.targetDigests ?? {}).sort()).toEqual([
+        'safe',
+        'vulnerable',
+      ]);
+      stored = { sha256, bytes: (await real!.evidence.get(sha256))! };
+      const attBytes = await real!.evidence.get(sealed!.attestationSha256);
+      attestationJson = Buffer.from(attBytes!).toString('utf8');
+      expect(JSON.parse(attestationJson)).toEqual(sealed!.attestation);
       expect(caseUsage(records)).toMatchObject({
         unmeasuredRuns: 0,
         egressAttempts: 0,

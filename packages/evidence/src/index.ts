@@ -7,3 +7,4 @@ export * from './tar.js';
 export * from './attestation.js';
 export * from './keys.js';
 export * from './verify.js';
+export * from './seal.js';

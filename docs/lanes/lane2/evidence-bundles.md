@@ -136,6 +136,33 @@ their address and throws `EvidenceCorruptError` when they do not.
 `storeBundle` puts every file of the bundle under its own digest and the tar under the bundle
 digest; `loadBundle` gets the tar by digest and opens it.
 
+## Sealing a verdict (CR-11)
+
+`packages/evidence/src/seal.ts` is the step between a verdict and `CaseStore.appendVerdict`. No
+contract change: `Verdict.bundleSha256` is already optional.
+
+- `sealVerdict(input, { evidence, signer })` builds the bundle, stores it (`storeBundle`), has the
+  signer attest the manifest, checks the attestation is for that manifest (`attestationProblem`),
+  stores the attestation's canonical JSON under its own digest, and returns the verdict with
+  `bundleSha256` set, plus `attestationSha256`. Any failure throws `SealError` and no verdict comes
+  back, so nothing is written without its bundle. A verdict that already names a bundle is refused
+  before anything is signed.
+- `VerdictSealer` reads what it needs from a `SealSource`: `pinnedCaseFile(caseId)` (the case
+  file with the image digests the exhibits ran on; the real Judge gives it with
+  `CaseTargets.bind`) and `records(caseId)` (each exhibit as submitted, the Judge's result, and
+  the run log from the `RunLogRecorder`). `onSealed` runs before the verdict is returned, for
+  example to record `attestationSha256` next to the verdict.
+- A verdict that cites no exhibit passes through unsealed: nothing ran in the sandbox, so there
+  is no evidence to attest, and a bundle must pin a target image that a case closed before any
+  boot never had. Every other verdict is sealed or refused; there is no unsealed fallback.
+- `sealingCaseStore(store, sealer)` wraps a `CaseStore` so `appendVerdict` seals first. If
+  sealing fails, nothing is appended and the stage fails like any other stage error.
+- A failed seal can leave bundle files in the store. They are content addressed and no verdict
+  names them. A retried seal gets a new `createdAt`, so a new bundle digest; only the one the
+  written verdict names counts.
+
+Wiring it is outside Lane 2 (see `real-judge-host.md`, "Requests for the lead and Lane 1").
+
 ## Evidence
 
 - Unit tests (`pnpm --filter @affidavit/evidence test`): determinism, refusals when building,
@@ -167,7 +194,8 @@ digest; `loadBundle` gets the tar by digest and opens it.
   `verifyPatch` itself is in PR #17, so there is no sandbox-host patch replay yet.
 - **Run logs.** `RunRecord` carries stdout and stderr digests, but `JudgePort` does not return the
   logs, so they are not in the bundle.
-- **Signature.** L2-09 signs the manifest digest; `replay` will then check the attestation before
+- **Signature.** L2-09 signs the manifest digest, and `sealVerdict` stores the attestation next
+  to the bundle; `replay` will then check the attestation before
   trusting the manifest. Public verification of a bundle and its attestation (`verify`, L2-12)
   already exists and needs the published keys file (`--keys docs/keys/keys.json`, format in
   `docs/keys/README.md`): it refuses a bundle signed by a key whose status is `revoked`, and exits
