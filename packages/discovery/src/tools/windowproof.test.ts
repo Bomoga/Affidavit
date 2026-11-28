@@ -216,9 +216,10 @@ describe('percent escapes that decode to whitespace, file level (round 4, fourth
 });
 
 describe('inWindowProofClass', () => {
-  it('lockfiles by exact name and SVG files only', () => {
-    for (const n of ['package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml'])
+  it('JSON lockfiles by exact name and SVG files only; YAML lockfiles fail closed', () => {
+    for (const n of ['package-lock.json', 'npm-shrinkwrap.json'])
       expect(inWindowProofClass(n), n).toBe(true);
+    for (const n of ['yarn.lock', 'pnpm-lock.yaml']) expect(inWindowProofClass(n), n).toBe(false);
     expect(inWindowProofClass('icons.svg')).toBe(true);
     expect(inWindowProofClass('ICONS.SVG')).toBe(true);
     for (const n of ['Package-Lock.json', 'package-lock.json.bak', 'big.js', 'data.json', 'a.svgz'])

@@ -869,6 +869,18 @@ describe('runTool', () => {
         lifted: true,
       },
       {
+        name: 'real-looking integrity lines, but YAML lockfiles are never proven',
+        file: 'pnpm-lock.yaml',
+        body: `      integrity: sha512-${'Zm9vYmFy'.repeat(10)}fQ==\n`.repeat(1_500),
+        lifted: false,
+      },
+      {
+        name: 'real-looking integrity lines, but YAML lockfiles are never proven',
+        file: 'yarn.lock',
+        body: `  integrity sha512-${'Zm9vYmFy'.repeat(10)}fQ==\n`.repeat(1_500),
+        lifted: false,
+      },
+      {
         name: 'a plain text file with short lines (not in the proof class)',
         file: 'src/big.txt',
         body: plain,
