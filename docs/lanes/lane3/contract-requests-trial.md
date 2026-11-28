@@ -117,6 +117,15 @@ Proposals only. Nothing here changes `packages/contracts`; per implementation-pl
   4. Apply for the provider's verification program for security research use, so the safeguards can be adjusted for this organization? This is a provider-side process the lead owns; it does not replace one of the routes above while it is pending.
      Whatever is chosen, a refusal never dismisses a candidate, least of all a high-arraignment-score one, and the port never retries it on the same model.
 
+## CR-T14: `verdict-written` must carry the sealed verdict (CR-11, second half)
+
+- **Need:** Lane 2's `sealingCaseStore` (PR #87, open as of 2026-11-27) seals inside `CaseStore.appendVerdict`: it sets `bundleSha256` on the verdict it stores. `packages/trial` appends the verdict it built and then emits `verdict-written` with that same local object (`orchestrator.ts` around line 953, `verify.ts` around line 78). With only the store wrapped, the stored verdict names its bundle and the event does not. The courtroom, the CLI and `pnpm gate` read the event, so they would see an unsealed verdict for a sealed case.
+- **Proposal (no contract change):** after `appendVerdict`, read the verdict back with `store.getVerdict(caseId)` and emit that one, falling back to the local verdict only if the store returns null. The alternative, an optional `seal(verdict)` in `OrchestratorDeps` whose result is emitted, also works but adds a second path; the read-back keeps the store the one source of truth. Apply it in both places that write a verdict.
+- **Tests to add:** a store whose `appendVerdict` adds `bundleSha256` (a small wrapper over `FakeCaseStore` in the test) and an assertion that the emitted `verdict-written` payload equals `getVerdict`. Also assert that a sealing failure (the wrapped `appendVerdict` throws) emits no `verdict-written` and leaves the case at its stage.
+- **Also decide:** a `proven-fixed` verdict that cites no exhibit passes through Lane 2's sealer unsealed, because a bundle needs exhibits. The orchestrator should never build one; a guard that refuses to write a `proven-fixed` verdict with an empty `exhibits` list would make that explicit. Your call.
+- **Depends on:** PR #87 merging and Lane 1's wiring (CR-11 in `docs/lanes/lane1/contract-requests.md`). Until then the fakes behave as today.
+- **Not requested:** an `attestationSha256` field on `Verdict`. That is a contracts change for the lead (the PR proposes an optional field); the attestation is found by its own digest in the meantime.
+
 ## Contracts v1.2 follow-ups for Lane 3 (from the lead)
 
 Status (2026-11-21): CR-T1 (contract part), CR-T11 and CR-T12 landed in contracts v1.2. CR-T13's halt reason `model-refusal` and its `RefusalCategory` allowlist landed with CR-T12; the CR-T13 routing decision (second Defense attempt or human review) is not part of v1.2. CR-T3 is covered by the `halted` event. See `packages/contracts/CHANGELOG.md`. Nothing was implemented in `packages/trial`; v1.2 is additive, so Lane 3 keeps compiling unchanged. What Lane 3 should do with it:
